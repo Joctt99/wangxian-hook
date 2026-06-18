@@ -1,0 +1,58 @@
+name: Build Stub Dylibs
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'stub_signature/**'
+      - '.github/workflows/build-stubs.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build stub lnSignature.dylib
+        run: |
+          clang -dynamiclib \
+            -target arm64-apple-ios13.0 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -framework Foundation -framework CoreFoundation \
+            -framework UIKit -framework Security \
+            -fobjc-arc -O2 \
+            -install_name @executable_path/Frameworks/lnSignature.dylib \
+            stub_signature/StubSignatureCheck.m \
+            -o lnSignature.dylib
+
+      - name: Build stub libSupport.dylib
+        run: |
+          clang -dynamiclib \
+            -target arm64-apple-ios13.0 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -framework Foundation -framework CoreFoundation \
+            -framework UIKit -framework Security \
+            -fobjc-arc -O2 \
+            -install_name @executable_path/Dylibs/libSupport.dylib \
+            stub_signature/StubSupport.m \
+            -o libSupport.dylib
+
+      - name: Verify outputs
+        run: |
+          file lnSignature.dylib
+          file libSupport.dylib
+          ls -la lnSignature.dylib libSupport.dylib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: StubDylibs
+          path: |
+            lnSignature.dylib
+            libSupport.dylib
+          retention-days: 90
