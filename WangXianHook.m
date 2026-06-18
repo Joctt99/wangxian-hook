@@ -1,13 +1,12 @@
 /**
- * WangXianHook.dylib v6.0 - Smart signature bypass
+ * WangXianHook.dylib v7.0
  *
- * Key insight: DO NOT hook +load (triggers anti-tamper detection)
- * Instead: let the check run, but BLOCK the exit/alert actions.
- *
- * Only hooks:
- *   - exitApplication (prevent forced quit)
- *   - showAlert: (prevent error popup)
- *   - showTipViewEND: (prevent tip view)
+ * Strategy:
+ *   - DO NOT hook +load (triggers anti-tamper)
+ *   - Hook exitApplication/showAlert (prevent exit/alert from dylibs)
+ *   - Hook UIAlertController (block "版本过低" alert from main binary)
+ *   - Hook UIViewController presentVC (block alert presentation)
+ *   - ALL UIKit hooks deferred to after app launches
  */
 
 #import <Foundation/Foundation.h>
@@ -16,12 +15,14 @@
 
 #define WXLOG(fmt, ...) NSLog(@"[WXHook] " fmt, ##__VA_ARGS__)
 
-// Block: prevent exit
+// ============================================================
+#pragma mark - Signature action blockers
+// ============================================================
+
 static void block_void(id self, SEL _cmd) {
     WXLOG(@"BLOCKED [%s %s]", class_getName(object_getClass(self)), sel_getName(_cmd));
 }
 
-// Block: prevent alert with 1 arg
 static void block_void_1(id self, SEL _cmd, id a1) {
     WXLOG(@"BLOCKED [%s %s]", class_getName(object_getClass(self)), sel_getName(_cmd));
 }
@@ -34,43 +35,122 @@ static BOOL tryHook(Class cls, SEL sel, IMP imp) {
     return YES;
 }
 
-static int installHooks(void) {
+static int installSignatureHooks(void) {
     int count = 0;
-    
-    // SignatureCheck - ONLY action methods, NOT +load
     Class sigChk = objc_getClass("SignatureCheck");
     if (sigChk) {
         count += tryHook(sigChk, @selector(exitApplication), (IMP)block_void);
         count += tryHook(sigChk, @selector(showTipViewEND:), (IMP)block_void_1);
     }
-    
-    // SignatureKit - ONLY action methods, NOT +load
     Class sigKit = objc_getClass("SignatureKit");
     if (sigKit) {
         count += tryHook(sigKit, @selector(exitApplication), (IMP)block_void);
         count += tryHook(sigKit, @selector(showAlert:), (IMP)block_void_1);
     }
-    
     return count;
 }
 
+// ============================================================
+#pragma mark - UIAlertController blocker (deferred)
+// ============================================================
+
+typedef UIAlertController *(*AlertCreateIMP)(id, SEL, NSString *, NSString *, NSInteger);
+static AlertCreateIMP orig_alertControllerWithTitle = NULL;
+
+static UIAlertController *hooked_alertControllerWithTitle(id self, SEL _cmd,
+                                                           NSString *title,
+                                                           NSString *message,
+                                                           NSInteger style) {
+    if ([message containsString:@"版本过低"] ||
+        [message containsString:@"下载最新版本"] ||
+        [message containsString:@"联系客服"] ||
+        [message containsString:@"下载最新的版本"] ||
+        [title containsString:@"版本过低"]) {
+        WXLOG(@"BLOCKED alert: '%@' / '%@'", title, message);
+        return [UIAlertController alertControllerWithTitle:@"" message:@"" preferredStyle:UIAlertControllerStyleAlert];
+    }
+    return orig_alertControllerWithTitle(self, _cmd, title, message, style);
+}
+
+// ============================================================
+#pragma mark - UIViewController presentVC blocker (deferred)
+// ============================================================
+
+typedef void (*PresentVCIMP)(id, SEL, UIViewController *, BOOL, void (^)(void));
+static PresentVCIMP orig_presentViewController = NULL;
+
+static void hooked_presentViewController(id self, SEL _cmd,
+                                          UIViewController *vc,
+                                          BOOL animated,
+                                          void (^completion)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *alert = (UIAlertController *)vc;
+        NSString *msg = alert.message ?: @"";
+        NSString *title = alert.title ?: @"";
+        if ([msg containsString:@"版本过低"] ||
+            [msg containsString:@"下载最新版本"] ||
+            [msg containsString:@"联系客服"] ||
+            [msg containsString:@"下载最新的版本"] ||
+            [title containsString:@"版本过低"]) {
+            WXLOG(@"BLOCKED present: '%@' / '%@'", title, msg);
+            if (completion) completion();
+            return;
+        }
+    }
+    orig_presentViewController(self, _cmd, vc, animated, completion);
+}
+
+static void installUIKitHooks(void) {
+    WXLOG(@"Installing UIKit hooks...");
+    
+    Class alertCls = [UIAlertController class];
+    if (alertCls) {
+        Method m = class_getClassMethod(alertCls, @selector(alertControllerWithTitle:message:preferredStyle:));
+        if (m) {
+            orig_alertControllerWithTitle = (AlertCreateIMP)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_alertControllerWithTitle);
+            WXLOG(@"[OK] UIAlertController");
+        }
+    }
+    
+    Class vcCls = [UIViewController class];
+    if (vcCls) {
+        Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
+        if (m) {
+            orig_presentViewController = (PresentVCIMP)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_presentViewController);
+            WXLOG(@"[OK] UIViewController presentVC");
+        }
+    }
+}
+
+// ============================================================
+#pragma mark - Constructor
+// ============================================================
+
 __attribute__((constructor))
 static void wangxian_hook_entry(void) {
-    WXLOG(@"WangXianHook v6.0 starting");
+    WXLOG(@"WangXianHook v7.0 starting");
     
-    int count = installHooks();
-    WXLOG(@"Initial hooks: %d", count);
+    // Immediate: signature action blockers (safe, no +load hook)
+    int count = installSignatureHooks();
+    WXLOG(@"Signature hooks: %d", count);
     
-    // Retry after delays (classes might load later)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+    // Deferred: UIKit hooks after app launches
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidFinishLaunchingNotification
+        object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(NSNotification *note) {
+            WXLOG(@"App launched");
+            installUIKitHooks();
+            installSignatureHooks(); // retry
+        }];
+    
+    // Extra retry
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        int c = installHooks();
-        WXLOG(@"0.5s retry: %d hooks", c);
-    });
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        int c = installHooks();
-        WXLOG(@"2s retry: %d hooks", c);
+        int c = installSignatureHooks();
+        WXLOG(@"1s retry: %d", c);
+        installUIKitHooks();
     });
 }
