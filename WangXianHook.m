@@ -264,9 +264,12 @@ static void installAlertHook(void) {
 #pragma mark - Floating Log Button & Viewer
 // ============================================================
 
+@class WXLogButtonHandler;
+
 static UIButton *g_logBtn = nil;
 static UITextView *g_logTextView = nil;
 static UIView *g_logPanel = nil;
+static WXLogButtonHandler *g_handler = nil;
 
 static NSString *readLogFile(void) {
     if (!g_logPath) return @"No log path";
@@ -472,7 +475,7 @@ static void createFloatingButton(void) {
     }
     if (!keyWin) return;
     
-    WXLogButtonHandler *handler = [[WXLogButtonHandler alloc] init];
+    g_handler = [[WXLogButtonHandler alloc] init];
     
     g_logBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     g_logBtn.frame = CGRectMake(keyWin.bounds.size.width - 60, 200, 50, 50);
@@ -485,7 +488,7 @@ static void createFloatingButton(void) {
     g_logBtn.titleLabel.font = [UIFont systemFontOfSize:10];
     [g_logBtn setTitle:@"LOG" forState:UIControlStateNormal];
     [g_logBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [g_logBtn addTarget:handler action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+    [g_logBtn addTarget:g_handler action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
     [keyWin addSubview:g_logBtn];
     
     // Make draggable
