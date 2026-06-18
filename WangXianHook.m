@@ -261,6 +261,242 @@ static void installAlertHook(void) {
 }
 
 // ============================================================
+#pragma mark - Floating Log Button & Viewer
+// ============================================================
+
+static UIButton *g_logBtn = nil;
+static UITextView *g_logTextView = nil;
+static UIView *g_logPanel = nil;
+
+static NSString *readLogFile(void) {
+    if (!g_logPath) return @"No log path";
+    NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil];
+    return content ?: @"Empty log";
+}
+
+static void showLogViewer(void) {
+    UIWindow *keyWin = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) { keyWin = w; break; }
+            }
+        }
+    }
+    if (!keyWin) return;
+    
+    if (g_logPanel) { [g_logPanel removeFromSuperview]; g_logPanel = nil; }
+    
+    CGRect frame = keyWin.bounds;
+    g_logPanel = [[UIView alloc] initWithFrame:frame];
+    g_logPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
+    
+    // Title bar
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 50, frame.size.width - 32, 30)];
+    title.text = @"WXHook Diagnostic Log";
+    title.textColor = [UIColor greenColor];
+    title.font = [UIFont boldSystemFontOfSize:16];
+    [g_logPanel addSubview:title];
+    
+    // Buttons
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    copyBtn.frame = CGRectMake(16, 85, 100, 36);
+    [copyBtn setTitle:@"Copy All" forState:UIControlStateNormal];
+    [copyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    copyBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:1];
+    copyBtn.layer.cornerRadius = 8;
+    [copyBtn addTarget:[NSNull null] action:@selector(description) forControlEvents:UIControlEventTouchUpInside]; // placeholder
+    [copyBtn addTarget:g_logPanel action:@selector(removeFromSuperview) forControlEvents:UIControlEventAllTouchEvents]; // will override
+    [g_logPanel addSubview:copyBtn];
+    
+    UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    refreshBtn.frame = CGRectMake(130, 85, 100, 36);
+    [refreshBtn setTitle:@"Refresh" forState:UIControlStateNormal];
+    [refreshBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    refreshBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.4 blue:0.8 alpha:1];
+    refreshBtn.layer.cornerRadius = 8;
+    [g_logPanel addSubview:refreshBtn];
+    
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.frame = CGRectMake(frame.size.width - 116, 85, 100, 36);
+    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    closeBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1];
+    closeBtn.layer.cornerRadius = 8;
+    [g_logPanel addSubview:closeBtn];
+    
+    // Log text view
+    g_logTextView = [[UITextView alloc] initWithFrame:CGRectMake(8, 130, frame.size.width - 16, frame.size.height - 180)];
+    g_logTextView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
+    g_logTextView.textColor = [UIColor greenColor];
+    g_logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
+    g_logTextView.editable = NO;
+    g_logTextView.text = readLogFile();
+    [g_logPanel addSubview:g_logTextView];
+    
+    // Button actions using blocks
+    // Copy
+    void (^copyAction)(void) = ^{
+        [UIPasteboard generalPasteboard].string = readLogFile();
+        g_logTextView.text = @"=== Copied to clipboard! ===";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            g_logTextView.text = readLogFile();
+        });
+    };
+    
+    // We can't easily add block actions to UIButton, so use a helper class
+    // Instead, use touchUpInside with a target-action pattern
+    // Remove old targets and use custom subclass approach
+    
+    // Actually, let's use a simpler approach with UIControl events
+    // Override copy button tap
+    UITapGestureRecognizer *copyTap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+    // This is getting complicated. Let me use a different approach.
+    
+    // Simplest: store blocks in associated objects
+    // Actually simplest: just use the existing patterns
+    
+    // Let's just add the panel and use a simple close approach
+    [keyWin addSubview:g_logPanel];
+    
+    // Close button - use KVO or notification
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"WXHookCloseLog" object:nil];
+}
+
+// ============================================================
+#pragma mark - Simple Floating Button (using category)
+// ============================================================
+
+@interface WXLogButtonHandler : NSObject
+- (void)buttonTapped;
+- (void)copyTapped;
+- (void)refreshTapped;
+- (void)closeTapped;
+@end
+
+@implementation WXLogButtonHandler
+- (void)buttonTapped {
+    _log(@"[UI] Log button tapped");
+    UIWindow *keyWin = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) { keyWin = w; break; }
+            }
+        }
+    }
+    if (!keyWin) return;
+    
+    if (g_logPanel) { [g_logPanel removeFromSuperview]; g_logPanel = nil; return; }
+    
+    CGRect f = keyWin.bounds;
+    g_logPanel = [[UIView alloc] initWithFrame:f];
+    g_logPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
+    
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
+    lbl.text = @"WXHook Log";
+    lbl.textColor = [UIColor greenColor];
+    lbl.font = [UIFont boldSystemFontOfSize:16];
+    [g_logPanel addSubview:lbl];
+    
+    UIButton *cpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    cpBtn.frame = CGRectMake(16, 84, 90, 34);
+    [cpBtn setTitle:@"Copy" forState:UIControlStateNormal];
+    [cpBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    cpBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:1];
+    cpBtn.layer.cornerRadius = 8;
+    [cpBtn addTarget:self action:@selector(copyTapped) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:cpBtn];
+    
+    UIButton *rfBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    rfBtn.frame = CGRectMake(116, 84, 90, 34);
+    [rfBtn setTitle:@"Refresh" forState:UIControlStateNormal];
+    [rfBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    rfBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.4 blue:0.8 alpha:1];
+    rfBtn.layer.cornerRadius = 8;
+    [rfBtn addTarget:self action:@selector(refreshTapped) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:rfBtn];
+    
+    UIButton *clBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clBtn.frame = CGRectMake(f.size.width - 106, 84, 90, 34);
+    [clBtn setTitle:@"Close" forState:UIControlStateNormal];
+    [clBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    clBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1];
+    clBtn.layer.cornerRadius = 8;
+    [clBtn addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:clBtn];
+    
+    g_logTextView = [[UITextView alloc] initWithFrame:CGRectMake(8, 126, f.size.width - 16, f.size.height - 170)];
+    g_logTextView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.05 alpha:1];
+    g_logTextView.textColor = [UIColor greenColor];
+    g_logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
+    g_logTextView.editable = NO;
+    g_logTextView.text = readLogFile();
+    [g_logPanel addSubview:g_logTextView];
+    
+    g_logPanel.alpha = 0;
+    [keyWin addSubview:g_logPanel];
+    [UIView animateWithDuration:0.2 animations:^{ g_logPanel.alpha = 1; }];
+}
+
+- (void)copyTapped {
+    [UIPasteboard generalPasteboard].string = readLogFile();
+    g_logTextView.text = @">>> COPIED TO CLIPBOARD <<<";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        g_logTextView.text = readLogFile();
+    });
+}
+
+- (void)refreshTapped {
+    g_logTextView.text = readLogFile();
+}
+
+- (void)closeTapped {
+    [UIView animateWithDuration:0.2 animations:^{ g_logPanel.alpha = 0; } completion:^(BOOL done) {
+        [g_logPanel removeFromSuperview];
+        g_logPanel = nil;
+    }];
+}
+@end
+
+static void createFloatingButton(void) {
+    UIWindow *keyWin = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) { keyWin = w; break; }
+            }
+        }
+    }
+    if (!keyWin) return;
+    
+    WXLogButtonHandler *handler = [[WXLogButtonHandler alloc] init];
+    
+    g_logBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    g_logBtn.frame = CGRectMake(keyWin.bounds.size.width - 60, 200, 50, 50);
+    g_logBtn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
+    g_logBtn.layer.cornerRadius = 25;
+    g_logBtn.layer.shadowColor = [UIColor blackColor].CGColor;
+    g_logBtn.layer.shadowOffset = CGSizeMake(0, 2);
+    g_logBtn.layer.shadowRadius = 4;
+    g_logBtn.layer.shadowOpacity = 0.5;
+    g_logBtn.titleLabel.font = [UIFont systemFontOfSize:10];
+    [g_logBtn setTitle:@"LOG" forState:UIControlStateNormal];
+    [g_logBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [g_logBtn addTarget:handler action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+    [keyWin addSubview:g_logBtn];
+    
+    // Make draggable
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:handler action:nil];
+    // Simple drag using a block-based approach
+    // Actually let's skip drag for simplicity
+    
+    _log(@"[UI] Floating log button created");
+}
+
+// ============================================================
 #pragma mark - Constructor
 // ============================================================
 
@@ -272,14 +508,20 @@ static void wangxian_hook_entry(void) {
     installNetworkHooks();
     installSignatureLogHooks();
     
-    // Deferred: alert hook
+    // Deferred: alert hook + floating button
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidFinishLaunchingNotification
         object:nil queue:[NSOperationQueue mainQueue]
         usingBlock:^(NSNotification *note) {
-            _log(@"[INIT] App launched, installing alert hook");
+            _log(@"[INIT] App launched");
             installAlertHook();
-            installSignatureLogHooks(); // retry
+            installSignatureLogHooks();
+            
+            // Create floating button after a short delay
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                createFloatingButton();
+            });
         }];
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
