@@ -155,7 +155,7 @@ static void log_void_1(id self, SEL _cmd, id a1) {
 }
 
 static id log_nil(id self, SEL _cmd) {
-    _log([NSString stringWithFormat:@"[SIG] +[%s %s] -> nil", class_getName(object_getClass(self)), sel_getName(_cmd))]);
+    _log([NSString stringWithFormat:@"[SIG] +[%s %s] -> nil", class_getName(object_getClass(self)), sel_getName(_cmd)]);
     return nil;
 }
 
