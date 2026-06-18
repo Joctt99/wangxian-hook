@@ -491,11 +491,6 @@ static void createFloatingButton(void) {
     [g_logBtn addTarget:g_handler action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
     [keyWin addSubview:g_logBtn];
     
-    // Make draggable
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:handler action:nil];
-    // Simple drag using a block-based approach
-    // Actually let's skip drag for simplicity
-    
     _log(@"[UI] Floating log button created");
 }
 
