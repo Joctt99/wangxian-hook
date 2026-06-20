@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v18.0 ===");
+        _log(@"=== WXHook v19.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -300,6 +300,34 @@ static NSURLSession *hook_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionC
 }
 
 // ============================================================
+#pragma mark - NSURLSessionTask.response hook (fake HTTP 200)
+// ============================================================
+
+typedef NSURLResponse *(*TaskResponseIMP)(id, SEL);
+static TaskResponseIMP orig_taskResponse = NULL;
+static NSMutableSet *g_fakeResponseTasks = nil;  // task IDs that need fake HTTP 200
+
+static NSURLResponse *hook_taskResponse(id self, SEL _cmd) {
+    NSURLSessionTask *task = (NSURLSessionTask *)self;
+    NSNumber *tid = @(task.taskIdentifier);
+    
+    if (g_fakeResponseTasks && [g_fakeResponseTasks containsObject:tid]) {
+        NSURLResponse *realResp = orig_taskResponse ? orig_taskResponse(self, _cmd) : nil;
+        if (realResp && [realResp isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)realResp;
+            if (httpResp.statusCode != 200) {
+                DLOG(@"[RESP-HOOK] Faking HTTP 200 for taskID=%lu (was %ld)", (unsigned long)task.taskIdentifier, (long)httpResp.statusCode);
+                return [[NSHTTPURLResponse alloc] initWithURL:realResp.URL
+                                                   statusCode:200
+                                                  HTTPVersion:@"HTTP/1.1"
+                                                 headerFields:@{@"Content-Type": @"application/json"}];
+            }
+        }
+    }
+    return orig_taskResponse ? orig_taskResponse(self, _cmd) : nil;
+}
+
+// ============================================================
 #pragma mark - Delegate method swizzling for response interception
 // ============================================================
 
@@ -380,6 +408,10 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
         NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         DLOG(@"[DELEG] Original resp task=%lu: %@", (unsigned long)task.taskIdentifier, respStr);
         
+        // Mark this task for fake HTTP 200 response
+        if (!g_fakeResponseTasks) g_fakeResponseTasks = [NSMutableSet set];
+        [g_fakeResponseTasks addObject:@(task.taskIdentifier)];
+        
         // Create FAKE success response and deliver to delegate
         NSDictionary *fakeResp = @{
             @"timestamp": @"2026-06-20T14:42:12.039+0000",
@@ -407,6 +439,9 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
         ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, nil);
     } else if (url && error) {
         DLOG(@"[DELEG] Error on qunhongtech task: %@", error);
+        // Mark for fake response
+        if (!g_fakeResponseTasks) g_fakeResponseTasks = [NSMutableSet set];
+        [g_fakeResponseTasks addObject:@(task.taskIdentifier)];
         // Even on error, deliver fake success
         NSDictionary *fakeResp = @{@"status": @200, @"ispass": @"YES", @"code": @0, @"msg": @"success"};
         NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeResp options:0 error:nil];
@@ -427,6 +462,7 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
     [g_taskDataMap removeObjectForKey:tid];
     [g_taskRespMap removeObjectForKey:tid];
     [g_taskURLMap removeObjectForKey:tid];
+    [g_fakeResponseTasks removeObjectForKey:tid];
 }
 
 static void swizzleDelegate(id delegate) {
@@ -749,7 +785,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v18.0";
+    lbl.text = @"WXHook v19.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -836,6 +872,15 @@ static void entry(void) {
         Method m4 = class_getInstanceMethod(cls, @selector(dataTaskWithURL:));
         if (m4) { orig_dtu = (DTUrlIMP)method_getImplementation(m4); method_setImplementation(m4, (IMP)hook_dtu); }
         _log(@"[INIT] NSURLSession hooked (completionHandler + delegate)");
+        
+        // Hook NSURLSessionTask.response getter to fake HTTP 200
+        Class taskCls = [NSURLSessionTask class];
+        Method respMethod = class_getInstanceMethod(taskCls, @selector(response));
+        if (respMethod) {
+            orig_taskResponse = (TaskResponseIMP)method_getImplementation(respMethod);
+            method_setImplementation(respMethod, (IMP)hook_taskResponse);
+            _log(@"[INIT] NSURLSessionTask.response hooked (fake HTTP 200)");
+        }
         
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
