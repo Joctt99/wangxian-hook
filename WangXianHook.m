@@ -462,7 +462,7 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
     [g_taskDataMap removeObjectForKey:tid];
     [g_taskRespMap removeObjectForKey:tid];
     [g_taskURLMap removeObjectForKey:tid];
-    [g_fakeResponseTasks removeObjectForKey:tid];
+    [g_fakeResponseTasks removeObject:tid];
 }
 
 static void swizzleDelegate(id delegate) {
