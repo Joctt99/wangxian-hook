@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v19.0 ===");
+        _log(@"=== WXHook v20.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -299,6 +299,34 @@ static NSURLSession *hook_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionC
     return orig_sessionWithConfigOnly ? orig_sessionWithConfigOnly(self, _cmd, config) : nil;
 }
 
+// AFNetworking internal delegate swizzle for didReceiveResponse
+typedef void (*AFRecvRespHandlerIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSURLSessionResponseDisposition));
+static AFRecvRespHandlerIMP orig_afRecvRespHandler = NULL;
+
+static void swizzled_af_didReceiveResponseWithHandler(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSURLResponse *response, void (^completionHandler)(NSURLSessionResponseDisposition)) {
+    NSNumber *tid = @(task.taskIdentifier);
+    NSString *url = g_taskURLMap ? g_taskURLMap[tid] : nil;
+    
+    if (url && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+        DLOG(@"[AF-RESP] Intercepted response task=%lu status=%ld url=%@", (unsigned long)task.taskIdentifier, (long)httpResp.statusCode, url);
+        
+        // Create fake HTTP 200 response
+        NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:response.URL
+                                                                 statusCode:200
+                                                                HTTPVersion:@"HTTP/1.1"
+                                                               headerFields:@{@"Content-Type": @"application/json"}];
+        if (orig_afRecvRespHandler) {
+            orig_afRecvRespHandler(self, _cmd, session, task, fakeResp, completionHandler);
+        }
+        return;
+    }
+    // Not our task
+    if (orig_afRecvRespHandler) {
+        orig_afRecvRespHandler(self, _cmd, session, task, response, completionHandler);
+    }
+}
+
 // ============================================================
 #pragma mark - NSURLSessionTask.response hook (fake HTTP 200)
 // ============================================================
@@ -492,9 +520,8 @@ static void swizzleDelegate(id delegate) {
         return;
     }
     
-    // Add overridden methods
+    // Add overridden methods for AFHTTPSessionManager
     if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveResponse:completionHandler:)]) {
-        // AFNetworking uses the completionHandler variant
         class_addMethod(subClass, @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
                        (IMP)swizzled_didReceiveResponseWithHandler, "v@:@@@@?");
     } else if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveResponse:)]) {
@@ -517,6 +544,23 @@ static void swizzleDelegate(id delegate) {
     [g_subclassedDelegates addObject:className];
     
     DLOG(@"[DELEG] Created subclass %@, swizzled instance", subClassName);
+    
+    // Also try to swizzle AFURLSessionManagerTaskDelegate (AFNetworking internal class)
+    Class taskDelegateCls = objc_getClass("AFURLSessionManagerTaskDelegate");
+    if (taskDelegateCls) {
+        SEL recvRespHandlerSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
+        if ([taskDelegateCls instancesRespondToSelector:recvRespHandlerSel]) {
+            Method m = class_getInstanceMethod(taskDelegateCls, recvRespHandlerSel);
+            if (m) {
+                // Store original IMP
+                orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
+                DLOG(@"[DELEG] Swizzled AFURLSessionManagerTaskDelegate.didReceiveResponse:completionHandler:");
+            }
+        }
+    } else {
+        DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
+    }
 }
 
 // ============================================================
@@ -785,7 +829,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v19.0";
+    lbl.text = @"WXHook v20.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
