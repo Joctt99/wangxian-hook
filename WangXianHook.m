@@ -196,7 +196,52 @@ static UIAlertController *log_alert(id self, SEL _cmd, NSString *title, NSString
 }
 
 // ============================================================
-#pragma mark - Hook installation
+#pragma mark - NSURLConnection hooks
+// ============================================================
+
+typedef void (^NSURLConnCompHandler)(NSURLResponse *, NSData *, NSError *);
+typedef id (*AsyncReqIMP)(id, SEL, NSURLRequest *, NSOperationQueue *, NSURLConnCompHandler);
+static AsyncReqIMP orig_asyncReq = NULL;
+
+static id hook_sendAsync(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *queue, NSURLConnCompHandler handler) {
+    NSString *urlStr = req.URL.absoluteString;
+    _log([NSString stringWithFormat:@"[NET] NSURLConnection async: %@", urlStr]);
+    
+    NSURLConnCompHandler wrappedHandler = ^(NSURLResponse *response, NSData *data, NSError *error) {
+        _log([NSString stringWithFormat:@"[NET] NSURLConnection done: %@", urlStr]);
+        if (data) {
+            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (respStr && respStr.length < 2000) {
+                _log([NSString stringWithFormat:@"[NET]   Data: %@", respStr]);
+            }
+        }
+        NSData *patchedData = patchResponse(data, urlStr);
+        if (handler) handler(response, patchedData, error);
+    };
+    
+    return orig_asyncReq ? orig_asyncReq(self, _cmd, req, queue, wrappedHandler) : nil;
+}
+
+typedef NSData *(*SyncReqIMP)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
+static SyncReqIMP orig_syncReq = NULL;
+
+static NSData *hook_sendSync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **error) {
+    NSString *urlStr = req.URL.absoluteString;
+    _log([NSString stringWithFormat:@"[NET] NSURLConnection sync: %@", urlStr]);
+    
+    NSData *data = orig_syncReq ? orig_syncReq(self, _cmd, req, resp, error) : nil;
+    
+    if (data) {
+        NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (respStr && respStr.length < 2000) {
+            _log([NSString stringWithFormat:@"[NET]   Data: %@", respStr]);
+        }
+    }
+    return patchResponse(data, urlStr);
+}
+
+// ============================================================
+#pragma mark - Hook Installation
 // ============================================================
 
 static void installNetworkHooks(void) {
@@ -217,6 +262,23 @@ static void installNetworkHooks(void) {
     if (m) { orig_dtwuc = (DTUrlCompIMP)method_getImplementation(m); method_setImplementation(m, (IMP)log_dtwuc); }
     
     _log(@"[INIT] NSURLSession hooks installed");
+    
+    // NSURLConnection hooks
+    Class connCls = [NSURLConnection class];
+    if (connCls) {
+        Method am = class_getClassMethod(connCls, @selector(sendAsynchronousRequest:queue:completionHandler:));
+        if (am) {
+            orig_asyncReq = (AsyncReqIMP)method_getImplementation(am);
+            method_setImplementation(am, (IMP)hook_sendAsync);
+            _log(@"[INIT] NSURLConnection async hook installed");
+        }
+        Method sm = class_getClassMethod(connCls, @selector(sendSynchronousRequest:returningResponse:error:));
+        if (sm) {
+            orig_syncReq = (SyncReqIMP)method_getImplementation(sm);
+            method_setImplementation(sm, (IMP)hook_sendSync);
+            _log(@"[INIT] NSURLConnection sync hook installed");
+        }
+    }
 }
 
 static void installSignatureLogHooks(void) {
