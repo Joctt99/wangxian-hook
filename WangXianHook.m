@@ -26,7 +26,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v14.0 ===");
+        _log(@"=== WXHook v15.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -308,6 +308,28 @@ static DTReqIMP orig_dtr = NULL;
 static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
     NSString *u = req.URL.absoluteString ?: @"(null)";
     DLOG(@"[NET] delegate task: %@", u);
+    
+    // Try to inject our protocol into the session's configuration
+    @try {
+        NSURLSession *session = (NSURLSession *)self;
+        NSURLSessionConfiguration *config = session.configuration;
+        if (config) {
+            NSArray *currentProtocols = config.protocolClasses;
+            BOOL hasOurProtocol = NO;
+            for (Class pc in currentProtocols) {
+                if (pc == [WXInterceptor class]) { hasOurProtocol = YES; break; }
+            }
+            if (!hasOurProtocol) {
+                NSMutableArray *newProtocols = [NSMutableArray arrayWithArray:currentProtocols ?: @[]];
+                [newProtocols insertObject:[WXInterceptor class] atIndex:0];
+                config.protocolClasses = newProtocols;
+                DLOG(@"[INJECT] WXInterceptor added to session config for: %@", u);
+            }
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[INJECT] Exception: %@", e);
+    }
+    
     return orig_dtr ? orig_dtr(self, _cmd, req) : nil;
 }
 
@@ -532,7 +554,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v14.0";
+    lbl.text = @"WXHook v15.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
