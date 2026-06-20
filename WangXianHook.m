@@ -1,6 +1,6 @@
 /**
- * WangXianHook v7.0 - NSUserDefaults override + SignatureKit hooks
- * Core strategy: override license check results stored in NSUserDefaults
+ * WangXianHook v8.0 - Full UI monitoring + NSUserDefaults override
+ * Catches ALL views including custom popups
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -25,7 +25,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v7.0 ===");
+        _log(@"=== WXHook v8.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -187,6 +187,79 @@ static id hook_stringForKey(id self, SEL _cmd, NSString *key) {
 }
 
 // ============================================================
+#pragma mark - UIView.addSubview hook (catch ALL popups)
+// ============================================================
+
+typedef void (*AddSubviewIMP)(id, SEL, UIView *);
+static AddSubviewIMP orig_addSubview = NULL;
+
+static void dumpViewTree(UIView *v, int depth) {
+    if (depth > 5) return;
+    NSString *indent = [@"" stringByPaddingToLength:depth*2 withString:@" " startingAtIndex:0];
+    NSString *cls = NSStringFromClass([v class]);
+    NSString *text = @"";
+    // Get text from UILabel, UIButton, UITextView, UITextField
+    if ([v isKindOfClass:[UILabel class]]) {
+        text = ((UILabel *)v).text ?: @"";
+    } else if ([v isKindOfClass:[UIButton class]]) {
+        text = ((UIButton *)v).currentTitle ?: @"";
+    } else if ([v isKindOfClass:[UITextView class]]) {
+        text = [((UITextView *)v).text substringToIndex:MIN(((UITextView *)v).text.length, 50)];
+    }
+    if (text.length > 0 || ![cls hasPrefix:@"_"]) {
+        DLOG(@"[VIEW] %@%@ frame=%.0fx%.0f text='%@'", indent, cls, v.frame.size.width, v.frame.size.height, text);
+    }
+    for (UIView *sub in v.subviews) {
+        dumpViewTree(sub, depth + 1);
+    }
+}
+
+static void hook_addSubview(id self, SEL _cmd, UIView *view) {
+    NSString *cls = NSStringFromClass([view class]);
+    // Log interesting views (alerts, dialogs, popups, labels with Chinese text)
+    BOOL interesting = NO;
+    NSString *lower = [cls lowercaseString];
+    if ([lower containsString:@"alert"] || [lower containsString:@"dialog"] || 
+        [lower containsString:@"popup"] || [lower containsString:@"modal"] ||
+        [lower containsString:@"tip"] || [lower containsString:@"banner"] ||
+        [lower containsString:@"toast"] || [lower containsString:@"hud"]) {
+        interesting = YES;
+    }
+    // Also check for UILabel with specific text
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text;
+        if (text && ([text containsString:@"版本"] || [text containsString:@"过低"] || [text containsString:@"更新"])) {
+            DLOG(@"[LABEL-CATCH] class=%@ text='%@'", cls, text);
+            interesting = YES;
+        }
+    }
+    if (interesting) {
+        DLOG(@"[ADDVIEW] %@ added to %@", cls, NSStringFromClass([self class]));
+        dumpViewTree(view, 0);
+    }
+    if (orig_addSubview) orig_addSubview(self, _cmd, view);
+}
+
+// ============================================================
+#pragma mark - UILabel.setText hook
+// ============================================================
+
+typedef void (*SetTextIMP)(id, SEL, NSString *);
+static SetTextIMP orig_setText = NULL;
+
+static void hook_setText(id self, SEL _cmd, NSString *text) {
+    if (text && ([text containsString:@"版本"] || [text containsString:@"过低"] || [text containsString:@"更新"])) {
+        DLOG(@"[LABEL-TEXT] class=%@ text='%@'", NSStringFromClass([self class]), text);
+        // Get call stack
+        NSArray *stack = [NSThread callStackSymbols];
+        for (int i = 0; i < MIN((int)stack.count, 8); i++) {
+            DLOG(@"[STACK] %@", stack[i]);
+        }
+    }
+    if (orig_setText) orig_setText(self, _cmd, text);
+}
+
+// ============================================================
 #pragma mark - UIAlertController hook
 // ============================================================
 
@@ -279,7 +352,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v7.0";
+    lbl.text = @"WXHook v8.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -304,6 +377,13 @@ static WXHandler *g_handler = nil;
     g_tv.textColor = [UIColor greenColor];
     g_tv.font = [UIFont fontWithName:@"Menlo" size:10];
     g_tv.editable = NO;
+    // Dump current view hierarchy to log
+    _log(@"[DUMP] === View Hierarchy ===");
+    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+        dumpViewTree(win, 0);
+    }
+    _log(@"[DUMP] === End Hierarchy ===");
+    
     g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"Empty";
     [g_panel addSubview:g_tv];
     [w addSubview:g_panel];
@@ -356,10 +436,20 @@ static void entry(void) {
         _log(@"[INIT] NSURLSession hooked");
     }
     
-    // === PHASE 3: UIAlertController hook ===
+    // === PHASE 3: UI hooks ===
     Class vcCls = [UIViewController class];
     Method pm = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
     if (pm) { orig_presentVC = (PresentVC_IMP)method_getImplementation(pm); method_setImplementation(pm, (IMP)hook_presentVC); _log(@"[INIT] UIAlertController hooked"); }
+    
+    // UIView.addSubview - catch ALL popups including custom ones
+    Class viewCls = [UIView class];
+    Method asv = class_getInstanceMethod(viewCls, @selector(addSubview:));
+    if (asv) { orig_addSubview = (AddSubviewIMP)method_getImplementation(asv); method_setImplementation(asv, (IMP)hook_addSubview); _log(@"[INIT] UIView.addSubview hooked"); }
+    
+    // UILabel.setText - detect Chinese text changes
+    Class lblCls = [UILabel class];
+    Method stm = class_getInstanceMethod(lblCls, @selector(setText:));
+    if (stm) { orig_setText = (SetTextIMP)method_getImplementation(stm); method_setImplementation(stm, (IMP)hook_setText); _log(@"[INIT] UILabel.setText hooked"); }
     
     // === PHASE 4: Deferred - SignatureKit hooks + UI ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
