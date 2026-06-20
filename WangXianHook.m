@@ -1,15 +1,9 @@
 /**
- * WangXianHook.dylib - DIAGNOSTIC VERSION
+ * WangXianHook.dylib - PRODUCTION VERSION v2.0
  * 
- * Does NOT block anything. Only OBSERVES and LOGS:
- *   1. ALL NSURLSession network requests (URL, method, headers, body)
- *   2. ALL NSURLSession responses (status code, data)
- *   3. SignatureKit/SignatureCheck method calls
- *   4. UIAlertController creation/presentation
- *   5. exit() calls
- *
- * Log file: /tmp/wxhook.log
- * Read via: cat /tmp/wxhook.log (from device or iFile)
+ * 1. Hooks md5xor.com responses, changes ispass:NO -> ispass:YES
+ * 2. Logs all network requests for debugging
+ * 3. Floating LOG button for diagnostics
  */
 
 #import <Foundation/Foundation.h>
@@ -90,18 +84,38 @@ typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
 typedef NSURLSessionDataTask *(*DTReqCompIMP)(id, SEL, NSURLRequest *, CompHandler);
 static DTReqCompIMP orig_dtwrc = NULL;
 
+static NSData *patchResponse(NSData *data, NSString *url) {
+    if (!data || !url) return data;
+    // Patch md5xor.com responses: ispass NO -> YES
+    if ([url containsString:@"md5xor.com"] || [url containsString:@"ln_sign_cert"]) {
+        NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (str) {
+            NSString *patched = [str stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\""
+                                                              withString:@"\"ispass\":\"YES\""];
+            patched = [patched stringByReplacingOccurrencesOfString:@"\"test\":\"NO\""
+                                                         withString:@"\"test\":\"YES\""];
+            NSData *newData = [patched dataUsingEncoding:NSUTF8StringEncoding];
+            if (newData && ![str isEqualToString:patched]) {
+                _log(@"[PATCH] Modified response: ispass NO->YES");
+                return newData;
+            }
+        }
+    }
+    return data;
+}
+
 static NSURLSessionDataTask *log_dtwrc(id self, SEL _cmd, NSURLRequest *req, CompHandler handler) {
-    _log([NSString stringWithFormat:@"[NET] dataTask+Comp %@", req.URL.absoluteString]);
+    NSString *urlStr = req.URL.absoluteString;
+    _log([NSString stringWithFormat:@"[NET] dataTask+Comp %@", urlStr]);
     if (req.HTTPBody) {
         NSString *body = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
         if (body) _log([NSString stringWithFormat:@"[NET]   Body: %@", body]);
     }
     
-    // Wrap completion handler to log response
     CompHandler wrappedHandler = ^(NSData *data, NSURLResponse *response, NSError *error) {
         if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
             NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-            _log([NSString stringWithFormat:@"[NET]   Response %ld: %@", (long)httpResp.statusCode, req.URL.absoluteString]);
+            _log([NSString stringWithFormat:@"[NET]   Response %ld: %@", (long)httpResp.statusCode, urlStr]);
         }
         if (data) {
             NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
@@ -114,7 +128,9 @@ static NSURLSessionDataTask *log_dtwrc(id self, SEL _cmd, NSURLRequest *req, Com
         if (error) {
             _log([NSString stringWithFormat:@"[NET]   Error: %@", error.localizedDescription]);
         }
-        if (handler) handler(data, response, error);
+        // Patch md5xor.com response
+        NSData *patchedData = patchResponse(data, urlStr);
+        if (handler) handler(patchedData, response, error);
     };
     
     return orig_dtwrc ? orig_dtwrc(self, _cmd, req, wrappedHandler) : nil;
@@ -124,18 +140,21 @@ typedef NSURLSessionDataTask *(*DTUrlCompIMP)(id, SEL, NSURL *, CompHandler);
 static DTUrlCompIMP orig_dtwuc = NULL;
 
 static NSURLSessionDataTask *log_dtwuc(id self, SEL _cmd, NSURL *url, CompHandler handler) {
-    _log([NSString stringWithFormat:@"[NET] dataTaskURL+Comp %@", url.absoluteString]);
+    NSString *urlStr = url.absoluteString;
+    _log([NSString stringWithFormat:@"[NET] dataTaskURL+Comp %@", urlStr]);
     
     CompHandler wrappedHandler = ^(NSData *data, NSURLResponse *response, NSError *error) {
         if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
             NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-            _log([NSString stringWithFormat:@"[NET]   Response %ld: %@", (long)httpResp.statusCode, url.absoluteString]);
+            _log([NSString stringWithFormat:@"[NET]   Response %ld: %@", (long)httpResp.statusCode, urlStr]);
         }
         if (data) {
             NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
             if (respStr && respStr.length < 2000) _log([NSString stringWithFormat:@"[NET]   Data: %@", respStr]);
         }
-        if (handler) handler(data, response, error);
+        // Patch md5xor.com response
+        NSData *patchedData = patchResponse(data, urlStr);
+        if (handler) handler(patchedData, response, error);
     };
     
     return orig_dtwuc ? orig_dtwuc(self, _cmd, url, wrappedHandler) : nil;
@@ -501,7 +520,7 @@ static void createFloatingButton(void) {
 __attribute__((constructor))
 static void wangxian_hook_entry(void) {
     log_init();
-    _log(@"=== WangXianHook Diagnostic v1.0 ===");
+    _log(@"=== WangXianHook v2.0 ===");
     
     installNetworkHooks();
     installSignatureLogHooks();
