@@ -26,7 +26,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v13.0 ===");
+        _log(@"=== WXHook v14.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -199,7 +199,13 @@ static NSString * const kWXProtocolHandled = @"WXProtocolHandled";
 @implementation WXInterceptor
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSString *urlStr = request.URL.absoluteString ?: @"";
+    NSString *urlStr = request.URL.absoluteString ?: @"(nil)";
+    // Log ALL requests for debugging (first 30 only to avoid flood)
+    static int canInitCount = 0;
+    if (canInitCount < 30) {
+        canInitCount++;
+        _log([NSString stringWithFormat:@"[PROTO-CHECK] #%d %@", canInitCount, urlStr]);
+    }
     if ([urlStr containsString:@"qunhongtech"] || [urlStr containsString:@"md5xor"] ||
         [urlStr containsString:@"judgeAppInfo"]) {
         if ([NSURLProtocol propertyForKey:kWXProtocolHandled inRequest:request]) {
@@ -526,7 +532,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v13.0";
+    lbl.text = @"WXHook v14.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -617,22 +623,6 @@ static void entry(void) {
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
         _log(@"[INIT] NSURLProtocol interceptor registered for qunhongtech.com");
-        
-        // Hook sessionWithConfiguration:delegate:delegateQueue: to inject protocol
-        Class sessCls = [NSURLSession class];
-        Method scd = class_getClassMethod(sessCls, @selector(sessionWithConfiguration:delegate:delegateQueue:));
-        if (scd) {
-            orig_sessionWithConfig = (SessionWithConfigIMP)method_getImplementation(scd);
-            method_setImplementation(scd, (IMP)hook_sessionWithConfig);
-            _log(@"[INIT] NSURLSession.sessionWithConfiguration hooked");
-        }
-        // Also hook sessionWithConfiguration: (no delegate)
-        Method sc = class_getClassMethod(sessCls, @selector(sessionWithConfiguration:));
-        if (sc) {
-            orig_sessionWithConfigOnly = (SessionWithConfigOnlyIMP)method_getImplementation(sc);
-            method_setImplementation(sc, (IMP)hook_sessionWithConfigOnly);
-            _log(@"[INIT] NSURLSession.sessionWithConfiguration (no delegate) hooked");
-        }
     }
     
     // === PHASE 2.5: NSURL creation hooks (catch ALL URLs at lowest level) ===
