@@ -26,7 +26,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v9.0 ===");
+        _log(@"=== WXHook v10.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -185,6 +185,65 @@ static id hook_stringForKey(id self, SEL _cmd, NSString *key) {
         }
     }
     return result;
+}
+
+// ============================================================
+#pragma mark - NSURLSession delegate hooks (catch response data)
+// ============================================================
+
+// Hook didReceiveData delegate method
+typedef void (*DidRecvDataIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
+static DidRecvDataIMP orig_didRecvData = NULL;
+static NSMutableData *g_capturedData = nil;
+static NSString *g_capturedURL = nil;
+
+static void hook_didRecvData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
+    if (!g_capturedData) g_capturedData = [[NSMutableData alloc] init];
+    [g_capturedData appendData:data];
+    if (task.originalRequest.URL) {
+        g_capturedURL = task.originalRequest.URL.absoluteString;
+    }
+    if (orig_didRecvData) orig_didRecvData(self, _cmd, session, task, data);
+}
+
+// Hook didCompleteWithError delegate method
+typedef void (*DidCompleteIMP)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
+static DidCompleteIMP orig_didComplete = NULL;
+
+static void hook_didComplete(id self, SEL _cmd, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+    if (g_capturedData && g_capturedData.length > 0 && g_capturedURL) {
+        NSString *respStr = [[NSString alloc] initWithData:g_capturedData encoding:NSUTF8StringEncoding];
+        if (respStr && respStr.length < 2000) {
+            DLOG(@"[DEL-RESP] %@: %@", g_capturedURL, respStr);
+            // Patch ispass in captured data
+            NSData *patched = patchIspass(g_capturedData, g_capturedURL);
+            if (patched != g_capturedData) {
+                DLOG(@"[DEL-PATCH] Patched response for delegate mode");
+            }
+        }
+        g_capturedData = nil;
+        g_capturedURL = nil;
+    }
+    if (orig_didComplete) orig_didComplete(self, _cmd, session, task, error);
+}
+
+// Hook NSURLSession dataTaskWithRequest: (no completion handler - delegate mode)
+typedef NSURLSessionDataTask *(*DTReqIMP)(id, SEL, NSURLRequest *);
+static DTReqIMP orig_dtr = NULL;
+
+static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
+    NSString *u = req.URL.absoluteString ?: @"(null)";
+    DLOG(@"[NET] delegate task: %@", u);
+    return orig_dtr ? orig_dtr(self, _cmd, req) : nil;
+}
+
+typedef NSURLSessionDataTask *(*DTUrlIMP)(id, SEL, NSURL *);
+static DTUrlIMP orig_dtu = NULL;
+
+static NSURLSessionDataTask *hook_dtu(id self, SEL _cmd, NSURL *url) {
+    NSString *u = url.absoluteString ?: @"(null)";
+    DLOG(@"[NET] delegate url: %@", u);
+    return orig_dtu ? orig_dtu(self, _cmd, url) : nil;
 }
 
 // ============================================================
@@ -399,7 +458,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v9.0";
+    lbl.text = @"WXHook v10.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -480,7 +539,12 @@ static void entry(void) {
         if (m1) { orig_dtwrc = (DTReqCompIMP)method_getImplementation(m1); method_setImplementation(m1, (IMP)hook_dtwrc); }
         Method m2 = class_getInstanceMethod(cls, @selector(dataTaskWithURL:completionHandler:));
         if (m2) { orig_dtwuc = (DTUrlCompIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_dtwuc); }
-        _log(@"[INIT] NSURLSession hooked");
+        // Also hook delegate mode (no completion handler)
+        Method m3 = class_getInstanceMethod(cls, @selector(dataTaskWithRequest:));
+        if (m3) { orig_dtr = (DTReqIMP)method_getImplementation(m3); method_setImplementation(m3, (IMP)hook_dtr); }
+        Method m4 = class_getInstanceMethod(cls, @selector(dataTaskWithURL:));
+        if (m4) { orig_dtu = (DTUrlIMP)method_getImplementation(m4); method_setImplementation(m4, (IMP)hook_dtu); }
+        _log(@"[INIT] NSURLSession hooked (completionHandler + delegate)");
     }
     
     // === PHASE 2.5: NSURL creation hooks (catch ALL URLs at lowest level) ===
