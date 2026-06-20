@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v17.0 ===");
+        _log(@"=== WXHook v18.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -308,6 +308,46 @@ static NSMutableDictionary *g_taskRespMap = nil;   // taskIdentifier -> NSURLRes
 static NSMutableDictionary *g_taskURLMap = nil;    // taskIdentifier -> NSString (URL)
 static NSMutableSet *g_subclassedDelegates = nil;   // Set of delegate class names already subclassed
 
+// Swizzled didReceiveResponse - fake HTTP 200 status
+typedef void (*DidRecvRespIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *);
+static void swizzled_didReceiveResponse(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSURLResponse *response) {
+    NSNumber *tid = @(task.taskIdentifier);
+    NSString *url = g_taskURLMap[tid];
+    if (url && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+        DLOG(@"[DELEG] didReceiveResponse task=%lu status=%ld (faking 200)", (unsigned long)task.taskIdentifier, (long)httpResp.statusCode);
+        NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:response.URL
+                                                                 statusCode:200
+                                                                HTTPVersion:@"HTTP/1.1"
+                                                               headerFields:@{@"Content-Type": @"application/json"}];
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, fakeResp);
+        return;
+    }
+    struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+    ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, response);
+}
+
+// completionHandler variant (AFNetworking uses this)
+typedef void (*RecvRespCompletion)(NSURLSessionResponseDisposition);
+static void swizzled_didReceiveResponseWithHandler(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSURLResponse *response, RecvRespCompletion completionHandler) {
+    NSNumber *tid = @(task.taskIdentifier);
+    NSString *url = g_taskURLMap[tid];
+    if (url && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+        DLOG(@"[DELEG] didReceiveResponse+handler task=%lu status=%ld (faking 200)", (unsigned long)task.taskIdentifier, (long)httpResp.statusCode);
+        NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:response.URL
+                                                                 statusCode:200
+                                                                HTTPVersion:@"HTTP/1.1"
+                                                               headerFields:@{@"Content-Type": @"application/json"}];
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, id, id, id, RecvRespCompletion))objc_msgSendSuper)(&superInfo, _cmd, session, task, fakeResp, completionHandler);
+        return;
+    }
+    struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+    ((void (*)(struct objc_super *, SEL, id, id, id, RecvRespCompletion))objc_msgSendSuper)(&superInfo, _cmd, session, task, response, completionHandler);
+}
+
 // Swizzled didReceiveData - accumulate response data per task
 typedef void (*DidRecvDataOrigIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
 static void swizzled_didReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
@@ -417,6 +457,14 @@ static void swizzleDelegate(id delegate) {
     }
     
     // Add overridden methods
+    if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveResponse:completionHandler:)]) {
+        // AFNetworking uses the completionHandler variant
+        class_addMethod(subClass, @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
+                       (IMP)swizzled_didReceiveResponseWithHandler, "v@:@@@@?");
+    } else if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveResponse:)]) {
+        class_addMethod(subClass, @selector(URLSession:dataTask:didReceiveResponse:),
+                       (IMP)swizzled_didReceiveResponse, "v@:@@@");
+    }
     if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveData:)]) {
         class_addMethod(subClass, @selector(URLSession:dataTask:didReceiveData:),
                        (IMP)swizzled_didReceiveData, "v@:@@@@");
@@ -701,7 +749,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v17.0";
+    lbl.text = @"WXHook v18.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
