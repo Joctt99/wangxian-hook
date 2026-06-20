@@ -26,7 +26,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v12.0 ===");
+        _log(@"=== WXHook v13.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -258,6 +258,39 @@ static NSString * const kWXProtocolHandled = @"WXProtocolHandled";
 }
 
 @end
+
+// ============================================================
+#pragma mark - NSURLSession sessionWithConfiguration hooks
+// ============================================================
+
+typedef NSURLSession *(*SessionWithConfigIMP)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *);
+static SessionWithConfigIMP orig_sessionWithConfig = NULL;
+
+static NSURLSession *hook_sessionWithConfig(id self, SEL _cmd, NSURLSessionConfiguration *config, id delegate, NSOperationQueue *queue) {
+    // Inject our protocol at the front
+    NSMutableArray *protocols = [[config protocolClasses] mutableCopy];
+    if (!protocols) protocols = [NSMutableArray array];
+    if (![protocols containsObject:[WXInterceptor class]]) {
+        [protocols insertObject:[WXInterceptor class] atIndex:0];
+        [config setProtocolClasses:protocols];
+        _log(@"[SESSION] Injected WXInterceptor into session config");
+    }
+    return orig_sessionWithConfig ? orig_sessionWithConfig(self, _cmd, config, delegate, queue) : nil;
+}
+
+typedef NSURLSession *(*SessionWithConfigOnlyIMP)(id, SEL, NSURLSessionConfiguration *);
+static SessionWithConfigOnlyIMP orig_sessionWithConfigOnly = NULL;
+
+static NSURLSession *hook_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionConfiguration *config) {
+    NSMutableArray *protocols = [[config protocolClasses] mutableCopy];
+    if (!protocols) protocols = [NSMutableArray array];
+    if (![protocols containsObject:[WXInterceptor class]]) {
+        [protocols insertObject:[WXInterceptor class] atIndex:0];
+        [config setProtocolClasses:protocols];
+        _log(@"[SESSION] Injected WXInterceptor into session config (no delegate)");
+    }
+    return orig_sessionWithConfigOnly ? orig_sessionWithConfigOnly(self, _cmd, config) : nil;
+}
 
 // ============================================================
 #pragma mark - NSURLSession delegate mode logging
@@ -493,7 +526,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v12.0";
+    lbl.text = @"WXHook v13.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -585,20 +618,20 @@ static void entry(void) {
         [NSURLProtocol registerClass:[WXInterceptor class]];
         _log(@"[INIT] NSURLProtocol interceptor registered for qunhongtech.com");
         
-        // Force inject our protocol into ALL NSURLSession configurations
-        Class cfgCls = [NSURLSessionConfiguration class];
-        Method pcm = class_getInstanceMethod(cfgCls, @selector(protocolClasses));
-        if (pcm) {
-            IMP origPC = method_getImplementation(pcm);
-            method_setImplementation(pcm, imp_implementationWithBlock(^NSArray *(NSURLSessionConfiguration *self_cfg) {
-                NSArray *original = ((NSArray *(*)(id, SEL))origPC)(self_cfg, @selector(protocolClasses));
-                NSMutableArray *modified = [original mutableCopy] ?: [NSMutableArray array];
-                if (![modified containsObject:[WXInterceptor class]]) {
-                    [modified insertObject:[WXInterceptor class] atIndex:0];
-                }
-                return [modified copy];
-            }));
-            _log(@"[INIT] NSURLSessionConfiguration.protocolClasses overridden");
+        // Hook sessionWithConfiguration:delegate:delegateQueue: to inject protocol
+        Class sessCls = [NSURLSession class];
+        Method scd = class_getClassMethod(sessCls, @selector(sessionWithConfiguration:delegate:delegateQueue:));
+        if (scd) {
+            orig_sessionWithConfig = (SessionWithConfigIMP)method_getImplementation(scd);
+            method_setImplementation(scd, (IMP)hook_sessionWithConfig);
+            _log(@"[INIT] NSURLSession.sessionWithConfiguration hooked");
+        }
+        // Also hook sessionWithConfiguration: (no delegate)
+        Method sc = class_getClassMethod(sessCls, @selector(sessionWithConfiguration:));
+        if (sc) {
+            orig_sessionWithConfigOnly = (SessionWithConfigOnlyIMP)method_getImplementation(sc);
+            method_setImplementation(sc, (IMP)hook_sessionWithConfigOnly);
+            _log(@"[INIT] NSURLSession.sessionWithConfiguration (no delegate) hooked");
         }
     }
     
