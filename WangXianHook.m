@@ -25,7 +25,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v8.0 ===");
+        _log(@"=== WXHook v9.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -184,6 +184,52 @@ static id hook_stringForKey(id self, SEL _cmd, NSString *key) {
         }
     }
     return result;
+}
+
+// ============================================================
+#pragma mark - NSURL creation hook (catch ALL URLs)
+// ============================================================
+
+typedef id (*URLWithStringIMP)(id, SEL, NSString *);
+static URLWithStringIMP orig_urlWithString = NULL;
+
+static id hook_urlWithString(id self, SEL _cmd, NSString *string) {
+    id result = orig_urlWithString ? orig_urlWithString(self, _cmd, string) : nil;
+    if (string && string.length > 0) {
+        NSString *lower = [string lowercaseString];
+        if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"]) {
+            DLOG(@"[URL] %@", string);
+        }
+    }
+    return result;
+}
+
+// NSURLRequest initWithURL hook
+typedef id (*ReqInitIMP)(id, SEL, NSURL *, NSUInteger, NSTimeInterval);
+static ReqInitIMP orig_reqInit = NULL;
+
+static id hook_reqInit(id self, SEL _cmd, NSURL *url, NSUInteger policy, NSTimeInterval timeout) {
+    id result = orig_reqInit ? orig_reqInit(self, _cmd, url, policy, timeout) : nil;
+    if (url) {
+        DLOG(@"[REQ] %@", url.absoluteString);
+    }
+    return result;
+}
+
+// CFNetwork function hooks
+#include <CoreFoundation/CoreFoundation.h>
+typedef CFHTTPMessageRef (*CFHTTPMsgCreateReqFunc)(CFAllocatorRef, CFURLRef, CFStringRef, CFStringRef, CFStringRef);
+static CFHTTPMsgCreateReqFunc orig_cfCreateReq = NULL;
+
+static CFHTTPMessageRef hook_cfCreateReq(CFAllocatorRef alloc, CFURLRef url, CFStringRef method, CFStringRef version, CFStringRef unused) {
+    if (url) {
+        CFStringRef urlStr = CFURLGetString(url);
+        if (urlStr) {
+            NSString *nsStr = (__bridge NSString *)urlStr;
+            DLOG(@"[CFNET] %@ %@", (__bridge NSString *)method, nsStr);
+        }
+    }
+    return orig_cfCreateReq ? orig_cfCreateReq(alloc, url, method, version, unused) : NULL;
 }
 
 // ============================================================
@@ -352,7 +398,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v8.0";
+    lbl.text = @"WXHook v9.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -434,6 +480,25 @@ static void entry(void) {
         Method m2 = class_getInstanceMethod(cls, @selector(dataTaskWithURL:completionHandler:));
         if (m2) { orig_dtwuc = (DTUrlCompIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_dtwuc); }
         _log(@"[INIT] NSURLSession hooked");
+    }
+    
+    // === PHASE 2.5: NSURL creation hooks (catch ALL URLs at lowest level) ===
+    Class urlCls = [NSURL class];
+    Method usm = class_getClassMethod(urlCls, @selector(URLWithString:));
+    if (usm) { orig_urlWithString = (URLWithStringIMP)method_getImplementation(usm); method_setImplementation(usm, (IMP)hook_urlWithString); _log(@"[INIT] NSURL.URLWithString hooked"); }
+    
+    // NSURLRequest init hook
+    Class reqCls = [NSURLRequest class];
+    Method rim = class_getInstanceMethod(reqCls, @selector(initWithURL:cachePolicy:timeoutInterval:));
+    if (rim) { orig_reqInit = (ReqInitIMP)method_getImplementation(rim); method_setImplementation(rim, (IMP)hook_reqInit); _log(@"[INIT] NSURLRequest.initWithURL hooked"); }
+    
+    // CFNetwork function hook
+    void *cfFunc = dlsym(RTLD_DEFAULT, "CFHTTPMessageCreateRequest");
+    if (cfFunc) {
+        orig_cfCreateReq = (CFHTTPMsgCreateReqFunc)cfFunc;
+        // Note: can't easily hook C functions with method_setImplementation
+        // Instead, we rely on NSURL/NSURLRequest hooks above
+        _log(@"[INIT] CFHTTPMessageCreateRequest found (logging via NSURL hooks)");
     }
     
     // === PHASE 3: UI hooks ===
