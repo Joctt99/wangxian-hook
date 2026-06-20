@@ -163,7 +163,7 @@ static void scanAndHookLicenseClasses(void) {
     
     // Also enumerate all loaded classes
     int total = objc_getClassList(NULL, 0);
-    Class *classes = malloc(sizeof(Class) * total);
+    Class *classes = (Class *)malloc(sizeof(Class) * total);
     objc_getClassList(classes, total);
     for (int i = 0; i < total; i++) {
         NSString *name = NSStringFromClass(classes[i]);
