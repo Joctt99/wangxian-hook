@@ -1,7 +1,6 @@
 /**
- * WangXianHook v5.0 - Patch API responses only
- * Does NOT hook signature methods (lets stub do real API calls)
- * Hooks NSURLConnection sync + NSURLSession to patch ispass
+ * WangXianHook v6.0 - Full Diagnostic
+ * Logs: SignatureCheck methods, SignatureKit methods, network, alerts, all UI
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -26,92 +25,74 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v5.0 ===");
+        _log(@"=== WXHook v6.0 Full Diagnostic ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
 
 // ============================================================
-#pragma mark - ispass patching helper
+#pragma mark - ispass patch
 // ============================================================
 
 static NSData *patchIspass(NSData *data, NSString *url) {
     if (!data) return data;
     NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!str) return data;
-    
     NSString *patched = str;
-    // Patch all variations of ispass
     patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
     patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\": \"NO\"" withString:@"\"ispass\": \"YES\""];
     patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\":false" withString:@"\"ispass\":true"];
-    patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\": false" withString:@"\"ispass\": true"];
-    patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\":0" withString:@"\"ispass\":1"];
-    patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\": 0" withString:@"\"ispass\": 1"];
-    // Also patch test field
     patched = [patched stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
-    
     NSData *newData = [patched dataUsingEncoding:NSUTF8StringEncoding];
     if (newData && ![str isEqualToString:patched]) {
         DLOG(@"[PATCH] ispass patched: %@", url);
-        DLOG(@"[PATCH] Before: %@", str);
-        DLOG(@"[PATCH] After: %@", patched);
         return newData;
     }
     return data;
 }
 
 // ============================================================
-#pragma mark - NSURLConnection sync hook (for +load API calls)
+#pragma mark - NSURLConnection sync hook
 // ============================================================
 
 typedef NSData *(*SyncReqIMP)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
 static SyncReqIMP orig_syncReq = NULL;
 
-static NSData *hook_sendSync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **error) {
-    NSString *urlStr = req.URL.absoluteString ?: @"(null)";
-    DLOG(@"[NET] NSURLConnection sync: %@", urlStr);
-    
+static NSData *hook_sync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **error) {
+    NSString *u = req.URL.absoluteString ?: @"(null)";
+    DLOG(@"[NET] NSURLConnection sync: %@", u);
     NSData *data = orig_syncReq ? orig_syncReq(self, _cmd, req, resp, error) : nil;
-    
     if (data) {
-        NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        if (respStr && respStr.length < 1500) {
-            DLOG(@"[NET] sync resp: %@", respStr);
-        }
+        NSString *r = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (r && r.length < 1500) DLOG(@"[NET] sync resp: %@", r);
     }
-    if (error && *error) {
-        DLOG(@"[NET] sync error: %@", (*error).localizedDescription);
-    }
-    
-    return patchIspass(data, urlStr);
+    if (error && *error) DLOG(@"[NET] sync error: %@", (*error).localizedDescription);
+    return patchIspass(data, u);
 }
 
 // ============================================================
 #pragma mark - NSURLConnection async hook
 // ============================================================
 
-typedef void (^NSURLConnCompHandler)(NSURLResponse *, NSData *, NSError *);
-typedef id (*AsyncReqIMP)(id, SEL, NSURLRequest *, NSOperationQueue *, NSURLConnCompHandler);
+typedef void (^NSURLConnComp)(NSURLResponse *, NSData *, NSError *);
+typedef id (*AsyncReqIMP)(id, SEL, NSURLRequest *, NSOperationQueue *, NSURLConnComp);
 static AsyncReqIMP orig_asyncReq = NULL;
 
-static id hook_sendAsync(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *queue, NSURLConnCompHandler handler) {
-    NSString *urlStr = req.URL.absoluteString ?: @"(null)";
-    DLOG(@"[NET] NSURLConnection async: %@", urlStr);
-    
-    NSURLConnCompHandler wrapped = ^(NSURLResponse *response, NSData *data, NSError *error) {
+static id hook_async(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *queue, NSURLConnComp handler) {
+    NSString *u = req.URL.absoluteString ?: @"(null)";
+    DLOG(@"[NET] NSURLConnection async: %@", u);
+    NSURLConnComp wrapped = ^(NSURLResponse *resp, NSData *data, NSError *error) {
         if (data) {
-            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (respStr && respStr.length < 1500) DLOG(@"[NET] async resp: %@", respStr);
+            NSString *r = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (r && r.length < 1500) DLOG(@"[NET] async resp: %@", r);
         }
-        if (handler) handler(response, patchIspass(data, urlStr), error);
+        if (handler) handler(resp, patchIspass(data, u), error);
     };
-    
     return orig_asyncReq ? orig_asyncReq(self, _cmd, req, queue, wrapped) : nil;
 }
 
 // ============================================================
-#pragma mark - NSURLSession completionHandler hook
+#pragma mark - NSURLSession hooks
 // ============================================================
 
 typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
@@ -119,17 +100,15 @@ typedef NSURLSessionDataTask *(*DTReqCompIMP)(id, SEL, NSURLRequest *, CompHandl
 static DTReqCompIMP orig_dtwrc = NULL;
 
 static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, CompHandler handler) {
-    NSString *urlStr = req.URL.absoluteString ?: @"(null)";
-    DLOG(@"[NET] NSURLSession req: %@", urlStr);
-    
+    NSString *u = req.URL.absoluteString ?: @"(null)";
+    DLOG(@"[NET] NSURLSession req: %@", u);
     CompHandler wrapped = ^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data) {
-            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (respStr && respStr.length < 1500) DLOG(@"[NET] session resp: %@", respStr);
+            NSString *r = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (r && r.length < 1500) DLOG(@"[NET] session resp: %@", r);
         }
-        if (handler) handler(patchIspass(data, urlStr), response, error);
+        if (handler) handler(patchIspass(data, u), response, error);
     };
-    
     return orig_dtwrc ? orig_dtwrc(self, _cmd, req, wrapped) : nil;
 }
 
@@ -137,18 +116,84 @@ typedef NSURLSessionDataTask *(*DTUrlCompIMP)(id, SEL, NSURL *, CompHandler);
 static DTUrlCompIMP orig_dtwuc = NULL;
 
 static NSURLSessionDataTask *hook_dtwuc(id self, SEL _cmd, NSURL *url, CompHandler handler) {
-    NSString *urlStr = url.absoluteString ?: @"(null)";
-    DLOG(@"[NET] NSURLSession url: %@", urlStr);
-    
+    NSString *u = url.absoluteString ?: @"(null)";
+    DLOG(@"[NET] NSURLSession url: %@", u);
     CompHandler wrapped = ^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data) {
-            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (respStr && respStr.length < 1500) DLOG(@"[NET] session resp: %@", respStr);
+            NSString *r = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (r && r.length < 1500) DLOG(@"[NET] session resp: %@", r);
         }
-        if (handler) handler(patchIspass(data, urlStr), response, error);
+        if (handler) handler(patchIspass(data, u), response, error);
     };
-    
     return orig_dtwuc ? orig_dtwuc(self, _cmd, url, wrapped) : nil;
+}
+
+// ============================================================
+#pragma mark - SignatureCheck method hooks (log only, pass through)
+// ============================================================
+
+static void hook_sig_method(Class cls, SEL sel, const char *label) {
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    IMP origImp = method_getImplementation(m);
+    IMP newImp = imp_implementationWithBlock(^(id self) {
+        DLOG(@"[SIG] +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
+        // Call original
+        void (*fp)(id, SEL) = (void *)origImp;
+        fp(self, sel);
+    });
+    method_setImplementation(m, newImp);
+    DLOG(@"[INIT] Hooked +%s", label);
+}
+
+static void hook_sig_method_arg(Class cls, SEL sel, const char *label) {
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    IMP origImp = method_getImplementation(m);
+    IMP newImp = imp_implementationWithBlock(^(id self, id arg) {
+        DLOG(@"[SIG] +[%@ %@] arg=%@", NSStringFromClass(cls), NSStringFromSelector(sel), arg);
+        void (*fp)(id, SEL, id) = (void *)origImp;
+        fp(self, sel, arg);
+    });
+    method_setImplementation(m, newImp);
+    DLOG(@"[INIT] Hooked +%s", label);
+}
+
+// ============================================================
+#pragma mark - UIAlertController hook
+// ============================================================
+
+typedef void (*PresentVC_IMP)(id, SEL, id, BOOL, id);
+static PresentVC_IMP orig_presentVC = NULL;
+
+static void hook_presentVC(id self, SEL _cmd, id vc, BOOL animated, id completion) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *alert = (UIAlertController *)vc;
+        DLOG(@"[ALERT] UIAlertController presented!");
+        DLOG(@"[ALERT] title: %@", alert.title ?: @"(nil)");
+        DLOG(@"[ALERT] message: %@", alert.message ?: @"(nil)");
+        for (UIAlertAction *action in alert.actions) {
+            DLOG(@"[ALERT] action: %@", action.title ?: @"(nil)");
+        }
+    }
+    if (orig_presentVC) orig_presentVC(self, _cmd, vc, animated, completion);
+}
+
+// ============================================================
+#pragma mark - UIView addSubview hook (catch popup views)
+// ============================================================
+
+typedef void (*AddSubviewIMP)(id, SEL, UIView *);
+static AddSubviewIMP orig_addSubview = NULL;
+
+static void hook_addSubview(id self, SEL _cmd, UIView *view) {
+    NSString *cls = NSStringFromClass([view class]);
+    if ([cls containsString:@"Alert"] || [cls containsString:@"Tip"] || 
+        [cls containsString:@"Dialog"] || [cls containsString:@"Modal"] ||
+        [cls containsString:@"Popup"] || [cls containsString:@"Banner"]) {
+        DLOG(@"[UI] addSubview: %@", cls);
+    }
+    if (orig_addSubview) orig_addSubview(self, _cmd, view);
 }
 
 // ============================================================
@@ -182,7 +227,7 @@ static WXHandler *g_handler = nil;
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v5.0";
+    lbl.text = @"WXHook v6.0 Diagnostic";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -212,7 +257,6 @@ static WXHandler *g_handler = nil;
     g_tv.editable = NO;
     g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"Empty";
     [g_panel addSubview:g_tv];
-    
     [w addSubview:g_panel];
 }
 
@@ -226,31 +270,23 @@ static WXHandler *g_handler = nil;
 @end
 
 // ============================================================
-#pragma mark - Constructor - ONLY hooks network APIs, NOT signature methods
+#pragma mark - Constructor
 // ============================================================
 
 __attribute__((constructor))
 static void entry(void) {
     log_init();
     
-    // Hook NSURLConnection sync (used by SignatureCheck +load)
+    // Hook NSURLConnection sync
     Class connCls = [NSURLConnection class];
     if (connCls) {
         Method sm = class_getClassMethod(connCls, @selector(sendSynchronousRequest:returningResponse:error:));
-        if (sm) {
-            orig_syncReq = (SyncReqIMP)method_getImplementation(sm);
-            method_setImplementation(sm, (IMP)hook_sendSync);
-            _log(@"[INIT] NSURLConnection sync hooked");
-        }
+        if (sm) { orig_syncReq = (SyncReqIMP)method_getImplementation(sm); method_setImplementation(sm, (IMP)hook_sync); _log(@"[INIT] NSURLConnection sync hooked"); }
         Method am = class_getClassMethod(connCls, @selector(sendAsynchronousRequest:queue:completionHandler:));
-        if (am) {
-            orig_asyncReq = (AsyncReqIMP)method_getImplementation(am);
-            method_setImplementation(am, (IMP)hook_sendAsync);
-            _log(@"[INIT] NSURLConnection async hooked");
-        }
+        if (am) { orig_asyncReq = (AsyncReqIMP)method_getImplementation(am); method_setImplementation(am, (IMP)hook_async); _log(@"[INIT] NSURLConnection async hooked"); }
     }
     
-    // Hook NSURLSession completionHandler
+    // Hook NSURLSession
     Class cls = [NSURLSession class];
     if (cls) {
         Method m1 = class_getInstanceMethod(cls, @selector(dataTaskWithRequest:completionHandler:));
@@ -260,11 +296,70 @@ static void entry(void) {
         _log(@"[INIT] NSURLSession hooked");
     }
     
-    // NOTE: We do NOT hook SignatureCheck or SignatureKit methods!
-    // The stub dylibs will call the real API and our network hooks will patch the response.
+    // Hook UIAlertController presentation
+    Class vcCls = [UIViewController class];
+    Method pm = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
+    if (pm) {
+        orig_presentVC = (PresentVC_IMP)method_getImplementation(pm);
+        method_setImplementation(pm, (IMP)hook_presentVC);
+        _log(@"[INIT] UIAlertController hook installed");
+    }
     
-    // Deferred: floating button
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Hook UIView addSubview for popup detection
+    Class viewCls = [UIView class];
+    Method asv = class_getInstanceMethod(viewCls, @selector(addSubview:));
+    if (asv) {
+        orig_addSubview = (AddSubviewIMP)method_getImplementation(asv);
+        method_setImplementation(asv, (IMP)hook_addSubview);
+    }
+    
+    // Deferred: hook SignatureCheck/SignatureKit + create UI
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Hook SignatureCheck class methods
+        Class scCls = NSClassFromString(@"SignatureCheck");
+        if (scCls) {
+            hook_sig_method(scCls, @selector(load), "[SignatureCheck load]");
+            hook_sig_method(scCls, @selector(JudgeApp), "[SignatureCheck JudgeApp]");
+            hook_sig_method(scCls, @selector(GetApp), "[SignatureCheck GetApp]");
+            hook_sig_method(scCls, @selector(PostApp), "[SignatureCheck PostApp]");
+            hook_sig_method_arg(scCls, @selector(showTipViewEND:), "[SignatureCheck showTipViewEND:]");
+            hook_sig_method(scCls, @selector(exitApplication), "[SignatureCheck exitApplication]");
+            DLOG(@"[INIT] SignatureCheck hooks installed (6 methods)");
+        } else {
+            _log(@"[INIT] WARNING: SignatureCheck class NOT found!");
+        }
+        
+        // Hook SignatureKit class methods
+        Class skCls = NSClassFromString(@"SignatureKit");
+        if (skCls) {
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(object_getClass(skCls), &mcount);
+            for (unsigned int i = 0; i < mcount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *selStr = NSStringFromSelector(sel);
+                DLOG(@"[INIT] SignatureKit +[%@]", selStr);
+            }
+            if (methods) free(methods);
+            _log(@"[INIT] SignatureKit hooks installed");
+        } else {
+            _log(@"[INIT] WARNING: SignatureKit class NOT found!");
+        }
+        
+        // Scan all loaded classes for signing-related ones
+        int total = objc_getClassList(NULL, 0);
+        Class *classes = (Class *)malloc(sizeof(Class) * total);
+        objc_getClassList(classes, total);
+        for (int i = 0; i < total; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            NSString *lower = [name lowercaseString];
+            if ([lower containsString:@"anyou"] || [lower containsString:@"md5xor"] ||
+                [lower containsString:@"licensecheck"] || [lower containsString:@"signcheck"]) {
+                DLOG(@"[SCAN] Found suspicious class: %@", name);
+            }
+        }
+        free(classes);
+        
+        // Create floating button
         UIWindow *w = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s.activationState == UISceneActivationStateForegroundActive) {
