@@ -1,13 +1,25 @@
 /**
- * Stub lnSignature.dylib v3 - SignatureCheck with real API calls
- * +load: initial attempt (may fail if WangXianHook not loaded yet)
- * JudgeApp: retry during login (WangXianHook hooks should be active)
+ * Stub lnSignature.dylib v4 - Real API calls with file logging
+ * +load: only logs (NO network to avoid deadlock)
+ * JudgeApp: calls real API (WangXianHook hooks are active by then)
+ * Logs to same wxhook.log file as WangXianHook
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
+static NSString *g_logPath = nil;
 static NSDictionary *g_verifyResult = nil;
 static BOOL g_verifyPassed = NO;
+
+static void slog(NSString *msg) {
+    if (!g_logPath) return;
+    NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
+    if (data) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+    }
+    NSLog(@"[StubSig] %@", msg);
+}
 
 @interface SignatureCheck : NSObject
 + (void)load;
@@ -22,9 +34,8 @@ static BOOL g_verifyPassed = NO;
 @implementation SignatureCheck
 
 + (void)doVerify:(NSString *)caller {
-    NSLog(@"[StubSig] doVerify from %@ - current passed=%d", caller, g_verifyPassed);
+    slog([NSString stringWithFormat:@"doVerify from %@, current passed=%d", caller, g_verifyPassed]);
     
-    // Hardcoded bundle ID (NSBundles mainBundle may be nil in +load)
     NSString *bundleId = @"com.sqage.wangxianapp";
     NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"UNKNOWN-UDID";
     
@@ -32,13 +43,10 @@ static BOOL g_verifyPassed = NO;
         @"http://ln_sign_cert.9iy.com/cert/judgeAppInfoApi?APPID=%@&UDID=%@",
         bundleId, udid];
     
-    NSLog(@"[StubSig] API URL: %@", urlStr);
+    slog([NSString stringWithFormat:@"API URL: %@", urlStr]);
     
     NSURL *url = [NSURL URLWithString:urlStr];
-    if (!url) {
-        NSLog(@"[StubSig] ERROR: invalid URL");
-        return;
-    }
+    if (!url) { slog(@"ERROR: invalid URL"); return; }
     
     NSURLRequest *req = [NSURLRequest requestWithURL:url
                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
@@ -56,43 +64,53 @@ static BOOL g_verifyPassed = NO;
             dispatch_semaphore_signal(sem);
         }];
     [task resume];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    long waitResult = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    
+    if (waitResult != 0) {
+        slog(@"API TIMEOUT after 15s");
+        return;
+    }
     
     if (respData) {
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
         NSString *rawStr = [[NSString alloc] initWithData:respData encoding:NSUTF8StringEncoding];
-        NSLog(@"[StubSig] API raw response: %@", rawStr);
+        slog([NSString stringWithFormat:@"API raw response: %@", rawStr]);
+        
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
         if (json) {
             g_verifyResult = json;
             NSString *ispass = json[@"ispass"];
             if (!ispass) ispass = json[@"result"][@"ispass"];
-            NSLog(@"[StubSig] ispass=%@", ispass);
+            slog([NSString stringWithFormat:@"ispass=%@", ispass]);
             if ([ispass isEqualToString:@"YES"]) {
                 g_verifyPassed = YES;
-                NSLog(@"[StubSig] PASSED!");
+                slog(@"VERIFICATION PASSED!");
+            } else {
+                slog(@"VERIFICATION FAILED - ispass is not YES");
             }
+        } else {
+            slog(@"ERROR: failed to parse JSON");
         }
     } else {
-        NSLog(@"[StubSig] API error: %@", respErr);
+        slog([NSString stringWithFormat:@"API error: %@", respErr]);
     }
 }
 
 + (void)load {
-    NSLog(@"[StubSig] +load - attempting initial verification");
-    [self doVerify:@"+load"];
-    NSLog(@"[StubSig] +load done, passed=%d", g_verifyPassed);
+    // Init log path
+    g_logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook.log"];
+    slog(@"=== StubSignatureCheck v4 +load ===");
+    slog(@"NO network request in +load (avoid deadlock)");
 }
 
 + (void)JudgeApp {
-    NSLog(@"[StubSig] JudgeApp called, passed=%d", g_verifyPassed);
-    // Always re-verify - WangXianHook should be loaded by now
+    slog(@"JudgeApp called - performing real API verification");
     [self doVerify:@"JudgeApp"];
-    NSLog(@"[StubSig] JudgeApp done, passed=%d", g_verifyPassed);
+    slog([NSString stringWithFormat:@"JudgeApp done, passed=%d", g_verifyPassed]);
 }
 
-+ (void)GetApp { NSLog(@"[StubSig] GetApp"); }
-+ (void)PostApp { NSLog(@"[StubSig] PostApp"); }
-+ (void)showTipViewEND:(id)arg { NSLog(@"[StubSig] showTipViewEND: %@", arg); }
-+ (void)exitApplication { NSLog(@"[StubSig] exitApplication BLOCKED"); }
++ (void)GetApp { slog(@"GetApp"); }
++ (void)PostApp { slog(@"PostApp"); }
++ (void)showTipViewEND:(id)arg { slog([NSString stringWithFormat:@"showTipViewEND: %@", arg]); }
++ (void)exitApplication { slog(@"exitApplication BLOCKED"); }
 
 @end
