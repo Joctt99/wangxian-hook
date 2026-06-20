@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#include <objc/message.h>
 #include <dlfcn.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
@@ -26,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v15.0 ===");
+        _log(@"=== WXHook v16.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -299,6 +300,111 @@ static NSURLSession *hook_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionC
 }
 
 // ============================================================
+#pragma mark - Delegate method swizzling for response interception
+// ============================================================
+
+static NSMutableDictionary *g_taskDataMap = nil;   // taskIdentifier -> NSMutableData
+static NSMutableDictionary *g_taskRespMap = nil;   // taskIdentifier -> NSURLResponse
+static NSMutableDictionary *g_taskURLMap = nil;    // taskIdentifier -> NSString (URL)
+static NSMutableSet *g_subclassedDelegates = nil;   // Set of delegate class names already subclassed
+
+// Swizzled didReceiveData - accumulate response data per task
+typedef void (*DidRecvDataOrigIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
+static void swizzled_didReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
+    NSNumber *tid = @(task.taskIdentifier);
+    NSString *url = g_taskURLMap[tid];
+    if (url) {
+        NSMutableData *accumulated = g_taskDataMap[tid];
+        if (!accumulated) {
+            accumulated = [NSMutableData data];
+            g_taskDataMap[tid] = accumulated;
+        }
+        [accumulated appendData:data];
+        DLOG(@"[DELEG] didReceiveData task=%lu url=%@ len=%lu", (unsigned long)task.taskIdentifier, url, (unsigned long)data.length);
+    }
+    // Call superclass implementation (original delegate method)
+    struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+    ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, data);
+}
+
+// Swizzled didCompleteWithError - patch data and deliver to original delegate
+typedef void (*DidCompleteOrigIMP)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
+static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+    NSNumber *tid = @(task.taskIdentifier);
+    NSString *url = g_taskURLMap[tid];
+    NSMutableData *data = g_taskDataMap[tid];
+    
+    if (url && data && data.length > 0 && !error) {
+        NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        DLOG(@"[DELEG] didComplete task=%lu url=%@ resp=%@", (unsigned long)task.taskIdentifier, url, respStr);
+        
+        // Patch the response data
+        NSData *patched = patchIspass(data, url);
+        if (patched && patched != data) {
+            NSString *patchedStr = [[NSString alloc] initWithData:patched encoding:NSUTF8StringEncoding];
+            DLOG(@"[DELEG] PATCHED task=%lu resp=%@", (unsigned long)task.taskIdentifier, patchedStr);
+            // TODO: We need to deliver patched data, but the original delegate already received the real data via didReceiveData
+            // For now, just log the patch
+        }
+    }
+    
+    // Cleanup
+    [g_taskDataMap removeObjectForKey:tid];
+    [g_taskRespMap removeObjectForKey:tid];
+    [g_taskURLMap removeObjectForKey:tid];
+    
+    // Call superclass implementation
+    struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+    ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, error);
+}
+
+static void swizzleDelegate(id delegate) {
+    if (!delegate) return;
+    
+    Class origClass = object_getClass(delegate);
+    NSString *className = NSStringFromClass(origClass);
+    
+    // Only subclass once per class
+    if ([g_subclassedDelegates containsObject:className]) {
+        DLOG(@"[DELEG] Already subclassed: %@", className);
+        return;
+    }
+    
+    // Check if delegate implements the methods we want to swizzle
+    if (![delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveData:)] &&
+        ![delegate respondsToSelector:@selector(URLSession:task:didCompleteWithError:)]) {
+        DLOG(@"[DELEG] %@ doesn't implement delegate methods", className);
+        return;
+    }
+    
+    // Create a dynamic subclass
+    NSString *subClassName = [NSString stringWithFormat:@"WXHook_%@", className];
+    Class subClass = objc_allocateClassPair(origClass, [subClassName UTF8String], 0);
+    if (!subClass) {
+        DLOG(@"[DELEG] Failed to create subclass for %@", className);
+        return;
+    }
+    
+    // Add overridden methods
+    if ([delegate respondsToSelector:@selector(URLSession:dataTask:didReceiveData:)]) {
+        class_addMethod(subClass, @selector(URLSession:dataTask:didReceiveData:),
+                       (IMP)swizzled_didReceiveData, "v@:@@@@");
+    }
+    if ([delegate respondsToSelector:@selector(URLSession:task:didCompleteWithError:)]) {
+        class_addMethod(subClass, @selector(URLSession:task:didCompleteWithError:),
+                       (IMP)swizzled_didCompleteWithError, "v@:@@@@");
+    }
+    
+    objc_registerClassPair(subClass);
+    
+    // Change this instance's class to the subclass
+    object_setClass(delegate, subClass);
+    [g_subclassedDelegates addObject:className];
+    
+    DLOG(@"[DELEG] Created subclass %@, swizzled instance", subClassName);
+}
+
+// ============================================================
 #pragma mark - NSURLSession delegate mode logging
 // ============================================================
 
@@ -309,28 +415,38 @@ static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
     NSString *u = req.URL.absoluteString ?: @"(null)";
     DLOG(@"[NET] delegate task: %@", u);
     
-    // Try to inject our protocol into the session's configuration
-    @try {
-        NSURLSession *session = (NSURLSession *)self;
-        NSURLSessionConfiguration *config = session.configuration;
-        if (config) {
-            NSArray *currentProtocols = config.protocolClasses;
-            BOOL hasOurProtocol = NO;
-            for (Class pc in currentProtocols) {
-                if (pc == [WXInterceptor class]) { hasOurProtocol = YES; break; }
+    // Track this task for delegate swizzling
+    if ([u containsString:@"qunhongtech"] || [u containsString:@"md5xor"]) {
+        // Initialize tracking maps
+        if (!g_taskDataMap) g_taskDataMap = [NSMutableDictionary dictionary];
+        if (!g_taskRespMap) g_taskRespMap = [NSMutableDictionary dictionary];
+        if (!g_taskURLMap) g_taskURLMap = [NSMutableDictionary dictionary];
+        if (!g_subclassedDelegates) g_subclassedDelegates = [NSMutableSet set];
+        
+        // Swizzle the session's delegate
+        @try {
+            id delegate = ((NSURLSession *)self).delegate;
+            if (delegate) {
+                swizzleDelegate(delegate);
+                DLOG(@"[NET] Tracking task for delegate swizzle: %@", u);
+            } else {
+                DLOG(@"[NET] No delegate found for session");
             }
-            if (!hasOurProtocol) {
-                NSMutableArray *newProtocols = [NSMutableArray arrayWithArray:currentProtocols ?: @[]];
-                [newProtocols insertObject:[WXInterceptor class] atIndex:0];
-                config.protocolClasses = newProtocols;
-                DLOG(@"[INJECT] WXInterceptor added to session config for: %@", u);
-            }
+        } @catch (NSException *e) {
+            DLOG(@"[NET] Delegate swizzle error: %@", e);
         }
-    } @catch (NSException *e) {
-        DLOG(@"[INJECT] Exception: %@", e);
     }
     
-    return orig_dtr ? orig_dtr(self, _cmd, req) : nil;
+    NSURLSessionDataTask *task = orig_dtr ? orig_dtr(self, _cmd, req) : nil;
+    
+    // Record the task ID -> URL mapping AFTER task is created
+    if (task && ([u containsString:@"qunhongtech"] || [u containsString:@"md5xor"])) {
+        NSNumber *tid = @(task.taskIdentifier);
+        g_taskURLMap[tid] = u;
+        DLOG(@"[NET] Mapped taskID %lu -> %@", (unsigned long)task.taskIdentifier, u);
+    }
+    
+    return task;
 }
 
 typedef NSURLSessionDataTask *(*DTUrlIMP)(id, SEL, NSURL *);
@@ -554,7 +670,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v15.0";
+    lbl.text = @"WXHook v16.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
