@@ -26,7 +26,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v11.0 ===");
+        _log(@"=== WXHook v12.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -193,20 +193,20 @@ static id hook_stringForKey(id self, SEL _cmd, NSString *key) {
 
 static NSString * const kWXProtocolHandled = @"WXProtocolHandled";
 
-@interface WXInterceptor : NSURLProtocol <NSURLSessionDataDelegate>
-@property (nonatomic, strong) NSURLSession *interceptSession;
-@property (nonatomic, strong) NSMutableData *responseData;
-@property (nonatomic, strong) NSURLResponse *urlResponse;
+@interface WXInterceptor : NSURLProtocol
 @end
 
 @implementation WXInterceptor
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSString *host = request.URL.host ?: @"";
-    if ([host containsString:@"qunhongtech.com"] || [host containsString:@"md5xor.com"]) {
-        // Only handle once
-        if ([NSURLProtocol propertyForKey:kWXProtocolHandled inRequest:request]) return NO;
-        _log([NSString stringWithFormat:@"[INTERCEPT] Catching: %@", request.URL.absoluteString]);
+    NSString *urlStr = request.URL.absoluteString ?: @"";
+    if ([urlStr containsString:@"qunhongtech"] || [urlStr containsString:@"md5xor"] ||
+        [urlStr containsString:@"judgeAppInfo"]) {
+        if ([NSURLProtocol propertyForKey:kWXProtocolHandled inRequest:request]) {
+            _log(@"[INTERCEPT] Already handled, skip");
+            return NO;
+        }
+        _log([NSString stringWithFormat:@"[INTERCEPT] MATCH! URL=%@", urlStr]);
         return YES;
     }
     return NO;
@@ -217,60 +217,44 @@ static NSString * const kWXProtocolHandled = @"WXProtocolHandled";
 }
 
 - (void)startLoading {
-    NSMutableURLRequest *mutableReq = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kWXProtocolHandled inRequest:mutableReq];
+    NSString *urlStr = self.request.URL.absoluteString ?: @"";
+    _log([NSString stringWithFormat:@"[INTERCEPT] startLoading: %@", urlStr]);
     
-    _log([NSString stringWithFormat:@"[INTERCEPT] Forwarding: %@", mutableReq.URL.absoluteString]);
+    // Log request body if POST
+    if (self.request.HTTPBody) {
+        NSString *body = [[NSString alloc] initWithData:self.request.HTTPBody encoding:NSUTF8StringEncoding];
+        if (body && body.length < 2000) {
+            _log([NSString stringWithFormat:@"[INTERCEPT] Request body: %@", body]);
+        }
+    }
     
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    self.interceptSession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
-    self.responseData = [[NSMutableData alloc] init];
+    // Return FAKE success response immediately
+    NSDictionary *fakeResp = @{
+        @"code": @0,
+        @"msg": @"success",
+        @"ispass": @"YES",
+        @"status": @1,
+        @"result": @"pass",
+        @"pass": @"YES",
+        @"verify": @"YES",
+        @"data": @{@"ispass": @"YES", @"status": @1}
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:fakeResp options:0 error:nil];
+    NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    _log([NSString stringWithFormat:@"[INTERCEPT] Fake response: %@", jsonStr]);
     
-    NSURLSessionDataTask *task = [self.interceptSession dataTaskWithRequest:mutableReq];
-    [task resume];
+    NSHTTPURLResponse *httpResp = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                                              statusCode:200
+                                                             HTTPVersion:@"HTTP/1.1"
+                                                            headerFields:@{@"Content-Type": @"application/json"}];
+    
+    [self.client URLProtocol:self didReceiveResponse:httpResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:jsonData];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
 - (void)stopLoading {
-    [self.interceptSession invalidateAndCancel];
-}
-
-// NSURLSessionDataDelegate - receive response
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
-    didReceiveResponse:(NSURLResponse *)response
-    completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    self.urlResponse = response;
-    completionHandler(NSURLSessionResponseAllow);
-}
-
-// Receive data chunks
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
-    didReceiveData:(NSData *)data {
-    [self.responseData appendData:data];
-}
-
-// Task complete - modify and deliver response
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
-    didCompleteWithError:(NSError *)error {
-    if (error) {
-        [self.client URLProtocol:self didFailWithError:error];
-        return;
-    }
-    
-    NSString *urlStr = task.originalRequest.URL.absoluteString;
-    NSString *rawResp = [[NSString alloc] initWithData:self.responseData encoding:NSUTF8StringEncoding];
-    _log([NSString stringWithFormat:@"[INTERCEPT] Original response: %@", rawResp]);
-    
-    // Patch the response
-    NSData *patchedData = patchIspass(self.responseData, urlStr);
-    if (patchedData != self.responseData) {
-        NSString *patchedStr = [[NSString alloc] initWithData:patchedData encoding:NSUTF8StringEncoding];
-        _log([NSString stringWithFormat:@"[INTERCEPT] Patched response: %@", patchedStr]);
-    }
-    
-    // Deliver the (possibly patched) response to the client
-    [self.client URLProtocol:self didReceiveResponse:self.urlResponse cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:patchedData ?: self.responseData];
-    [self.client URLProtocolDidFinishLoading:self];
+    // Nothing to clean up
 }
 
 @end
@@ -509,7 +493,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v11.0";
+    lbl.text = @"WXHook v12.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -600,6 +584,22 @@ static void entry(void) {
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
         _log(@"[INIT] NSURLProtocol interceptor registered for qunhongtech.com");
+        
+        // Force inject our protocol into ALL NSURLSession configurations
+        Class cfgCls = [NSURLSessionConfiguration class];
+        Method pcm = class_getInstanceMethod(cfgCls, @selector(protocolClasses));
+        if (pcm) {
+            IMP origPC = method_getImplementation(pcm);
+            method_setImplementation(pcm, imp_implementationWithBlock(^NSArray *(NSURLSessionConfiguration *self_cfg) {
+                NSArray *original = ((NSArray *(*)(id, SEL))origPC)(self_cfg, @selector(protocolClasses));
+                NSMutableArray *modified = [original mutableCopy] ?: [NSMutableArray array];
+                if (![modified containsObject:[WXInterceptor class]]) {
+                    [modified insertObject:[WXInterceptor class] atIndex:0];
+                }
+                return [modified copy];
+            }));
+            _log(@"[INIT] NSURLSessionConfiguration.protocolClasses overridden");
+        }
     }
     
     // === PHASE 2.5: NSURL creation hooks (catch ALL URLs at lowest level) ===
