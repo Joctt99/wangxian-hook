@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v20.0 ===");
+        _log(@"=== WXHook v21.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -332,6 +332,30 @@ static void swizzled_af_didReceiveResponseWithHandler(id self, SEL _cmd, NSURLSe
     if (orig_afRecvRespHandler) {
         orig_afRecvRespHandler(self, _cmd, session, task, response, completionHandler);
     }
+}
+
+// ============================================================
+#pragma mark - AFHTTPResponseSerializer validation hook
+// ============================================================
+
+// AFHTTPResponseSerializer.validateResponse:data:error: hook
+typedef BOOL (*ValidateResponseIMP)(id, SEL, NSHTTPURLResponse *, NSData *, NSError **);
+static ValidateResponseIMP orig_validateResponse = NULL;
+
+static BOOL hook_validateResponse(id self, SEL _cmd, NSHTTPURLResponse *response, NSData *data, NSError **error) {
+    // Always return YES (valid) - bypass AFNetworking status code validation
+    BOOL result = YES;
+    if (orig_validateResponse) {
+        result = orig_validateResponse(self, _cmd, response, data, error);
+        if (!result) {
+            // Validation failed - force it to pass
+            DLOG(@"[VALIDATE] Original validation FAILED (status=%ld), forcing YES", (long)response.statusCode);
+            if (error) *error = nil;  // Clear the error
+        } else {
+            DLOG(@"[VALIDATE] Original validation passed (status=%ld)", (long)response.statusCode);
+        }
+    }
+    return YES;  // Always return valid
 }
 
 // ============================================================
@@ -830,7 +854,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v20.0";
+    lbl.text = @"WXHook v21.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -925,6 +949,23 @@ static void entry(void) {
             orig_taskResponse = (TaskResponseIMP)method_getImplementation(respMethod);
             method_setImplementation(respMethod, (IMP)hook_taskResponse);
             _log(@"[INIT] NSURLSessionTask.response hooked (fake HTTP 200)");
+        }
+        
+        // Swizzle AFHTTPResponseSerializer to bypass status code validation
+        Class httpSerCls = objc_getClass("AFHTTPResponseSerializer");
+        if (httpSerCls) {
+            // Swizzle validateResponse:data:error: to always return YES
+            SEL validateSel = @selector(validateResponse:data:error:);
+            Method vm = class_getInstanceMethod(httpSerCls, validateSel);
+            if (vm) {
+                orig_validateResponse = (ValidateResponseIMP)method_getImplementation(vm);
+                method_setImplementation(vm, (IMP)hook_validateResponse);
+                _log(@"[INIT] AFHTTPResponseSerializer.validateResponse hooked");
+            } else {
+                _log(@"[INIT] AFHTTPResponseSerializer.validateResponse not found");
+            }
+        } else {
+            _log(@"[INIT] AFHTTPResponseSerializer not found");
         }
         
         // Register NSURLProtocol interceptor
