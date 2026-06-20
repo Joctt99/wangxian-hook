@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v16.0 ===");
+        _log(@"=== WXHook v17.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -320,9 +320,11 @@ static void swizzled_didReceiveData(id self, SEL _cmd, NSURLSession *session, NS
             g_taskDataMap[tid] = accumulated;
         }
         [accumulated appendData:data];
-        DLOG(@"[DELEG] didReceiveData task=%lu url=%@ len=%lu", (unsigned long)task.taskIdentifier, url, (unsigned long)data.length);
+        DLOG(@"[DELEG] BLOCKED didReceiveData task=%lu len=%lu (not forwarding)", (unsigned long)task.taskIdentifier, (unsigned long)data.length);
+        // DO NOT forward to original delegate - we'll deliver patched data later
+        return;
     }
-    // Call superclass implementation (original delegate method)
+    // Not our task - forward normally
     struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
     ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, data);
 }
@@ -334,28 +336,57 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
     NSString *url = g_taskURLMap[tid];
     NSMutableData *data = g_taskDataMap[tid];
     
-    if (url && data && data.length > 0 && !error) {
+    if (url && data && data.length > 0) {
         NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        DLOG(@"[DELEG] didComplete task=%lu url=%@ resp=%@", (unsigned long)task.taskIdentifier, url, respStr);
+        DLOG(@"[DELEG] Original resp task=%lu: %@", (unsigned long)task.taskIdentifier, respStr);
         
-        // Patch the response data
-        NSData *patched = patchIspass(data, url);
-        if (patched && patched != data) {
-            NSString *patchedStr = [[NSString alloc] initWithData:patched encoding:NSUTF8StringEncoding];
-            DLOG(@"[DELEG] PATCHED task=%lu resp=%@", (unsigned long)task.taskIdentifier, patchedStr);
-            // TODO: We need to deliver patched data, but the original delegate already received the real data via didReceiveData
-            // For now, just log the patch
+        // Create FAKE success response and deliver to delegate
+        NSDictionary *fakeResp = @{
+            @"timestamp": @"2026-06-20T14:42:12.039+0000",
+            @"status": @200,
+            @"code": @0,
+            @"msg": @"success",
+            @"ispass": @"YES",
+            @"pass": @"YES",
+            @"result": @"pass",
+            @"verify": @"YES",
+            @"data": @{@"ispass": @"YES", @"status": @1}
+        };
+        NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeResp options:0 error:nil];
+        NSString *fakeStr = [[NSString alloc] initWithData:fakeData encoding:NSUTF8StringEncoding];
+        DLOG(@"[DELEG] DELIVERING fake response: %@", fakeStr);
+        
+        // Deliver fake data to the original delegate
+        SEL didRecvDataSel = @selector(URLSession:dataTask:didReceiveData:);
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        if ([self respondsToSelector:didRecvDataSel]) {
+            ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, didRecvDataSel, session, task, fakeData);
         }
+        
+        // Then deliver completion with no error
+        ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, nil);
+    } else if (url && error) {
+        DLOG(@"[DELEG] Error on qunhongtech task: %@", error);
+        // Even on error, deliver fake success
+        NSDictionary *fakeResp = @{@"status": @200, @"ispass": @"YES", @"code": @0, @"msg": @"success"};
+        NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeResp options:0 error:nil];
+        DLOG(@"[DELEG] DELIVERING fake response on error");
+        SEL didRecvDataSel = @selector(URLSession:dataTask:didReceiveData:);
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        if ([self respondsToSelector:didRecvDataSel]) {
+            ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, didRecvDataSel, session, task, fakeData);
+        }
+        ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, nil);
+    } else {
+        // Not our task - forward normally
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, error);
     }
     
     // Cleanup
     [g_taskDataMap removeObjectForKey:tid];
     [g_taskRespMap removeObjectForKey:tid];
     [g_taskURLMap removeObjectForKey:tid];
-    
-    // Call superclass implementation
-    struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
-    ((void (*)(struct objc_super *, SEL, id, id, id))objc_msgSendSuper)(&superInfo, _cmd, session, task, error);
 }
 
 static void swizzleDelegate(id delegate) {
@@ -670,7 +701,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v16.0";
+    lbl.text = @"WXHook v17.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
