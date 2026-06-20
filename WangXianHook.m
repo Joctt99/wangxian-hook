@@ -299,6 +299,13 @@ static NSURLSession *hook_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionC
     return orig_sessionWithConfigOnly ? orig_sessionWithConfigOnly(self, _cmd, config) : nil;
 }
 
+// Global tracking variables (declared early for use by all swizzle functions)
+static NSMutableDictionary *g_taskDataMap = nil;   // taskIdentifier -> NSMutableData
+static NSMutableDictionary *g_taskRespMap = nil;   // taskIdentifier -> NSURLResponse
+static NSMutableDictionary *g_taskURLMap = nil;    // taskIdentifier -> NSString (URL)
+static NSMutableSet *g_subclassedDelegates = nil;   // Set of delegate class names already subclassed
+static NSMutableSet *g_fakeResponseTasks = nil;  // task IDs that need fake HTTP 200
+
 // AFNetworking internal delegate swizzle for didReceiveResponse
 typedef void (*AFRecvRespHandlerIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSURLSessionResponseDisposition));
 static AFRecvRespHandlerIMP orig_afRecvRespHandler = NULL;
@@ -333,7 +340,6 @@ static void swizzled_af_didReceiveResponseWithHandler(id self, SEL _cmd, NSURLSe
 
 typedef NSURLResponse *(*TaskResponseIMP)(id, SEL);
 static TaskResponseIMP orig_taskResponse = NULL;
-static NSMutableSet *g_fakeResponseTasks = nil;  // task IDs that need fake HTTP 200
 
 static NSURLResponse *hook_taskResponse(id self, SEL _cmd) {
     NSURLSessionTask *task = (NSURLSessionTask *)self;
@@ -358,11 +364,6 @@ static NSURLResponse *hook_taskResponse(id self, SEL _cmd) {
 // ============================================================
 #pragma mark - Delegate method swizzling for response interception
 // ============================================================
-
-static NSMutableDictionary *g_taskDataMap = nil;   // taskIdentifier -> NSMutableData
-static NSMutableDictionary *g_taskRespMap = nil;   // taskIdentifier -> NSURLResponse
-static NSMutableDictionary *g_taskURLMap = nil;    // taskIdentifier -> NSString (URL)
-static NSMutableSet *g_subclassedDelegates = nil;   // Set of delegate class names already subclassed
 
 // Swizzled didReceiveResponse - fake HTTP 200 status
 typedef void (*DidRecvRespIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *);
