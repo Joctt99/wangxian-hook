@@ -22,40 +22,48 @@ static BOOL g_verifyPassed = NO;
 @implementation SignatureCheck
 
 + (void)load {
-    // Perform real verification during load
     NSLog(@"[StubSig] SignatureCheck +load called - performing real verification");
     
     NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"unknown";
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     
-    // Build the API URL (same as original)
     NSString *urlStr = [NSString stringWithFormat:
         @"http://ln_sign_cert.9iy.com/cert/judgeAppInfoApi?APPID=%@&UDID=%@",
         bundleId, udid];
     
     NSLog(@"[StubSig] Calling API: %@", urlStr);
     
-    // Make synchronous request (safe in +load since it runs on a background thread)
     NSURL *url = [NSURL URLWithString:urlStr];
     if (url) {
-        NSURLRequest *req = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:10];
-        NSURLResponse *resp = nil;
-        NSError *err = nil;
-        NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+        NSURLRequest *req = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:15];
         
-        if (data) {
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        // Use NSURLSession with semaphore for synchronous call in +load
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSData *respData = nil;
+        __block NSError *respErr = nil;
+        
+        NSURLSession *session = [NSURLSession sharedSession];
+        NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            respData = data;
+            respErr = error;
+            dispatch_semaphore_signal(sem);
+        }];
+        [task resume];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+        
+        if (respData) {
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
             NSLog(@"[StubSig] API response: %@", json);
             if (json) {
                 g_verifyResult = json;
-                // Check if verification passed
-                NSString *ispass = json[@"ispass"] ?: json[@"data"][@"ispass"];
+                NSString *ispass = json[@"ispass"];
+                if (!ispass) ispass = json[@"result"][@"ispass"];
                 if ([ispass isEqualToString:@"YES"]) {
                     g_verifyPassed = YES;
                 }
             }
         } else {
-            NSLog(@"[StubSig] API error: %@", err);
+            NSLog(@"[StubSig] API error: %@", respErr);
         }
     }
     
@@ -64,10 +72,6 @@ static BOOL g_verifyPassed = NO;
 
 + (void)JudgeApp {
     NSLog(@"[StubSig] JudgeApp called - result: %d", g_verifyPassed);
-    // If verification didn't pass, try again
-    if (!g_verifyPassed) {
-        [self load];
-    }
 }
 
 + (void)GetApp {
@@ -80,36 +84,10 @@ static BOOL g_verifyPassed = NO;
 
 + (void)showTipViewEND:(id)arg {
     NSLog(@"[StubSig] showTipViewEND called with: %@", arg);
-    // Do nothing - don't show any tip
 }
 
 + (void)exitApplication {
     NSLog(@"[StubSig] exitApplication called - BLOCKED");
-    // Do nothing - don't exit
 }
 
-@end
-/**
- * Stub lnSignature.dylib - provides SignatureCheck class
- * All methods are empty stubs to satisfy symbol resolution.
- */
-#import <Foundation/Foundation.h>
-
-@interface SignatureCheck : NSObject
-+ (void)load;
-+ (void)JudgeApp;
-+ (void)GetApp;
-+ (void)PostApp;
-+ (void)showTipViewEND:(id)arg;
-+ (void)exitApplication;
-@property (nonatomic, retain) id nettimes;
-@end
-
-@implementation SignatureCheck
-+ (void)load {}
-+ (void)JudgeApp {}
-+ (void)GetApp {}
-+ (void)PostApp {}
-+ (void)showTipViewEND:(id)arg {}
-+ (void)exitApplication {}
 @end
