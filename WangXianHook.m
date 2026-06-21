@@ -7,12 +7,11 @@
 #import <objc/runtime.h>
 #include <objc/message.h>
 #include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/dyld_images.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -305,22 +304,72 @@ static uint32_t *g_visibleMap = NULL;  // visibleMap[realIndex] = visibleIndex
 static uint32_t g_realCount = 0;
 static uint32_t g_visibleCount = 0;
 
+// Build visible map by reading dyld_all_image_infos directly
 static void buildVisibleMap(void) {
     static BOOL built = NO;
     if (built) return;
     built = YES;
     
-    g_realCount = _dyld_image_count();
+    // Get dyld_all_image_infos via task_info
+    struct task_dyld_info dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &count);
+    if (kr != KERN_SUCCESS || dyld_info.all_image_info_addr == 0) {
+        DLOG(@"[DYLD] task_info failed (kr=%d), fallback to _dyld functions", kr);
+        g_realCount = _dyld_image_count();
+        g_visibleCount = g_realCount;
+        return;
+    }
+    
+    // Read dyld_all_image_infos structure
+    // struct dyld_all_image_infos { ... uint32_t infoArrayCount; const struct dyld_image_info* infoArray; ... }
+    // On 64-bit: infoArrayCount is at offset 8, infoArray is at offset 16
+    struct dyld_all_info {
+        uint32_t version;
+        uint32_t padding;
+        uint32_t infoArrayCount;
+        uint32_t padding2;
+        uint64_t infoArray; // pointer to array of {mach_header*, path, slide}
+    };
+    
+    struct dyld_all_info allInfo;
+    vm_size_t size = sizeof(allInfo);
+    kr = vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, size, (vm_address_t)&allInfo, &size);
+    if (kr != KERN_SUCCESS) {
+        DLOG(@"[DYLD] vm_read all_image_infos failed");
+        g_realCount = _dyld_image_count();
+        g_visibleCount = g_realCount;
+        return;
+    }
+    
+    g_realCount = allInfo.infoArrayCount;
     g_visibleMap = (uint32_t *)calloc(g_realCount, sizeof(uint32_t));
     g_visibleCount = 0;
     
+    // Read each dyld_image_info entry
+    // struct dyld_image_info { const mach_header* imageLoadAddress; const char* imageFilePath; intptr_t imageFileModDate; }
     for (uint32_t i = 0; i < g_realCount; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!shouldHideImage(name)) {
+        // Each entry is 24 bytes on 64-bit (8+8+8)
+        struct { uint64_t addr; uint64_t path; uint64_t modDate; } entry;
+        vm_size_t esize = sizeof(entry);
+        kr = vm_read_overwrite(mach_task_self(), allInfo.infoArray + i * 24, esize, (vm_address_t)&entry, &esize);
+        if (kr != KERN_SUCCESS) { g_visibleMap[i] = g_visibleCount++; continue; }
+        
+        // Read path string (up to 256 chars)
+        char path[256] = {0};
+        vm_size_t psize = 255;
+        kr = vm_read_overwrite(mach_task_self(), entry.path, psize, (vm_address_t)path, &psize);
+        
+        if (kr == KERN_SUCCESS && !shouldHideImage(path)) {
             g_visibleMap[i] = g_visibleCount;
             g_visibleCount++;
         } else {
-            g_visibleMap[i] = 0xFFFFFFFF; // hidden
+            g_visibleMap[i] = 0xFFFFFFFF;
+            // Log hidden dylib
+            if (kr == KERN_SUCCESS) {
+                NSString *nsname = [NSString stringWithUTF8String:path];
+                DLOG(@"[DYLD] HIDING: %u: %@", i, nsname.lastPathComponent);
+            }
         }
     }
     DLOG(@"[DYLD] Real images: %u, Visible: %u (hidden: %u)", g_realCount, g_visibleCount, g_realCount - g_visibleCount);
@@ -331,8 +380,7 @@ typedef uint32_t (*DyldCountFunc)(void);
 static DyldCountFunc orig_dyldCount = NULL;
 static uint32_t hook_dyldCount(void) {
     buildVisibleMap();
-    if (g_visibleCount > 0) return g_visibleCount;
-    return orig_dyldCount ? orig_dyldCount() : 0;
+    return g_visibleCount;
 }
 
 // Replacement for _dyld_get_image_name
@@ -341,17 +389,33 @@ static DyldNameFunc orig_dyldName = NULL;
 static const char *hook_dyldName(uint32_t idx) {
     buildVisibleMap();
     // Map visible index back to real index
-    uint32_t realIdx = 0;
     uint32_t visIdx = 0;
-    for (realIdx = 0; realIdx < g_realCount; realIdx++) {
+    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
         if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
             if (visIdx == idx) {
-                return orig_dyldName ? orig_dyldName(realIdx) : NULL;
+                // Read name from dyld_all_image_infos
+                struct task_dyld_info dyld_info;
+                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
+                if (dyld_info.all_image_info_addr) {
+                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
+                    vm_size_t s = sizeof(ai);
+                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
+                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
+                    vm_size_t es = sizeof(entry);
+                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
+                    // Return static buffer for the name
+                    static char nameBuf[256];
+                    vm_size_t ns = 255;
+                    kern_return_t r = vm_read_overwrite(mach_task_self(), entry.path, ns, (vm_address_t)nameBuf, &ns);
+                    if (r == KERN_SUCCESS) { nameBuf[255] = 0; return nameBuf; }
+                }
+                return NULL;
             }
             visIdx++;
         }
     }
-    return orig_dyldName ? orig_dyldName(idx) : NULL;
+    return NULL;
 }
 
 // Replacement for _dyld_get_image_header
@@ -359,17 +423,29 @@ typedef const struct mach_header *(*DyldHeaderFunc)(uint32_t);
 static DyldHeaderFunc orig_dyldHeader = NULL;
 static const struct mach_header *hook_dyldHeader(uint32_t idx) {
     buildVisibleMap();
-    uint32_t realIdx = 0;
     uint32_t visIdx = 0;
-    for (realIdx = 0; realIdx < g_realCount; realIdx++) {
+    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
         if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
             if (visIdx == idx) {
-                return orig_dyldHeader ? orig_dyldHeader(realIdx) : NULL;
+                // Read header address from dyld_all_image_infos
+                struct task_dyld_info dyld_info;
+                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
+                if (dyld_info.all_image_info_addr) {
+                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
+                    vm_size_t s = sizeof(ai);
+                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
+                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
+                    vm_size_t es = sizeof(entry);
+                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
+                    return (const struct mach_header *)(uintptr_t)entry.addr;
+                }
+                return NULL;
             }
             visIdx++;
         }
     }
-    return orig_dyldHeader ? orig_dyldHeader(idx) : NULL;
+    return NULL;
 }
 
 // Replacement for _dyld_get_image_vmaddr_slide
@@ -377,154 +453,74 @@ typedef intptr_t (*DyldSlideFunc)(uint32_t);
 static DyldSlideFunc orig_dyldSlide = NULL;
 static intptr_t hook_dyldSlide(uint32_t idx) {
     buildVisibleMap();
-    uint32_t realIdx = 0;
     uint32_t visIdx = 0;
-    for (realIdx = 0; realIdx < g_realCount; realIdx++) {
+    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
         if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
             if (visIdx == idx) {
-                return orig_dyldSlide ? orig_dyldSlide(realIdx) : 0;
+                struct task_dyld_info dyld_info;
+                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
+                if (dyld_info.all_image_info_addr) {
+                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
+                    vm_size_t s = sizeof(ai);
+                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
+                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
+                    vm_size_t es = sizeof(entry);
+                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
+                    return (intptr_t)entry.mod;
+                }
+                return 0;
             }
             visIdx++;
         }
     }
-    return orig_dyldSlide ? orig_dyldSlide(idx) : 0;
+    return 0;
 }
 
-// Minimal fishhook: rebind symbol in a single image
-static int rebindSymbolInImage(const struct mach_header_64 *header, intptr_t slide,
-                               const char *symbolName, void *replacement, void **original) {
-    // Find __DATA (or __DATA_CONST) segment
-    const struct segment_command_64 *dataSeg = NULL;
-    const struct segment_command_64 *linkeditSeg = NULL;
-    const struct load_command *cmd = (const struct load_command *)((char *)header + sizeof(struct mach_header_64));
-    
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
-            if (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
-                dataSeg = seg;
-            } else if (strcmp(seg->segname, "__LINKEDIT") == 0) {
-                linkeditSeg = seg;
-            }
-        }
-        cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
+// ARM64 inline patch: write a B instruction at target to redirect to hook
+static BOOL patchBranch(void *target, void *hook, const char *name) {
+    intptr_t offset = (char *)hook - (char *)target;
+    // B instruction range is +/- 128MB
+    if (offset < -0x8000000 || offset > 0x7FFFFFC) {
+        DLOG(@"[HOOK] %s: offset too large (%ld), skip", name, (long)offset);
+        return NO;
     }
+    uint32_t branchInstr = 0x14000000 | ((uint32_t)(offset >> 2) & 0x03FFFFFF);
     
-    if (!linkeditSeg) return -1;
-    
-    // Find LC_DYLD_INFO_ONLY
-    struct linkedit_data_command *dyldInfo = NULL;
-    cmd = (const struct load_command *)((char *)header + sizeof(struct mach_header_64));
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_DYLD_INFO_ONLY) {
-            dyldInfo = (struct linkedit_data_command *)cmd;
-            break;
-        }
-        cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
-    }
-    
-    // Find LC_SYMTAB
-    struct symtab_command *symtab = NULL;
-    cmd = (const struct load_command *)((char *)header + sizeof(struct mach_header_64));
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_SYMTAB) {
-            symtab = (struct symtab_command *)cmd;
-            break;
-        }
-        cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
-    }
-    
-    if (!dyldInfo || !symtab) return -1;
-    
-    char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
-    const struct nlist_64 *symtab_entries = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
-    char *strtab = (char *)(linkeditBase + symtab->stroff);
-    
-    // Process lazy and non-lazy bind opcodes
-    uint32_t *bindOffsets[] = { &dyldInfo->lazy_bind_off, &dyldInfo->bind_off };
-    uint32_t bindSizes[] = { dyldInfo->lazy_bind_size, dyldInfo->bind_size };
-    
-    int rebindCount = 0;
-    
-    // Also check __DATA.__la_symbol_ptr and __DATA.__got sections
-    if (dataSeg) {
-        const struct section_64 *sec = (const struct section_64 *)((char *)dataSeg + sizeof(struct segment_command_64));
-        for (uint32_t s = 0; s < dataSeg->nsects; s++) {
-            if (strcmp(sec[s].sectname, "__la_symbol_ptr") == 0 ||
-                strcmp(sec[s].sectname, "__got") == 0) {
-                void **pointers = (void **)((char *)slide + sec[s].addr);
-                uint32_t count = (uint32_t)(sec[s].size / sizeof(void *));
-                // Get indirect symbol table entries
-                uint32_t *indirectSyms = (uint32_t *)(linkeditBase + symtab->indirectsymoff + sec[s].reserved1 * sizeof(uint32_t));
-                
-                for (uint32_t j = 0; j < count; j++) {
-                    uint32_t symIdx = indirectSyms[j];
-                    if (symIdx == INDIRECT_SYMBOL_ABS || symIdx == INDIRECT_SYMBOL_LOCAL ||
-                        symIdx == (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)) continue;
-                    
-                    const char *symName = strtab + symtab_entries[symIdx].n_un.n_strx;
-                    if (strcmp(symName, symbolName) == 0) {
-                        if (original && *original == NULL) {
-                            *original = pointers[j];
-                        }
-                        // Make page writable
-                        size_t pageSize = getpagesize();
-                        void *page = (void *)((uintptr_t)&pointers[j] & ~(pageSize - 1));
-                        if (mprotect(page, pageSize, PROT_READ | PROT_WRITE) == 0) {
-                            pointers[j] = replacement;
-                            rebindCount++;
-                        }
-                    }
-                }
-            }
+    // Make page writable + executable
+    size_t pageSize = 16384; // 16KB pages on ARM64
+    void *page = (void *)((uintptr_t)target & ~(pageSize - 1));
+    if (mprotect(page, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        // Try vm_protect
+        vm_address_t addr = (vm_address_t)target;
+        kern_return_t kr = vm_protect(mach_task_self(), addr & ~(pageSize - 1), pageSize, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            DLOG(@"[HOOK] %s: mprotect failed", name);
+            return NO;
         }
     }
-    return rebindCount;
-}
-
-static void rebindAllImages(const char *symbolName, void *replacement, void **original) {
-    uint32_t count = _dyld_image_count();
-    int totalRebinds = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        if (header) {
-            int r = rebindSymbolInImage(header, slide, symbolName, replacement, original);
-            if (r > 0) {
-                const char *name = _dyld_get_image_name(i);
-                DLOG(@"[HOOK] Rebound '%s' in %s (%d pointers)", symbolName, name ? strrchr(name, '/') + 1 : "?", r);
-                totalRebinds += r;
-            }
-        }
-    }
-    DLOG(@"[HOOK] Total rebinds for '%s': %d", symbolName, totalRebinds);
+    *(uint32_t *)target = branchInstr;
+    // Flush instruction cache
+    __builtin___clear_cache((char *)target, (char *)target + 4);
+    DLOG(@"[HOOK] %s: patched @ %p -> %p", name, target, hook);
+    return YES;
 }
 
 static void installDyldHooks(void) {
-    // Log current dylibs
-    uint32_t count = _dyld_image_count();
-    DLOG(@"[DYLD] Total loaded images: %u", count);
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name) {
-            NSString *nsname = [NSString stringWithUTF8String:name];
-            if ([nsname containsString:@".dylib"]) {
-                DLOG(@"[DYLD] %u: %@", i, nsname.lastPathComponent);
-            }
-        }
-    }
+    // Build visible map FIRST (uses task_info, no dyld calls)
+    buildVisibleMap();
     
-    // Save originals
+    // Save original function pointers BEFORE patching
     orig_dyldCount = _dyld_image_count;
     orig_dyldName = _dyld_get_image_name;
     orig_dyldHeader = _dyld_get_image_header;
     orig_dyldSlide = _dyld_get_image_vmaddr_slide;
     
-    // Rebind in all loaded images
-    rebindAllImages("_dyld_image_count", (void *)hook_dyldCount, (void **)&orig_dyldCount);
-    rebindAllImages("_dyld_get_image_name", (void *)hook_dyldName, (void **)&orig_dyldName);
-    rebindAllImages("_dyld_get_image_header", (void *)hook_dyldHeader, (void **)&orig_dyldHeader);
-    rebindAllImages("_dyld_get_image_vmaddr_slide", (void *)hook_dyldSlide, (void **)&orig_dyldSlide);
+    // Patch dyld functions with ARM64 B instructions
+    patchBranch((void *)_dyld_image_count, (void *)hook_dyldCount, "_dyld_image_count");
+    patchBranch((void *)_dyld_get_image_name, (void *)hook_dyldName, "_dyld_get_image_name");
+    patchBranch((void *)_dyld_get_image_header, (void *)hook_dyldHeader, "_dyld_get_image_header");
+    patchBranch((void *)_dyld_get_image_vmaddr_slide, (void *)hook_dyldSlide, "_dyld_get_image_vmaddr_slide");
     
     DLOG(@"[HOOK] dyld hooks installed - hiding %d dylibs", (int)(sizeof(g_hiddenDylibs)/sizeof(g_hiddenDylibs[0]) - 1));
 }
