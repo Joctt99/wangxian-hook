@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v32.0 MINIMAL ===");
+        _log(@"=== WXHook v32.1 MINIMAL + Observer ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -148,7 +148,7 @@ static WXHandler *g_handler = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 32, 24)];
-            lbl.text = @"WXHook v32.0";
+            lbl.text = @"WXHook v32.1";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:16];
             [g_panel addSubview:lbl];
@@ -186,12 +186,68 @@ static WXHandler *g_handler = nil;
 @end
 
 // ============================================================
-#pragma mark - Constructor - MINIMAL: only SignatureKit + SignatureCheck
+#pragma mark - Observation-only hooks (log, don't modify)
+// ============================================================
+
+// NSURLSession.dataTaskWithRequest:completionHandler: - observe only
+typedef NSURLSessionDataTask *(*DTReqCompIMP)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+static DTReqCompIMP orig_dtwrc = NULL;
+static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, void (^comp)(NSData *, NSURLResponse *, NSError *)) {
+    NSString *url = req.URL.absoluteString;
+    DLOG(@"[NET] URL: %@", url);
+    
+    // Wrap completion handler to observe response (don't modify)
+    void (^wrappedComp)(NSData *, NSURLResponse *, NSError *) = comp;
+    if (comp) {
+        wrappedComp = [^(NSData *data, NSURLResponse *resp, NSError *err) {
+            NSHTTPURLResponse *httpResp = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
+            DLOG(@"[NET] Response: status=%ld url=%@ err=%@ bodyLen=%lu",
+                 httpResp ? (long)httpResp.statusCode : -1, url, err, (unsigned long)data.length);
+            if (data && data.length > 0 && data.length < 2000) {
+                NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (body) DLOG(@"[NET] Body: %@", body);
+            }
+            comp(data, resp, err);
+        } copy];
+    }
+    
+    if (orig_dtwrc) return orig_dtwrc(self, _cmd, req, wrappedComp);
+    return nil;
+}
+
+// UIViewController.presentViewController - observe only
+typedef void (*PresentVC_IMP)(id, SEL, UIViewController *, BOOL, void (^)(void));
+static PresentVC_IMP orig_presentVC = NULL;
+static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
+    NSString *vcClass = NSStringFromClass([vc class]);
+    NSString *title = @"";
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *alert = (UIAlertController *)vc;
+        title = [NSString stringWithFormat:@" title='%@' msg='%@'", alert.title ?: @"", alert.message ?: @""];
+    }
+    DLOG(@"[UI] presentVC: %@%@", vcClass, title);
+    if (orig_presentVC) orig_presentVC(self, _cmd, vc, animated, completion);
+}
+
+// ============================================================
+#pragma mark - Constructor - MINIMAL + observer hooks
 // ============================================================
 
 __attribute__((constructor))
 static void entry(void) {
     log_init();
+    
+    // === IMMEDIATE: Observation-only network/UI hooks ===
+    Class sessCls = [NSURLSession class];
+    if (sessCls) {
+        Method m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:completionHandler:));
+        if (m) { orig_dtwrc = (DTReqCompIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtwrc); _log(@"[INIT] NSURLSession.dataTask observe-only"); }
+    }
+    Class vcCls = [UIViewController class];
+    if (vcCls) {
+        Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
+        if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe-only"); }
+    }
     
     // === DEFERRED: Wait for all dylibs to load, then hook SignatureKit + SignatureCheck ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
