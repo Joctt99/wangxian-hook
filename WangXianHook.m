@@ -11,9 +11,10 @@
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
 static NSString *g_logPath = nil;
+static BOOL g_logEnabled = YES; // logging toggle
 
 static void _log(NSString *msg) {
-    if (!g_logPath) return;
+    if (!g_logPath || !g_logEnabled) return;
     NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
     if (data) {
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
@@ -27,7 +28,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v32.1 MINIMAL + Observer ===");
+        _log(@"=== WXHook v32.2 UI + Delegate Obs ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -128,12 +129,15 @@ static void hook_scExit(id self, SEL _cmd) {
 @interface WXHandler : NSObject
 @property (nonatomic) BOOL showing;
 - (void)toggle;
+- (void)clearLog;
+- (void)toggleLogging;
 @end
 
 static UIButton *g_btn = nil;
 static UIView *g_panel = nil;
 static UITextView *g_tv = nil;
 static WXHandler *g_handler = nil;
+static UILabel *g_statusLbl = nil;
 
 @implementation WXHandler
 - (void)toggle {
@@ -147,20 +151,43 @@ static WXHandler *g_handler = nil;
             g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
             g_panel.layer.cornerRadius = 12;
             
-            UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 32, 24)];
-            lbl.text = @"WXHook v32.1";
+            UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
+            lbl.text = @"WXHook v32.2";
             lbl.textColor = [UIColor greenColor];
-            lbl.font = [UIFont boldSystemFontOfSize:16];
+            lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
             
+            // Status label (shows ON/OFF)
+            g_statusLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 34, 80, 20)];
+            g_statusLbl.text = @"LOG: ON";
+            g_statusLbl.textColor = [UIColor greenColor];
+            g_statusLbl.font = [UIFont boldSystemFontOfSize:12];
+            [g_panel addSubview:g_statusLbl];
+            
+            // Button row
+            CGFloat bx = pw - 200;
+            UIButton *onOffBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            onOffBtn.frame = CGRectMake(bx, 8, 60, 28);
+            [onOffBtn setTitle:@"On/Off" forState:UIControlStateNormal];
+            [onOffBtn setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
+            [onOffBtn addTarget:self action:@selector(toggleLogging) forControlEvents:UIControlEventTouchUpInside];
+            [g_panel addSubview:onOffBtn];
+            
+            UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            clearBtn.frame = CGRectMake(bx + 65, 8, 60, 28);
+            [clearBtn setTitle:@"Clear" forState:UIControlStateNormal];
+            [clearBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
+            [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
+            [g_panel addSubview:clearBtn];
+            
             UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            copyBtn.frame = CGRectMake(pw - 80, 8, 64, 28);
+            copyBtn.frame = CGRectMake(bx + 130, 8, 60, 28);
             [copyBtn setTitle:@"Copy" forState:UIControlStateNormal];
             [copyBtn setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
             [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:copyBtn];
             
-            g_tv = [[UITextView alloc] initWithFrame:CGRectMake(8, 40, pw - 16, ph - 50)];
+            g_tv = [[UITextView alloc] initWithFrame:CGRectMake(8, 56, pw - 16, ph - 66)];
             g_tv.backgroundColor = [UIColor blackColor];
             g_tv.textColor = [UIColor greenColor];
             g_tv.font = [UIFont fontWithName:@"Menlo" size:11];
@@ -174,6 +201,22 @@ static WXHandler *g_handler = nil;
         [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
     } else {
         g_panel.hidden = YES;
+    }
+}
+- (void)clearLog {
+    [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    g_tv.text = @"(cleared)";
+    g_logEnabled = YES;
+    g_statusLbl.text = @"LOG: ON";
+    g_statusLbl.textColor = [UIColor greenColor];
+    DLOG(@"=== Log cleared ===");
+}
+- (void)toggleLogging {
+    g_logEnabled = !g_logEnabled;
+    g_statusLbl.text = g_logEnabled ? @"LOG: ON" : @"LOG: OFF";
+    g_statusLbl.textColor = g_logEnabled ? [UIColor greenColor] : [UIColor redColor];
+    if (g_logEnabled) {
+        DLOG(@"=== Logging resumed ===");
     }
 }
 - (void)copyLog {
@@ -215,6 +258,32 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
     return nil;
 }
 
+// NSURLSession.dataTaskWithRequest: (delegate mode, no completion handler)
+typedef NSURLSessionDataTask *(*DTReqIMP)(id, SEL, NSURLRequest *);
+static DTReqIMP orig_dtr = NULL;
+static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
+    DLOG(@"[NET-D] delegate URL: %@", req.URL.absoluteString);
+    if (orig_dtr) return orig_dtr(self, _cmd, req);
+    return nil;
+}
+
+// NSURLConnection.sendAsynchronousRequest:queue:completionHandler:
+typedef void (*AsyncReqIMP)(id, SEL, NSURLRequest *, NSOperationQueue *, void (^)(NSURLResponse *, NSData *, NSError *));
+static AsyncReqIMP orig_asyncReq = NULL;
+static void hook_async(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *q, void (^comp)(NSURLResponse *, NSData *, NSError *)) {
+    DLOG(@"[NET-C] async URL: %@", req.URL.absoluteString);
+    if (orig_asyncReq) orig_asyncReq(self, _cmd, req, q, comp);
+}
+
+// NSURLConnection.sendSynchronousRequest:returningResponse:error:
+typedef NSData *(*SyncReqIMP)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
+static SyncReqIMP orig_syncReq = NULL;
+static NSData *hook_sync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+    DLOG(@"[NET-C] sync URL: %@", req.URL.absoluteString);
+    if (orig_syncReq) return orig_syncReq(self, _cmd, req, resp, err);
+    return nil;
+}
+
 // UIViewController.presentViewController - observe only
 typedef void (*PresentVC_IMP)(id, SEL, UIViewController *, BOOL, void (^)(void));
 static PresentVC_IMP orig_presentVC = NULL;
@@ -237,16 +306,30 @@ __attribute__((constructor))
 static void entry(void) {
     log_init();
     
-    // === IMMEDIATE: Observation-only network/UI hooks ===
+    // === IMMEDIATE: Observation-only hooks ===
+    // NSURLSession completion handler mode
     Class sessCls = [NSURLSession class];
     if (sessCls) {
         Method m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:completionHandler:));
-        if (m) { orig_dtwrc = (DTReqCompIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtwrc); _log(@"[INIT] NSURLSession.dataTask observe-only"); }
+        if (m) { orig_dtwrc = (DTReqCompIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtwrc); _log(@"[INIT] NSURLSession.dataTask+comp observe"); }
+        // Delegate mode (no completion handler)
+        m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:));
+        if (m) { orig_dtr = (DTReqIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtr); _log(@"[INIT] NSURLSession.dataTask delegate observe"); }
     }
+    // NSURLConnection
+    Class connCls = [NSURLConnection class];
+    if (connCls) {
+        Method am = class_getClassMethod(connCls, @selector(sendAsynchronousRequest:queue:completionHandler:));
+        if (am) { orig_asyncReq = (AsyncReqIMP)method_getImplementation(am); method_setImplementation(am, (IMP)hook_async); }
+        Method sm = class_getClassMethod(connCls, @selector(sendSynchronousRequest:returningResponse:error:));
+        if (sm) { orig_syncReq = (SyncReqIMP)method_getImplementation(sm); method_setImplementation(sm, (IMP)hook_sync); }
+        _log(@"[INIT] NSURLConnection observe");
+    }
+    // UIViewController present
     Class vcCls = [UIViewController class];
     if (vcCls) {
         Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
-        if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe-only"); }
+        if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe"); }
     }
     
     // === DEFERRED: Wait for all dylibs to load, then hook SignatureKit + SignatureCheck ===
