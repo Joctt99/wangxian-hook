@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v26.0 Serializer Patch ===");
+        _log(@"=== WXHook v27.0 TaskDelegate Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -546,21 +546,56 @@ static void swizzleDelegate(id delegate) {
     
     DLOG(@"[DELEG] Created subclass %@, swizzled instance", subClassName);
     
-    // Also try to swizzle AFURLSessionManagerTaskDelegate (AFNetworking internal class)
-    Class taskDelegateCls = objc_getClass("AFURLSessionManagerTaskDelegate");
-    if (taskDelegateCls) {
-        SEL recvRespHandlerSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-        if ([taskDelegateCls instancesRespondToSelector:recvRespHandlerSel]) {
+    // Swizzle AFURLSessionManagerTaskDelegate (AFNetworking internal class)
+    @try {
+        Class taskDelegateCls = objc_getClass("AFURLSessionManagerTaskDelegate");
+        if (taskDelegateCls) {
+            DLOG(@"[DELEG] Found AFURLSessionManagerTaskDelegate");
+            SEL recvRespHandlerSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
+            
+            // Try to find method directly on the class
             Method m = class_getInstanceMethod(taskDelegateCls, recvRespHandlerSel);
             if (m) {
-                // Store original IMP
                 orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
                 method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
-                DLOG(@"[DELEG] Swizzled AFURLSessionManagerTaskDelegate.didReceiveResponse:completionHandler:");
+                DLOG(@"[DELEG] Swizzled TaskDelegate.didReceiveResponse:completionHandler: (found)");
+            } else {
+                // Method not found - might be dynamically resolved via forwardInvocation
+                // Force add the method directly
+                DLOG(@"[DELEG] TaskDelegate method not found, adding via class_addMethod");
+                BOOL added = class_addMethod(taskDelegateCls, recvRespHandlerSel,
+                                            (IMP)swizzled_af_didReceiveResponseWithHandler,
+                                            "v@:@@@@?");
+                if (added) {
+                    DLOG(@"[DELEG] Added TaskDelegate.didReceiveResponse:completionHandler: via class_addMethod");
+                } else {
+                    DLOG(@"[DELEG] class_addMethod FAILED for TaskDelegate");
+                }
             }
+            
+            // Also try to add/swizzle didCompleteWithError: on TaskDelegate
+            SEL completeSel = @selector(URLSession:task:didCompleteWithError:);
+            Method cm = class_getInstanceMethod(taskDelegateCls, completeSel);
+            if (cm) {
+                DLOG(@"[DELEG] TaskDelegate has URLSession:task:didCompleteWithError: (direct)");
+            } else {
+                DLOG(@"[DELEG] TaskDelegate does NOT have URLSession:task:didCompleteWithError: directly");
+            }
+            
+            // List ALL methods on TaskDelegate for debugging
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(taskDelegateCls, &methodCount);
+            DLOG(@"[DELEG] TaskDelegate direct methods: %u", methodCount);
+            for (unsigned int i = 0; i < methodCount && i < 20; i++) {
+                NSString *name = NSStringFromSelector(method_getName(methods[i]));
+                DLOG(@"[DELEG]   - %@", name);
+            }
+            if (methods) free(methods);
+        } else {
+            DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
         }
-    } else {
-        DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
+    } @catch (NSException *e) {
+        DLOG(@"[DELEG] Exception swizzling TaskDelegate: %@", e);
     }
 }
 
@@ -830,7 +865,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v26.0";
+    lbl.text = @"WXHook v27.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -874,51 +909,6 @@ static WXHandler *g_handler = nil;
     });
 }
 @end
-
-// ============================================================
-#pragma mark - AFHTTPSessionManager init hooks (modify responseSerializer)
-// ============================================================
-
-typedef id (*AFHttpInitIMP)(id, SEL);
-typedef id (*AFHttpInitCfgIMP)(id, SEL, NSURLSessionConfiguration *);
-static AFHttpInitIMP orig_afHttpInit = NULL;
-static AFHttpInitCfgIMP orig_afHttpInitCfg = NULL;
-
-static void patchSerializer(id manager) {
-    @try {
-        id serializer = [manager performSelector:@selector(responseSerializer)];
-        if (serializer) {
-            // Log current acceptable status codes
-            id currentCodes = [serializer performSelector:@selector(acceptableStatusCodes)];
-            DLOG(@"[SER] Before patch: acceptableStatusCodes = %@", currentCodes);
-            
-            // Set acceptableStatusCodes to include ALL status codes (1-999)
-            NSIndexSet *allCodes = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(1, 999)];
-            [serializer performSelector:@selector(setAcceptableStatusCodes:) withObject:allCodes];
-            
-            id newCodes = [serializer performSelector:@selector(acceptableStatusCodes)];
-            DLOG(@"[SER] After patch: acceptableStatusCodes = %@", newCodes);
-        } else {
-            DLOG(@"[SER] responseSerializer is nil");
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[SER] Exception patching serializer: %@", e);
-    }
-}
-
-static id hook_afHttpInit(id self, SEL _cmd) {
-    id result = orig_afHttpInit ? orig_afHttpInit(self, _cmd) : nil;
-    DLOG(@"[AFHTTP] init called");
-    if (result) patchSerializer(result);
-    return result;
-}
-
-static id hook_afHttpInitCfg(id self, SEL _cmd, NSURLSessionConfiguration *config) {
-    id result = orig_afHttpInitCfg ? orig_afHttpInitCfg(self, _cmd, config) : nil;
-    DLOG(@"[AFHTTP] initWithSessionConfiguration: called");
-    if (result) patchSerializer(result);
-    return result;
-}
 
 // ============================================================
 #pragma mark - Constructor - CRITICAL: NSUserDefaults hooked FIRST
@@ -973,27 +963,7 @@ static void entry(void) {
         }
         
         // NO scan code in constructor (causes crashes in v21-24)
-        // Instead: hook AFHTTPSessionManager init to modify responseSerializer
-        Class afHttpCls = objc_getClass("AFHTTPSessionManager");
-        if (afHttpCls) {
-            // Hook init (no config)
-            Method initM = class_getInstanceMethod(afHttpCls, @selector(init));
-            if (initM) {
-                orig_afHttpInit = (AFHttpInitIMP)method_getImplementation(initM);
-                method_setImplementation(initM, (IMP)hook_afHttpInit);
-                _log(@"[INIT] AFHTTPSessionManager.init hooked");
-            }
-            // Hook initWithSessionConfiguration:
-            SEL initCfgSel = @selector(initWithSessionConfiguration:);
-            Method initCfgM = class_getInstanceMethod(afHttpCls, initCfgSel);
-            if (initCfgM) {
-                orig_afHttpInitCfg = (AFHttpInitCfgIMP)method_getImplementation(initCfgM);
-                method_setImplementation(initCfgM, (IMP)hook_afHttpInitCfg);
-                _log(@"[INIT] AFHTTPSessionManager.initWithSessionConfiguration: hooked");
-            }
-        } else {
-            _log(@"[INIT] AFHTTPSessionManager not found");
-        }
+        // NO AFHTTPSessionManager init hooks (never triggered, causes 2nd launch crash)
         
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
