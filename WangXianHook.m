@@ -28,32 +28,30 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v32.2 UI + Delegate Obs ===");
+        _log(@"=== WXHook v32.3 Full SK Hooks ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
 
 // ============================================================
-#pragma mark - SignatureKit hooks (4 methods only)
+#pragma mark - SignatureKit hooks
 // ============================================================
 
-// 1. showAlert: - SUPPRESS all alerts from signing tool
+// 1. showAlert: - SUPPRESS
 typedef void (*ShowAlertIMP)(id, SEL, id);
 static ShowAlertIMP orig_showAlert = NULL;
 static void hook_showAlert(id self, SEL _cmd, id msg) {
     DLOG(@"[SK] showAlert: SUPPRESSED: %@", msg);
-    // Don't call original - suppress the alert
 }
 
-// 2. exitApplication - BLOCK exit
+// 2. exitApplication - BLOCK
 typedef void (*ExitAppIMP)(id, SEL);
 static ExitAppIMP orig_exitApp = NULL;
 static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
-    // Don't call original - block exit
 }
 
-// 3. handleAppInfoResult: - LOG the result
+// 3. handleAppInfoResult: - LOG + pass through
 typedef void (*HandleResultIMP)(id, SEL, id);
 static HandleResultIMP orig_handleResult = NULL;
 static void hook_handleResult(id self, SEL _cmd, id result) {
@@ -61,38 +59,54 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     if (orig_handleResult) orig_handleResult(self, _cmd, result);
 }
 
-// 4. judgeAppInfoWithBaseUrl: - BYPASS verification entirely
+// 4. judgeAppInfoWithBaseUrl: - BYPASS
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (BYPASSING - no HTTP request)", baseUrl);
-    
-    // DON'T call original (which would make HTTP request to failing server)
-    // Instead, directly call handleAppInfoResult: with fake success data
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (BYPASSING)", baseUrl);
     @try {
-        NSDictionary *fakeResult = @{
-            @"status": @200,
-            @"ispass": @"YES",
-            @"pass": @"YES",
-            @"result": @"pass",
-            @"code": @0,
-            @"verify": @"YES",
-            @"data": @{@"status": @1, @"ispass": @"YES"},
-            @"msg": @"success",
-            @"timestamp": @"2026-06-21T00:00:00.000+0000"
-        };
-        DLOG(@"[SK] Calling handleAppInfoResult: with fake success");
-        
-        // handleAppInfoResult: is a class method, self IS the class
-        SEL handleSel = @selector(handleAppInfoResult:);
-        // Call through our hook (which will call orig_handleResult)
-        ((void (*)(id, SEL, id))objc_msgSend)(self, handleSel, fakeResult);
+        NSDictionary *fakeResult = @{@"status":@200,@"ispass":@"YES",@"pass":@"YES",@"result":@"pass",@"code":@0,@"verify":@"YES",@"data":@{@"status":@1,@"ispass":@"YES"},@"msg":@"success"};
+        ((void (*)(id, SEL, id))objc_msgSend)(self, @selector(handleAppInfoResult:), fakeResult);
         DLOG(@"[SK] handleAppInfoResult: called OK");
     } @catch (NSException *e) {
         DLOG(@"[SK] Exception in bypass: %@", e);
-        // Fallback: call original
         if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
     }
+}
+
+// 5. judgeNet - LOG only (observe which method triggers HTTP)
+typedef void (*JudgeNetIMP)(id, SEL);
+static JudgeNetIMP orig_judgeNet = NULL;
+static void hook_judgeNet(id self, SEL _cmd) {
+    DLOG(@"[SK] judgeNet called (passing through)");
+    if (orig_judgeNet) orig_judgeNet(self, _cmd);
+}
+
+// 6. verifySignatureFromParameters: - LOG only
+typedef id (*VerifySigIMP)(id, SEL, id);
+static VerifySigIMP orig_verifySig = NULL;
+static id hook_verifySig(id self, SEL _cmd, id params) {
+    DLOG(@"[SK] verifySignatureFromParameters: %@", params);
+    if (orig_verifySig) return orig_verifySig(self, _cmd, params);
+    return nil;
+}
+
+// 7. generateRequestParams - LOG only
+typedef id (*GenParamsIMP)(id, SEL);
+static GenParamsIMP orig_genParams = NULL;
+static id hook_genParams(id self, SEL _cmd) {
+    DLOG(@"[SK] generateRequestParams called");
+    if (orig_genParams) return orig_genParams(self, _cmd);
+    return nil;
+}
+
+// 8. createSignatureParams: - LOG only
+typedef id (*CreateSigParamsIMP)(id, SEL, id);
+static CreateSigParamsIMP orig_createSigParams = NULL;
+static id hook_createSigParams(id self, SEL _cmd, id arg) {
+    DLOG(@"[SK] createSignatureParams: %@", arg);
+    if (orig_createSigParams) return orig_createSigParams(self, _cmd, arg);
+    return nil;
 }
 
 // ============================================================
@@ -152,7 +166,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v32.2";
+            lbl.text = @"WXHook v32.3";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -199,6 +213,8 @@ static UILabel *g_statusLbl = nil;
         g_panel.hidden = NO;
         g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
         [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+        // Ensure LOG button stays on top
+        if (g_btn.superview) [g_btn.superview bringSubviewToFront:g_btn];
     } else {
         g_panel.hidden = YES;
     }
@@ -354,6 +370,22 @@ static void entry(void) {
             // handleAppInfoResult: - LOG
             m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
             if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: hooked"); }
+            
+            // judgeNet - LOG
+            m = class_getClassMethod(skCls, @selector(judgeNet));
+            if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet hooked (LOG)"); }
+            
+            // verifySignatureFromParameters: - LOG
+            m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
+            if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: hooked (LOG)"); }
+            
+            // generateRequestParams - LOG
+            m = class_getClassMethod(skCls, @selector(generateRequestParams));
+            if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams hooked (LOG)"); }
+            
+            // createSignatureParams: - LOG
+            m = class_getClassMethod(skCls, @selector(createSignatureParams:));
+            if (m) { orig_createSigParams = (CreateSigParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_createSigParams); _log(@"[INIT] SK.createSignatureParams: hooked (LOG)"); }
             
             // Enumerate all methods for diagnostics
             unsigned int mcount = 0;
