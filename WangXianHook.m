@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v28.0 Early TaskDelegate ===");
+        _log(@"=== WXHook v29.0 Fix Double Swizzle ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -305,6 +305,7 @@ static NSMutableDictionary *g_taskRespMap = nil;   // taskIdentifier -> NSURLRes
 static NSMutableDictionary *g_taskURLMap = nil;    // taskIdentifier -> NSString (URL)
 static NSMutableSet *g_subclassedDelegates = nil;   // Set of delegate class names already subclassed
 static NSMutableSet *g_fakeResponseTasks = nil;  // task IDs that need fake HTTP 200
+static BOOL g_earlyTaskDelegateSwizzled = NO;  // Whether Phase 0 already swizzled TaskDelegate
 
 // AFNetworking internal delegate swizzle for didReceiveResponse
 typedef void (*AFRecvRespHandlerIMP)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSURLSessionResponseDisposition));
@@ -323,14 +324,24 @@ static void swizzled_af_didReceiveResponseWithHandler(id self, SEL _cmd, NSURLSe
                                                                  statusCode:200
                                                                 HTTPVersion:@"HTTP/1.1"
                                                                headerFields:@{@"Content-Type": @"application/json"}];
+        
         if (orig_afRecvRespHandler) {
+            // Call original with fake response
             orig_afRecvRespHandler(self, _cmd, session, task, fakeResp, completionHandler);
+        } else {
+            // No original (method was added by us) - call completion handler directly
+            DLOG(@"[AF-RESP] No original IMP, calling completionHandler(Allow) with fake 200");
+            if (completionHandler) {
+                completionHandler(NSURLSessionResponseAllow);
+            }
         }
         return;
     }
-    // Not our task
+    // Not our task - forward to original if available
     if (orig_afRecvRespHandler) {
         orig_afRecvRespHandler(self, _cmd, session, task, response, completionHandler);
+    } else if (completionHandler) {
+        completionHandler(NSURLSessionResponseAllow);
     }
 }
 
@@ -553,44 +564,29 @@ static void swizzleDelegate(id delegate) {
             DLOG(@"[DELEG] Found AFURLSessionManagerTaskDelegate");
             SEL recvRespHandlerSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
             
-            // Try to find method directly on the class
-            Method m = class_getInstanceMethod(taskDelegateCls, recvRespHandlerSel);
-            if (m) {
-                orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
-                method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
-                DLOG(@"[DELEG] Swizzled TaskDelegate.didReceiveResponse:completionHandler: (found)");
-            } else {
-                // Method not found - might be dynamically resolved via forwardInvocation
-                // Force add the method directly
-                DLOG(@"[DELEG] TaskDelegate method not found, adding via class_addMethod");
-                BOOL added = class_addMethod(taskDelegateCls, recvRespHandlerSel,
-                                            (IMP)swizzled_af_didReceiveResponseWithHandler,
-                                            "v@:@@@@?");
-                if (added) {
-                    DLOG(@"[DELEG] Added TaskDelegate.didReceiveResponse:completionHandler: via class_addMethod");
+            // IMPORTANT: Only swizzle if not already done in Phase 0
+            // Phase 0 may have already added/swizzled this method
+            if (!g_earlyTaskDelegateSwizzled) {
+                Method m = class_getInstanceMethod(taskDelegateCls, recvRespHandlerSel);
+                if (m) {
+                    IMP currentIMP = method_getImplementation(m);
+                    // Check if this is already our swizzled IMP
+                    if (currentIMP != (IMP)swizzled_af_didReceiveResponseWithHandler) {
+                        orig_afRecvRespHandler = (AFRecvRespHandlerIMP)currentIMP;
+                        method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
+                        DLOG(@"[DELEG] Swizzled TaskDelegate.didReceiveResponse (not yet swizzled)");
+                    } else {
+                        DLOG(@"[DELEG] TaskDelegate already swizzled (same IMP), skipping");
+                    }
                 } else {
-                    DLOG(@"[DELEG] class_addMethod FAILED for TaskDelegate");
+                    DLOG(@"[DELEG] TaskDelegate method not found, adding");
+                    class_addMethod(taskDelegateCls, recvRespHandlerSel,
+                                   (IMP)swizzled_af_didReceiveResponseWithHandler,
+                                   "v@:@@@@?");
                 }
-            }
-            
-            // Also try to add/swizzle didCompleteWithError: on TaskDelegate
-            SEL completeSel = @selector(URLSession:task:didCompleteWithError:);
-            Method cm = class_getInstanceMethod(taskDelegateCls, completeSel);
-            if (cm) {
-                DLOG(@"[DELEG] TaskDelegate has URLSession:task:didCompleteWithError: (direct)");
             } else {
-                DLOG(@"[DELEG] TaskDelegate does NOT have URLSession:task:didCompleteWithError: directly");
+                DLOG(@"[DELEG] TaskDelegate already swizzled in Phase 0, skipping");
             }
-            
-            // List ALL methods on TaskDelegate for debugging
-            unsigned int methodCount = 0;
-            Method *methods = class_copyMethodList(taskDelegateCls, &methodCount);
-            DLOG(@"[DELEG] TaskDelegate direct methods: %u", methodCount);
-            for (unsigned int i = 0; i < methodCount && i < 20; i++) {
-                NSString *name = NSStringFromSelector(method_getName(methods[i]));
-                DLOG(@"[DELEG]   - %@", name);
-            }
-            if (methods) free(methods);
         } else {
             DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
         }
@@ -865,7 +861,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v28.0";
+    lbl.text = @"WXHook v29.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -929,12 +925,19 @@ static void entry(void) {
             if (m) {
                 orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
                 method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
+                g_earlyTaskDelegateSwizzled = YES;
                 _log(@"[INIT-EARLY] TaskDelegate.didReceiveResponse swizzled (found)");
             } else {
                 BOOL added = class_addMethod(tdCls, sel,
                                             (IMP)swizzled_af_didReceiveResponseWithHandler,
                                             "v@:@@@@?");
-                _log(added ? @"[INIT-EARLY] TaskDelegate.didReceiveResponse added" : @"[INIT-EARLY] TaskDelegate add FAILED");
+                if (added) {
+                    g_earlyTaskDelegateSwizzled = YES;
+                    // orig_afRecvRespHandler stays NULL - no original existed
+                    _log(@"[INIT-EARLY] TaskDelegate.didReceiveResponse added (no original)");
+                } else {
+                    _log(@"[INIT-EARLY] TaskDelegate add FAILED");
+                }
             }
         } else {
             _log(@"[INIT-EARLY] AFURLSessionManagerTaskDelegate not found (class not loaded yet)");
