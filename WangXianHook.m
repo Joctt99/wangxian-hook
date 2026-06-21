@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v27.0 TaskDelegate Fix ===");
+        _log(@"=== WXHook v28.0 Early TaskDelegate ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -865,7 +865,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v27.0";
+    lbl.text = @"WXHook v28.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -917,6 +917,31 @@ static WXHandler *g_handler = nil;
 __attribute__((constructor))
 static void entry(void) {
     log_init();
+    
+    // === PHASE 0: Pre-inject method into AFURLSessionManagerTaskDelegate ===
+    // MUST be done BEFORE any NSURLSession is created, because NSURLSession
+    // caches the delegate's method list at session creation time.
+    @try {
+        Class tdCls = objc_getClass("AFURLSessionManagerTaskDelegate");
+        if (tdCls) {
+            SEL sel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
+            Method m = class_getInstanceMethod(tdCls, sel);
+            if (m) {
+                orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
+                _log(@"[INIT-EARLY] TaskDelegate.didReceiveResponse swizzled (found)");
+            } else {
+                BOOL added = class_addMethod(tdCls, sel,
+                                            (IMP)swizzled_af_didReceiveResponseWithHandler,
+                                            "v@:@@@@?");
+                _log(added ? @"[INIT-EARLY] TaskDelegate.didReceiveResponse added" : @"[INIT-EARLY] TaskDelegate add FAILED");
+            }
+        } else {
+            _log(@"[INIT-EARLY] AFURLSessionManagerTaskDelegate not found (class not loaded yet)");
+        }
+    } @catch (NSException *e) {
+        _log([NSString stringWithFormat:@"[INIT-EARLY] Exception: %@", e]);
+    }
     
     // === PHASE 1: Install NSUserDefaults hooks IMMEDIATELY ===
     // These must be active before any +load methods run
