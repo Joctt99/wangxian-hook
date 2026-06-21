@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v29.0 Fix Double Swizzle ===");
+        _log(@"=== WXHook v30.0 CompletionHandler Hook ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -505,6 +505,36 @@ static void swizzled_didCompleteWithError(id self, SEL _cmd, NSURLSession *sessi
     [g_fakeResponseTasks removeObject:tid];
 }
 
+// ============================================================
+#pragma mark - AFURLSessionManagerTaskDelegate.setCompletionHandler: hook
+// ============================================================
+
+// Completion block type: void (^)(NSURLResponse *response, id responseObject, NSError *error)
+typedef void (^AFCompletionBlock)(NSURLResponse *, id, NSError *);
+typedef void (*SetCompletionHandlerIMP)(id, SEL, AFCompletionBlock);
+static SetCompletionHandlerIMP orig_setCompletionHandler = NULL;
+
+static void hook_setCompletionHandler(id self, SEL _cmd, AFCompletionBlock originalBlock) {
+    // Wrap the completion block to intercept the response
+    AFCompletionBlock wrappedBlock = nil;
+    if (originalBlock) {
+        wrappedBlock = [^(NSURLResponse *response, id responseObject, NSError *error) {
+            DLOG(@"[COMP] Completion handler called! status=%ld error=%@",
+                 response ? (long)[(NSHTTPURLResponse *)response statusCode] : -1,
+                 error);
+            
+            // Call original with modified parameters
+            // Force nil error and pass through the response/responseObject
+            originalBlock(response, responseObject, nil);
+        } copy];
+    }
+    
+    // Call original setter with wrapped block
+    if (orig_setCompletionHandler) {
+        orig_setCompletionHandler(self, _cmd, wrappedBlock);
+    }
+}
+
 static void swizzleDelegate(id delegate) {
     if (!delegate) return;
     
@@ -557,41 +587,29 @@ static void swizzleDelegate(id delegate) {
     
     DLOG(@"[DELEG] Created subclass %@, swizzled instance", subClassName);
     
-    // Swizzle AFURLSessionManagerTaskDelegate (AFNetworking internal class)
+    // Hook setCompletionHandler: on AFURLSessionManagerTaskDelegate
+    // This intercepts the completion block that AFNetworking calls with the response
     @try {
-        Class taskDelegateCls = objc_getClass("AFURLSessionManagerTaskDelegate");
-        if (taskDelegateCls) {
-            DLOG(@"[DELEG] Found AFURLSessionManagerTaskDelegate");
-            SEL recvRespHandlerSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-            
-            // IMPORTANT: Only swizzle if not already done in Phase 0
-            // Phase 0 may have already added/swizzled this method
-            if (!g_earlyTaskDelegateSwizzled) {
-                Method m = class_getInstanceMethod(taskDelegateCls, recvRespHandlerSel);
+        static BOOL completionHandlerHooked = NO;
+        if (!completionHandlerHooked) {
+            Class taskDelegateCls = objc_getClass("AFURLSessionManagerTaskDelegate");
+            if (taskDelegateCls) {
+                SEL setCompSel = @selector(setCompletionHandler:);
+                Method m = class_getInstanceMethod(taskDelegateCls, setCompSel);
                 if (m) {
-                    IMP currentIMP = method_getImplementation(m);
-                    // Check if this is already our swizzled IMP
-                    if (currentIMP != (IMP)swizzled_af_didReceiveResponseWithHandler) {
-                        orig_afRecvRespHandler = (AFRecvRespHandlerIMP)currentIMP;
-                        method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
-                        DLOG(@"[DELEG] Swizzled TaskDelegate.didReceiveResponse (not yet swizzled)");
-                    } else {
-                        DLOG(@"[DELEG] TaskDelegate already swizzled (same IMP), skipping");
-                    }
+                    orig_setCompletionHandler = (SetCompletionHandlerIMP)method_getImplementation(m);
+                    method_setImplementation(m, (IMP)hook_setCompletionHandler);
+                    completionHandlerHooked = YES;
+                    DLOG(@"[DELEG] Hooked TaskDelegate.setCompletionHandler:");
                 } else {
-                    DLOG(@"[DELEG] TaskDelegate method not found, adding");
-                    class_addMethod(taskDelegateCls, recvRespHandlerSel,
-                                   (IMP)swizzled_af_didReceiveResponseWithHandler,
-                                   "v@:@@@@?");
+                    DLOG(@"[DELEG] TaskDelegate.setCompletionHandler: not found");
                 }
             } else {
-                DLOG(@"[DELEG] TaskDelegate already swizzled in Phase 0, skipping");
+                DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
             }
-        } else {
-            DLOG(@"[DELEG] AFURLSessionManagerTaskDelegate not found");
         }
     } @catch (NSException *e) {
-        DLOG(@"[DELEG] Exception swizzling TaskDelegate: %@", e);
+        DLOG(@"[DELEG] Exception hooking setCompletionHandler: %@", e);
     }
 }
 
@@ -861,7 +879,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v29.0";
+    lbl.text = @"WXHook v30.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -913,38 +931,6 @@ static WXHandler *g_handler = nil;
 __attribute__((constructor))
 static void entry(void) {
     log_init();
-    
-    // === PHASE 0: Pre-inject method into AFURLSessionManagerTaskDelegate ===
-    // MUST be done BEFORE any NSURLSession is created, because NSURLSession
-    // caches the delegate's method list at session creation time.
-    @try {
-        Class tdCls = objc_getClass("AFURLSessionManagerTaskDelegate");
-        if (tdCls) {
-            SEL sel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-            Method m = class_getInstanceMethod(tdCls, sel);
-            if (m) {
-                orig_afRecvRespHandler = (AFRecvRespHandlerIMP)method_getImplementation(m);
-                method_setImplementation(m, (IMP)swizzled_af_didReceiveResponseWithHandler);
-                g_earlyTaskDelegateSwizzled = YES;
-                _log(@"[INIT-EARLY] TaskDelegate.didReceiveResponse swizzled (found)");
-            } else {
-                BOOL added = class_addMethod(tdCls, sel,
-                                            (IMP)swizzled_af_didReceiveResponseWithHandler,
-                                            "v@:@@@@?");
-                if (added) {
-                    g_earlyTaskDelegateSwizzled = YES;
-                    // orig_afRecvRespHandler stays NULL - no original existed
-                    _log(@"[INIT-EARLY] TaskDelegate.didReceiveResponse added (no original)");
-                } else {
-                    _log(@"[INIT-EARLY] TaskDelegate add FAILED");
-                }
-            }
-        } else {
-            _log(@"[INIT-EARLY] AFURLSessionManagerTaskDelegate not found (class not loaded yet)");
-        }
-    } @catch (NSException *e) {
-        _log([NSString stringWithFormat:@"[INIT-EARLY] Exception: %@", e]);
-    }
     
     // === PHASE 1: Install NSUserDefaults hooks IMMEDIATELY ===
     // These must be active before any +load methods run
