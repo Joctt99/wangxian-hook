@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v22.0 Full Scan ===");
+        _log(@"=== WXHook v23.0 Delayed Scan ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -830,7 +830,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v22.0";
+    lbl.text = @"WXHook v23.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -894,9 +894,12 @@ static id safe_hook_acceptableStatusCodes(id self, SEL _cmd) {
 }
 
 static void scanAFNetworkingClasses(void) {
+    @try {
     // First, scan for all classes with AF prefix
     int count = objc_getClassList(NULL, 0);
+    if (count <= 0) { DLOG(@"[SCAN] objc_getClassList returned %d", count); return; }
     Class *classes = (Class *)malloc(sizeof(Class) * count);
+    if (!classes) { DLOG(@"[SCAN] malloc failed"); return; }
     objc_getClassList(classes, count);
     
     int afCount = 0;
@@ -994,6 +997,9 @@ static void scanAFNetworkingClasses(void) {
     }
     
     free(classes);
+    } @catch (NSException *e) {
+        DLOG(@"[SCAN] Outer exception in scan: %@", e);
+    }
 }
 
 // ============================================================
@@ -1048,8 +1054,15 @@ static void entry(void) {
             _log(@"[INIT] NSURLSessionTask.response hooked (fake HTTP 200)");
         }
         
-        // Comprehensive AFNetworking class scan (replaces v21.0 crashy swizzle)
-        scanAFNetworkingClasses();
+        // Delayed AFNetworking class scan (after all classes loaded)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            DLOG(@"[SCAN] Starting delayed AFNetworking scan");
+            @try {
+                scanAFNetworkingClasses();
+            } @catch (NSException *e) {
+                DLOG(@"[SCAN] Exception in delayed scan: %@", e);
+            }
+        });
         
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
