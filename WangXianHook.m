@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v30.0 CompletionHandler Hook ===");
+        _log(@"=== WXHook v31.0 Direct Bypass ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -834,9 +834,41 @@ static void hook_exitApp(id self, SEL _cmd) {
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SIG] SignatureKit judgeAppInfoWithBaseUrl: %@", baseUrl);
-    // Call original so verification proceeds
-    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
+    DLOG(@"[SIG] SignatureKit judgeAppInfoWithBaseUrl: %@ (BYPASSING)", baseUrl);
+    
+    // DON'T call original (which would make HTTP request to failing server)
+    // Instead, directly call handleAppInfoResult: with fake success data
+    @try {
+        NSDictionary *fakeResult = @{
+            @"status": @200,
+            @"ispass": @"YES",
+            @"pass": @"YES",
+            @"result": @"pass",
+            @"code": @0,
+            @"verify": @"YES",
+            @"data": @{@"status": @1, @"ispass": @"YES"},
+            @"msg": @"success",
+            @"timestamp": @"2026-06-21T00:00:00.000+0000"
+        };
+        DLOG(@"[SIG] Calling handleAppInfoResult: with fake success");
+        
+        // Call handleAppInfoResult: on the same class
+        Class skCls = object_getClass(self);
+        SEL handleSel = @selector(handleAppInfoResult:);
+        if ([skCls respondsToSelector:handleSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(skCls, handleSel, fakeResult);
+            DLOG(@"[SIG] handleAppInfoResult: called successfully");
+        } else {
+            DLOG(@"[SIG] handleAppInfoResult: not found on class, trying orig");
+            if (orig_handleResult) {
+                orig_handleResult(self, handleSel, fakeResult);
+            }
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[SIG] Exception in bypass: %@", e);
+        // Fallback: call original
+        if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
+    }
 }
 
 // ============================================================
@@ -879,7 +911,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v30.0";
+    lbl.text = @"WXHook v31.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
