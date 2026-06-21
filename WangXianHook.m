@@ -27,7 +27,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v24.0 Safe Scan ===");
+        _log(@"=== WXHook v25.0 Clean ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -830,7 +830,7 @@ static WXHandler *g_handler = nil;
     g_panel = [[UIView alloc] initWithFrame:f];
     g_panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, f.size.width - 32, 24)];
-    lbl.text = @"WXHook v24.0";
+    lbl.text = @"WXHook v25.0";
     lbl.textColor = [UIColor greenColor];
     lbl.font = [UIFont boldSystemFontOfSize:16];
     [g_panel addSubview:lbl];
@@ -872,152 +872,6 @@ static WXHandler *g_handler = nil;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
     });
-}
-@end
-
-// ============================================================
-#pragma mark - AFNetworking Class Scan & Safe Swizzle
-// ============================================================
-
-// Swizzled validateResponse for ANY AF serializer class
-static BOOL safe_hook_validateResponse(id self, SEL _cmd, NSHTTPURLResponse *response, NSData *data, NSError **error) {
-    // Always return YES - bypass ALL AFNetworking response validation
-    if (error) *error = nil;
-    DLOG(@"[VALIDATE] Intercepted validateResponse, status=%ld, forcing YES", (long)response.statusCode);
-    return YES;
-}
-
-// Swizzled acceptableStatusCodes for AFHTTPResponseSerializer
-static id safe_hook_acceptableStatusCodes(id self, SEL _cmd) {
-    DLOG(@"[STATUS] Intercepted acceptableStatusCodes, returning all");
-    return [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(1, 999)];
-}
-
-static void scanAFNetworkingClasses(void) {
-    @try {
-    // First, scan for all classes with AF prefix
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) { DLOG(@"[SCAN] objc_getClassList returned %d", count); return; }
-    Class *classes = (Class *)malloc(sizeof(Class) * count);
-    if (!classes) { DLOG(@"[SCAN] malloc failed"); return; }
-    objc_getClassList(classes, count);
-    
-    int afCount = 0;
-    NSMutableString *afList = [NSMutableString string];
-    
-    for (int i = 0; i < count; i++) {
-        Class cls = classes[i];
-        const char *name = class_getName(cls);
-        if (!name) continue;
-        NSString *nsName = [NSString stringWithUTF8String:name];
-        
-        if ([nsName hasPrefix:@"AF"]) {
-            afCount++;
-            [afList appendFormat:@"%@ ", nsName];
-            
-            // Count methods
-            unsigned int methodCount = 0;
-            Method *methods = class_copyMethodList(cls, &methodCount);
-            
-            for (unsigned int j = 0; j < methodCount; j++) {
-                SEL sel = method_getName(methods[j]);
-                NSString *selName = NSStringFromSelector(sel);
-                
-                // Check for validation-related methods
-                if ([selName containsString:@"validate"] || 
-                    [selName containsString:@"acceptable"] ||
-                    [selName containsString:@"statusCode"] ||
-                    [selName containsString:@"acceptableStatusCodes"]) {
-                    
-                    DLOG(@"[SCAN] Found %@.%@ (count=%u)", nsName, selName, methodCount);
-                    
-                    // Try safe swizzle with @try/@catch
-                    @try {
-                        if ([selName isEqualToString:@"acceptableStatusCodes"]) {
-                            IMP newIMP = imp_implementationWithBlock(^id(id self) {
-                                return [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(1, 999)];
-                            });
-                            method_setImplementation(methods[j], newIMP);
-                            DLOG(@"[SCAN] Swizzled %@.acceptableStatusCodes", nsName);
-                        }
-                    } @catch (NSException *e) {
-                        DLOG(@"[SCAN] Failed to swizzle %@.%@: %@", nsName, selName, e);
-                    }
-                }
-            }
-            if (methods) free(methods);
-        }
-    }
-    
-    DLOG(@"[SCAN] Found %d AF classes: %@", afCount, afList);
-    
-    // Also try specific known methods with safe approach
-    @try {
-        // Try AFHTTPResponseSerializer - validateResponse:data:error:
-        Class httpSerCls = objc_getClass("AFHTTPResponseSerializer");
-        if (httpSerCls) {
-            DLOG(@"[SCAN] Found AFHTTPResponseSerializer");
-            SEL validateSel = @selector(validateResponse:data:error:);
-            Method vm = class_getInstanceMethod(httpSerCls, validateSel);
-            if (vm) {
-                const char *types = method_getTypeEncoding(vm);
-                DLOG(@"[SCAN] AFHTTPResponseSerializer.validateResponse type: %s", types ? types : "null");
-                method_setImplementation(vm, (IMP)safe_hook_validateResponse);
-                DLOG(@"[SCAN] Swizzled AFHTTPResponseSerializer.validateResponse");
-            }
-            
-            // Try acceptableStatusCodes getter
-            SEL statusSel = @selector(acceptableStatusCodes);
-            Method sm = class_getInstanceMethod(httpSerCls, statusSel);
-            if (sm) {
-                method_setImplementation(sm, (IMP)safe_hook_acceptableStatusCodes);
-                DLOG(@"[SCAN] Swizzled AFHTTPResponseSerializer.acceptableStatusCodes");
-            }
-        } else {
-            DLOG(@"[SCAN] AFHTTPResponseSerializer not found");
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[SCAN] Exception during AFHTTPResponseSerializer swizzle: %@", e);
-    }
-    
-    // Try AFJSONResponseSerializer
-    @try {
-        Class jsonCls = objc_getClass("AFJSONResponseSerializer");
-        if (jsonCls) {
-            DLOG(@"[SCAN] Found AFJSONResponseSerializer");
-            SEL validateSel = @selector(validateResponse:data:error:);
-            Method vm = class_getInstanceMethod(jsonCls, validateSel);
-            if (vm) {
-                method_setImplementation(vm, (IMP)safe_hook_validateResponse);
-                DLOG(@"[SCAN] Swizzled AFJSONResponseSerializer.validateResponse");
-            }
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[SCAN] Exception during AFJSONResponseSerializer: %@", e);
-    }
-    
-    free(classes);
-    } @catch (NSException *e) {
-        DLOG(@"[SCAN] Outer exception in scan: %@", e);
-    }
-}
-
-// ============================================================
-#pragma mark - Scan Receiver (triggered by notification)
-// ============================================================
-
-@interface WXScanReceiver : NSObject
-+ (void)performScan;
-@end
-
-@implementation WXScanReceiver
-+ (void)performScan {
-    DLOG(@"[SCAN] performScan triggered by notification");
-    @try {
-        scanAFNetworkingClasses();
-    } @catch (NSException *e) {
-        DLOG(@"[SCAN] Exception in performScan: %@", e);
-    }
 }
 @end
 
@@ -1073,12 +927,8 @@ static void entry(void) {
             _log(@"[INIT] NSURLSessionTask.response hooked (fake HTTP 200)");
         }
         
-        // Use notification observer for delayed scan (safe - all classes loaded)
-        [[NSNotificationCenter defaultCenter] addObserver:[WXScanReceiver class]
-                                                 selector:@selector(performScan)
-                                                     name:UIApplicationDidFinishLaunchingNotification
-                                                   object:nil];
-        _log(@"[INIT] AFNetworking scan scheduled (will run after app launch)");
+        // NO scan code in constructor (causes crashes in v21-24)
+        // Pure v20.0 approach: delegate swizzle only
         
         // Register NSURLProtocol interceptor
         [NSURLProtocol registerClass:[WXInterceptor class]];
