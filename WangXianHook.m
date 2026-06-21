@@ -28,7 +28,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v32.4 Delegate Inject ===");
+        _log(@"=== WXHook v32.5 Stable + Diagnostics ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -166,7 +166,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v32.4";
+            lbl.text = @"WXHook v32.5";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -201,7 +201,16 @@ static UILabel *g_statusLbl = nil;
             [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:copyBtn];
             
-            g_tv = [[UITextView alloc] initWithFrame:CGRectMake(8, 56, pw - 16, ph - 66)];
+            // Second row: Dump button
+            UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            dumpBtn.frame = CGRectMake(bx, 34, 80, 24);
+            [dumpBtn setTitle:@"Dump View" forState:UIControlStateNormal];
+            [dumpBtn setTitleColor:[UIColor orangeColor] forState:UIControlStateNormal];
+            dumpBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+            [dumpBtn addTarget:self action:@selector(dumpViews) forControlEvents:UIControlEventTouchUpInside];
+            [g_panel addSubview:dumpBtn];
+            
+            g_tv = [[UITextView alloc] initWithFrame:CGRectMake(8, 62, pw - 16, ph - 72)];
             g_tv.backgroundColor = [UIColor blackColor];
             g_tv.textColor = [UIColor greenColor];
             g_tv.font = [UIFont fontWithName:@"Menlo" size:11];
@@ -233,6 +242,30 @@ static UILabel *g_statusLbl = nil;
     g_statusLbl.textColor = g_logEnabled ? [UIColor greenColor] : [UIColor redColor];
     if (g_logEnabled) {
         DLOG(@"=== Logging resumed ===");
+    }
+}
+- (void)dumpViews {
+    DLOG(@"=== View Dump ===");
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        [self dumpView:w indent:0];
+    }
+    DLOG(@"=== End Dump ===");
+    g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    [g_tv scrollRangeToVisible:NSMakeRange(g_tv.text.length, 0)];
+}
+- (void)dumpView:(UIView *)v indent:(int)indent {
+    NSMutableString *prefix = [NSMutableString string];
+    for (int i = 0; i < indent; i++) [prefix appendString:@"  "];
+    NSString *cls = NSStringFromClass([v class]);
+    NSString *text = @"";
+    if ([v isKindOfClass:[UILabel class]]) text = ((UILabel *)v).text ?: @"";
+    else if ([v isKindOfClass:[UIButton class]]) {
+        text = [(UIButton *)v titleLabel].text ?: @"";
+    }
+    if (text.length > 50) text = [text substringToIndex:50];
+    DLOG(@"[VIEW] %@%@ frame=%.0fx%.0f text='%@'", prefix, cls, v.frame.size.width, v.frame.size.height, text);
+    for (UIView *sub in v.subviews) {
+        [self dumpView:sub indent:indent + 1];
     }
 }
 - (void)copyLog {
@@ -275,75 +308,11 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
 }
 
 // NSURLSession.dataTaskWithRequest: (delegate mode, no completion handler)
+// OBSERVE ONLY - no interception (delegate injection causes crashes)
 typedef NSURLSessionDataTask *(*DTReqIMP)(id, SEL, NSURLRequest *);
 static DTReqIMP orig_dtr = NULL;
 static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
-    NSString *url = req.URL.absoluteString;
-    DLOG(@"[NET-D] delegate URL: %@", url);
-    
-    // Check if this is a qunhongtech.com request
-    BOOL isQHT = [url containsString:@"qunhongtech.com"];
-    
-    if (isQHT && orig_dtr) {
-        NSURLSessionDataTask *task = orig_dtr(self, _cmd, req);
-        DLOG(@"[NET-D] Intercepting qunhongtech.com! task=%lu", task ? (unsigned long)task.taskIdentifier : 0);
-        
-        // Find session delegate via KVC
-        @try {
-            id delegate = [self valueForKey:@"delegate"];
-            DLOG(@"[NET-D] Session delegate: %@", delegate ? NSStringFromClass([delegate class]) : @"nil");
-            
-            if (delegate && task) {
-                // Create fake success response
-                NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
-                    initWithURL:req.URL
-                    statusCode:200
-                    HTTPVersion:@"HTTP/1.1"
-                    headerFields:@{@"Content-Type": @"application/json"}];
-                
-                // Create fake JSON body
-                NSDictionary *fakeJSON = @{@"status":@200,@"ispass":@"YES",@"pass":@"YES",
-                    @"result":@"pass",@"code":@0,@"verify":@"YES",
-                    @"data":@{@"status":@1,@"ispass":@"YES"},@"msg":@"success"};
-                NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeJSON options:0 error:nil];
-                
-                // Inject fake delegate callbacks after a short delay
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    // 1. didReceiveResponse:completionHandler:
-                    SEL respSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-                    if ([delegate respondsToSelector:respSel]) {
-                        DLOG(@"[NET-D] Calling delegate.didReceiveResponse with fake 200");
-                        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSURLSessionResponseDisposition)))objc_msgSend)(
-                            delegate, respSel, (NSURLSession *)self, task, fakeResp,
-                            ^(NSURLSessionResponseDisposition disposition) {
-                                DLOG(@"[NET-D] Response disposition: %ld", (long)disposition);
-                            });
-                    }
-                    
-                    // 2. didReceiveData:
-                    SEL dataSel = @selector(URLSession:dataTask:didReceiveData:);
-                    if ([delegate respondsToSelector:dataSel]) {
-                        DLOG(@"[NET-D] Calling delegate.didReceiveData (%lu bytes)", (unsigned long)fakeData.length);
-                        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))objc_msgSend)(
-                            delegate, dataSel, (NSURLSession *)self, task, fakeData);
-                    }
-                    
-                    // 3. didCompleteWithError:
-                    SEL compSel = @selector(URLSession:task:didCompleteWithError:);
-                    if ([delegate respondsToSelector:compSel]) {
-                        DLOG(@"[NET-D] Calling delegate.didCompleteWithError: nil");
-                        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSError *))objc_msgSend)(
-                            delegate, compSel, (NSURLSession *)self, task, nil);
-                    }
-                });
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[NET-D] Exception injecting response: %@", e);
-        }
-        
-        return task;
-    }
-    
+    DLOG(@"[NET-D] delegate URL: %@", req.URL.absoluteString);
     if (orig_dtr) return orig_dtr(self, _cmd, req);
     return nil;
 }
