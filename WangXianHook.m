@@ -28,7 +28,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v32.5 Stable + Diagnostics ===");
+        _log(@"=== WXHook v32.6 NSUD + Dump ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -166,7 +166,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v32.5";
+            lbl.text = @"WXHook v32.6";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -278,6 +278,34 @@ static UILabel *g_statusLbl = nil;
 @end
 
 // ============================================================
+#pragma mark - NSUserDefaults observation (log reads, set verify flags)
+// ============================================================
+
+typedef id (*ObjForKeyIMP)(id, SEL, NSString *);
+static ObjForKeyIMP orig_objectForKey = NULL;
+static int g_nsudCount = 0;
+static id hook_objectForKey(id self, SEL _cmd, NSString *key) {
+    id val = orig_objectForKey ? orig_objectForKey(self, _cmd, key) : nil;
+    // Log first 50 NSUserDefaults reads to avoid spam
+    if (g_nsudCount < 50) {
+        DLOG(@"[NSUD] objectForKey: %@ = %@", key, val);
+    }
+    g_nsudCount++;
+    return val;
+}
+
+typedef BOOL (*BoolForKeyIMP)(id, SEL, NSString *);
+static BoolForKeyIMP orig_boolForKey = NULL;
+static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
+    BOOL val = orig_boolForKey ? orig_boolForKey(self, _cmd, key) : NO;
+    if (g_nsudCount < 50) {
+        DLOG(@"[NSUD] boolForKey: %@ = %d", key, val);
+    }
+    g_nsudCount++;
+    return val;
+}
+
+// ============================================================
 #pragma mark - Observation-only hooks (log, don't modify)
 // ============================================================
 
@@ -355,6 +383,16 @@ static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
 __attribute__((constructor))
 static void entry(void) {
     log_init();
+    
+    // === IMMEDIATE: NSUserDefaults hooks ===
+    Class udCls = [NSUserDefaults class];
+    if (udCls) {
+        Method m1 = class_getInstanceMethod(udCls, @selector(objectForKey:));
+        if (m1) { orig_objectForKey = (ObjForKeyIMP)method_getImplementation(m1); method_setImplementation(m1, (IMP)hook_objectForKey); }
+        Method m2 = class_getInstanceMethod(udCls, @selector(boolForKey:));
+        if (m2) { orig_boolForKey = (BoolForKeyIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_boolForKey); }
+        _log(@"[INIT] NSUserDefaults hooked (objectForKey + boolForKey)");
+    }
     
     // === IMMEDIATE: Observation-only hooks ===
     // NSURLSession completion handler mode
@@ -459,6 +497,26 @@ static void entry(void) {
         } else {
             _log(@"[INIT] WARNING: SignatureCheck NOT found!");
         }
+        
+        // Dump NSUserDefaults to find verification keys
+        @try {
+            NSDictionary *allDefaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+            DLOG(@"[NSUD-DUMP] Total keys: %lu", (unsigned long)allDefaults.count);
+            for (NSString *key in allDefaults) {
+                // Only log keys that look like they might be related to verification
+                NSString *lk = [key lowercaseString];
+                if ([lk containsString:@"pass"] || [lk containsString:@"verify"] || 
+                    [lk containsString:@"sign"] || [lk containsString:@"license"] ||
+                    [lk containsString:@"ispass"] || [lk containsString:@"cert"] ||
+                    [lk containsString:@"check"] || [lk containsString:@"auth"] ||
+                    [lk containsString:@"valid"]) {
+                    DLOG(@"[NSUD-DUMP] %@ = %@", key, allDefaults[key]);
+                }
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[NSUD-DUMP] Exception: %@", e);
+        }
+        DLOG(@"[NSUD] Total reads so far: %d", g_nsudCount);
         
         // --- Create LOG button ---
         UIWindow *w = nil;
