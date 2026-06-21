@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#include <libkern/OSCacheControl.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -501,7 +502,7 @@ static BOOL patchBranch(void *target, void *hook, const char *name) {
     }
     *(uint32_t *)target = branchInstr;
     // Flush instruction cache
-    __builtin___clear_cache((char *)target, (char *)target + 4);
+    sys_icache_invalidate(target, 4);
     DLOG(@"[HOOK] %s: patched @ %p -> %p", name, target, hook);
     return YES;
 }
