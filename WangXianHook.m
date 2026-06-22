@@ -30,7 +30,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.1 Security Bypass ===");
+        _log(@"=== WXHook v33.2 Socket + Interpose ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -168,7 +168,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.1";
+            lbl.text = @"WXHook v33.2";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -278,6 +278,47 @@ static UILabel *g_statusLbl = nil;
     });
 }
 @end
+
+// ============================================================
+#pragma mark - BSD socket hooks (detect game network traffic)
+// ============================================================
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+// Hook connect() to detect all network connections
+typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
+static ConnectFunc orig_connect = NULL;
+static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    char host[256] = "unknown";
+    int port = 0;
+    if (addr->sa_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
+        port = ntohs(in->sin_port);
+        DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
+    } else if (addr->sa_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
+        port = ntohs(in6->sin6_port);
+        DLOG(@"[SOCK] connect6 fd=%d [%s]:%d", sockfd, host, port);
+    }
+    return orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+}
+
+// dyld interposing: replace connect() in all images
+struct interpose_s {
+    void *replacement;
+    void *original;
+};
+
+__attribute__((used))
+static const struct interpose_s interposers[]
+    __attribute__((section("__DATA,__interpose"))) = {
+        { (void *)hook_connect, (void *)connect },
+};
 
 // ============================================================
 #pragma mark - /proc/self/maps filtering (hide injected dylibs)
@@ -451,6 +492,10 @@ static void entry(void) {
     
     // === IMMEDIATE: Anti-cheat bypass (diagnostic) ===
     installSecurityHooks();
+    
+    // Save original connect() via RTLD_NEXT
+    orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
+    DLOG(@"[SOCK] Original connect() = %p", orig_connect);
     
     // === IMMEDIATE: NSUserDefaults hooks ===
     Class udCls = [NSUserDefaults class];
