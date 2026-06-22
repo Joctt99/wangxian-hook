@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.7 Patched IPA Mode ===");
+        _log(@"=== WXHook v33.8 Version Patch + Response Filter ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.7";
+            lbl.text = @"WXHook v33.8";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -325,6 +325,13 @@ static const char *getHostForFd(int fd) {
     return NULL;
 }
 
+static int getPortForFd(int fd) {
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd) return g_trackedPorts[i];
+    }
+    return 0;
+}
+
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     char host[64] = "unknown";
@@ -348,6 +355,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
     if (host && len > 0) {
         // Log first 256 bytes as hex + ascii
         const unsigned char *p = (const unsigned char *)buf;
@@ -358,7 +366,27 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, g_trackedPorts[0], len, hex, ascii);
+        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
+        
+        // === VERSION PATCH: Replace "7.6.0" with "8.0.0" in game server packets ===
+        if (port == 5678 && len >= 5) {
+            unsigned char *patched = NULL;
+            for (size_t i = 0; i <= len - 5; i++) {
+                if (p[i] == '7' && p[i+1] == '.' && p[i+2] == '6' && p[i+3] == '.' && p[i+4] == '0') {
+                    if (!patched) {
+                        patched = (unsigned char *)malloc(len);
+                        memcpy(patched, buf, len);
+                    }
+                    patched[i] = '8'; patched[i+1] = '.'; patched[i+2] = '0'; patched[i+3] = '.'; patched[i+4] = '0';
+                    DLOG(@"[PATCH] Version 7.6.0 -> 8.0.0 at offset %zu", i);
+                }
+            }
+            if (patched) {
+                ssize_t ret = orig_send(fd, patched, len, flags);
+                free(patched);
+                return ret;
+            }
+        }
     }
     return orig_send ? orig_send(fd, buf, len, flags) : -1;
 }
@@ -367,6 +395,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     ssize_t ret = orig_recv(fd, buf, len, flags);
     const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
     if (host && ret > 0) {
         const unsigned char *p = (const unsigned char *)buf;
         NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
@@ -376,7 +405,29 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, g_trackedPorts[0], ret, hex, ascii);
+        DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
+        
+        // === ANTI-CHEAT RESPONSE PATCH ===
+        // Detect "版本过低" or "当前版本" in response and neutralize
+        if (port == 5678 && ret > 6) {
+            // UTF-8: 版本过低 = E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E
+            static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+                if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                    DLOG(@"[PATCH] Detected '版本过低' in server response at offset %zd, neutralizing", i);
+                    // Replace with spaces to break the message
+                    memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+                }
+            }
+            // Also check for 当前版本 = E5 BD 93 E5 89 8D E7 89 88 E6 9C AC
+            static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+                if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                    DLOG(@"[PATCH] Detected '当前版本' in server response at offset %zd, neutralizing", i);
+                    memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+                }
+            }
+        }
     }
     return ret;
 }
@@ -384,6 +435,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 static ssize_t hook_write(int fd, const void *buf, size_t len) {
     if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
     const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
     if (host && len > 0 && len < 4096) {
         const unsigned char *p = (const unsigned char *)buf;
         NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
@@ -393,7 +445,27 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[WRITE] fd=%d %s len=%zu\n  hex: %@\n  txt: %@", fd, host, len, hex, ascii);
+        DLOG(@"[WRITE] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
+        
+        // === VERSION PATCH in write too ===
+        if (port == 5678 && len >= 5) {
+            unsigned char *patched = NULL;
+            for (size_t i = 0; i <= len - 5; i++) {
+                if (p[i] == '7' && p[i+1] == '.' && p[i+2] == '6' && p[i+3] == '.' && p[i+4] == '0') {
+                    if (!patched) {
+                        patched = (unsigned char *)malloc(len);
+                        memcpy(patched, buf, len);
+                    }
+                    patched[i] = '8'; patched[i+1] = '.'; patched[i+2] = '0'; patched[i+3] = '.'; patched[i+4] = '0';
+                    DLOG(@"[PATCH-W] Version 7.6.0 -> 8.0.0 at offset %zu", i);
+                }
+            }
+            if (patched) {
+                ssize_t ret = orig_write(fd, patched, len);
+                free(patched);
+                return ret;
+            }
+        }
     }
     return orig_write ? orig_write(fd, buf, len) : -1;
 }
@@ -402,6 +474,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     ssize_t ret = orig_read(fd, buf, len);
     const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
     if (host && ret > 0 && ret < 4096) {
         const unsigned char *p = (const unsigned char *)buf;
         NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
@@ -411,7 +484,25 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[READ] fd=%d %s ret=%zd\n  hex: %@\n  txt: %@", fd, host, ret, hex, ascii);
+        DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
+        
+        // === ANTI-CHEAT RESPONSE PATCH in read too ===
+        if (port == 5678 && ret > 6) {
+            static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+                if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                    DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
+                    memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+                }
+            }
+            static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+                if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                    DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
+                    memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+                }
+            }
+        }
     }
     return ret;
 }
