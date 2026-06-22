@@ -7,8 +7,11 @@
 #import <objc/runtime.h>
 #include <objc/message.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -30,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.2 Socket + Interpose ===");
+        _log(@"=== WXHook v33.3 Socket Fishhook ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -168,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.2";
+            lbl.text = @"WXHook v33.3";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -308,17 +311,68 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
     return orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
 }
 
-// dyld interposing: replace connect() in all images
-struct interpose_s {
-    void *replacement;
-    void *original;
-};
-
-__attribute__((used))
-static const struct interpose_s interposers[]
-    __attribute__((section("__DATA,__interpose"))) = {
-        { (void *)hook_connect, (void *)connect },
-};
+// Minimal fishhook: patch connect() in the main binary's __la_symbol_ptr
+static void installConnectHook(void) {
+    // Save original
+    orig_connect = connect;
+    
+    // Find main binary's __DATA segment and __la_symbol_ptr section
+    const struct mach_header_64 *mainHeader = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    if (!mainHeader) { DLOG(@"[SOCK] main binary header not found"); return; }
+    
+    const struct load_command *cmd = (const struct load_command *)((char *)mainHeader + sizeof(struct mach_header_64));
+    const struct segment_command_64 *linkeditSeg = NULL;
+    const struct segment_command_64 *dataSeg = NULL;
+    struct symtab_command *symtab = NULL;
+    
+    for (uint32_t i = 0; i < mainHeader->ncmds; i++) {
+        if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkeditSeg = seg;
+            else if (strcmp(seg->segname, "__DATA") == 0) dataSeg = seg;
+        } else if (cmd->cmd == LC_SYMTAB) {
+            symtab = (struct symtab_command *)cmd;
+        }
+        cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
+    }
+    
+    if (!linkeditSeg || !dataSeg || !symtab) {
+        DLOG(@"[SOCK] Missing segments for fishhook");
+        return;
+    }
+    
+    char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
+    const struct nlist_64 *syms = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
+    char *strtab = (char *)(linkeditBase + symtab->stroff);
+    uint32_t *indirectSyms = (uint32_t *)(linkeditBase + symtab->indirectsymoff);
+    
+    const struct section_64 *sec = (const struct section_64 *)((char *)dataSeg + sizeof(struct segment_command_64));
+    for (uint32_t s = 0; s < dataSeg->nsects; s++) {
+        if (strcmp(sec[s].sectname, "__la_symbol_ptr") == 0) {
+            void **pointers = (void **)((char *)slide + sec[s].addr);
+            uint32_t count = (uint32_t)(sec[s].size / sizeof(void *));
+            for (uint32_t j = 0; j < count; j++) {
+                uint32_t symIdx = indirectSyms[sec[s].reserved1 + j];
+                if (symIdx >= symtab->nsyms) continue;
+                const char *name = strtab + syms[symIdx].n_un.n_strx;
+                if (strcmp(name, "_connect") == 0) {
+                    // Found connect in __la_symbol_ptr!
+                    size_t pageSize = 16384;
+                    void *page = (void *)((uintptr_t)&pointers[j] & ~(pageSize - 1));
+                    if (mprotect(page, pageSize, PROT_READ | PROT_WRITE) == 0) {
+                        pointers[j] = (void *)hook_connect;
+                        DLOG(@"[SOCK] connect() hooked in main binary (index %u)", j);
+                        return;
+                    } else {
+                        DLOG(@"[SOCK] mprotect failed for connect");
+                    }
+                }
+            }
+        }
+    }
+    DLOG(@"[SOCK] connect not found in __la_symbol_ptr");
+}
 
 // ============================================================
 #pragma mark - /proc/self/maps filtering (hide injected dylibs)
@@ -496,6 +550,9 @@ static void entry(void) {
     // Save original connect() via RTLD_NEXT
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     DLOG(@"[SOCK] Original connect() = %p", orig_connect);
+    
+    // Install connect hook via fishhook (main binary only)
+    installConnectHook();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
     Class udCls = [NSUserDefaults class];
