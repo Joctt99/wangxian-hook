@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.8 Version Patch + Response Filter ===");
+        _log(@"=== WXHook v33.9 Response Filter Only ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.8";
+            lbl.text = @"WXHook v33.9";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -368,25 +368,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
         
-        // === VERSION PATCH: Replace "7.6.0" with "8.0.0" in game server packets ===
-        if (port == 5678 && len >= 5) {
-            unsigned char *patched = NULL;
-            for (size_t i = 0; i <= len - 5; i++) {
-                if (p[i] == '7' && p[i+1] == '.' && p[i+2] == '6' && p[i+3] == '.' && p[i+4] == '0') {
-                    if (!patched) {
-                        patched = (unsigned char *)malloc(len);
-                        memcpy(patched, buf, len);
-                    }
-                    patched[i] = '8'; patched[i+1] = '.'; patched[i+2] = '0'; patched[i+3] = '.'; patched[i+4] = '0';
-                    DLOG(@"[PATCH] Version 7.6.0 -> 8.0.0 at offset %zu", i);
-                }
-            }
-            if (patched) {
-                ssize_t ret = orig_send(fd, patched, len, flags);
-                free(patched);
-                return ret;
-            }
-        }
+        // Version patch DISABLED - server rejects unknown versions (returns latest=0)
+        // Keeping response filter only
     }
     return orig_send ? orig_send(fd, buf, len, flags) : -1;
 }
@@ -447,25 +430,8 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
         }
         DLOG(@"[WRITE] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
         
-        // === VERSION PATCH in write too ===
-        if (port == 5678 && len >= 5) {
-            unsigned char *patched = NULL;
-            for (size_t i = 0; i <= len - 5; i++) {
-                if (p[i] == '7' && p[i+1] == '.' && p[i+2] == '6' && p[i+3] == '.' && p[i+4] == '0') {
-                    if (!patched) {
-                        patched = (unsigned char *)malloc(len);
-                        memcpy(patched, buf, len);
-                    }
-                    patched[i] = '8'; patched[i+1] = '.'; patched[i+2] = '0'; patched[i+3] = '.'; patched[i+4] = '0';
-                    DLOG(@"[PATCH-W] Version 7.6.0 -> 8.0.0 at offset %zu", i);
-                }
-            }
-            if (patched) {
-                ssize_t ret = orig_write(fd, patched, len);
-                free(patched);
-                return ret;
-            }
-        }
+        // Version patch DISABLED in write too
+        (void)port;
     }
     return orig_write ? orig_write(fd, buf, len) : -1;
 }
