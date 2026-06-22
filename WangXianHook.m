@@ -17,7 +17,6 @@
 
 static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
-static BOOL g_interposeActive = NO; // guard for interpose phase (before constructor)
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -34,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.6 Interpose + Immediate Hooks ===");
+        _log(@"=== WXHook v33.7 Patched IPA Mode ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.6";
+            lbl.text = @"WXHook v33.7";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -328,7 +327,6 @@ static const char *getHostForFd(int fd) {
 
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-    if (!g_interposeActive) return orig_connect(sockfd, addr, addrlen);
     char host[64] = "unknown";
     int port = 0;
     if (addr->sa_family == AF_INET) {
@@ -349,7 +347,6 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
-    if (!g_interposeActive) return orig_send(fd, buf, len, flags);
     const char *host = getHostForFd(fd);
     if (host && len > 0) {
         // Log first 256 bytes as hex + ascii
@@ -368,7 +365,6 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-    if (!g_interposeActive) return orig_recv(fd, buf, len, flags);
     ssize_t ret = orig_recv(fd, buf, len, flags);
     const char *host = getHostForFd(fd);
     if (host && ret > 0) {
@@ -387,7 +383,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
 static ssize_t hook_write(int fd, const void *buf, size_t len) {
     if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
-    if (!g_interposeActive) return orig_write(fd, buf, len);
     const char *host = getHostForFd(fd);
     if (host && len > 0 && len < 4096) {
         const unsigned char *p = (const unsigned char *)buf;
@@ -405,7 +400,6 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
 
 static ssize_t hook_read(int fd, void *buf, size_t len) {
     if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-    if (!g_interposeActive) return orig_read(fd, buf, len);
     ssize_t ret = orig_read(fd, buf, len);
     const char *host = getHostForFd(fd);
     if (host && ret > 0 && ret < 4096) {
@@ -677,7 +671,6 @@ static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
 
 __attribute__((constructor))
 static void entry(void) {
-    g_interposeActive = YES; // interpose phase complete, enable hook logging
     log_init();
     
     // === IMMEDIATE: Anti-cheat bypass (diagnostic) ===
@@ -833,21 +826,5 @@ static void entry(void) {
     });
 }
 
-// ============================================================
-#pragma mark - dyld interpose (runs BEFORE all +load methods)
-// ============================================================
-
-typedef struct {
-    void *replacement;
-    void *original;
-} dyld_interpose_entry;
-
-__attribute__((used))
-static const dyld_interpose_entry gInterposes[]
-    __attribute__((section("__DATA,__interpose"))) = {
-    { (void *)hook_connect, (void *)connect },
-    { (void *)hook_send,    (void *)send },
-    { (void *)hook_recv,    (void *)recv },
-    { (void *)hook_write,   (void *)write },
-    { (void *)hook_read,    (void *)read },
-};
+// __DATA,__interpose REMOVED - causes white screen crash (intercepts ALL system connect/send/recv too early)
+// Using patched IPA with stub dylibs instead - prevents original +load from running
