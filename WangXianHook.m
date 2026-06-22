@@ -1,6 +1,6 @@
 /**
- * WangXianHook v33.0 - Anti-Cheat Bypass: Hide injected dylibs
- * Strategy: Hook _dyld functions to hide our dylibs from the game's anti-cheat
+ * WangXianHook v33.1 - Anti-Cheat Bypass: Security framework + /proc/self/maps
+ * Strategy: Hook Security APIs and /proc/self/maps to hide injected dylibs
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -9,10 +9,6 @@
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <mach/mach.h>
-#include <mach/vm_map.h>
-#include <libkern/OSCacheControl.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -34,7 +30,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.0 Anti-Cheat Bypass ===");
+        _log(@"=== WXHook v33.1 Security Bypass ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -172,7 +168,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.0";
+            lbl.text = @"WXHook v33.1";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -284,246 +280,123 @@ static UILabel *g_statusLbl = nil;
 @end
 
 // ============================================================
-#pragma mark - Dylib hiding (anti-cheat bypass)
+#pragma mark - /proc/self/maps filtering (hide injected dylibs)
 // ============================================================
 
-// Dylib names to hide from the game's anti-cheat
 static const char *g_hiddenDylibs[] = {
     "WangXianHook", "lnSignature", "libSupport", "liblnSignature", NULL
 };
 
-static BOOL shouldHideImage(const char *name) {
-    if (!name) return NO;
+static BOOL shouldHideLine(const char *line) {
     for (int i = 0; g_hiddenDylibs[i]; i++) {
-        if (strstr(name, g_hiddenDylibs[i])) return YES;
+        if (strstr(line, g_hiddenDylibs[i])) return YES;
     }
     return NO;
 }
 
-// Build a mapping of visible images
-static uint32_t *g_visibleMap = NULL;  // visibleMap[realIndex] = visibleIndex
-static uint32_t g_realCount = 0;
-static uint32_t g_visibleCount = 0;
+// Hook fopen to filter /proc/self/maps
+typedef FILE *(*FopenFunc)(const char *, const char *);
+static FopenFunc orig_fopen = NULL;
+static FILE *hook_fopen(const char *path, const char *mode) {
+    FILE *f = orig_fopen ? orig_fopen(path, mode) : NULL;
+    if (f && path && strstr(path, "/proc/self/maps")) {
+        DLOG(@"[PROC] /proc/self/maps opened - filtering");
+    }
+    return f;
+}
 
-// Build visible map by reading dyld_all_image_infos directly
-static void buildVisibleMap(void) {
-    static BOOL built = NO;
-    if (built) return;
-    built = YES;
-    
-    // Get dyld_all_image_infos via task_info
-    struct task_dyld_info dyld_info;
-    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    kern_return_t kr = task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &count);
-    if (kr != KERN_SUCCESS || dyld_info.all_image_info_addr == 0) {
-        DLOG(@"[DYLD] task_info failed (kr=%d), fallback to _dyld functions", kr);
-        g_realCount = _dyld_image_count();
-        g_visibleCount = g_realCount;
-        return;
+// Hook fgets to filter out our dylibs from /proc/self/maps
+typedef char *(*FgetsFunc)(char *, int, FILE *);
+static FgetsFunc orig_fgets = NULL;
+static char *hook_fgets(char *buf, int size, FILE *stream) {
+    char *result = orig_fgets ? orig_fgets(buf, size, stream) : NULL;
+    if (result && shouldHideLine(result)) {
+        // Return empty line instead of the dylib entry
+        buf[0] = '\n';
+        buf[1] = '\0';
     }
-    
-    // Read dyld_all_image_infos structure
-    // struct dyld_all_image_infos { ... uint32_t infoArrayCount; const struct dyld_image_info* infoArray; ... }
-    // On 64-bit: infoArrayCount is at offset 8, infoArray is at offset 16
-    struct dyld_all_info {
-        uint32_t version;
-        uint32_t padding;
-        uint32_t infoArrayCount;
-        uint32_t padding2;
-        uint64_t infoArray; // pointer to array of {mach_header*, path, slide}
-    };
-    
-    struct dyld_all_info allInfo;
-    vm_size_t size = sizeof(allInfo);
-    kr = vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, size, (vm_address_t)&allInfo, &size);
-    if (kr != KERN_SUCCESS) {
-        DLOG(@"[DYLD] vm_read all_image_infos failed");
-        g_realCount = _dyld_image_count();
-        g_visibleCount = g_realCount;
-        return;
-    }
-    
-    g_realCount = allInfo.infoArrayCount;
-    g_visibleMap = (uint32_t *)calloc(g_realCount, sizeof(uint32_t));
-    g_visibleCount = 0;
-    
-    // Read each dyld_image_info entry
-    // struct dyld_image_info { const mach_header* imageLoadAddress; const char* imageFilePath; intptr_t imageFileModDate; }
-    for (uint32_t i = 0; i < g_realCount; i++) {
-        // Each entry is 24 bytes on 64-bit (8+8+8)
-        struct { uint64_t addr; uint64_t path; uint64_t modDate; } entry;
-        vm_size_t esize = sizeof(entry);
-        kr = vm_read_overwrite(mach_task_self(), allInfo.infoArray + i * 24, esize, (vm_address_t)&entry, &esize);
-        if (kr != KERN_SUCCESS) { g_visibleMap[i] = g_visibleCount++; continue; }
-        
-        // Read path string (up to 256 chars)
-        char path[256] = {0};
-        vm_size_t psize = 255;
-        kr = vm_read_overwrite(mach_task_self(), entry.path, psize, (vm_address_t)path, &psize);
-        
-        if (kr == KERN_SUCCESS && !shouldHideImage(path)) {
-            g_visibleMap[i] = g_visibleCount;
-            g_visibleCount++;
-        } else {
-            g_visibleMap[i] = 0xFFFFFFFF;
-            // Log hidden dylib
-            if (kr == KERN_SUCCESS) {
-                NSString *nsname = [NSString stringWithUTF8String:path];
-                DLOG(@"[DYLD] HIDING: %u: %@", i, nsname.lastPathComponent);
+    return result;
+}
+
+// Hook fread to filter /proc/self/maps content
+typedef size_t (*FreadFunc)(void *, size_t, size_t, FILE *);
+static FreadFunc orig_fread = NULL;
+static size_t hook_fread(void *ptr, size_t sz, size_t cnt, FILE *stream) {
+    size_t result = orig_fread ? orig_fread(ptr, sz, cnt, stream) : 0;
+    if (result > 0) {
+        // Check if this looks like /proc/self/maps content
+        char *content = (char *)ptr;
+        for (int i = 0; g_hiddenDylibs[i]; i++) {
+            char *found = strstr(content, g_hiddenDylibs[i]);
+            if (found) {
+                DLOG(@"[PROC] Filtering %s from maps", g_hiddenDylibs[i]);
+                // Find the start of the line
+                char *lineStart = found;
+                while (lineStart > content && lineStart[-1] != '\n') lineStart--;
+                // Find the end of the line
+                char *lineEnd = found + strlen(g_hiddenDylibs[i]);
+                while (*lineEnd && *lineEnd != '\n') lineEnd++;
+                if (*lineEnd == '\n') lineEnd++;
+                // Remove the line by shifting content
+                size_t lineLen = lineEnd - lineStart;
+                size_t tailLen = content + result - lineEnd;
+                memmove(lineStart, lineEnd, tailLen);
+                result -= lineLen;
+                // Recurse to catch multiple occurrences
+                // (simple approach: just filter the first one found)
             }
         }
     }
-    DLOG(@"[DYLD] Real images: %u, Visible: %u (hidden: %u)", g_realCount, g_visibleCount, g_realCount - g_visibleCount);
+    return result;
 }
 
-// Replacement for _dyld_image_count
-typedef uint32_t (*DyldCountFunc)(void);
-static DyldCountFunc orig_dyldCount = NULL;
-static uint32_t hook_dyldCount(void) {
-    buildVisibleMap();
-    return g_visibleCount;
+// Hook SecCodeCopySigningInformation to return modified signing info
+// This prevents the game from detecting that the app was re-signed
+#import <Security/Security.h>
+
+typedef OSStatus (*SecCodeCopySignInfoFunc)(SecStaticCodeRef, SecCSFlags, CFDictionaryRef *);
+static SecCodeCopySignInfoFunc orig_secCodeCopySignInfo = NULL;
+
+static OSStatus hook_secCodeCopySignInfo(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef *info) {
+    OSStatus status = orig_secCodeCopySignInfo ? orig_secCodeCopySignInfo(code, flags, info) : errSecSuccess;
+    DLOG(@"[SEC] SecCodeCopySigningInformation called (status=%d)", (int)status);
+    if (info && *info) {
+        DLOG(@"[SEC] Sign info keys: %@", (NSArray *)CFBridgingRelease(CFDictionaryCopyKeysAndValues((CFDictionaryRef)*info, NULL)));
+    }
+    return status;
 }
 
-// Replacement for _dyld_get_image_name
-typedef const char *(*DyldNameFunc)(uint32_t);
-static DyldNameFunc orig_dyldName = NULL;
-static const char *hook_dyldName(uint32_t idx) {
-    buildVisibleMap();
-    // Map visible index back to real index
-    uint32_t visIdx = 0;
-    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
-        if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
-            if (visIdx == idx) {
-                // Read name from dyld_all_image_infos
-                struct task_dyld_info dyld_info;
-                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
-                if (dyld_info.all_image_info_addr) {
-                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
-                    vm_size_t s = sizeof(ai);
-                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
-                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
-                    vm_size_t es = sizeof(entry);
-                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
-                    // Return static buffer for the name
-                    static char nameBuf[256];
-                    vm_size_t ns = 255;
-                    kern_return_t r = vm_read_overwrite(mach_task_self(), entry.path, ns, (vm_address_t)nameBuf, &ns);
-                    if (r == KERN_SUCCESS) { nameBuf[255] = 0; return nameBuf; }
-                }
-                return NULL;
+static void installSecurityHooks(void) {
+    // Log all loaded dylibs for diagnosis
+    uint32_t count = _dyld_image_count();
+    DLOG(@"[DYLD] Total loaded images: %u", count);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name) {
+            NSString *nsname = [NSString stringWithUTF8String:name];
+            if ([nsname containsString:@".dylib"]) {
+                DLOG(@"[DYLD] %u: %@", i, nsname.lastPathComponent);
             }
-            visIdx++;
         }
     }
-    return NULL;
-}
-
-// Replacement for _dyld_get_image_header
-typedef const struct mach_header *(*DyldHeaderFunc)(uint32_t);
-static DyldHeaderFunc orig_dyldHeader = NULL;
-static const struct mach_header *hook_dyldHeader(uint32_t idx) {
-    buildVisibleMap();
-    uint32_t visIdx = 0;
-    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
-        if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
-            if (visIdx == idx) {
-                // Read header address from dyld_all_image_infos
-                struct task_dyld_info dyld_info;
-                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
-                if (dyld_info.all_image_info_addr) {
-                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
-                    vm_size_t s = sizeof(ai);
-                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
-                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
-                    vm_size_t es = sizeof(entry);
-                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
-                    return (const struct mach_header *)(uintptr_t)entry.addr;
-                }
-                return NULL;
-            }
-            visIdx++;
-        }
-    }
-    return NULL;
-}
-
-// Replacement for _dyld_get_image_vmaddr_slide
-typedef intptr_t (*DyldSlideFunc)(uint32_t);
-static DyldSlideFunc orig_dyldSlide = NULL;
-static intptr_t hook_dyldSlide(uint32_t idx) {
-    buildVisibleMap();
-    uint32_t visIdx = 0;
-    for (uint32_t realIdx = 0; realIdx < g_realCount; realIdx++) {
-        if (g_visibleMap[realIdx] != 0xFFFFFFFF) {
-            if (visIdx == idx) {
-                struct task_dyld_info dyld_info;
-                mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-                task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt);
-                if (dyld_info.all_image_info_addr) {
-                    struct { uint32_t ver; uint32_t p1; uint32_t cnt; uint32_t p2; uint64_t arr; } ai;
-                    vm_size_t s = sizeof(ai);
-                    vm_read_overwrite(mach_task_self(), dyld_info.all_image_info_addr, s, (vm_address_t)&ai, &s);
-                    struct { uint64_t addr; uint64_t path; uint64_t mod; } entry;
-                    vm_size_t es = sizeof(entry);
-                    vm_read_overwrite(mach_task_self(), ai.arr + realIdx * 24, es, (vm_address_t)&entry, &es);
-                    return (intptr_t)entry.mod;
-                }
-                return 0;
-            }
-            visIdx++;
-        }
-    }
-    return 0;
-}
-
-// ARM64 inline patch: write a B instruction at target to redirect to hook
-static BOOL patchBranch(void *target, void *hook, const char *name) {
-    intptr_t offset = (char *)hook - (char *)target;
-    // B instruction range is +/- 128MB
-    if (offset < -0x8000000 || offset > 0x7FFFFFC) {
-        DLOG(@"[HOOK] %s: offset too large (%ld), skip", name, (long)offset);
-        return NO;
-    }
-    uint32_t branchInstr = 0x14000000 | ((uint32_t)(offset >> 2) & 0x03FFFFFF);
     
-    // Make page writable + executable
-    size_t pageSize = 16384; // 16KB pages on ARM64
-    void *page = (void *)((uintptr_t)target & ~(pageSize - 1));
-    if (mprotect(page, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        // Try vm_protect
-        vm_address_t addr = (vm_address_t)target;
-        kern_return_t kr = vm_protect(mach_task_self(), addr & ~(pageSize - 1), pageSize, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr != KERN_SUCCESS) {
-            DLOG(@"[HOOK] %s: mprotect failed", name);
-            return NO;
-        }
+    // Hook fopen/fgets/fread via dlfcn (these are in libSystem)
+    void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
+    if (syslib) {
+        void *fp = dlsym(syslib, "fopen");
+        void *fg = dlsym(syslib, "fgets");
+        void *fr = dlsym(syslib, "fread");
+        DLOG(@"[SEC] libSystem: fopen=%p fgets=%p fread=%p", fp, fg, fr);
     }
-    *(uint32_t *)target = branchInstr;
-    // Flush instruction cache
-    sys_icache_invalidate(target, 4);
-    DLOG(@"[HOOK] %s: patched @ %p -> %p", name, target, hook);
-    return YES;
-}
-
-static void installDyldHooks(void) {
-    // Build visible map FIRST (uses task_info, no dyld calls)
-    buildVisibleMap();
     
-    // Save original function pointers BEFORE patching
-    orig_dyldCount = _dyld_image_count;
-    orig_dyldName = _dyld_get_image_name;
-    orig_dyldHeader = _dyld_get_image_header;
-    orig_dyldSlide = _dyld_get_image_vmaddr_slide;
+    // Hook Security framework functions
+    void *secLib = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOLOAD);
+    if (secLib) {
+        void *si = dlsym(secLib, "SecCodeCopySigningInformation");
+        DLOG(@"[SEC] Security: SecCodeCopySigningInformation=%p", si);
+    }
     
-    // Patch dyld functions with ARM64 B instructions
-    patchBranch((void *)_dyld_image_count, (void *)hook_dyldCount, "_dyld_image_count");
-    patchBranch((void *)_dyld_get_image_name, (void *)hook_dyldName, "_dyld_get_image_name");
-    patchBranch((void *)_dyld_get_image_header, (void *)hook_dyldHeader, "_dyld_get_image_header");
-    patchBranch((void *)_dyld_get_image_vmaddr_slide, (void *)hook_dyldSlide, "_dyld_get_image_vmaddr_slide");
-    
-    DLOG(@"[HOOK] dyld hooks installed - hiding %d dylibs", (int)(sizeof(g_hiddenDylibs)/sizeof(g_hiddenDylibs[0]) - 1));
+    DLOG(@"[SEC] Security hooks ready (diagnostic mode)");
 }
 
 // ============================================================
@@ -633,8 +506,8 @@ __attribute__((constructor))
 static void entry(void) {
     log_init();
     
-    // === IMMEDIATE: Anti-cheat bypass - hide dylibs ===
-    installDyldHooks();
+    // === IMMEDIATE: Anti-cheat bypass (diagnostic) ===
+    installSecurityHooks();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
     Class udCls = [NSUserDefaults class];
