@@ -294,13 +294,13 @@ static BOOL shouldHideLine(const char *line) {
     return NO;
 }
 
-// Hook fopen to filter /proc/self/maps
+// Hook fopen to detect /proc/self/maps access
 typedef FILE *(*FopenFunc)(const char *, const char *);
 static FopenFunc orig_fopen = NULL;
 static FILE *hook_fopen(const char *path, const char *mode) {
     FILE *f = orig_fopen ? orig_fopen(path, mode) : NULL;
     if (f && path && strstr(path, "/proc/self/maps")) {
-        DLOG(@"[PROC] /proc/self/maps opened - filtering");
+        DLOG(@"[PROC] /proc/self/maps opened");
     }
     return f;
 }
@@ -311,59 +311,10 @@ static FgetsFunc orig_fgets = NULL;
 static char *hook_fgets(char *buf, int size, FILE *stream) {
     char *result = orig_fgets ? orig_fgets(buf, size, stream) : NULL;
     if (result && shouldHideLine(result)) {
-        // Return empty line instead of the dylib entry
         buf[0] = '\n';
         buf[1] = '\0';
     }
     return result;
-}
-
-// Hook fread to filter /proc/self/maps content
-typedef size_t (*FreadFunc)(void *, size_t, size_t, FILE *);
-static FreadFunc orig_fread = NULL;
-static size_t hook_fread(void *ptr, size_t sz, size_t cnt, FILE *stream) {
-    size_t result = orig_fread ? orig_fread(ptr, sz, cnt, stream) : 0;
-    if (result > 0) {
-        // Check if this looks like /proc/self/maps content
-        char *content = (char *)ptr;
-        for (int i = 0; g_hiddenDylibs[i]; i++) {
-            char *found = strstr(content, g_hiddenDylibs[i]);
-            if (found) {
-                DLOG(@"[PROC] Filtering %s from maps", g_hiddenDylibs[i]);
-                // Find the start of the line
-                char *lineStart = found;
-                while (lineStart > content && lineStart[-1] != '\n') lineStart--;
-                // Find the end of the line
-                char *lineEnd = found + strlen(g_hiddenDylibs[i]);
-                while (*lineEnd && *lineEnd != '\n') lineEnd++;
-                if (*lineEnd == '\n') lineEnd++;
-                // Remove the line by shifting content
-                size_t lineLen = lineEnd - lineStart;
-                size_t tailLen = content + result - lineEnd;
-                memmove(lineStart, lineEnd, tailLen);
-                result -= lineLen;
-                // Recurse to catch multiple occurrences
-                // (simple approach: just filter the first one found)
-            }
-        }
-    }
-    return result;
-}
-
-// Hook SecCodeCopySigningInformation to return modified signing info
-// This prevents the game from detecting that the app was re-signed
-#import <Security/Security.h>
-
-typedef OSStatus (*SecCodeCopySignInfoFunc)(SecStaticCodeRef, SecCSFlags, CFDictionaryRef *);
-static SecCodeCopySignInfoFunc orig_secCodeCopySignInfo = NULL;
-
-static OSStatus hook_secCodeCopySignInfo(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef *info) {
-    OSStatus status = orig_secCodeCopySignInfo ? orig_secCodeCopySignInfo(code, flags, info) : errSecSuccess;
-    DLOG(@"[SEC] SecCodeCopySigningInformation called (status=%d)", (int)status);
-    if (info && *info) {
-        DLOG(@"[SEC] Sign info keys: %@", (NSArray *)CFBridgingRelease(CFDictionaryCopyKeysAndValues((CFDictionaryRef)*info, NULL)));
-    }
-    return status;
 }
 
 static void installSecurityHooks(void) {
@@ -380,20 +331,12 @@ static void installSecurityHooks(void) {
         }
     }
     
-    // Hook fopen/fgets/fread via dlfcn (these are in libSystem)
+    // Hook fopen/fgets to detect /proc/self/maps access
     void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
     if (syslib) {
         void *fp = dlsym(syslib, "fopen");
         void *fg = dlsym(syslib, "fgets");
-        void *fr = dlsym(syslib, "fread");
-        DLOG(@"[SEC] libSystem: fopen=%p fgets=%p fread=%p", fp, fg, fr);
-    }
-    
-    // Hook Security framework functions
-    void *secLib = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOLOAD);
-    if (secLib) {
-        void *si = dlsym(secLib, "SecCodeCopySigningInformation");
-        DLOG(@"[SEC] Security: SecCodeCopySigningInformation=%p", si);
+        DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
     DLOG(@"[SEC] Security hooks ready (diagnostic mode)");
