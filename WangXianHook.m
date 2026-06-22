@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.4 Full Socket Monitor ===");
+        _log(@"=== WXHook v33.5 Immediate Hooks ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -60,8 +60,8 @@ static void hook_exitApp(id self, SEL _cmd) {
 typedef void (*HandleResultIMP)(id, SEL, id);
 static HandleResultIMP orig_handleResult = NULL;
 static void hook_handleResult(id self, SEL _cmd, id result) {
-    DLOG(@"[SK] handleAppInfoResult: %@", result);
-    if (orig_handleResult) orig_handleResult(self, _cmd, result);
+    DLOG(@"[SK] handleAppInfoResult: BLOCKED: %@", result);
+    // Don't call original - prevent anti-cheat result processing
 }
 
 // 4. judgeAppInfoWithBaseUrl: - BYPASS
@@ -83,17 +83,16 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called (passing through)");
-    if (orig_judgeNet) orig_judgeNet(self, _cmd);
+    DLOG(@"[SK] judgeNet BLOCKED (no HTTP request)");
+    // Don't call original - prevent anti-cheat HTTP request
 }
 
 // 6. verifySignatureFromParameters: - LOG only
 typedef id (*VerifySigIMP)(id, SEL, id);
 static VerifySigIMP orig_verifySig = NULL;
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    DLOG(@"[SK] verifySignatureFromParameters: %@", params);
-    if (orig_verifySig) return orig_verifySig(self, _cmd, params);
-    return nil;
+    DLOG(@"[SK] verifySignatureFromParameters: BLOCKED: %@", params);
+    return @{@"status":@200,@"ispass":@"YES",@"pass":@"YES"};
 }
 
 // 7. generateRequestParams - LOG only
@@ -171,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.4";
+            lbl.text = @"WXHook v33.5";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -369,7 +368,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
         NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
-        size_t showLen = ret > 256 ? 256 : (size_t)ret;
+        size_t showLen = ret > 1024 ? 1024 : (size_t)ret;
         for (size_t i = 0; i < showLen; i++) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
@@ -719,106 +718,88 @@ static void entry(void) {
         if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe"); }
     }
     
-    // === DEFERRED: Wait for all dylibs to load, then hook SignatureKit + SignatureCheck ===
+    // === IMMEDIATE: Hook SignatureKit (must run before original +load) ===
+    Class skCls = NSClassFromString(@"SignatureKit");
+    if (skCls) {
+        Class metaCls = object_getClass(skCls);
+        
+        Method m = class_getClassMethod(skCls, @selector(showAlert:));
+        if (m) { orig_showAlert = (ShowAlertIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showAlert); _log(@"[INIT] SK.showAlert: SUPPRESS"); }
+        
+        m = class_getClassMethod(skCls, @selector(exitApplication));
+        if (m) { orig_exitApp = (ExitAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_exitApp); _log(@"[INIT] SK.exitApplication: BLOCK"); }
+        
+        m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
+        if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: BYPASS"); }
+        
+        m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
+        if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: LOG"); }
+        
+        m = class_getClassMethod(skCls, @selector(judgeNet));
+        if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet: BLOCK"); }
+        
+        m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
+        if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: BLOCK"); }
+        
+        m = class_getClassMethod(skCls, @selector(generateRequestParams));
+        if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams: LOG"); }
+        
+        m = class_getClassMethod(skCls, @selector(createSignatureParams:));
+        if (m) { orig_createSigParams = (CreateSigParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_createSigParams); _log(@"[INIT] SK.createSignatureParams: LOG"); }
+        
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(metaCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            DLOG(@"[SK] +[%@]", NSStringFromSelector(method_getName(methods[i])));
+        }
+        if (methods) free(methods);
+    } else {
+        _log(@"[INIT] WARNING: SignatureKit NOT found!");
+    }
+    
+    // === IMMEDIATE: Hook SignatureCheck ===
+    Class scCls = NSClassFromString(@"SignatureCheck");
+    if (scCls) {
+        Class metaCls = object_getClass(scCls);
+        
+        Method m = class_getClassMethod(scCls, @selector(JudgeApp));
+        if (m) { orig_judgeApp = (JudgeAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeApp); _log(@"[INIT] SC.JudgeApp: BLOCK"); }
+        
+        m = class_getClassMethod(scCls, @selector(showTipViewEND:));
+        if (m) { orig_showTip = (ShowTipIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showTip); _log(@"[INIT] SC.showTipViewEND: SUPPRESS"); }
+        
+        m = class_getClassMethod(scCls, @selector(exitApplication));
+        if (m) { orig_scExit = (SCExitIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_scExit); _log(@"[INIT] SC.exitApplication: BLOCK"); }
+        
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(metaCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            DLOG(@"[SC] +[%@]", NSStringFromSelector(method_getName(methods[i])));
+        }
+        if (methods) free(methods);
+    } else {
+        _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+    }
+    
+    // Dump NSUserDefaults
+    @try {
+        NSDictionary *allDefaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+        DLOG(@"[NSUD-DUMP] Total keys: %lu", (unsigned long)allDefaults.count);
+        for (NSString *key in allDefaults) {
+            NSString *lk = [key lowercaseString];
+            if ([lk containsString:@"pass"] || [lk containsString:@"verify"] || 
+                [lk containsString:@"sign"] || [lk containsString:@"ispass"] ||
+                [lk containsString:@"cert"] || [lk containsString:@"check"]) {
+                DLOG(@"[NSUD-DUMP] %@ = %@", key, allDefaults[key]);
+            }
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[NSUD-DUMP] Exception: %@", e);
+    }
+    DLOG(@"[NSUD] Total reads so far: %d", g_nsudCount);
+    
+    // === DEFERRED: Create UI button only ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // --- Hook SignatureKit (全能签 verification) ---
-        Class skCls = NSClassFromString(@"SignatureKit");
-        if (skCls) {
-            Class metaCls = object_getClass(skCls);
-            
-            // showAlert: - SUPPRESS
-            Method m = class_getClassMethod(skCls, @selector(showAlert:));
-            if (m) { orig_showAlert = (ShowAlertIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showAlert); _log(@"[INIT] SK.showAlert: hooked (SUPPRESS)"); }
-            
-            // exitApplication - BLOCK
-            m = class_getClassMethod(skCls, @selector(exitApplication));
-            if (m) { orig_exitApp = (ExitAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_exitApp); _log(@"[INIT] SK.exitApplication hooked (BLOCK)"); }
-            
-            // judgeAppInfoWithBaseUrl: - BYPASS
-            m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
-            if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: hooked (BYPASS)"); }
-            
-            // handleAppInfoResult: - LOG
-            m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
-            if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: hooked"); }
-            
-            // judgeNet - LOG
-            m = class_getClassMethod(skCls, @selector(judgeNet));
-            if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet hooked (LOG)"); }
-            
-            // verifySignatureFromParameters: - LOG
-            m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
-            if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: hooked (LOG)"); }
-            
-            // generateRequestParams - LOG
-            m = class_getClassMethod(skCls, @selector(generateRequestParams));
-            if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams hooked (LOG)"); }
-            
-            // createSignatureParams: - LOG
-            m = class_getClassMethod(skCls, @selector(createSignatureParams:));
-            if (m) { orig_createSigParams = (CreateSigParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_createSigParams); _log(@"[INIT] SK.createSignatureParams: hooked (LOG)"); }
-            
-            // Enumerate all methods for diagnostics
-            unsigned int mcount = 0;
-            Method *methods = class_copyMethodList(metaCls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                DLOG(@"[SK] +[%@]", NSStringFromSelector(method_getName(methods[i])));
-            }
-            if (methods) free(methods);
-        } else {
-            _log(@"[INIT] WARNING: SignatureKit NOT found!");
-        }
-        
-        // --- Hook SignatureCheck (original verification - from stub) ---
-        Class scCls = NSClassFromString(@"SignatureCheck");
-        if (scCls) {
-            Class metaCls = object_getClass(scCls);
-            
-            // JudgeApp - BLOCK (prevents real HTTP request)
-            Method m = class_getClassMethod(scCls, @selector(JudgeApp));
-            if (m) { orig_judgeApp = (JudgeAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeApp); _log(@"[INIT] SC.JudgeApp hooked (BLOCK)"); }
-            
-            // showTipViewEND: - SUPPRESS
-            m = class_getClassMethod(scCls, @selector(showTipViewEND:));
-            if (m) { orig_showTip = (ShowTipIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showTip); _log(@"[INIT] SC.showTipViewEND: hooked (SUPPRESS)"); }
-            
-            // exitApplication - BLOCK
-            m = class_getClassMethod(scCls, @selector(exitApplication));
-            if (m) { orig_scExit = (SCExitIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_scExit); _log(@"[INIT] SC.exitApplication hooked (BLOCK)"); }
-            
-            // Enumerate all methods
-            unsigned int mcount = 0;
-            Method *methods = class_copyMethodList(metaCls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                DLOG(@"[SC] +[%@]", NSStringFromSelector(method_getName(methods[i])));
-            }
-            if (methods) free(methods);
-        } else {
-            _log(@"[INIT] WARNING: SignatureCheck NOT found!");
-        }
-        
-        // Dump NSUserDefaults to find verification keys
-        @try {
-            NSDictionary *allDefaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-            DLOG(@"[NSUD-DUMP] Total keys: %lu", (unsigned long)allDefaults.count);
-            for (NSString *key in allDefaults) {
-                // Only log keys that look like they might be related to verification
-                NSString *lk = [key lowercaseString];
-                if ([lk containsString:@"pass"] || [lk containsString:@"verify"] || 
-                    [lk containsString:@"sign"] || [lk containsString:@"license"] ||
-                    [lk containsString:@"ispass"] || [lk containsString:@"cert"] ||
-                    [lk containsString:@"check"] || [lk containsString:@"auth"] ||
-                    [lk containsString:@"valid"]) {
-                    DLOG(@"[NSUD-DUMP] %@ = %@", key, allDefaults[key]);
-                }
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[NSUD-DUMP] Exception: %@", e);
-        }
-        DLOG(@"[NSUD] Total reads so far: %d", g_nsudCount);
-        
-        // --- Create LOG button ---
-        UIWindow *w = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s.activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *win in s.windows) { if (win.isKeyWindow) { w = win; break; } }
