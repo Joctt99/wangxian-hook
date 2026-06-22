@@ -325,6 +325,7 @@ static void installConnectHook(void) {
     const struct segment_command_64 *linkeditSeg = NULL;
     const struct segment_command_64 *dataSeg = NULL;
     struct symtab_command *symtab = NULL;
+    struct dysymtab_command *dysymtab = NULL;
     
     for (uint32_t i = 0; i < mainHeader->ncmds; i++) {
         if (cmd->cmd == LC_SEGMENT_64) {
@@ -333,11 +334,13 @@ static void installConnectHook(void) {
             else if (strcmp(seg->segname, "__DATA") == 0) dataSeg = seg;
         } else if (cmd->cmd == LC_SYMTAB) {
             symtab = (struct symtab_command *)cmd;
+        } else if (cmd->cmd == LC_DYSYMTAB) {
+            dysymtab = (struct dysymtab_command *)cmd;
         }
         cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
     }
     
-    if (!linkeditSeg || !dataSeg || !symtab) {
+    if (!linkeditSeg || !dataSeg || !symtab || !dysymtab) {
         DLOG(@"[SOCK] Missing segments for fishhook");
         return;
     }
@@ -345,7 +348,7 @@ static void installConnectHook(void) {
     char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
     const struct nlist_64 *syms = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
     char *strtab = (char *)(linkeditBase + symtab->stroff);
-    uint32_t *indirectSyms = (uint32_t *)(linkeditBase + symtab->indirectsymoff);
+    uint32_t *indirectSyms = (uint32_t *)(linkeditBase + dysymtab->indirectsymoff);
     
     const struct section_64 *sec = (const struct section_64 *)((char *)dataSeg + sizeof(struct segment_command_64));
     for (uint32_t s = 0; s < dataSeg->nsects; s++) {
