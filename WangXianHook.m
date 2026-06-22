@@ -205,6 +205,24 @@ static UILabel *g_statusLbl = nil;
             [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:copyBtn];
             
+            // Share button
+            UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            shareBtn.frame = CGRectMake(bx, 8, 60, 28);
+            [shareBtn setTitle:@"Share" forState:UIControlStateNormal];
+            [shareBtn setTitleColor:[UIColor magentaColor] forState:UIControlStateNormal];
+            shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            [shareBtn addTarget:self action:@selector(shareLog) forControlEvents:UIControlEventTouchUpInside];
+            [g_panel addSubview:shareBtn];
+            
+            // Refresh button
+            UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            refreshBtn.frame = CGRectMake(bx + 130, 34, 60, 24);
+            [refreshBtn setTitle:@"Refresh" forState:UIControlStateNormal];
+            [refreshBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
+            refreshBtn.titleLabel.font = [UIFont systemFontOfSize:11];
+            [refreshBtn addTarget:self action:@selector(refreshLog) forControlEvents:UIControlEventTouchUpInside];
+            [g_panel addSubview:refreshBtn];
+            
             // Second row: Dump button
             UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             dumpBtn.frame = CGRectMake(bx, 34, 80, 24);
@@ -273,11 +291,27 @@ static UILabel *g_statusLbl = nil;
     }
 }
 - (void)copyLog {
-    [UIPasteboard generalPasteboard].string = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
-    g_tv.text = @">>> COPIED <<<";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        g_tv.text = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    [UIPasteboard generalPasteboard].string = content;
+    DLOG(@">>> COPIED %lu chars >>>", (unsigned long)content.length);
+    g_tv.text = [NSString stringWithFormat:@">>> COPIED %lu chars to clipboard <<<", (unsigned long)content.length];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self refreshLog];
     });
+}
+- (void)shareLog {
+    NSURL *fileURL = [NSURL fileURLWithPath:g_logPath];
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+    UIViewController *topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+    [topVC presentViewController:avc animated:YES completion:nil];
+}
+- (void)refreshLog {
+    NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    g_tv.text = content;
+    if (content.length > 0) {
+        [g_tv scrollRangeToVisible:NSMakeRange(content.length - 1, 0)];
+    }
 }
 @end
 
