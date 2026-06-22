@@ -170,14 +170,14 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.9";
+            lbl.text = @"WXHook v33.9 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
             
             // Status label (shows ON/OFF)
             g_statusLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 34, 80, 20)];
-            g_statusLbl.text = @"LOG: ON";
+            g_statusLbl.text = @"日志: 开";
             g_statusLbl.textColor = [UIColor greenColor];
             g_statusLbl.font = [UIFont boldSystemFontOfSize:12];
             [g_panel addSubview:g_statusLbl];
@@ -186,21 +186,21 @@ static UILabel *g_statusLbl = nil;
             CGFloat bx = pw - 200;
             UIButton *onOffBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             onOffBtn.frame = CGRectMake(bx, 8, 60, 28);
-            [onOffBtn setTitle:@"On/Off" forState:UIControlStateNormal];
+            [onOffBtn setTitle:@"开关" forState:UIControlStateNormal];
             [onOffBtn setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
             [onOffBtn addTarget:self action:@selector(toggleLogging) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:onOffBtn];
             
             UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             clearBtn.frame = CGRectMake(bx + 65, 8, 60, 28);
-            [clearBtn setTitle:@"Clear" forState:UIControlStateNormal];
+            [clearBtn setTitle:@"清除" forState:UIControlStateNormal];
             [clearBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
             [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:clearBtn];
             
             UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             copyBtn.frame = CGRectMake(bx + 130, 8, 60, 28);
-            [copyBtn setTitle:@"Copy" forState:UIControlStateNormal];
+            [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
             [copyBtn setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
             [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:copyBtn];
@@ -208,7 +208,7 @@ static UILabel *g_statusLbl = nil;
             // Share button
             UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             shareBtn.frame = CGRectMake(bx, 8, 60, 28);
-            [shareBtn setTitle:@"Share" forState:UIControlStateNormal];
+            [shareBtn setTitle:@"导出" forState:UIControlStateNormal];
             [shareBtn setTitleColor:[UIColor magentaColor] forState:UIControlStateNormal];
             shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
             [shareBtn addTarget:self action:@selector(shareLog) forControlEvents:UIControlEventTouchUpInside];
@@ -217,7 +217,7 @@ static UILabel *g_statusLbl = nil;
             // Refresh button
             UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             refreshBtn.frame = CGRectMake(bx + 130, 34, 60, 24);
-            [refreshBtn setTitle:@"Refresh" forState:UIControlStateNormal];
+            [refreshBtn setTitle:@"刷新" forState:UIControlStateNormal];
             [refreshBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
             refreshBtn.titleLabel.font = [UIFont systemFontOfSize:11];
             [refreshBtn addTarget:self action:@selector(refreshLog) forControlEvents:UIControlEventTouchUpInside];
@@ -226,7 +226,7 @@ static UILabel *g_statusLbl = nil;
             // Second row: Dump button
             UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             dumpBtn.frame = CGRectMake(bx, 34, 80, 24);
-            [dumpBtn setTitle:@"Dump View" forState:UIControlStateNormal];
+            [dumpBtn setTitle:@"视图树" forState:UIControlStateNormal];
             [dumpBtn setTitleColor:[UIColor orangeColor] forState:UIControlStateNormal];
             dumpBtn.titleLabel.font = [UIFont systemFontOfSize:12];
             [dumpBtn addTarget:self action:@selector(dumpViews) forControlEvents:UIControlEventTouchUpInside];
@@ -254,13 +254,13 @@ static UILabel *g_statusLbl = nil;
     [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     g_tv.text = @"(cleared)";
     g_logEnabled = YES;
-    g_statusLbl.text = @"LOG: ON";
+    g_statusLbl.text = @"日志: 开";
     g_statusLbl.textColor = [UIColor greenColor];
     DLOG(@"=== Log cleared ===");
 }
 - (void)toggleLogging {
     g_logEnabled = !g_logEnabled;
-    g_statusLbl.text = g_logEnabled ? @"LOG: ON" : @"LOG: OFF";
+    g_statusLbl.text = g_logEnabled ? @"日志: 开" : @"日志: 关";
     g_statusLbl.textColor = g_logEnabled ? [UIColor greenColor] : [UIColor redColor];
     if (g_logEnabled) {
         DLOG(@"=== Logging resumed ===");
