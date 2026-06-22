@@ -182,48 +182,45 @@ static UILabel *g_statusLbl = nil;
             g_statusLbl.font = [UIFont boldSystemFontOfSize:12];
             [g_panel addSubview:g_statusLbl];
             
-            // Button row
-            CGFloat bx = pw - 200;
+            // Button row 1
+            CGFloat bx = pw - 270;
             UIButton *onOffBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            onOffBtn.frame = CGRectMake(bx, 8, 60, 28);
+            onOffBtn.frame = CGRectMake(bx, 8, 50, 28);
             [onOffBtn setTitle:@"开关" forState:UIControlStateNormal];
             [onOffBtn setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
             [onOffBtn addTarget:self action:@selector(toggleLogging) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:onOffBtn];
             
             UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            clearBtn.frame = CGRectMake(bx + 65, 8, 60, 28);
+            clearBtn.frame = CGRectMake(bx + 55, 8, 50, 28);
             [clearBtn setTitle:@"清除" forState:UIControlStateNormal];
             [clearBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
             [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:clearBtn];
             
             UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            copyBtn.frame = CGRectMake(bx + 130, 8, 60, 28);
+            copyBtn.frame = CGRectMake(bx + 110, 8, 50, 28);
             [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
             [copyBtn setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
             [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:copyBtn];
             
-            // Share button
             UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            shareBtn.frame = CGRectMake(bx, 8, 60, 28);
+            shareBtn.frame = CGRectMake(bx + 165, 8, 50, 28);
             [shareBtn setTitle:@"导出" forState:UIControlStateNormal];
             [shareBtn setTitleColor:[UIColor magentaColor] forState:UIControlStateNormal];
-            shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
             [shareBtn addTarget:self action:@selector(shareLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:shareBtn];
             
-            // Refresh button
             UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            refreshBtn.frame = CGRectMake(bx + 130, 34, 60, 24);
+            refreshBtn.frame = CGRectMake(bx + 220, 8, 50, 28);
             [refreshBtn setTitle:@"刷新" forState:UIControlStateNormal];
             [refreshBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
-            refreshBtn.titleLabel.font = [UIFont systemFontOfSize:11];
             [refreshBtn addTarget:self action:@selector(refreshLog) forControlEvents:UIControlEventTouchUpInside];
             [g_panel addSubview:refreshBtn];
             
-            // Second row: Dump button
+            // Row 2: Dump button
             UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
             dumpBtn.frame = CGRectMake(bx, 34, 80, 24);
             [dumpBtn setTitle:@"视图树" forState:UIControlStateNormal];
