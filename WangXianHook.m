@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.3 Socket Fishhook ===");
+        _log(@"=== WXHook v33.4 Full Socket Monitor ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.3";
+            lbl.text = @"WXHook v33.4";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -291,90 +291,212 @@ static UILabel *g_statusLbl = nil;
 #include <arpa/inet.h>
 #include <unistd.h>
 
-// Hook connect() to detect all network connections
+// === Socket hook functions ===
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
+typedef ssize_t (*SendFunc)(int, const void *, size_t, int);
+typedef ssize_t (*RecvFunc)(int, void *, size_t, int);
+typedef ssize_t (*WriteFunc)(int, const void *, size_t);
+typedef ssize_t (*ReadFunc)(int, void *, size_t);
+
 static ConnectFunc orig_connect = NULL;
+static SendFunc orig_send = NULL;
+static RecvFunc orig_recv = NULL;
+static WriteFunc orig_write = NULL;
+static ReadFunc orig_read = NULL;
+
+// Track connected fds for data capture
+#define MAX_TRACKED_FDS 32
+static int g_trackedFds[MAX_TRACKED_FDS];
+static char g_trackedHosts[MAX_TRACKED_FDS][64];
+static int g_trackedPorts[MAX_TRACKED_FDS];
+static int g_trackedCount = 0;
+
+static void trackFd(int fd, const char *host, int port) {
+    if (g_trackedCount >= MAX_TRACKED_FDS) return;
+    g_trackedFds[g_trackedCount] = fd;
+    strncpy(g_trackedHosts[g_trackedCount], host, 63);
+    g_trackedPorts[g_trackedCount] = port;
+    g_trackedCount++;
+}
+
+static const char *getHostForFd(int fd) {
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd) return g_trackedHosts[i];
+    }
+    return NULL;
+}
+
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    char host[256] = "unknown";
+    char host[64] = "unknown";
     int port = 0;
     if (addr->sa_family == AF_INET) {
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
+        trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
         port = ntohs(in6->sin6_port);
+        trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect6 fd=%d [%s]:%d", sockfd, host, port);
     }
     return orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
 }
 
-// Minimal fishhook: patch connect() in the main binary's __la_symbol_ptr
-static void installConnectHook(void) {
-    // Save original
-    orig_connect = connect;
-    
-    // Find main binary's __DATA segment and __la_symbol_ptr section
-    const struct mach_header_64 *mainHeader = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    if (!mainHeader) { DLOG(@"[SOCK] main binary header not found"); return; }
-    
-    const struct load_command *cmd = (const struct load_command *)((char *)mainHeader + sizeof(struct mach_header_64));
-    const struct segment_command_64 *linkeditSeg = NULL;
-    const struct segment_command_64 *dataSeg = NULL;
-    struct symtab_command *symtab = NULL;
-    struct dysymtab_command *dysymtab = NULL;
-    
-    for (uint32_t i = 0; i < mainHeader->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
-            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkeditSeg = seg;
-            else if (strcmp(seg->segname, "__DATA") == 0) dataSeg = seg;
-        } else if (cmd->cmd == LC_SYMTAB) {
-            symtab = (struct symtab_command *)cmd;
-        } else if (cmd->cmd == LC_DYSYMTAB) {
-            dysymtab = (struct dysymtab_command *)cmd;
+static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
+    const char *host = getHostForFd(fd);
+    if (host && len > 0) {
+        // Log first 256 bytes as hex + ascii
+        const unsigned char *p = (const unsigned char *)buf;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:len];
+        size_t showLen = len > 256 ? 256 : len;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", p[i]];
+            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
+        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, g_trackedPorts[0], len, hex, ascii);
     }
-    
-    if (!linkeditSeg || !dataSeg || !symtab || !dysymtab) {
-        DLOG(@"[SOCK] Missing segments for fishhook");
-        return;
+    return orig_send ? orig_send(fd, buf, len, flags) : -1;
+}
+
+static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
+    ssize_t ret = orig_recv ? orig_recv(fd, buf, len, flags) : -1;
+    const char *host = getHostForFd(fd);
+    if (host && ret > 0) {
+        const unsigned char *p = (const unsigned char *)buf;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
+        size_t showLen = ret > 256 ? 256 : (size_t)ret;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", p[i]];
+            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+        }
+        DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, g_trackedPorts[0], ret, hex, ascii);
     }
+    return ret;
+}
+
+static ssize_t hook_write(int fd, const void *buf, size_t len) {
+    const char *host = getHostForFd(fd);
+    if (host && len > 0 && len < 4096) {
+        const unsigned char *p = (const unsigned char *)buf;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:len];
+        size_t showLen = len > 128 ? 128 : len;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", p[i]];
+            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+        }
+        DLOG(@"[WRITE] fd=%d %s len=%zu\n  hex: %@\n  txt: %@", fd, host, len, hex, ascii);
+    }
+    return orig_write ? orig_write(fd, buf, len) : -1;
+}
+
+static ssize_t hook_read(int fd, void *buf, size_t len) {
+    ssize_t ret = orig_read ? orig_read(fd, buf, len) : -1;
+    const char *host = getHostForFd(fd);
+    if (host && ret > 0 && ret < 4096) {
+        const unsigned char *p = (const unsigned char *)buf;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
+        size_t showLen = ret > 128 ? 128 : (size_t)ret;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", p[i]];
+            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+        }
+        DLOG(@"[READ] fd=%d %s ret=%zd\n  hex: %@\n  txt: %@", fd, host, ret, hex, ascii);
+    }
+    return ret;
+}
+
+// === Universal fishhook: patch symbol in ALL loaded images ===
+static int rebindSymbol(const char *symbolName, void *replacement, void **original) {
+    int totalPatched = 0;
+    uint32_t imageCount = _dyld_image_count();
+    size_t pageSize = 16384;
     
-    char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
-    const struct nlist_64 *syms = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
-    char *strtab = (char *)(linkeditBase + symtab->stroff);
-    uint32_t *indirectSyms = (uint32_t *)(linkeditBase + dysymtab->indirectsymoff);
-    
-    const struct section_64 *sec = (const struct section_64 *)((char *)dataSeg + sizeof(struct segment_command_64));
-    for (uint32_t s = 0; s < dataSeg->nsects; s++) {
-        if (strcmp(sec[s].sectname, "__la_symbol_ptr") == 0) {
-            void **pointers = (void **)((char *)slide + sec[s].addr);
-            uint32_t count = (uint32_t)(sec[s].size / sizeof(void *));
-            for (uint32_t j = 0; j < count; j++) {
-                uint32_t symIdx = indirectSyms[sec[s].reserved1 + j];
-                if (symIdx >= symtab->nsyms) continue;
-                const char *name = strtab + syms[symIdx].n_un.n_strx;
-                if (strcmp(name, "_connect") == 0) {
-                    // Found connect in __la_symbol_ptr!
-                    size_t pageSize = 16384;
-                    void *page = (void *)((uintptr_t)&pointers[j] & ~(pageSize - 1));
-                    if (mprotect(page, pageSize, PROT_READ | PROT_WRITE) == 0) {
-                        pointers[j] = (void *)hook_connect;
-                        DLOG(@"[SOCK] connect() hooked in main binary (index %u)", j);
-                        return;
-                    } else {
-                        DLOG(@"[SOCK] mprotect failed for connect");
+    for (uint32_t img = 0; img < imageCount; img++) {
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(img);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+        if (!header || header->magic != 0xFEEDFACF) continue;
+        
+        const struct load_command *cmd = (const struct load_command *)((char *)header + sizeof(struct mach_header_64));
+        const struct segment_command_64 *linkeditSeg = NULL;
+        struct symtab_command *symtab = NULL;
+        struct dysymtab_command *dysymtab = NULL;
+        
+        // Collect data segments
+        const struct segment_command_64 *dataSegs[8];
+        int dataSegCount = 0;
+        
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkeditSeg = seg;
+                else if (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
+                    if (dataSegCount < 8) dataSegs[dataSegCount++] = seg;
+                }
+            } else if (cmd->cmd == LC_SYMTAB) {
+                symtab = (struct symtab_command *)cmd;
+            } else if (cmd->cmd == LC_DYSYMTAB) {
+                dysymtab = (struct dysymtab_command *)cmd;
+            }
+            cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
+        }
+        
+        if (!linkeditSeg || !symtab || !dysymtab) continue;
+        
+        char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
+        const struct nlist_64 *syms = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
+        char *strtab = (char *)(linkeditBase + symtab->stroff);
+        uint32_t *indirectSyms = (uint32_t *)(linkeditBase + dysymtab->indirectsymoff);
+        
+        for (int d = 0; d < dataSegCount; d++) {
+            const struct section_64 *sec = (const struct section_64 *)((char *)dataSegs[d] + sizeof(struct segment_command_64));
+            for (uint32_t s = 0; s < dataSegs[d]->nsects; s++) {
+                // Check both __la_symbol_ptr and __got
+                if (strcmp(sec[s].sectname, "__la_symbol_ptr") != 0 &&
+                    strcmp(sec[s].sectname, "__got") != 0) continue;
+                
+                void **pointers = (void **)((char *)slide + sec[s].addr);
+                uint32_t count = (uint32_t)(sec[s].size / sizeof(void *));
+                for (uint32_t j = 0; j < count; j++) {
+                    uint32_t symIdx = indirectSyms[sec[s].reserved1 + j];
+                    if (symIdx >= symtab->nsyms) continue;
+                    const char *name = strtab + syms[symIdx].n_un.n_strx;
+                    if (strcmp(name, symbolName) == 0) {
+                        void *page = (void *)((uintptr_t)&pointers[j] & ~(pageSize - 1));
+                        if (mprotect(page, pageSize, PROT_READ | PROT_WRITE) == 0) {
+                            if (original && !*original) *original = pointers[j];
+                            pointers[j] = replacement;
+                            totalPatched++;
+                        }
                     }
                 }
             }
         }
     }
-    DLOG(@"[SOCK] connect not found in __la_symbol_ptr");
+    return totalPatched;
+}
+
+static void installSocketHooks(void) {
+    orig_connect = connect;
+    orig_send = send;
+    orig_recv = recv;
+    orig_write = write;
+    orig_read = read;
+    
+    int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
+    int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
+    int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
+    int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
+    int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
+    
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d write=%d read=%d", c, s, r, w, rd);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
 }
 
 // ============================================================
@@ -550,12 +672,16 @@ static void entry(void) {
     // === IMMEDIATE: Anti-cheat bypass (diagnostic) ===
     installSecurityHooks();
     
-    // Save original connect() via RTLD_NEXT
+    // Save original connect() via RTLD_NEXT as fallback
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-    DLOG(@"[SOCK] Original connect() = %p", orig_connect);
+    orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+    orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+    DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
     
-    // Install connect hook via fishhook (main binary only)
-    installConnectHook();
+    // Install socket hooks via universal fishhook (all images)
+    installSocketHooks();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
     Class udCls = [NSUserDefaults class];
