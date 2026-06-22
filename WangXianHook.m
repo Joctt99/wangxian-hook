@@ -800,6 +800,7 @@ static void entry(void) {
     
     // === DEFERRED: Create UI button only ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *w = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s.activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *win in s.windows) { if (win.isKeyWindow) { w = win; break; } }
