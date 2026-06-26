@@ -1,6 +1,6 @@
 /**
- * WangXianHook v33.1 - Anti-Cheat Bypass: Security framework + /proc/self/maps
- * Strategy: Hook Security APIs and /proc/self/maps to hide injected dylibs
+ * WangXianHook v34.0 - Anti-Cheat Bypass + Protocol-Level Login Patch
+ * Strategy: Hook Security APIs + patch login response error code at protocol level
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v33.9 Response Filter Only ===");
+        _log(@"=== WXHook v34.0 Protocol Login Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v33.9 诊断面板";
+            lbl.text = @"WXHook v34.0 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -422,18 +422,38 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
         
         // === ANTI-CHEAT RESPONSE PATCH ===
-        // Detect "版本过低" or "当前版本" in response and neutralize
         if (port == 5678 && ret > 6) {
-            // UTF-8: 版本过低 = E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E
+            // --- Protocol-level login response patch ---
+            // Protocol: [4B length BE][4B command BE][4B seq][data body]
+            // Login response command = 0x8002A017
+            if (ret >= 16) {
+                uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                  ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+                if (cmd == 0x8002A017) {
+                    DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
+                    // Scan data body (offset 12+) for non-zero 4-byte error code
+                    // Successful login = all zeros in status/error fields
+                    // Server sends non-zero error code to reject (e.g. 版本过低)
+                    for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+                        uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
+                                       ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
+                        if (val != 0) {
+                            DLOG(@"[PROTO-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
+                            memset((unsigned char *)buf + off, 0, 4);
+                        }
+                    }
+                }
+            }
+            // --- UTF-8 text patch (fallback) ---
             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
                 if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
                     DLOG(@"[PATCH] Detected '版本过低' in server response at offset %zd, neutralizing", i);
-                    // Replace with spaces to break the message
                     memset((unsigned char *)buf + i, ' ', sizeof(verLow));
                 }
             }
-            // Also check for 当前版本 = E5 BD 93 E5 89 8D E7 89 88 E6 9C AC
             static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
                 if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
@@ -485,6 +505,25 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         
         // === ANTI-CHEAT RESPONSE PATCH in read too ===
         if (port == 5678 && ret > 6) {
+            // --- Protocol-level login response patch ---
+            if (ret >= 16) {
+                uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                  ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+                if (cmd == 0x8002A017) {
+                    DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
+                    for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+                        uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
+                                       ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
+                        if (val != 0) {
+                            DLOG(@"[PROTO-R-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
+                            memset((unsigned char *)buf + off, 0, 4);
+                        }
+                    }
+                }
+            }
+            // --- UTF-8 text patch (fallback) ---
             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
                 if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
