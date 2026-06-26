@@ -1,6 +1,7 @@
 /**
- * WangXianHook v34.0 - Anti-Cheat Bypass + Protocol-Level Login Patch
+ * WangXianHook v34.1 - Anti-Cheat Bypass + Protocol-Level Login Patch (Stability Fix)
  * Strategy: Hook Security APIs + patch login response error code at protocol level
+ * Fixed: Memory safety - NULL checks, boundary protection, host tracking validation
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -33,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.0 Protocol Login Patch ===");
+        _log(@"=== WXHook v34.1 Protocol Login Patch (Stability Fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.0 诊断面板";
+            lbl.text = @"WXHook v34.1 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -407,62 +408,61 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recv || !buf) return -1;
+    
     ssize_t ret = orig_recv(fd, buf, len, flags);
+    if (ret <= 0) return ret;
+    
     const char *host = getHostForFd(fd);
+    if (!host) return ret;
+    
     int port = getPortForFd(fd);
-    if (host && ret > 0) {
-        const unsigned char *p = (const unsigned char *)buf;
-        NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
-        size_t showLen = ret > 1024 ? 1024 : (size_t)ret;
-        for (size_t i = 0; i < showLen; i++) {
-            [hex appendFormat:@"%02X ", p[i]];
-            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
-        }
-        DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
-        
-        // === ANTI-CHEAT RESPONSE PATCH ===
-        if (port == 5678 && ret > 6) {
-            // --- Protocol-level login response patch ---
-            // Protocol: [4B length BE][4B command BE][4B seq][data body]
-            // Login response command = 0x8002A017
-            if (ret >= 16) {
-                uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-                uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                                  ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-                if (cmd == 0x8002A017) {
-                    DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
-                    // Scan data body (offset 12+) for non-zero 4-byte error code
-                    // Successful login = all zeros in status/error fields
-                    // Server sends non-zero error code to reject (e.g. 版本过低)
-                    for (ssize_t off = 12; off + 4 <= ret; off += 4) {
-                        uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
-                                       ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
-                        if (val != 0) {
-                            DLOG(@"[PROTO-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
-                            memset((unsigned char *)buf + off, 0, 4);
-                        }
-                    }
-                }
-            }
-            // --- UTF-8 text patch (fallback) ---
-            static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-                if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                    DLOG(@"[PATCH] Detected '版本过低' in server response at offset %zd, neutralizing", i);
-                    memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-                }
-            }
-            static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-                if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                    DLOG(@"[PATCH] Detected '当前版本' in server response at offset %zd, neutralizing", i);
-                    memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+    const unsigned char *p = (const unsigned char *)buf;
+    
+    NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
+    NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
+    size_t showLen = ret > 1024 ? 1024 : (size_t)ret;
+    for (size_t i = 0; i < showLen; i++) {
+        [hex appendFormat:@"%02X ", p[i]];
+        [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+    }
+    DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
+    
+    if (port == 5678 && ret >= 16) {
+        uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                          ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                          ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        if (cmd == 0x8002A017) {
+            DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
+            for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+                uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
+                               ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
+                if (val != 0) {
+                    DLOG(@"[PROTO-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
+                    memset((unsigned char *)buf + off, 0, 4);
                 }
             }
         }
     }
+    
+    if (port == 5678) {
+        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                DLOG(@"[PATCH] Detected '版本过低' in server response at offset %zd, neutralizing", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+            }
+        }
+        static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+            if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                DLOG(@"[PATCH] Detected '当前版本' in server response at offset %zd, neutralizing", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+            }
+        }
+    }
+    
     return ret;
 }
 
@@ -489,57 +489,61 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
 
 static ssize_t hook_read(int fd, void *buf, size_t len) {
     if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+    if (!orig_read || !buf) return -1;
+    
     ssize_t ret = orig_read(fd, buf, len);
+    if (ret <= 0 || ret >= 4096) return ret;
+    
     const char *host = getHostForFd(fd);
+    if (!host) return ret;
+    
     int port = getPortForFd(fd);
-    if (host && ret > 0 && ret < 4096) {
-        const unsigned char *p = (const unsigned char *)buf;
-        NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
-        size_t showLen = ret > 128 ? 128 : (size_t)ret;
-        for (size_t i = 0; i < showLen; i++) {
-            [hex appendFormat:@"%02X ", p[i]];
-            [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
-        }
-        DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
-        
-        // === ANTI-CHEAT RESPONSE PATCH in read too ===
-        if (port == 5678 && ret > 6) {
-            // --- Protocol-level login response patch ---
-            if (ret >= 16) {
-                uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-                uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                                  ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-                if (cmd == 0x8002A017) {
-                    DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
-                    for (ssize_t off = 12; off + 4 <= ret; off += 4) {
-                        uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
-                                       ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
-                        if (val != 0) {
-                            DLOG(@"[PROTO-R-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
-                            memset((unsigned char *)buf + off, 0, 4);
-                        }
-                    }
-                }
-            }
-            // --- UTF-8 text patch (fallback) ---
-            static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-                if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                    DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
-                    memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-                }
-            }
-            static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-                if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                    DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
-                    memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+    const unsigned char *p = (const unsigned char *)buf;
+    
+    NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
+    NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
+    size_t showLen = ret > 128 ? 128 : (size_t)ret;
+    for (size_t i = 0; i < showLen; i++) {
+        [hex appendFormat:@"%02X ", p[i]];
+        [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+    }
+    DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
+    
+    if (port == 5678 && ret >= 16) {
+        uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                          ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                          ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        if (cmd == 0x8002A017) {
+            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
+            for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+                uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
+                               ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
+                if (val != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
+                    memset((unsigned char *)buf + off, 0, 4);
                 }
             }
         }
     }
+    
+    if (port == 5678) {
+        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+            }
+        }
+        static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+            if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+            }
+        }
+    }
+    
     return ret;
 }
 
@@ -614,11 +618,11 @@ static int rebindSymbol(const char *symbolName, void *replacement, void **origin
 }
 
 static void installSocketHooks(void) {
-    orig_connect = connect;
-    orig_send = send;
-    orig_recv = recv;
-    orig_write = write;
-    orig_read = read;
+    orig_connect = NULL;
+    orig_send = NULL;
+    orig_recv = NULL;
+    orig_write = NULL;
+    orig_read = NULL;
     
     int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
     int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
