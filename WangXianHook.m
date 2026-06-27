@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.29 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.30 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.29 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.30 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -80,12 +80,12 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
     }
 }
 
-// 5. judgeNet - LOG only (observe which method triggers HTTP)
+// 5. judgeNet - Call original to let it complete
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet BLOCKED (no HTTP request)");
-    // Don't call original - prevent anti-cheat HTTP request
+    DLOG(@"[SK] judgeNet called, calling original");
+    if (orig_judgeNet) orig_judgeNet(self, _cmd);
 }
 
 // 6. verifySignatureFromParameters: - LOG only
@@ -118,13 +118,12 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 #pragma mark - SignatureCheck hooks (stub class - prevent HTTP calls)
 // ============================================================
 
-// Hook SignatureCheck.JudgeApp to skip the real HTTP verification
+// Hook SignatureCheck.JudgeApp - call original
 typedef void (*JudgeAppIMP)(id, SEL);
 static JudgeAppIMP orig_judgeApp = NULL;
 static void hook_judgeApp(id self, SEL _cmd) {
-    DLOG(@"[SC] SignatureCheck.JudgeApp called (BLOCKED - no HTTP request)");
-    // Don't call original - skip the real HTTP verification
-    // The original makes a synchronous HTTP request that might hang/fail
+    DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
+    if (orig_judgeApp) orig_judgeApp(self, _cmd);
 }
 
 typedef void (*ShowTipIMP)(id, SEL, id);
@@ -171,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.29 诊断面板";
+            lbl.text = @"WXHook v34.30 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
