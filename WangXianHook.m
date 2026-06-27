@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.20 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.21 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Dynamically update length field before UUID/MAC (big-endian 2 bytes)
+ * Key: Don't modify send data, construct fake server list in recv response
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -389,79 +389,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
-    void *sendBuf = (void *)buf;
-    size_t sendLen = len;
-    
-    if (port == 5678 && len >= 12) {
+    if (host && len > 0) {
         const unsigned char *p = (const unsigned char *)buf;
-        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        
-        if (cmd == 0x0002A018) {
-            const char *dataStart = (const char *)buf;
-            for (size_t i = 0; i + 20 < len; i++) {
-                if (memcmp(dataStart + i, "UUID=", 5) == 0) {
-                    if (memcmp(dataStart + i + 5, "MACADDRESS=", 11) == 0) {
-                        const char *replacement = "UUID=12345678-1234-1234-1234-123456789012MACADDRESS=00:11:22:33:44:55";
-                        size_t replaceLen = strlen(replacement); // 69
-                        size_t oldLen = 5 + 11; // 16
-                        size_t diff = replaceLen - oldLen; // 53
-                        
-                        void *newBuf = malloc(len + diff + 1);
-                        if (newBuf) {
-                            memcpy(newBuf, buf, len);
-                            
-                            // Update the length field before UUID= (2 bytes, little-endian)
-                            if (i >= 2) {
-                                uint16_t oldFieldLen = ((uint8_t)((char *)newBuf)[i-2] << 8) | (uint8_t)((char *)newBuf)[i-1];
-                                ((unsigned char *)newBuf)[i-2] = (replaceLen >> 8) & 0xFF;
-                                ((unsigned char *)newBuf)[i-1] = replaceLen & 0xFF;
-                                DLOG(@"[SEND-PATCH] Updated length field: %d -> %zu", oldFieldLen, replaceLen);
-                            }
-                            
-                            // Move data after MACADDRESS= to make room
-                            memmove(((char *)newBuf) + i + replaceLen, 
-                                    ((char *)newBuf) + i + oldLen, 
-                                    len - i - oldLen);
-                            
-                            // Write replacement
-                            memcpy(((char *)newBuf) + i, replacement, replaceLen);
-                            
-                            // Update packet length in header
-                            uint32_t newLen = pktLenBE + diff;
-                            ((unsigned char *)newBuf)[0] = (newLen >> 24) & 0xFF;
-                            ((unsigned char *)newBuf)[1] = (newLen >> 16) & 0xFF;
-                            ((unsigned char *)newBuf)[2] = (newLen >> 8) & 0xFF;
-                            ((unsigned char *)newBuf)[3] = newLen & 0xFF;
-                            
-                            sendBuf = newBuf;
-                            sendLen = len + diff;
-                            DLOG(@"[SEND-PATCH] Filled UUID/MAC for cmd=0x%08X (len %zu -> %zu)", cmd, len, sendLen);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    if (host && sendLen > 0) {
-        const unsigned char *p = (const unsigned char *)sendBuf;
-        NSMutableString *hex = [NSMutableString stringWithCapacity:sendLen * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:sendLen];
-        size_t showLen = sendLen > 256 ? 256 : sendLen;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:len];
+        size_t showLen = len > 256 ? 256 : len;
         for (size_t i = 0; i < showLen; i++) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
+        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
     }
     
-    ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
-    if (sendBuf != buf) free(sendBuf);
-    return ret;
+    return orig_send ? orig_send(fd, buf, len, flags) : -1;
 }
 
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
@@ -539,9 +479,40 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                     ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
                 DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
+                
                 if (status8 != 0 || status12 != 0) {
                     DLOG(@"[PROTO-PATCH] Server list status %u/%u -> 0 (force success)", status8, status12);
                     memset((unsigned char *)buf + 8, 0, 8);
+                }
+                
+                const char *serverListMarker = "SERVERLIST";
+                int hasServerList = 0;
+                for (size_t i = 0; i + strlen(serverListMarker) <= (size_t)ret; i++) {
+                    if (memcmp(p + i, serverListMarker, strlen(serverListMarker)) == 0) {
+                        hasServerList = 1;
+                        break;
+                    }
+                }
+                
+                if (!hasServerList && ret >= 16) {
+                    DLOG(@"[PROTO-PATCH] Server list is empty, constructing fake server list");
+                    const char *fakeServerData = "SERVERLIST=1|iOS测试服|1|47.100.222.229|5678|1|0|0|0";
+                    size_t fakeLen = strlen(fakeServerData);
+                    
+                    uint32_t newPktLen = pktLenBE + fakeLen;
+                    if (newPktLen <= len) {
+                        memset((unsigned char *)buf + 16, 0, newPktLen - 16);
+                        memcpy((unsigned char *)buf + 16, fakeServerData, fakeLen);
+                        
+                        ((unsigned char *)buf)[0] = (newPktLen >> 24) & 0xFF;
+                        ((unsigned char *)buf)[1] = (newPktLen >> 16) & 0xFF;
+                        ((unsigned char *)buf)[2] = (newPktLen >> 8) & 0xFF;
+                        ((unsigned char *)buf)[3] = newPktLen & 0xFF;
+                        
+                        DLOG(@"[PROTO-PATCH] Added fake server list (len=%zu, total=%u)", fakeLen, newPktLen);
+                    } else {
+                        DLOG(@"[PROTO-PATCH] Buffer too small for fake server list");
+                    }
                 }
             }
         }
