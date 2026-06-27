@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.3 - Anti-Cheat Bypass + Protocol-Level Login Patch (Status-Only Fix)
- * Strategy: Hook Security APIs + patch login response error code at protocol level
- * Fixed: Only patch status field (offset 12-15), never touch serverID or player data
+ * WangXianHook v34.4 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
+ * Key: _dyld_image_count/get_image_name/dladdr all hooked to return filtered results
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.3 Protocol Login Patch (Status-Only Fix) ===");
+        _log(@"=== WXHook v34.4 DYLD Hiding + Anti-Cheat Bypass ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.3 诊断面板";
+            lbl.text = @"WXHook v34.4 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -633,18 +633,159 @@ static void installSocketHooks(void) {
 }
 
 // ============================================================
-#pragma mark - /proc/self/maps filtering (hide injected dylibs)
+#pragma mark - DYLD API Hooking (hide injected dylibs from detection)
 // ============================================================
 
 static const char *g_hiddenDylibs[] = {
-    "WangXianHook", "lnSignature", "libSupport", "liblnSignature", NULL
+    "WangXianHook", "lnSignature", "libSupport", "liblnSignature", "substrate", "frida", NULL
 };
 
-static BOOL shouldHideLine(const char *line) {
+static BOOL shouldHideDylib(const char *name) {
+    if (!name) return NO;
     for (int i = 0; g_hiddenDylibs[i]; i++) {
-        if (strstr(line, g_hiddenDylibs[i])) return YES;
+        if (strstr(name, g_hiddenDylibs[i])) return YES;
     }
     return NO;
+}
+
+// Store original dyld functions
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+
+// Count of hidden images (computed at init)
+static uint32_t g_hiddenCount = 0;
+static uint32_t g_hiddenIndices[32] = {0};
+
+// Hooked dyld_image_count - return reduced count
+static uint32_t hook_dyld_image_count(void) {
+    uint32_t realCount = orig_dyld_image_count ? orig_dyld_image_count() : 0;
+    uint32_t fakeCount = realCount - g_hiddenCount;
+    DLOG(@"[DYLD-HOOK] image_count: real=%u fake=%u", realCount, fakeCount);
+    return fakeCount;
+}
+
+// Hooked dyld_get_image_name - filter out hidden libraries
+static const char *hook_dyld_get_image_name(uint32_t index) {
+    if (!orig_dyld_get_image_name) return "";
+    
+    uint32_t fakeCount = orig_dyld_image_count() - g_hiddenCount;
+    if (index >= fakeCount) {
+        DLOG(@"[DYLD-HOOK] get_image_name(%u): index out of range (fakeCount=%u)", index, fakeCount);
+        return "";
+    }
+    
+    // Map fake index to real index (skip hidden ones)
+    uint32_t realIndex = index;
+    for (uint32_t i = 0; i < g_hiddenCount; i++) {
+        if (g_hiddenIndices[i] <= realIndex) {
+            realIndex++;
+        }
+    }
+    
+    const char *name = orig_dyld_get_image_name(realIndex);
+    if (shouldHideDylib(name)) {
+        DLOG(@"[DYLD-HOOK] get_image_name(%u->%u): STILL hidden '%s', skipping", index, realIndex, name);
+        // Find next non-hidden
+        while (shouldHideDylib(name) && realIndex < orig_dyld_image_count()) {
+            realIndex++;
+            name = orig_dyld_get_image_name(realIndex);
+        }
+    }
+    
+    DLOG(@"[DYLD-HOOK] get_image_name(%u->%u): '%s'", index, realIndex, name ?: "");
+    return name ?: "";
+}
+
+// Hooked dyld_get_image_header - return header for mapped index
+static const struct mach_header *hook_dyld_get_image_header(uint32_t index) {
+    if (!orig_dyld_get_image_header) return NULL;
+    
+    uint32_t fakeCount = orig_dyld_image_count() - g_hiddenCount;
+    if (index >= fakeCount) return NULL;
+    
+    // Map fake index to real index
+    uint32_t realIndex = index;
+    for (uint32_t i = 0; i < g_hiddenCount; i++) {
+        if (g_hiddenIndices[i] <= realIndex) {
+            realIndex++;
+        }
+    }
+    
+    return orig_dyld_get_image_header(realIndex);
+}
+
+// Compute hidden indices at initialization
+static void computeHiddenIndices(void) {
+    g_hiddenCount = 0;
+    uint32_t realCount = _dyld_image_count();
+    for (uint32_t i = 0; i < realCount && g_hiddenCount < 32; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (shouldHideDylib(name)) {
+            g_hiddenIndices[g_hiddenCount++] = i;
+            DLOG(@"[DYLD-HIDE] Index %u: '%s' will be hidden", i, name);
+        }
+    }
+    DLOG(@"[DYLD-HIDE] Total hidden: %u / %u", g_hiddenCount, realCount);
+}
+
+static void installDyldHooks(void) {
+    // Compute hidden indices first
+    computeHiddenIndices();
+    
+    // Get original functions
+    orig_dyld_image_count = _dyld_image_count;
+    orig_dyld_get_image_name = _dyld_get_image_name;
+    orig_dyld_get_image_header = _dyld_get_image_header;
+    
+    // Try to rebind via fishhook (works for calls through PLT)
+    rebindSymbol("_dyld_image_count", (void *)hook_dyld_image_count, (void **)&orig_dyld_image_count);
+    rebindSymbol("_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    rebindSymbol("_dyld_get_image_header", (void *)hook_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    
+    DLOG(@"[DYLD-HOOK] Installed hooks for image_count/get_image_name/get_image_header");
+}
+
+// ============================================================
+#pragma mark - dladdr Hook (hide hook function origin)
+// ============================================================
+
+typedef int (*DladdrFunc)(const void *, Dl_info *);
+static DladdrFunc orig_dladdr = NULL;
+
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    if (!orig_dladdr || !info) return 0;
+    
+    int ret = orig_dladdr(addr, info);
+    if (ret && info->dli_fname) {
+        // If the address belongs to our hidden dylib, return fake info
+        if (shouldHideDylib(info->dli_fname)) {
+            DLOG(@"[DLADDR-HOOK] Hiding origin of addr %p (was '%s')", addr, info->dli_fname);
+            // Return libSystem.B.dylib as the origin
+            info->dli_fname = "/usr/lib/libSystem.B.dylib";
+            info->dli_fbase = (void *)0x19d500000;  // Fake base
+            info->dli_sname = NULL;
+            info->dli_saddr = NULL;
+        }
+    }
+    return ret;
+}
+
+static void installDladdrHook(void) {
+    void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_NOLOAD);
+    if (libdyld) {
+        orig_dladdr = (DladdrFunc)dlsym(libdyld, "dladdr");
+        rebindSymbol("_dladdr", (void *)hook_dladdr, (void **)&orig_dladdr);
+        DLOG(@"[DLADDR-HOOK] Installed, orig=%p", orig_dladdr);
+    }
+}
+
+// ============================================================
+#pragma mark - /proc/self/maps filtering (Linux fallback)
+// ============================================================
+
+static BOOL shouldHideLine(const char *line) {
+    return shouldHideDylib(line);
 }
 
 // Hook fopen to detect /proc/self/maps access
@@ -671,7 +812,7 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
 }
 
 static void installSecurityHooks(void) {
-    // Log all loaded dylibs for diagnosis
+    // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
     DLOG(@"[DYLD] Total loaded images: %u", count);
     for (uint32_t i = 0; i < count; i++) {
@@ -684,7 +825,11 @@ static void installSecurityHooks(void) {
         }
     }
     
-    // Hook fopen/fgets to detect /proc/self/maps access
+    // Install DYLD hooks to hide injected libraries
+    installDyldHooks();
+    installDladdrHook();
+    
+    // Hook fopen/fgets for /proc/self/maps (Linux fallback)
     void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
     if (syslib) {
         void *fp = dlsym(syslib, "fopen");
@@ -692,7 +837,7 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
-    DLOG(@"[SEC] Security hooks ready (diagnostic mode)");
+    DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
 }
 
 // ============================================================
