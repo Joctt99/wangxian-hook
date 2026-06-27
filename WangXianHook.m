@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.37 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.38 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.37 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.38 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.37 诊断面板";
+            lbl.text = @"WXHook v34.38 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -363,6 +363,19 @@ static int getPortForFd(int fd) {
     return 0;
 }
 
+static void updateFdHostPort(int fd, const char *host, int port) {
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd) {
+            strncpy(g_trackedHosts[i], host, 63);
+            g_trackedPorts[i] = port;
+            DLOG(@"[FD-UPDATE] Updated fd=%d to %s:%d", fd, host, port);
+            return;
+        }
+    }
+    // Not found, add new entry
+    trackFd(fd, host, port);
+}
+
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     char host[64] = "unknown";
@@ -373,6 +386,9 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         port = ntohs(in->sin_port);
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
+        
+        // Game server port (12003) may be down, try anyway
+        // If connection fails, we need special handling in recv
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
@@ -380,7 +396,27 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect6 fd=%d [%s]:%d", sockfd, host, port);
     }
-    return orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+    
+    int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+    
+    // If game server connection fails, try connecting to auth server instead
+    if (result != 0 && port == 12003) {
+        DLOG(@"[SOCK] Game server %s:%d connection failed (%d), trying auth server", host, port, result);
+        // Create auth server address
+        struct sockaddr_in authAddr;
+        memset(&authAddr, 0, sizeof(authAddr));
+        authAddr.sin_family = AF_INET;
+        authAddr.sin_port = htons(5678);  // Auth server port
+        inet_pton(AF_INET, "47.100.222.229", &authAddr.sin_addr);
+        result = orig_connect(sockfd, (struct sockaddr *)&authAddr, sizeof(authAddr));
+        if (result == 0) {
+            DLOG(@"[SOCK] Redirected game server to auth server successfully!");
+            // Update fd tracking
+            updateFdHostPort(sockfd, "47.100.222.229", 5678);
+        }
+    }
+    
+    return result;
 }
 
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
