@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.30 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.31 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.30 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.31 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.30 诊断面板";
+            lbl.text = @"WXHook v34.31 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -550,7 +550,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (status8 != 0 || status12 != 0 || ret <= 64) {
                     DLOG(@"[PROTO-PATCH] Server list empty or failed, constructing fake response");
                     
-                    const char fakeServer[] = "\x00\x00\x01\x90\x80\x02\xA0\x16\x00\x00\x00\x00\x00\x00\x00\x01"
+                    const char fakeServer[] = "\x00\x00\x00\x70\x80\x02\xA0\x16\x00\x00\x00\x00\x00\x00\x00\x01"
                         "\x00\x03\x49\x4F\x53"
                         "\x00\x05\x37\x2E\x36\x2E\x30"
                         "\x00\x03\x39\x37\x34"
@@ -571,7 +571,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         ret = (ssize_t)fakeLen;
                         DLOG(@"[PROTO-PATCH] Fake server list injected (len=%zu)", fakeLen);
                     } else {
-                        DLOG(@"[PROTO-PATCH] Buffer too small for fake response");
+                        DLOG(@"[PROTO-PATCH] Buffer too small (%zu < %zu)", len, fakeLen);
                     }
                 }
             }
