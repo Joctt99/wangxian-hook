@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.15 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.16 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fill UUID/MACADDRESS in both server list request and login request
+ * Key: Fixed memcmp crash - replace memmem with custom search
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.15 诊断面板";
+            lbl.text = @"WXHook v34.16 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -400,20 +400,38 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         
         if (cmd == 0x0002A018 || cmd == 0x0002A017) {
-            char *newBuf = malloc(len + 64);
-            if (newBuf) {
-                memcpy(newBuf, buf, len);
-                char *uuidPtr = memmem(newBuf, len, "UUID=", 5);
-                if (uuidPtr) {
-                    char *macPtr = memmem(uuidPtr + 5, len - (uuidPtr - newBuf) - 5, "MACADDRESS=", 11);
-                    if (macPtr && (macPtr - uuidPtr == 5)) {
+            // Find UUID= in data
+            const char *uuidPtr = NULL;
+            const char *dataStart = (const char *)buf;
+            for (size_t i = 0; i + 5 < len; i++) {
+                if (memcmp(dataStart + i, "UUID=", 5) == 0) {
+                    uuidPtr = dataStart + i;
+                    break;
+                }
+            }
+            
+            if (uuidPtr) {
+                const char *macPtr = NULL;
+                for (size_t i = (uuidPtr - dataStart) + 5; i + 11 < len; i++) {
+                    if (memcmp(dataStart + i, "MACADDRESS=", 11) == 0) {
+                        macPtr = dataStart + i;
+                        break;
+                    }
+                }
+                
+                if (macPtr && (macPtr - uuidPtr == 5)) {
+                    char *newBuf = malloc(len + 64);
+                    if (newBuf) {
                         const char *replacement = "UUID=12345678-1234-1234-1234-123456789012MACADDRESS=00:11:22:33:44:55";
                         size_t replaceLen = strlen(replacement);
-                        size_t oldLen = macPtr - uuidPtr + 11;
+                        size_t oldLen = (macPtr - uuidPtr) + 11;
                         size_t diff = replaceLen - oldLen;
                         
-                        memmove(macPtr + replaceLen - (macPtr - uuidPtr), macPtr + 11, len - (macPtr - newBuf) - 11);
-                        memcpy(uuidPtr, replacement, replaceLen);
+                        memcpy(newBuf, buf, len);
+                        memmove(newBuf + (uuidPtr - dataStart) + replaceLen, 
+                                macPtr + 11, 
+                                len - (macPtr - dataStart) - 11);
+                        memcpy(newBuf + (uuidPtr - dataStart), replacement, replaceLen);
                         
                         uint32_t newLen = pktLenBE + diff;
                         newBuf[0] = (newLen >> 24) & 0xFF;
@@ -424,11 +442,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         sendBuf = newBuf;
                         sendLen += diff;
                         DLOG(@"[SEND-PATCH] Filled UUID/MACADDRESS for cmd=0x%08X", cmd);
-                    } else {
-                        free(newBuf);
                     }
-                } else {
-                    free(newBuf);
                 }
             }
         }
