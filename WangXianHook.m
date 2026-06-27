@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.32 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.33 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.32 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.33 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.32 诊断面板";
+            lbl.text = @"WXHook v34.33 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -597,6 +597,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 size_t fakeLen = sizeof(fakeServerList) - 1;
                 if (fakeLen <= len) {
                     memcpy(buf, fakeServerList, fakeLen);
+                    ((unsigned char *)buf)[0] = (fakeLen >> 24) & 0xFF;
+                    ((unsigned char *)buf)[1] = (fakeLen >> 16) & 0xFF;
+                    ((unsigned char *)buf)[2] = (fakeLen >> 8) & 0xFF;
+                    ((unsigned char *)buf)[3] = fakeLen & 0xFF;
                     ret = (ssize_t)fakeLen;
                     DLOG(@"[PROTO-PATCH] Fake server list (0x802EE113) injected (len=%zu)", fakeLen);
                 } else {
