@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.7 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.8 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Full protocol logging + Fix version check cmd ID 0x802EE118 + Debug server list packets
+ * Key: Fix ret >= 13 threshold for version check response + Full protocol patching
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.7 Full Protocol Logging ===");
+        _log(@"=== WXHook v34.8 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -428,43 +428,45 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
-    if (port == 5678 && ret >= 16) {
+    // Version check response: ret >= 13 (0x802EE118 = 13 bytes)
+    if (port == 5678 && ret >= 13) {
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO] Login status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-PATCH] Login status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
-            }
-        }
-        
         if (cmd == 0x802EE118) {
             DLOG(@"[PROTO] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO] Version check status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-PATCH] Version check status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
+            // Status at offset 12 (1 byte for 13-byte packet)
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-PATCH] Version check status %u -> 0 (force success)", p[12]);
+                ((unsigned char *)buf)[12] = 0;
             }
         }
         
-        if (cmd == 0x8002A016) {
-            DLOG(@"[PROTO] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO] Server list status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-PATCH] Server list status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
+        // For larger packets with status at offset 12-15
+        if (ret >= 16) {
+            if (cmd == 0x8002A017) {
+                DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO] Login status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-PATCH] Login status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
+            }
+            
+            if (cmd == 0x8002A016) {
+                DLOG(@"[PROTO] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO] Server list status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-PATCH] Server list status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
             }
         }
     }
@@ -532,43 +534,43 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     }
     DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
-    if (port == 5678 && ret >= 16) {
+    // Version check response: ret >= 13
+    if (port == 5678 && ret >= 13) {
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-R] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
-            }
-        }
-        
         if (cmd == 0x802EE118) {
             DLOG(@"[PROTO-R] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO-R] Version check status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Version check status %u -> 0 (force success)", p[12]);
+                ((unsigned char *)buf)[12] = 0;
             }
         }
         
-        if (cmd == 0x8002A016) {
-            DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-            DLOG(@"[PROTO-R] Server list status at offset 12-15: %u (0x%08X)", status, status);
-            if (status != 0) {
-                DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0 (force success)", status);
-                memset((unsigned char *)buf + 12, 0, 4);
+        if (ret >= 16) {
+            if (cmd == 0x8002A017) {
+                DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
+            }
+            
+            if (cmd == 0x8002A016) {
+                DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Server list status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
             }
         }
     }
