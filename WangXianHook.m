@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.17 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.18 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Temporarily disable UUID/MAC patch to fix crash
+ * Key: Fill UUID/MACADDRESS in server list request (0x0002A018)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.17 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.18 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.17 诊断面板";
+            lbl.text = @"WXHook v34.18 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -389,19 +389,66 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
-    if (host && len > 0) {
+    void *sendBuf = (void *)buf;
+    size_t sendLen = len;
+    
+    if (port == 5678 && len >= 12) {
         const unsigned char *p = (const unsigned char *)buf;
-        NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:len];
-        size_t showLen = len > 256 ? 256 : len;
+        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        
+        if (cmd == 0x0002A018) {
+            const char *dataStart = (const char *)buf;
+            for (size_t i = 0; i + 20 < len; i++) {
+                if (memcmp(dataStart + i, "UUID=", 5) == 0) {
+                    if (memcmp(dataStart + i + 5, "MACADDRESS=", 11) == 0) {
+                        const char *replacement = "UUID=12345678-1234-1234-1234-123456789012MACADDRESS=00:11:22:33:44:55";
+                        size_t replaceLen = strlen(replacement);
+                        size_t oldLen = 5 + 11;
+                        size_t diff = replaceLen - oldLen;
+                        
+                        void *newBuf = malloc(len + 64);
+                        if (newBuf) {
+                            memcpy(newBuf, buf, len);
+                            memmove(((char *)newBuf) + i + replaceLen, 
+                                    ((char *)newBuf) + i + oldLen, 
+                                    len - i - oldLen);
+                            memcpy(((char *)newBuf) + i, replacement, replaceLen);
+                            
+                            uint32_t newLen = pktLenBE + diff;
+                            ((unsigned char *)newBuf)[0] = (newLen >> 24) & 0xFF;
+                            ((unsigned char *)newBuf)[1] = (newLen >> 16) & 0xFF;
+                            ((unsigned char *)newBuf)[2] = (newLen >> 8) & 0xFF;
+                            ((unsigned char *)newBuf)[3] = newLen & 0xFF;
+                            
+                            sendBuf = newBuf;
+                            sendLen += diff;
+                            DLOG(@"[SEND-PATCH] Filled UUID/MAC for cmd=0x%08X", cmd);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    if (host && sendLen > 0) {
+        const unsigned char *p = (const unsigned char *)sendBuf;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:sendLen * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:sendLen];
+        size_t showLen = sendLen > 256 ? 256 : sendLen;
         for (size_t i = 0; i < showLen; i++) {
             [hex appendFormat:@"%02X ", p[i]];
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
-        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
+        DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    return orig_send ? orig_send(fd, buf, len, flags) : -1;
+    ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
+    if (sendBuf != buf) free(sendBuf);
+    return ret;
 }
 
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
