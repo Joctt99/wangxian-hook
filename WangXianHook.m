@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.21 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.22 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Don't modify send data, construct fake server list in recv response
+ * Key: Inject fake server data without changing packet length
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -495,24 +495,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
                 
                 if (!hasServerList && ret >= 16) {
-                    DLOG(@"[PROTO-PATCH] Server list is empty, constructing fake server list");
-                    const char *fakeServerData = "SERVERLIST=1|iOS测试服|1|47.100.222.229|5678|1|0|0|0";
+                    DLOG(@"[PROTO-PATCH] Server list is empty, injecting fake server data");
+                    const char *fakeServerData = "iOS测试服|1|47.100.222.229|5678";
                     size_t fakeLen = strlen(fakeServerData);
+                    size_t availableSpace = (size_t)ret - 16;
                     
-                    uint32_t newPktLen = pktLenBE + fakeLen;
-                    if (newPktLen <= len) {
-                        memset((unsigned char *)buf + 16, 0, newPktLen - 16);
-                        memcpy((unsigned char *)buf + 16, fakeServerData, fakeLen);
-                        
-                        ((unsigned char *)buf)[0] = (newPktLen >> 24) & 0xFF;
-                        ((unsigned char *)buf)[1] = (newPktLen >> 16) & 0xFF;
-                        ((unsigned char *)buf)[2] = (newPktLen >> 8) & 0xFF;
-                        ((unsigned char *)buf)[3] = newPktLen & 0xFF;
-                        
-                        DLOG(@"[PROTO-PATCH] Added fake server list (len=%zu, total=%u)", fakeLen, newPktLen);
-                    } else {
-                        DLOG(@"[PROTO-PATCH] Buffer too small for fake server list");
+                    if (fakeLen > availableSpace) {
+                        fakeLen = availableSpace;
                     }
+                    
+                    memset((unsigned char *)buf + 16, 0, availableSpace);
+                    memcpy((unsigned char *)buf + 16, fakeServerData, fakeLen);
+                    
+                    DLOG(@"[PROTO-PATCH] Injected fake server data (len=%zu, available=%zu)", fakeLen, availableSpace);
                 }
             }
         }
