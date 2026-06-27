@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.44 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.45 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.44 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.45 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.44 诊断面板";
+            lbl.text = @"WXHook v34.45 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -586,19 +586,41 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 ((unsigned char *)buf)[11] = 0;
             }
             
-            // Patch server status in JSON string (status=6 -> status=1) to make servers available
+            // Patch server status in binary format (00 00 00 06 -> 00 00 00 01)
+            // These appear at regular intervals in the server list
             unsigned char *data = (unsigned char *)buf;
-            int patchCount = 0;
+            int binaryPatchCount = 0;
+            for (size_t i = 16; i + 4 < (size_t)ret; i++) {
+                // Look for binary status pattern: 00 00 00 06 followed by valid server data
+                if (data[i] == 0x00 && data[i+1] == 0x00 && 
+                    data[i+2] == 0x00 && data[i+3] == 0x06) {
+                    // Check if this looks like a server status (followed by valid data)
+                    // Server entries have IP addresses starting with 47 or 139 etc
+                    size_t ipStart = i + 8;
+                    if (ipStart + 4 < (size_t)ret && 
+                        (data[ipStart] == 0x34 || data[ipStart] == 0x31)) { // '4' or '1' in ASCII
+                        DLOG(@"[PROTO-PATCH] Found binary status=6 at offset %zu, changing to 1", i);
+                        data[i+3] = 0x01; // Change 06 to 01
+                        binaryPatchCount++;
+                    }
+                }
+            }
+            if (binaryPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d binary server status values from 6 to 1", binaryPatchCount);
+            }
+            
+            // Also patch ASCII status=6 in JSON format (for older/newer protocol variations)
+            int asciiPatchCount = 0;
             for (size_t i = 0; i + 7 < (size_t)ret; i++) {
                 if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
                     data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=' && data[i+7] == '6') {
-                    DLOG(@"[PROTO-PATCH] Found 'status=6' at offset %zu, changing to 'status=1'", i);
+                    DLOG(@"[PROTO-PATCH] Found ASCII 'status=6' at offset %zu, changing to 'status=1'", i);
                     data[i+7] = '1';
-                    patchCount++;
+                    asciiPatchCount++;
                 }
             }
-            if (patchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d server status values from 6 to 1", patchCount);
+            if (asciiPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d ASCII server status values from 6 to 1", asciiPatchCount);
             }
         }
         
