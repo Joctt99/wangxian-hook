@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.41 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.42 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.41 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.42 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.41 诊断面板";
+            lbl.text = @"WXHook v34.42 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -539,9 +539,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
             DLOG(@"[PROTO-PATCH] Got heartbeat from auth server, faking login success response");
             
-            // Fake login response: 0x8002A017 with status=0 (total 37 bytes)
+            // Fake login response: 0x8002A017 with status=0 (total 40 bytes)
             const char fakeLoginResp[] = 
-                "\x00\x00\x00\x25"  // length = 37 (0x25)
+                "\x00\x00\x00\x28"  // length = 40 (0x28)
                 "\x80\x02\xA0\x17"  // cmd = 0x8002A017 (login response)
                 "\x00\x00\x00\x00"  // status = 0 (success)
                 "\x00\x00\x00\x01"  // sub-status = 1
@@ -563,9 +563,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (cmd == 0x76666669 || cmd == 0x7666669A) {  // 'vffi' or 'vfii'
             DLOG(@"[PROTO-PATCH] Got login failure from auth server, faking login success response");
             
-            // Fake login success: 0x8002A017 with status=0 (total 37 bytes)
+            // Fake login success: 0x8002A017 with status=0 (total 40 bytes)
             const char fakeLoginResp[] = 
-                "\x00\x00\x00\x25"  // length = 37 (0x25)
+                "\x00\x00\x00\x28"  // length = 40 (0x28)
                 "\x80\x02\xA0\x17"  // cmd = 0x8002A017 (login response)
                 "\x00\x00\x00\x00"  // status = 0 (success)
                 "\x00\x00\x00\x01"  // sub-status = 1
