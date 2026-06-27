@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.2 - Anti-Cheat Bypass + Protocol-Level Login Patch (Packet Boundary Fix)
+ * WangXianHook v34.3 - Anti-Cheat Bypass + Protocol-Level Login Patch (Status-Only Fix)
  * Strategy: Hook Security APIs + patch login response error code at protocol level
- * Fixed: Protocol patch now respects pktLen boundary, only scans header portion (37 bytes max)
+ * Fixed: Only patch status field (offset 12-15), never touch serverID or player data
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.2 Protocol Login Patch (Packet Boundary Fix) ===");
+        _log(@"=== WXHook v34.3 Protocol Login Patch (Status-Only Fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.2 诊断面板";
+            lbl.text = @"WXHook v34.3 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -435,15 +435,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (cmd == 0x8002A017) {
             DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-            ssize_t scanLimit = (ssize_t)pktLenBE;
-            if (scanLimit > ret) scanLimit = ret;
-            for (ssize_t off = 12; off + 4 <= scanLimit; off += 4) {
-                uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
-                               ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
-                if (val != 0) {
-                    DLOG(@"[PROTO-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
-                    memset((unsigned char *)buf + off, 0, 4);
-                }
+            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+            DLOG(@"[PROTO] Login status at offset 12-15: %u (0x%08X)", status, status);
+            if (status != 0) {
+                DLOG(@"[PROTO-PATCH] Login status %u -> 0 (force success)", status);
+                memset((unsigned char *)buf + 12, 0, 4);
             }
         }
     }
@@ -518,15 +515,12 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (cmd == 0x8002A017) {
             DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-            ssize_t scanLimit = (ssize_t)pktLenBE;
-            if (scanLimit > ret) scanLimit = ret;
-            for (ssize_t off = 12; off + 4 <= scanLimit; off += 4) {
-                uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
-                               ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
-                if (val != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Login error code %u (0x%08X) at offset %zd -> 0", val, val, off);
-                    memset((unsigned char *)buf + off, 0, 4);
-                }
+            uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                              ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+            DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+            if (status != 0) {
+                DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                memset((unsigned char *)buf + 12, 0, 4);
             }
         }
     }
