@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.11 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.12 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fix version check 0x802EE118 + 0x802EE121 status at offset 8-11 (4 bytes) + offset 12 (1 byte)
+ * Key: Fix version check 0x802EE118 + 0x802EE121 status at offset 8-15 (8 bytes)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.11 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.12 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.11 诊断面板";
+            lbl.text = @"WXHook v34.12 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -458,7 +458,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[PROTO] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
             if (status4 != 0) {
                 DLOG(@"[PROTO-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 4);
+                memset((unsigned char *)buf + 8, 0, 8);
             }
         }
         
@@ -580,7 +580,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
             if (status4 != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 4);
+                memset((unsigned char *)buf + 8, 0, 8);
             }
         }
         
