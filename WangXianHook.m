@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.42 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.43 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.42 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.43 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.42 诊断面板";
+            lbl.text = @"WXHook v34.43 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -433,58 +433,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
         
-        if (cmd == 0x0002A018) {
-            for (size_t i = 0; i + 32 < len; i++) {
-                if (memcmp(p + i, "UUID=", 5) == 0) {
-                    size_t uuidValueStart = i + 5;
-                    size_t uuidValueEnd = uuidValueStart;
-                    
-                    while (uuidValueEnd < len && p[uuidValueEnd] != 0) {
-                        uuidValueEnd++;
-                    }
-                    
-                    size_t macStart = uuidValueEnd + 1;
-                    if (macStart + 11 <= len && memcmp(p + macStart, "MACADDRESS=", 11) == 0) {
-                        size_t macValueStart = macStart + 11;
-                        size_t macValueEnd = macValueStart;
-                        
-                        while (macValueEnd < len && p[macValueEnd] != 0) {
-                            macValueEnd++;
-                        }
-                        
-                        size_t oldDataLen = macValueEnd - i;
-                        const char replacement[] = "UUID=12345678-1234-1234-1234-123456789012\x00MACADDRESS=00:11:22:33:44:55\x00";
-                        size_t replaceLen = sizeof(replacement) - 1;
-                        size_t diff = replaceLen - oldDataLen;
-                        
-                        DLOG(@"[SEND-PATCH] UUID at %zu-%zu, MAC at %zu-%zu, old=%zu new=%zu diff=%zd", 
-                             i, uuidValueEnd, macStart, macValueEnd, oldDataLen, replaceLen, diff);
-                        
-                        void *newBuf = malloc(len + diff);
-                        if (newBuf) {
-                            memcpy(newBuf, buf, i);
-                            memcpy(((char *)newBuf) + i, replacement, replaceLen);
-                            memcpy(((char *)newBuf) + i + replaceLen, 
-                                   ((char *)buf) + macValueEnd,
-                                   len - macValueEnd);
-                            
-                            uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                               ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-                            uint32_t newPktLen = pktLenBE + (uint32_t)diff;
-                            ((unsigned char *)newBuf)[0] = (newPktLen >> 24) & 0xFF;
-                            ((unsigned char *)newBuf)[1] = (newPktLen >> 16) & 0xFF;
-                            ((unsigned char *)newBuf)[2] = (newPktLen >> 8) & 0xFF;
-                            ((unsigned char *)newBuf)[3] = newPktLen & 0xFF;
-                            
-                            sendBuf = newBuf;
-                            sendLen = len + diff;
-                            DLOG(@"[SEND-PATCH] Done: len=%zu -> %zu", len, sendLen);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        // UUID/MAC modification disabled - keeping original values for proper account distinction
+        (void)cmd;  // suppress unused warning
     }
     
     if (host && sendLen > 0) {
