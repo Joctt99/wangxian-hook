@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.33 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.34 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.33 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.34 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.33 诊断面板";
+            lbl.text = @"WXHook v34.34 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -543,7 +543,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     "\x94\xE5\x8C\xBA\x00\x06\xE6\x96\xB0\xE5\x8C\xBA\x00\x00\x00\x03\x00\x00"
                     "\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0E"
                     "\x00\x06\xE4\xB8\x80\xE5\x8C\xBA\x00\x09\xE5\xBF\x98\xE5\xB7\x9D\xE6\xB8"
-                    "\xA1\x00\x0E\x31\x30\x36\x2E\x31\x34\x2E\x31\x33\x32\x2E\x32\x31\x38\x00"
+                    "\xA1\x00\x0E\x34\x37\x2E\x31\x30\x30\x2E\x32\x30\x34\x2E\x31\x36\x30\x00"
                     "\x00\x2E\xE3\x00\x00\x00\x00\x00\x04\x00\x06\xE7\x81\xAB\xE7\x88\x86\x00"
                     "\x22\xE7\xA5\x9D\xE6\x82\xA8\xE4\xBB\x99\xE9\x80\x94\xE6\x84\x89\xE5\xBF"
                     "\xAB\x21\x20\x2D\x20\xE6\x9C\x80\xE8\xBF\x91\xE7\x99\xBB\xE9\x99\x86\x00"
