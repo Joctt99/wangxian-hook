@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.38 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.39 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.38 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.39 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.38 诊断面板";
+            lbl.text = @"WXHook v34.39 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -533,6 +533,34 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        // When receiving heartbeat from auth server (instead of game server response),
+        // fake a login success response so app continues to game
+        if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
+            DLOG(@"[PROTO-PATCH] Got heartbeat from auth server, faking login success response");
+            
+            // Fake login response: 0x8002A017 with status=0
+            const char fakeLoginResp[] = 
+                "\x00\x00\x00\x25"  // length = 37
+                "\x80\x02\xA0\x17"  // cmd = 0x8002A017 (login response)
+                "\x00\x00\x00\x00"  // status = 0 (success)
+                "\x00\x00\x00\x01"  // sub-status = 1
+                "\x00\x00\x00\x00"  // more status fields
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00"
+                "\x00\x00\x00\x00";
+            
+            if (sizeof(fakeLoginResp) - 1 <= len) {
+                memcpy(buf, fakeLoginResp, sizeof(fakeLoginResp) - 1);
+                ret = sizeof(fakeLoginResp) - 1;
+                DLOG(@"[PROTO-PATCH] Faked login response injected (len=%zd)", ret);
+            }
+        }
         
         if (cmd == 0x802EE118) {
             DLOG(@"[PROTO] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
