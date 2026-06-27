@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.24 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.25 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
- * Key: Correct format with null separator between UUID and MACADDRESS
+ * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -400,8 +400,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         if (cmd == 0x0002A018) {
             for (size_t i = 0; i + 16 < len; i++) {
                 if (memcmp(p + i, "UUID=MACADDRESS=", 16) == 0) {
-                    const char *replacement = "UUID=12345678-1234-1234-1234-123456789012\x00MACADDRESS=00:11:22:33:44:55";
-                    size_t replaceLen = strlen(replacement);
+                    const char replacement[] = "UUID=12345678-1234-1234-1234-123456789012\x00MACADDRESS=00:11:22:33:44:55";
+                    size_t replaceLen = sizeof(replacement) - 1;
                     size_t oldLen = 16;
                     size_t diff = replaceLen - oldLen;
                     
