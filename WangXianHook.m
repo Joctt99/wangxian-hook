@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.1 - Anti-Cheat Bypass + Protocol-Level Login Patch (Stability Fix)
+ * WangXianHook v34.2 - Anti-Cheat Bypass + Protocol-Level Login Patch (Packet Boundary Fix)
  * Strategy: Hook Security APIs + patch login response error code at protocol level
- * Fixed: Memory safety - NULL checks, boundary protection, host tracking validation
+ * Fixed: Protocol patch now respects pktLen boundary, only scans header portion (37 bytes max)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.1 Protocol Login Patch (Stability Fix) ===");
+        _log(@"=== WXHook v34.2 Protocol Login Patch (Packet Boundary Fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.1 诊断面板";
+            lbl.text = @"WXHook v34.2 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -429,13 +429,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
     if (port == 5678 && ret >= 16) {
-        uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                          ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-        uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                          ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
-            for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+            DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+            ssize_t scanLimit = (ssize_t)pktLenBE;
+            if (scanLimit > ret) scanLimit = ret;
+            for (ssize_t off = 12; off + 4 <= scanLimit; off += 4) {
                 uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
                                ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
                 if (val != 0) {
@@ -510,13 +512,15 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
     if (port == 5678 && ret >= 16) {
-        uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                          ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-        uint32_t cmd    = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                          ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLen, ret);
-            for (ssize_t off = 12; off + 4 <= ret; off += 4) {
+            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+            ssize_t scanLimit = (ssize_t)pktLenBE;
+            if (scanLimit > ret) scanLimit = ret;
+            for (ssize_t off = 12; off + 4 <= scanLimit; off += 4) {
                 uint32_t val = ((uint32_t)p[off] << 24) | ((uint32_t)p[off+1] << 16) |
                                ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
                 if (val != 0) {
