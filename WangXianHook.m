@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.19 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.20 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fill UUID/MACADDRESS + update internal length field (00 10 -> new value)
+ * Key: Dynamically update length field before UUID/MAC (big-endian 2 bytes)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.19 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.20 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.19 诊断面板";
+            lbl.text = @"WXHook v34.20 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -413,10 +413,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         if (newBuf) {
                             memcpy(newBuf, buf, len);
                             
-                            // Update the length field before UUID= (00 10 -> new value)
-                            if (i >= 2 && ((unsigned char *)newBuf)[i-2] == 0x00 && ((unsigned char *)newBuf)[i-1] == 0x10) {
-                                ((unsigned char *)newBuf)[i-1] = (unsigned char)replaceLen;
-                                DLOG(@"[SEND-PATCH] Updated length field: 16 -> %zu", replaceLen);
+                            // Update the length field before UUID= (2 bytes, little-endian)
+                            if (i >= 2) {
+                                uint16_t oldFieldLen = ((uint8_t)((char *)newBuf)[i-2] << 8) | (uint8_t)((char *)newBuf)[i-1];
+                                ((unsigned char *)newBuf)[i-2] = (replaceLen >> 8) & 0xFF;
+                                ((unsigned char *)newBuf)[i-1] = replaceLen & 0xFF;
+                                DLOG(@"[SEND-PATCH] Updated length field: %d -> %zu", oldFieldLen, replaceLen);
                             }
                             
                             // Move data after MACADDRESS= to make room
