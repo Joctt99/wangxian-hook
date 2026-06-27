@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.47 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.48 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.47 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.48 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.47 诊断面板";
+            lbl.text = @"WXHook v34.48 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -587,6 +587,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             unsigned char *data = (unsigned char *)buf;
+            
+            // Patch server count at offset 12-13 (01 4A -> 06 00 means 6 servers)
+            if (ret > 14 && data[12] == 0x01 && data[13] == 0x4A) {
+                DLOG(@"[PROTO-PATCH] Found server count 01 4A at offset 12-13, changing to 06 00");
+                data[12] = 0x06;
+                data[13] = 0x00;
+            }
+            
+            // Also check for other possible count locations (01 -> 06)
+            if (ret > 14 && data[12] == 0x01 && data[13] <= 0x10) {
+                DLOG(@"[PROTO-PATCH] Found small count 0x%02X at offset 12, changing to 0x06", data[13]);
+                data[13] = 0x06;
+            }
             
             // Patch server status in JSON format (status=6 -> status=1)
             int jsonPatchCount = 0;
