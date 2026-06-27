@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.12 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.13 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fix version check 0x802EE118 + 0x802EE121 status at offset 8-15 (8 bytes)
+ * Key: Fix version check 0x802EE118+0x802EE121 + server list 0x8002A016 at offset 8-15 (8 bytes)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.12 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.13 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.12 诊断面板";
+            lbl.text = @"WXHook v34.13 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -476,12 +476,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             if (cmd == 0x8002A016) {
                 DLOG(@"[PROTO] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO] Server list status at offset 12-15: %u (0x%08X)", status, status);
-                if (status != 0) {
-                    DLOG(@"[PROTO-PATCH] Server list status %u -> 0 (force success)", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
+                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
+                if (status8 != 0 || status12 != 0) {
+                    DLOG(@"[PROTO-PATCH] Server list status %u/%u -> 0 (force success)", status8, status12);
+                    memset((unsigned char *)buf + 8, 0, 8);
                 }
             }
         }
@@ -598,12 +600,14 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             
             if (cmd == 0x8002A016) {
                 DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO-R] Server list status at offset 12-15: %u (0x%08X)", status, status);
-                if (status != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0 (force success)", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
+                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Server list status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
+                if (status8 != 0 || status12 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0 (force success)", status8, status12);
+                    memset((unsigned char *)buf + 8, 0, 8);
                 }
             }
         }
