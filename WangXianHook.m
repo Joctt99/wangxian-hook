@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.8 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.9 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fix ret >= 13 threshold for version check response + Full protocol patching
+ * Key: Fix version check status at offset 8-11 (4 bytes) + offset 12 (1 byte)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -437,13 +437,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
         if (cmd == 0x802EE118) {
-            DLOG(@"[PROTO] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
-            // Status at offset 12 (1 byte for 13-byte packet)
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-PATCH] Version check status %u -> 0 (force success)", p[12]);
-                ((unsigned char *)buf)[12] = 0;
+                DLOG(@"[PROTO] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-PATCH] Version check 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
+                if (ret >= 13 && p[12] != 0) {
+                    DLOG(@"[PROTO-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                    ((unsigned char *)buf)[12] = 0;
+                }
             }
-        }
         
         // For larger packets with status at offset 12-15
         if (ret >= 16) {
@@ -544,8 +550,15 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         
         if (cmd == 0x802EE118) {
             DLOG(@"[PROTO-R] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
+            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+            DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+            if (status4 != 0) {
+                DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                memset((unsigned char *)buf + 8, 0, 4);
+            }
             if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check status %u -> 0 (force success)", p[12]);
+                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
         }
