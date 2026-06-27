@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.25 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.26 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.25 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.26 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.25 诊断面板";
+            lbl.text = @"WXHook v34.26 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -396,6 +396,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
         
         if (cmd == 0x0002A018) {
             for (size_t i = 0; i + 16 < len; i++) {
@@ -491,6 +492,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[PROTO-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
+        }
+
+        if (cmd == 0x0000E011) {
+            DLOG(@"[PROTO] Server info response 0x0000E011 pktLen=%u ret=%zd", pktLenBE, ret);
         }
 
         if (cmd == 0x802EE121) {
