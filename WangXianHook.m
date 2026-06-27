@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.4 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.5 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: _dyld_image_count/get_image_name/dladdr all hooked to return filtered results
+ * Key: Fixed command ID 0x802EE121 for actual login response, not 0x8002A017
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.4 DYLD Hiding + Anti-Cheat Bypass ===");
+        _log(@"=== WXHook v34.5 Protocol Login Patch (Fix Command ID) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.4 诊断面板";
+            lbl.text = @"WXHook v34.5 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -433,8 +433,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+        if (cmd == 0x802EE121) {
+            DLOG(@"[PROTO] Login response 0x802EE121 pktLen=%u ret=%zd", pktLenBE, ret);
             uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                               ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
             DLOG(@"[PROTO] Login status at offset 12-15: %u (0x%08X)", status, status);
@@ -513,8 +513,8 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
+        if (cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] Login response 0x802EE121 pktLen=%u ret=%zd", pktLenBE, ret);
             uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                               ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
             DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
