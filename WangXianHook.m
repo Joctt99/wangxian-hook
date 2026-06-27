@@ -1,7 +1,7 @@
 /**
- * WangXianHook v34.18 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.19 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Hook dyld API to hide injected libraries + bypass signature checks + patch login response
- * Key: Fill UUID/MACADDRESS in server list request (0x0002A018)
+ * Key: Fill UUID/MACADDRESS + update internal length field (00 10 -> new value)
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.18 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.19 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.18 诊断面板";
+            lbl.text = @"WXHook v34.19 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -405,18 +405,29 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (memcmp(dataStart + i, "UUID=", 5) == 0) {
                     if (memcmp(dataStart + i + 5, "MACADDRESS=", 11) == 0) {
                         const char *replacement = "UUID=12345678-1234-1234-1234-123456789012MACADDRESS=00:11:22:33:44:55";
-                        size_t replaceLen = strlen(replacement);
-                        size_t oldLen = 5 + 11;
-                        size_t diff = replaceLen - oldLen;
+                        size_t replaceLen = strlen(replacement); // 69
+                        size_t oldLen = 5 + 11; // 16
+                        size_t diff = replaceLen - oldLen; // 53
                         
-                        void *newBuf = malloc(len + 64);
+                        void *newBuf = malloc(len + diff + 1);
                         if (newBuf) {
                             memcpy(newBuf, buf, len);
+                            
+                            // Update the length field before UUID= (00 10 -> new value)
+                            if (i >= 2 && ((unsigned char *)newBuf)[i-2] == 0x00 && ((unsigned char *)newBuf)[i-1] == 0x10) {
+                                ((unsigned char *)newBuf)[i-1] = (unsigned char)replaceLen;
+                                DLOG(@"[SEND-PATCH] Updated length field: 16 -> %zu", replaceLen);
+                            }
+                            
+                            // Move data after MACADDRESS= to make room
                             memmove(((char *)newBuf) + i + replaceLen, 
                                     ((char *)newBuf) + i + oldLen, 
                                     len - i - oldLen);
+                            
+                            // Write replacement
                             memcpy(((char *)newBuf) + i, replacement, replaceLen);
                             
+                            // Update packet length in header
                             uint32_t newLen = pktLenBE + diff;
                             ((unsigned char *)newBuf)[0] = (newLen >> 24) & 0xFF;
                             ((unsigned char *)newBuf)[1] = (newLen >> 16) & 0xFF;
@@ -424,8 +435,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             ((unsigned char *)newBuf)[3] = newLen & 0xFF;
                             
                             sendBuf = newBuf;
-                            sendLen += diff;
-                            DLOG(@"[SEND-PATCH] Filled UUID/MAC for cmd=0x%08X", cmd);
+                            sendLen = len + diff;
+                            DLOG(@"[SEND-PATCH] Filled UUID/MAC for cmd=0x%08X (len %zu -> %zu)", cmd, len, sendLen);
                         }
                         break;
                     }
