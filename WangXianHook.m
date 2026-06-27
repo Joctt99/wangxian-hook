@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.46 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.47 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.46 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.47 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.46 诊断面板";
+            lbl.text = @"WXHook v34.47 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -635,6 +635,36 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             if (serverTypePatchCount > 0) {
                 DLOG(@"[PROTO-PATCH] Patched %d serverType values to 1", serverTypePatchCount);
+            }
+            
+            // Patch serverid=0 to serverid=1 for old accounts (serverid=0 may be invalid)
+            int serveridPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    serveridPatchCount++;
+                }
+            }
+            if (serveridPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d serverid values from 0 to 1", serveridPatchCount);
+            }
+            
+            // Patch clientid=0 to clientid=1 (may also be checked for validity)
+            int clientidPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
+                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    clientidPatchCount++;
+                }
+            }
+            if (clientidPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
             }
         }
         
