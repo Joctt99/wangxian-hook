@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.36 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.37 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.36 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.37 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.36 诊断面板";
+            lbl.text = @"WXHook v34.37 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -524,7 +524,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[PROTO] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
             if (status4 != 0) {
                 DLOG(@"[PROTO-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 8);
+                ((unsigned char *)buf)[8] = 0;
+                ((unsigned char *)buf)[9] = 0;
+                ((unsigned char *)buf)[10] = 0;
+                ((unsigned char *)buf)[11] = 0;
+            }
+            // Also clear offset 12-15 (another status field) and message string
+            if (ret > 16) {
+                DLOG(@"[PROTO-PATCH] Clearing version check message (offset 12 onwards)");
+                memset((unsigned char *)buf + 12, 0, ret - 12);
             }
         }
 
