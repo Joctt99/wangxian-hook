@@ -1,7 +1,8 @@
 /**
- * WangXianHook v34.54 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.55 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
+ * NEW: Log app behavior after receiving server list to diagnose empty list issue
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -34,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.54 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.55 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.54 诊断面板";
+            lbl.text = @"WXHook v34.55 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -549,6 +550,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             unsigned char *data = (unsigned char *)buf;
+            
+            // Patch server count at offset 12 (if it's 01, change to 05)
+            if (ret >= 16 && data[12] == 0x01) {
+                DLOG(@"[PROTO-PATCH] Server count at offset 12: 1 -> 5 (force multiple servers)");
+                data[12] = 0x05;  // Pretend we have 5 servers
+            }
             
             // Patch server status in JSON format (status=6 -> status=1)
             int jsonPatchCount = 0;
