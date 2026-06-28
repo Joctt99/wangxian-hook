@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.51 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.52 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.51 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.52 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.51 诊断面板";
+            lbl.text = @"WXHook v34.52 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -656,38 +656,28 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             if (cmd == 0x8002A016) {
-                DLOG(@"[PROTO] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
+                DLOG(@"[PROTO] Version/server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
                 uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                 uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                     ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
-                if (status8 != 0 || status12 != 0 || ret <= 64) {
-                    DLOG(@"[PROTO-PATCH] Server list empty or failed, constructing fake response");
-                    
-                    const char fakeServer[] = "\x00\x00\x00\x70\x80\x02\xA0\x16\x00\x00\x00\x00\x00\x00\x00\x01"
-                        "\x00\x03\x49\x4F\x53"
-                        "\x00\x05\x37\x2E\x36\x2E\x30"
-                        "\x00\x03\x39\x37\x34"
-                        "\x00\x01\x31"
-                        "\x00\x03\x4E\x4F\x31"
-                        "\x00\x03\x4E\x4F\x31"
-                        "\x00\x0B\x34\x37\x2E\x31\x30\x30\x2E\x32\x30\x34\x2E\x31\x36\x30"
-                        "\x00\x04\x2D\x03\x00\x00"
-                        "\x00\x04\x1F\x40\x00\x00"
-                        "\x00\x04\x00\x00\x00\x00"
-                        "\x00\x04\x00\x00\x00\x01"
-                        "\x00\x04\x00\x00\x00\x01"
-                        "\x00\x14\xE6\x9C\x8D\xE5\x8A\xA1\xE5\x99\xA8\xE7\xBB\xB4\xE6\x8A\xA4\xE4\xB8\xAD";
-                    
-                    size_t fakeLen = sizeof(fakeServer) - 1;
-                    if (fakeLen <= len) {
-                        memcpy(buf, fakeServer, fakeLen);
-                        ret = (ssize_t)fakeLen;
-                        DLOG(@"[PROTO-PATCH] Fake server list injected (len=%zu)", fakeLen);
-                    } else {
-                        DLOG(@"[PROTO-PATCH] Buffer too small (%zu < %zu)", len, fakeLen);
-                    }
+                DLOG(@"[PROTO] Status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
+                
+                // Just patch status to 0, do NOT construct fake response
+                // 0x8002A016 is likely version check, not server list
+                if (status8 != 0) {
+                    DLOG(@"[PROTO-PATCH] Status %u -> 0", status8);
+                    ((unsigned char *)buf)[8] = 0;
+                    ((unsigned char *)buf)[9] = 0;
+                    ((unsigned char *)buf)[10] = 0;
+                    ((unsigned char *)buf)[11] = 0;
+                }
+                if (status12 != 0) {
+                    DLOG(@"[PROTO-PATCH] Status12 %u -> 0", status12);
+                    ((unsigned char *)buf)[12] = 0;
+                    ((unsigned char *)buf)[13] = 0;
+                    ((unsigned char *)buf)[14] = 0;
+                    ((unsigned char *)buf)[15] = 0;
                 }
             }
         }
