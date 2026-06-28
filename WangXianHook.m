@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.58 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.59 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.58 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.59 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.58 诊断面板";
+            lbl.text = @"WXHook v34.59 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -638,6 +638,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[PROTO-PATCH] Patched %d serverid values from 0 to 1", serveridPatchCount);
             }
             
+            // Patch category='......' to category='默认' (same length: 6 bytes)
+            // '......' = 0x2E 0x2E 0x2E 0x2E 0x2E 0x2E
+            // '默认' = E7 94 B0 E9 BB 98 (UTF-8)
+            // Try replacing with '一区' = E4 B8 80 E5 8C BA (6 bytes) - "One District"
+            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};  // '......'
+            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};  // '一区'
+            
+            for (size_t i = 0; i + sizeof(oldCat) <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
+                    DLOG(@"[PROTO-PATCH] Found category='......' at offset %zu, replacing with '一区'", i);
+                    memcpy(data + i, newCat, sizeof(newCat));
+                }
+            }
+            
             // Patch clientid=0 to clientid=1
             int clientidPatchCount = 0;
             for (size_t i = 0; i + 9 < (size_t)ret; i++) {
@@ -949,6 +963,15 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                 }
             }
             
+            // Patch category='......' to '一区'
+            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
+            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+            for (size_t i = 0; i + sizeof(oldCat) <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
+                    memcpy(data + i, newCat, sizeof(newCat));
+                }
+            }
+            
             // Replace "维护" with "运行"
             const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};
             const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
@@ -1027,6 +1050,15 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                 for (size_t i = 0; i + 15 <= iov->iov_len; i++) {
                     if (memcmp(data + i, oldIP, 15) == 0) {
                         memcpy(data + i, newIP, 15);
+                    }
+                }
+                
+                // Patch category='......' to '一区'
+                const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
+                const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+                for (size_t i = 0; i + sizeof(oldCat) <= iov->iov_len; i++) {
+                    if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
+                        memcpy(data + i, newCat, sizeof(newCat));
                     }
                 }
             }
