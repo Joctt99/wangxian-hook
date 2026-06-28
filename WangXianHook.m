@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.48 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.49 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.48 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.49 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.48 诊断面板";
+            lbl.text = @"WXHook v34.49 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -573,111 +573,85 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO] Server list response 0x802EE113 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X)", status4, status4);
             
-            // Patch protocol status to 0 so app will parse the server list
-            if (status4 != 0) {
-                DLOG(@"[PROTO-PATCH] Protocol status %u -> 0", status4);
-                ((unsigned char *)buf)[8] = 0;
-                ((unsigned char *)buf)[9] = 0;
-                ((unsigned char *)buf)[10] = 0;
-                ((unsigned char *)buf)[11] = 0;
-            }
-            
-            unsigned char *data = (unsigned char *)buf;
-            
-            // Patch server count at offset 12-13 (01 4A -> 06 00 means 6 servers)
-            if (ret > 14 && data[12] == 0x01 && data[13] == 0x4A) {
-                DLOG(@"[PROTO-PATCH] Found server count 01 4A at offset 12-13, changing to 06 00");
-                data[12] = 0x06;
-                data[13] = 0x00;
-            }
-            
-            // Also check for other possible count locations (01 -> 06)
-            if (ret > 14 && data[12] == 0x01 && data[13] <= 0x10) {
-                DLOG(@"[PROTO-PATCH] Found small count 0x%02X at offset 12, changing to 0x06", data[13]);
-                data[13] = 0x06;
-            }
-            
-            // Patch server status in JSON format (status=6 -> status=1)
-            int jsonPatchCount = 0;
-            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
-                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
-                    // Change status from 6 to 1, or any other value to 1
-                    DLOG(@"[PROTO-PATCH] Found 'status=' at offset %zu, setting to 1", i);
-                    data[i+7] = '1';
-                    jsonPatchCount++;
+            // For old accounts: replace with fake server list containing REAL server IPs
+            // Old accounts only get 420 bytes with 1 test server, but app expects multiple servers
+            if (ret <= 500) {
+                DLOG(@"[PROTO-PATCH] Replacing short response (%zd bytes) with fake server list", ret);
+                
+                const char *fakeServerList = 
+                    "/MieshiServerInfo{priority=0, category='一区', name='忘仙录', realname='忘仙录', ip='47.100.184.77', port=12003, httpPort=8003, clientid=1, serverid=1, description='官方一区', onlinePlayerNum=1000, status=1, lastNotifyOnlineNumTime=1782633255539, serverType=1, serverUrl='http://47.100.184.77:8003'}\0"
+                    "/MieshiServerInfo{priority=0, category='二区', name='灵溪谷', realname='灵溪谷', ip='47.100.184.78', port=12003, httpPort=8003, clientid=2, serverid=2, description='官方二区', onlinePlayerNum=800, status=1, lastNotifyOnlineNumTime=1782633255539, serverType=1, serverUrl='http://47.100.184.78:8003'}\0"
+                    "/MieshiServerInfo{priority=0, category='三区', name='星器谷', realname='星器谷', ip='47.100.184.79', port=12003, httpPort=8003, clientid=3, serverid=3, description='官方三区', onlinePlayerNum=600, status=1, lastNotifyOnlineNumTime=1782633255539, serverType=1, serverUrl='http://47.100.184.79:8003'}\0"
+                    "/MieshiServerInfo{priority=0, category='四区', name='苍穹岭', realname='苍穹岭', ip='47.100.184.80', port=12003, httpPort=8003, clientid=4, serverid=4, description='官方四区', onlinePlayerNum=500, status=1, lastNotifyOnlineNumTime=1782633255539, serverType=1, serverUrl='http://47.100.184.80:8003'}\0"
+                    "/MieshiServerInfo{priority=0, category='五区', name='百花谷', realname='百花谷', ip='47.100.204.160', port=12003, httpPort=8003, clientid=5, serverid=5, description='官方五区', onlinePlayerNum=400, status=1, lastNotifyOnlineNumTime=1782633255539, serverType=1, serverUrl='http://47.100.204.160:8003'}\0";
+                
+                size_t fakeLen = strlen(fakeServerList);
+                DLOG(@"[PROTO-PATCH] Fake server list length: %zu", fakeLen);
+                
+                // Protocol header: 4 bytes length + 4 bytes command + 4 bytes status + data
+                size_t totalLen = 12 + fakeLen;
+                
+                // Allocate new buffer
+                unsigned char *newBuf = malloc(totalLen);
+                if (newBuf) {
+                    // Length (big endian)
+                    newBuf[0] = (totalLen >> 24) & 0xFF;
+                    newBuf[1] = (totalLen >> 16) & 0xFF;
+                    newBuf[2] = (totalLen >> 8) & 0xFF;
+                    newBuf[3] = totalLen & 0xFF;
+                    
+                    // Command 0x802EE113
+                    newBuf[4] = 0x80;
+                    newBuf[5] = 0x2E;
+                    newBuf[6] = 0xE1;
+                    newBuf[7] = 0x13;
+                    
+                    // Status = 0 (success)
+                    newBuf[8] = 0x00;
+                    newBuf[9] = 0x00;
+                    newBuf[10] = 0x00;
+                    newBuf[11] = 0x00;
+                    
+                    // Copy server list data
+                    memcpy(newBuf + 12, fakeServerList, fakeLen);
+                    
+                    // Replace original buffer
+                    free(buf);
+                    buf = newBuf;
+                    ret = totalLen;
+                    DLOG(@"[PROTO-PATCH] Replaced with %zd bytes fake server list containing 5 REAL servers", ret);
                 }
-            }
-            if (jsonPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d JSON status values to 1", jsonPatchCount);
-            }
-            
-            // Patch server status in binary format (00 00 00 06 -> 00 00 00 01)
-            int binaryPatchCount = 0;
-            for (size_t i = 16; i + 4 < (size_t)ret; i++) {
-                if (data[i] == 0x00 && data[i+1] == 0x00 && 
-                    data[i+2] == 0x00 && data[i+3] == 0x06) {
-                    // Check if followed by valid server data
-                    size_t ipStart = i + 8;
-                    if (ipStart + 4 < (size_t)ret && 
-                        (data[ipStart] == 0x34 || data[ipStart] == 0x31 || data[ipStart] == 0x30)) {
-                        DLOG(@"[PROTO-PATCH] Found binary status=6 at offset %zu, changing to 1", i);
-                        data[i+3] = 0x01;
-                        binaryPatchCount++;
+            } else {
+                // Normal handling for new accounts
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X)", status4, status4);
+                
+                // Patch protocol status to 0 if needed
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-PATCH] Protocol status %u -> 0", status4);
+                    ((unsigned char *)buf)[8] = 0;
+                    ((unsigned char *)buf)[9] = 0;
+                    ((unsigned char *)buf)[10] = 0;
+                    ((unsigned char *)buf)[11] = 0;
+                }
+                
+                unsigned char *data = (unsigned char *)buf;
+                
+                // Patch server status in JSON format (status=6 -> status=1)
+                int jsonPatchCount = 0;
+                for (size_t i = 0; i + 7 < (size_t)ret; i++) {
+                    if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
+                        data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
+                        DLOG(@"[PROTO-PATCH] Found 'status=' at offset %zu, setting to 1", i);
+                        data[i+7] = '1';
+                        jsonPatchCount++;
                     }
                 }
-            }
-            if (binaryPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d binary server status values from 6 to 1", binaryPatchCount);
-            }
-            
-            // For old accounts with JSON format: patch serverType=2 to serverType=1
-            int serverTypePatchCount = 0;
-            for (size_t i = 0; i + 10 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
-                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverType=' at offset %zu, setting to 1", i);
-                    data[i+11] = '1';
-                    serverTypePatchCount++;
+                if (jsonPatchCount > 0) {
+                    DLOG(@"[PROTO-PATCH] Patched %d JSON status values to 1", jsonPatchCount);
                 }
-            }
-            if (serverTypePatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d serverType values to 1", serverTypePatchCount);
-            }
-            
-            // Patch serverid=0 to serverid=1 for old accounts (serverid=0 may be invalid)
-            int serveridPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
-                    serveridPatchCount++;
-                }
-            }
-            if (serveridPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d serverid values from 0 to 1", serveridPatchCount);
-            }
-            
-            // Patch clientid=0 to clientid=1 (may also be checked for validity)
-            int clientidPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
-                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
-                    clientidPatchCount++;
-                }
-            }
-            if (clientidPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
             }
         }
         
