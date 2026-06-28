@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.50 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.51 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.50 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.51 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.50 诊断面板";
+            lbl.text = @"WXHook v34.51 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -582,6 +582,64 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             if (binaryPatchCount > 0) {
                 DLOG(@"[PROTO-PATCH] Patched %d binary server status values from 6 to 1", binaryPatchCount);
+            }
+            
+            // Also patch short binary status markers (00 06 -> 00 01) in the tail section
+            int shortBinaryPatchCount = 0;
+            for (size_t i = 350; i + 2 < (size_t)ret; i++) {
+                if (data[i] == 0x00 && data[i+1] == 0x06) {
+                    DLOG(@"[PROTO-PATCH] Found short binary status 06 at offset %zu, changing to 01", i);
+                    data[i+1] = 0x01;
+                    shortBinaryPatchCount++;
+                }
+            }
+            if (shortBinaryPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d short binary status markers from 06 to 01", shortBinaryPatchCount);
+            }
+            
+            // Patch serverType=2 to serverType=1 in JSON
+            int serverTypePatchCount = 0;
+            for (size_t i = 0; i + 10 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
+                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
+                    DLOG(@"[PROTO-PATCH] Found 'serverType=2' at offset %zu, changing to 1", i);
+                    data[i+11] = '1';
+                    serverTypePatchCount++;
+                }
+            }
+            if (serverTypePatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d serverType values from 2 to 1", serverTypePatchCount);
+            }
+            
+            // Patch serverid=0 to serverid=1
+            int serveridPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    serveridPatchCount++;
+                }
+            }
+            if (serveridPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d serverid values from 0 to 1", serveridPatchCount);
+            }
+            
+            // Patch clientid=0 to clientid=1
+            int clientidPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
+                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    clientidPatchCount++;
+                }
+            }
+            if (clientidPatchCount > 0) {
+                DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
             }
         }
         
