@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.52 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.53 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.52 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.53 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.52 诊断面板";
+            lbl.text = @"WXHook v34.53 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -663,21 +663,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                     ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
                 DLOG(@"[PROTO] Status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
                 
-                // Just patch status to 0, do NOT construct fake response
-                // 0x8002A016 is likely version check, not server list
+                // Only patch offset 8-11 (main status) to 0
+                // Keep offset 12-15 as-is (may indicate server count or sub-status)
                 if (status8 != 0) {
                     DLOG(@"[PROTO-PATCH] Status %u -> 0", status8);
                     ((unsigned char *)buf)[8] = 0;
                     ((unsigned char *)buf)[9] = 0;
                     ((unsigned char *)buf)[10] = 0;
                     ((unsigned char *)buf)[11] = 0;
-                }
-                if (status12 != 0) {
-                    DLOG(@"[PROTO-PATCH] Status12 %u -> 0", status12);
-                    ((unsigned char *)buf)[12] = 0;
-                    ((unsigned char *)buf)[13] = 0;
-                    ((unsigned char *)buf)[14] = 0;
-                    ((unsigned char *)buf)[15] = 0;
                 }
             }
         }
