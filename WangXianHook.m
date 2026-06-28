@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.53 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.54 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -34,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.53 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.54 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -170,7 +170,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.53 诊断面板";
+            lbl.text = @"WXHook v34.54 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -640,6 +640,34 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             if (clientidPatchCount > 0) {
                 DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
+            }
+            
+            // Replace old test server IP with auth server IP (workaround for old accounts)
+            // Old IP: 47.100.204.160 -> New IP: 47.100.222.229
+            const char *oldIP = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            size_t oldIPLen = strlen(oldIP);  // 15 bytes
+            size_t newIPLen = strlen(newIP);  // 15 bytes
+            
+            if (oldIPLen == newIPLen) {  // Same length, can do in-place replacement
+                for (size_t i = 0; i + oldIPLen <= (size_t)ret; i++) {
+                    if (memcmp(data + i, oldIP, oldIPLen) == 0) {
+                        DLOG(@"[PROTO-PATCH] Found old server IP at offset %zu, replacing with auth server IP", i);
+                        memcpy(data + i, newIP, newIPLen);
+                        break;  // Only replace first occurrence
+                    }
+                }
+                
+                // Also replace in serverUrl field
+                for (size_t i = 0; i + oldIPLen <= (size_t)ret; i++) {
+                    if (memcmp(data + i, oldIP, oldIPLen) == 0) {
+                        DLOG(@"[PROTO-PATCH] Found old IP in serverUrl at offset %zu, replacing", i);
+                        memcpy(data + i, newIP, newIPLen);
+                        break;
+                    }
+                }
+            } else {
+                DLOG(@"[PROTO-PATCH] IP length mismatch (%zu != %zu), skipping replacement", oldIPLen, newIPLen);
             }
         }
         
