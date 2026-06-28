@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.57 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.58 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.57 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.58 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.57 诊断面板";
+            lbl.text = @"WXHook v34.58 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1551,6 +1551,42 @@ static void entry(void) {
         if (methods) free(methods);
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+    }
+    
+    // === Hook MieshiServerInfo class to trace server list parsing ===
+    Class srvCls = NSClassFromString(@"MieshiServerInfo");
+    if (srvCls) {
+        _log(@"[INIT] Found MieshiServerInfo class, dumping methods...");
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(srvCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            Method method = methods[i];
+            NSString *selName = NSStringFromSelector(method_getName(method));
+            _log(@"[MIESHI] -[%@ %@]", srvCls, selName);
+        }
+        if (methods) free(methods);
+        
+        // Hook initWithDictionary: or similar init methods
+        SEL initSel = NSSelectorFromString(@"initWithDictionary:");
+        if (class_respondsToSelector(srvCls, initSel)) {
+            _log(@"[INIT] MieshiServerInfo responds to initWithDictionary:");
+        }
+    } else {
+        _log(@"[INIT] MieshiServerInfo class NOT found (may use different name)");
+        // Try to find classes containing "Server" or "Info" in name
+        unsigned int classCount = objc_getClassList(NULL, 0);
+        if (classCount > 0) {
+            Class *classes = (Class *)malloc(sizeof(Class) * classCount);
+            objc_getClassList(classes, classCount);
+            for (unsigned int i = 0; i < classCount && i < 500; i++) {
+                NSString *clsName = NSStringFromClass(classes[i]);
+                if (clsName && ([clsName.lowercaseString containsString:@"server"] || 
+                               [clsName.lowercaseString containsString:@"info"])) {
+                    _log(@"[CLASS-DUMP] %@", clsName);
+                }
+            }
+            free(classes);
+        }
     }
     
     // Dump NSUserDefaults
