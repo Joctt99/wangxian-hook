@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.62 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.63 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.62 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.63 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.62 诊断面板";
+            lbl.text = @"WXHook v34.63 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -573,44 +573,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
 
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO] Server list response 0x802EE113 - replacing with fake complete response");
+            DLOG(@"[PROTO] Server list response 0x802EE113 - PATCHING original response");
             
-            // Build a complete fake server list response from scratch
-            // Keep the same length as original (ret bytes)
-            uint8_t *fakeResp = (uint8_t *)malloc(ret);
-            if (!fakeResp) return ret;
-            memset(fakeResp, 0, ret);
+            // Just patch the original - don't replace
+            // Status at offset 8-11 should be 0
+            ((unsigned char *)buf)[8] = 0;
+            ((unsigned char *)buf)[9] = 0;
+            ((unsigned char *)buf)[10] = 0;
+            ((unsigned char *)buf)[11] = 0;
             
-            // Packet length and command - same as original
-            memcpy(fakeResp, p, 8);
-            // Status = 0 (success)
-            fakeResp[8] = 0; fakeResp[9] = 0; fakeResp[10] = 0; fakeResp[11] = 0;
-            // Server count = 1
-            fakeResp[12] = 0; fakeResp[13] = 0; fakeResp[14] = 0; fakeResp[15] = 1;
+            // Server count at offset 12-15 - keep as-is but ensure it's valid
+            // The app expects at least 1 server
             
-            // Build server info JSON string at offset 16
-            snprintf((char *)fakeResp + 16, ret - 16,
-                "/MieshiServerInfo{"
-                "priority=0, "
-                "category='一区', "
-                "name='测试一区C', "
-                "realname='测试一区C', "
-                "ip='47.100.222.229', "
-                "port=12003, "
-                "httpPort=0, "
-                "clientid=1, "
-                "serverid=1, "
-                "description='正常运行中...', "
-                "onlinePlayerNum=0, "
-                "status=1, "
-                "lastNotifyOnlineNumTime=0, "
-                "serverType=1, "
-                "serverUrl='http://47.100.222.229:8003'}");
-            
-            memcpy(buf, fakeResp, ret);
-            free(fakeResp);
-            
-            DLOG(@"[PROTO] Replaced server list with fake response (%zd bytes)", ret);
+            DLOG(@"[PROTO-PATCH] Server list status patched to 0");
         }
         
         if (ret >= 16) {
@@ -826,45 +801,15 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         }
         
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - replacing with fake complete response");
+            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - PATCHING original response");
             
-            // Build a complete fake server list response from scratch
-            // Keep the same length as original (ret bytes)
-            uint8_t *fakeResp = (uint8_t *)malloc(ret);
-            if (!fakeResp) return ret;
-            memset(fakeResp, 0, ret);
+            // Just patch the status at offset 8-11 to 0
+            ((unsigned char *)buf)[8] = 0;
+            ((unsigned char *)buf)[9] = 0;
+            ((unsigned char *)buf)[10] = 0;
+            ((unsigned char *)buf)[11] = 0;
             
-            // Packet length and command - same as original
-            memcpy(fakeResp, p, 8);
-            // Status = 0 (success)
-            fakeResp[8] = 0; fakeResp[9] = 0; fakeResp[10] = 0; fakeResp[11] = 0;
-            // Server count = 1
-            fakeResp[12] = 0; fakeResp[13] = 0; fakeResp[14] = 0; fakeResp[15] = 1;
-            
-            // Build server info JSON string at offset 16
-            snprintf((char *)fakeResp + 16, ret - 16,
-                "/MieshiServerInfo{"
-                "priority=0, "
-                "category='一区', "
-                "name='测试一区C', "
-                "realname='测试一区C', "
-                "ip='47.100.222.229', "
-                "port=12003, "
-                "httpPort=0, "
-                "clientid=1, "
-                "serverid=1, "
-                "description='正常运行中...', "
-                "onlinePlayerNum=0, "
-                "status=1, "
-                "lastNotifyOnlineNumTime=0, "
-                "serverType=1, "
-                "serverUrl='http://47.100.222.229:8003'}");
-            
-            memcpy(buf, fakeResp, ret);
-            free(fakeResp);
-            
-            DLOG(@"[PROTO-RF] Replaced server list with fake response (%zd bytes)", ret);
-            return ret;
+            DLOG(@"[PROTO-RF-PATCH] Server list status patched to 0");
         }
     }
     
