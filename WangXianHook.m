@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.63 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.64 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.63 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.64 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.63 诊断面板";
+            lbl.text = @"WXHook v34.64 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -573,19 +573,91 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
 
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO] Server list response 0x802EE113 - PATCHING original response");
+            DLOG(@"[PROTO] Server list response 0x802EE113 - full JSON patching");
             
-            // Just patch the original - don't replace
-            // Status at offset 8-11 should be 0
+            // 1. Patch protocol status at offset 8-11 to 0
             ((unsigned char *)buf)[8] = 0;
             ((unsigned char *)buf)[9] = 0;
             ((unsigned char *)buf)[10] = 0;
             ((unsigned char *)buf)[11] = 0;
+            DLOG(@"[PROTO-PATCH] Protocol status set to 0");
             
-            // Server count at offset 12-15 - keep as-is but ensure it's valid
-            // The app expects at least 1 server
+            unsigned char *data = (unsigned char *)buf;
             
-            DLOG(@"[PROTO-PATCH] Server list status patched to 0");
+            // 2. Patch JSON status=6 to status=1
+            int statusPatchCount = 0;
+            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
+                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=' && data[i+7] == '6') {
+                    DLOG(@"[PROTO-PATCH] Found 'status=6' at offset %zu, changing to 1", i);
+                    data[i+7] = '1';
+                    statusPatchCount++;
+                }
+            }
+            if (statusPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d JSON status values", statusPatchCount);
+            
+            // 3. Patch serverType=2 to serverType=1
+            int serverTypePatchCount = 0;
+            for (size_t i = 0; i + 11 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
+                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
+                    DLOG(@"[PROTO-PATCH] Found 'serverType=2' at offset %zu, changing to 1", i);
+                    data[i+11] = '1';
+                    serverTypePatchCount++;
+                }
+            }
+            if (serverTypePatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverType values", serverTypePatchCount);
+            
+            // 4. Patch clientid=0 to clientid=1
+            int clientidPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
+                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    clientidPatchCount++;
+                }
+            }
+            if (clientidPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d clientid values", clientidPatchCount);
+            
+            // 5. Patch serverid=0 to serverid=1
+            int serveridPatchCount = 0;
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
+                    data[i+9] = '1';
+                    serveridPatchCount++;
+                }
+            }
+            if (serveridPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverid values", serveridPatchCount);
+            
+            // 6. Replace old test server IP (47.100.204.160) with auth server IP (47.100.222.229)
+            const char *oldIP = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            size_t ipLen = 15;
+            
+            for (size_t i = 0; i + ipLen <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldIP, ipLen) == 0) {
+                    DLOG(@"[PROTO-PATCH] Found old IP at offset %zu, replacing", i);
+                    memcpy(data + i, newIP, ipLen);
+                }
+            }
+            
+            // 7. Patch category='......' to '一区' (6 bytes UTF-8)
+            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
+            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+            for (size_t i = 0; i + 6 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldCat, 6) == 0) {
+                    DLOG(@"[PROTO-PATCH] Found category='......' at %zu, replacing with '一区'", i);
+                    memcpy(data + i, newCat, 6);
+                }
+            }
+            
+            DLOG(@"[PROTO] Server list patching complete");
         }
         
         if (ret >= 16) {
@@ -801,15 +873,75 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         }
         
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - PATCHING original response");
+            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - full JSON patching");
             
-            // Just patch the status at offset 8-11 to 0
+            // 1. Patch protocol status at offset 8-11 to 0
             ((unsigned char *)buf)[8] = 0;
             ((unsigned char *)buf)[9] = 0;
             ((unsigned char *)buf)[10] = 0;
             ((unsigned char *)buf)[11] = 0;
+            DLOG(@"[PROTO-RF-PATCH] Protocol status set to 0");
             
-            DLOG(@"[PROTO-RF-PATCH] Server list status patched to 0");
+            unsigned char *data = (unsigned char *)buf;
+            
+            // 2. Patch JSON status=6 to status=1
+            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
+                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=' && data[i+7] == '6') {
+                    DLOG(@"[PROTO-RF-PATCH] Found 'status=6' at offset %zu, changing to 1", i);
+                    data[i+7] = '1';
+                }
+            }
+            
+            // 3. Patch serverType=2 to serverType=1
+            for (size_t i = 0; i + 11 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
+                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
+                    DLOG(@"[PROTO-RF-PATCH] Found 'serverType=2' at %zu, changing to 1", i);
+                    data[i+11] = '1';
+                }
+            }
+            
+            // 4. Patch clientid=0 to clientid=1
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
+                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-RF-PATCH] Found 'clientid=0' at %zu, changing to 1", i);
+                    data[i+9] = '1';
+                }
+            }
+            
+            // 5. Patch serverid=0 to serverid=1
+            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
+                    data[i+8] == '=' && data[i+9] == '0') {
+                    DLOG(@"[PROTO-RF-PATCH] Found 'serverid=0' at %zu, changing to 1", i);
+                    data[i+9] = '1';
+                }
+            }
+            
+            // 6. Replace old IP
+            const char *oldIP = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            for (size_t i = 0; i + 15 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldIP, 15) == 0) {
+                    memcpy(data + i, newIP, 15);
+                }
+            }
+            
+            // 7. Patch category
+            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
+            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+            for (size_t i = 0; i + 6 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldCat, 6) == 0) {
+                    memcpy(data + i, newCat, 6);
+                }
+            }
+            
+            DLOG(@"[PROTO-RF] Server list patching complete");
         }
     }
     
