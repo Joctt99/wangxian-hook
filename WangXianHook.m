@@ -1559,34 +1559,14 @@ static void entry(void) {
         _log(@"[INIT] Found MieshiServerInfo class, dumping methods...");
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(srvCls, &mcount);
-        for (unsigned int i = 0; i < mcount; i++) {
+        for (unsigned int i = 0; i < mcount && i < 50; i++) {
             Method method = methods[i];
             NSString *selName = NSStringFromSelector(method_getName(method));
             _log(@"[MIESHI] -[%@ %@]", srvCls, selName);
         }
         if (methods) free(methods);
-        
-        // Hook initWithDictionary: or similar init methods
-        SEL initSel = NSSelectorFromString(@"initWithDictionary:");
-        if (class_respondsToSelector(srvCls, initSel)) {
-            _log(@"[INIT] MieshiServerInfo responds to initWithDictionary:");
-        }
     } else {
-        _log(@"[INIT] MieshiServerInfo class NOT found (may use different name)");
-        // Try to find classes containing "Server" or "Info" in name
-        unsigned int classCount = objc_getClassList(NULL, 0);
-        if (classCount > 0) {
-            Class *classes = (Class *)malloc(sizeof(Class) * classCount);
-            objc_getClassList(classes, classCount);
-            for (unsigned int i = 0; i < classCount && i < 500; i++) {
-                NSString *clsName = NSStringFromClass(classes[i]);
-                if (clsName && ([clsName.lowercaseString containsString:@"server"] || 
-                               [clsName.lowercaseString containsString:@"info"])) {
-                    _log(@"[CLASS-DUMP] %@", clsName);
-                }
-            }
-            free(classes);
-        }
+        _log(@"[INIT] MieshiServerInfo class NOT found");
     }
     
     // Dump NSUserDefaults
