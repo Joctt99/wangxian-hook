@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.59 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.60 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.59 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.60 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.59 诊断面板";
+            lbl.text = @"WXHook v34.60 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -312,6 +312,40 @@ static UILabel *g_statusLbl = nil;
     }
 }
 @end
+
+// ============================================================
+#pragma mark - MieshiServerInfo hooks (trace server list parsing)
+// ============================================================
+
+static id hook_msi_generic(id self, SEL _cmd, ...) {
+    NSString *selName = NSStringFromSelector(_cmd);
+    DLOG(@"[MSI-CALL] -[%@ %@]", NSStringFromClass([self class]), selName);
+    
+    @try {
+        unsigned int count = 0;
+        objc_property_t *props = class_copyPropertyList([self class], &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *propName = property_getName(props[i]);
+            id value = [self valueForKey:[NSString stringWithUTF8String:propName]];
+            if (value) {
+                DLOG(@"[MSI-PROP] %s = %@", propName, value);
+            }
+        }
+        if (props) free(props);
+    } @catch (NSException *e) {
+        DLOG(@"[MSI-PROP] Exception: %@", e);
+    }
+    
+    va_list args;
+    va_start(args, _cmd);
+    id ret = ((id (*)(id, SEL, va_list))objc_msgSend)(self, _cmd, args);
+    va_end(args);
+    
+    if (ret) {
+        DLOG(@"[MSI-RET] %@ -> %@", selName, ret);
+    }
+    return ret;
+}
 
 // ============================================================
 #pragma mark - BSD socket hooks (detect game network traffic)
@@ -1583,6 +1617,35 @@ static void entry(void) {
         if (methods) free(methods);
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+    }
+    
+    // === IMMEDIATE: Hook MieshiServerInfo class to trace server list parsing ===
+    Class msiCls = NSClassFromString(@"MieshiServerInfo");
+    if (msiCls) {
+        DLOG(@"[MSI] MieshiServerInfo class FOUND!");
+        
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(msiCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            SEL sel = method_getName(methods[i]);
+            NSString *selName = NSStringFromSelector(sel);
+            DLOG(@"[MSI] -[%@ %@]", NSStringFromClass(msiCls), selName);
+            
+            if ([selName containsString:@"init"] || [selName containsString:@"Status"] || 
+                [selName containsString:@"status"] || [selName containsString:@"server"] ||
+                [selName containsString:@"Server"] || [selName containsString:@"ip"] ||
+                [selName containsString:@"IP"] || [selName containsString:@"category"]) {
+                DLOG(@"[MSI-HOOK] Attempting to hook: %@", selName);
+                IMP origImp = method_getImplementation(methods[i]);
+                if (origImp) {
+                    method_setImplementation(methods[i], (IMP)hook_msi_generic);
+                    DLOG(@"[MSI-HOOK] Hooked: %@", selName);
+                }
+            }
+        }
+        if (methods) free(methods);
+    } else {
+        DLOG(@"[MSI] MieshiServerInfo class NOT found!");
     }
     
     // Dump NSUserDefaults
