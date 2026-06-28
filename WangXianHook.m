@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.56 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.57 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.56 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.57 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.56 诊断面板";
+            lbl.text = @"WXHook v34.57 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -328,10 +328,14 @@ typedef ssize_t (*SendFunc)(int, const void *, size_t, int);
 typedef ssize_t (*RecvFunc)(int, void *, size_t, int);
 typedef ssize_t (*WriteFunc)(int, const void *, size_t);
 typedef ssize_t (*ReadFunc)(int, void *, size_t);
+typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
 
 static ConnectFunc orig_connect = NULL;
 static SendFunc orig_send = NULL;
 static RecvFunc orig_recv = NULL;
+static RecvfromFunc orig_recvfrom = NULL;
+static RecvmsgFunc orig_recvmsg = NULL;
 static WriteFunc orig_write = NULL;
 static ReadFunc orig_read = NULL;
 
@@ -651,9 +655,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             // Replace "服务器维护中" with "正常运行中" in description field (same length: 18 bytes)
             // E6 9C 8D E5 8A A1 E5 99 A8 (服务器) E7 BB B4 E6 8A A4 (维护) E4 B8 AD (中)
-            // Replace "维护" (E7 BB B4 E6 8A A4) with "运行" (E8 BF 90 E8 A1 A1) - same length: 6 bytes
+            // Replace "维护" (E7 BB B4 E6 8A A4) with "运行" (E8 BF 90 E8 A1 8C) - same length: 6 bytes
             const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};  // "维护"
-            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0xA1};    // "运行"
+            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};    // "运行"
             
             for (size_t i = 0; i + sizeof(oldMaint) <= (size_t)ret; i++) {
                 if (memcmp(data + i, oldMaint, sizeof(oldMaint)) == 0) {
@@ -868,6 +872,170 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     return ret;
 }
 
+static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_recvfrom || !buf) return -1;
+    
+    ssize_t ret = orig_recvfrom(fd, buf, len, flags, src_addr, addrlen);
+    if (ret <= 0) return ret;
+    
+    const char *host = getHostForFd(fd);
+    if (!host) return ret;
+    
+    int port = getPortForFd(fd);
+    const unsigned char *p = (const unsigned char *)buf;
+    
+    // Apply same patches as hook_recv
+    if (port == 5678 && ret >= 13) {
+        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        DLOG(@"[RECVFROM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        if (cmd == 0x802EE121) {
+            DLOG(@"[PROTO-RF] Version check response 0x802EE121 - clearing error messages");
+            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+            if (status4 != 0) {
+                DLOG(@"[PROTO-RF-PATCH] Status %u -> 0", status4);
+                memset((unsigned char *)buf + 8, 0, 4);
+            }
+            if (ret > 12) {
+                DLOG(@"[PROTO-RF-PATCH] Clearing message from offset 12");
+                memset((unsigned char *)buf + 12, 0, ret - 12);
+            }
+        }
+        
+        if (cmd == 0x802EE113) {
+            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - applying full patch");
+            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+            if (status4 != 0) {
+                DLOG(@"[PROTO-RF-PATCH] Protocol status %u -> 0", status4);
+                memset((unsigned char *)buf + 8, 0, 4);
+            }
+            unsigned char *data = (unsigned char *)buf;
+            
+            // Patch server count
+            if (ret >= 16 && data[12] == 0x01) {
+                DLOG(@"[PROTO-RF-PATCH] Server count 1 -> 5");
+                data[12] = 0x05;
+            }
+            
+            // Patch status=6 to status=1 in JSON
+            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
+                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
+                    data[i+7] = '1';
+                }
+            }
+            
+            // Patch serverType=2 to 1
+            for (size_t i = 0; i + 11 < (size_t)ret; i++) {
+                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
+                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
+                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
+                    data[i+11] = '1';
+                }
+            }
+            
+            // Patch IP
+            const char *oldIP = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            for (size_t i = 0; i + 15 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldIP, 15) == 0) {
+                    memcpy(data + i, newIP, 15);
+                }
+            }
+            
+            // Replace "维护" with "运行"
+            const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};
+            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
+            for (size_t i = 0; i + sizeof(oldMaint) <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldMaint, sizeof(oldMaint)) == 0) {
+                    memcpy(data + i, newRun, sizeof(newRun));
+                }
+            }
+        }
+    }
+    
+    return ret;
+}
+
+static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
+    if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+    if (!orig_recvmsg || !msg || !msg->msg_iov || msg->msg_iovlen == 0) return -1;
+    
+    ssize_t ret = orig_recvmsg(fd, msg, flags);
+    if (ret <= 0) return ret;
+    
+    const char *host = getHostForFd(fd);
+    if (!host) return ret;
+    
+    int port = getPortForFd(fd);
+    
+    // Apply same patches as hook_recv
+    if (port == 5678 && ret >= 13) {
+        struct iovec *iov = msg->msg_iov;
+        if (iov->iov_base && iov->iov_len >= 13) {
+            const unsigned char *p = (const unsigned char *)iov->iov_base;
+            uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+            uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            DLOG(@"[RECVMSG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            
+            if (cmd == 0x802EE121) {
+                DLOG(@"[PROTO-RM] Version check response 0x802EE121 - clearing error messages");
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-RM-PATCH] Status %u -> 0", status4);
+                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
+                }
+                if (iov->iov_len > 12) {
+                    DLOG(@"[PROTO-RM-PATCH] Clearing message from offset 12");
+                    memset((unsigned char *)iov->iov_base + 12, 0, iov->iov_len - 12);
+                }
+            }
+            
+            if (cmd == 0x802EE113) {
+                DLOG(@"[PROTO-RM] Server list response 0x802EE113 - applying full patch");
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-RM-PATCH] Protocol status %u -> 0", status4);
+                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
+                }
+                unsigned char *data = (unsigned char *)iov->iov_base;
+                
+                if (iov->iov_len >= 16 && data[12] == 0x01) {
+                    DLOG(@"[PROTO-RM-PATCH] Server count 1 -> 5");
+                    data[12] = 0x05;
+                }
+                
+                for (size_t i = 0; i + 7 < iov->iov_len; i++) {
+                    if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
+                        data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
+                        data[i+7] = '1';
+                    }
+                }
+                
+                const char *oldIP = "47.100.204.160";
+                const char *newIP = "47.100.222.229";
+                for (size_t i = 0; i + 15 <= iov->iov_len; i++) {
+                    if (memcmp(data + i, oldIP, 15) == 0) {
+                        memcpy(data + i, newIP, 15);
+                    }
+                }
+            }
+        }
+    }
+    
+    return ret;
+}
+
 // === Universal fishhook: patch symbol in ALL loaded images ===
 static int rebindSymbol(const char *symbolName, void *replacement, void **original) {
     int totalPatched = 0;
@@ -948,11 +1116,13 @@ static void installSocketHooks(void) {
     int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
     int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
     int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
+    int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
+    int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
     int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
     int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
     
-    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d write=%d read=%d", c, s, r, w, rd);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d", c, s, r, rf, rm, w, rd);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
 }
 
 // ============================================================
