@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.64 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.65 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.64 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.65 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.64 诊断面板";
+            lbl.text = @"WXHook v34.65 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -635,10 +635,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             if (serveridPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverid values", serveridPatchCount);
             
-            // 6. Replace old test server IP (47.100.204.160) with auth server IP (47.100.222.229)
-            const char *oldIP = "47.100.204.160";
-            const char *newIP = "47.100.222.229";
-            size_t ipLen = 15;
+            // 6. Replace old test server IP with auth server IP (include surrounding quotes)
+            // Old IP in data: '47.100.204.160' (16 bytes with quotes)
+            // New IP: '47.100.222.229' (16 bytes with quotes)
+            const char *oldIP = "'47.100.204.160'";  // 16 bytes with quotes
+            const char *newIP = "'47.100.222.229'";  // 16 bytes with quotes
+            size_t ipLen = 16;
             
             for (size_t i = 0; i + ipLen <= (size_t)ret; i++) {
                 if (memcmp(data + i, oldIP, ipLen) == 0) {
@@ -923,12 +925,13 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                 }
             }
             
-            // 6. Replace old IP
-            const char *oldIP = "47.100.204.160";
-            const char *newIP = "47.100.222.229";
-            for (size_t i = 0; i + 15 <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldIP, 15) == 0) {
-                    memcpy(data + i, newIP, 15);
+            // 6. Replace old IP (with quotes)
+            const char *oldIP = "'47.100.204.160'";  // 16 bytes
+            const char *newIP = "'47.100.222.229'";  // 16 bytes
+            for (size_t i = 0; i + 16 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldIP, 16) == 0) {
+                    DLOG(@"[PROTO-RF-PATCH] Found old IP at %zu, replacing", i);
+                    memcpy(data + i, newIP, 16);
                 }
             }
             
