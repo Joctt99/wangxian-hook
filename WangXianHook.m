@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.61 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.62 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.61 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.62 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.61 诊断面板";
+            lbl.text = @"WXHook v34.62 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -573,174 +573,44 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
 
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO] Server list response 0x802EE113 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO] Server list status at offset 8-11: %u (0x%08X)", status4, status4);
+            DLOG(@"[PROTO] Server list response 0x802EE113 - replacing with fake complete response");
             
-            // Patch protocol status to 0 so app will parse the server list
-            if (status4 != 0) {
-                DLOG(@"[PROTO-PATCH] Protocol status %u -> 0", status4);
-                ((unsigned char *)buf)[8] = 0;
-                ((unsigned char *)buf)[9] = 0;
-                ((unsigned char *)buf)[10] = 0;
-                ((unsigned char *)buf)[11] = 0;
-            }
+            // Build a complete fake server list response from scratch
+            // Keep the same length as original (ret bytes)
+            uint8_t *fakeResp = (uint8_t *)malloc(ret);
+            if (!fakeResp) return ret;
+            memset(fakeResp, 0, ret);
             
-            unsigned char *data = (unsigned char *)buf;
+            // Packet length and command - same as original
+            memcpy(fakeResp, p, 8);
+            // Status = 0 (success)
+            fakeResp[8] = 0; fakeResp[9] = 0; fakeResp[10] = 0; fakeResp[11] = 0;
+            // Server count = 1
+            fakeResp[12] = 0; fakeResp[13] = 0; fakeResp[14] = 0; fakeResp[15] = 1;
             
-            // Patch server count at offset 12 (if it's 01, change to 05)
-            if (ret >= 16 && data[12] == 0x01) {
-                DLOG(@"[PROTO-PATCH] Server count at offset 12: 1 -> 5 (force multiple servers)");
-                data[12] = 0x05;  // Pretend we have 5 servers
-            }
+            // Build server info JSON string at offset 16
+            snprintf((char *)fakeResp + 16, ret - 16,
+                "/MieshiServerInfo{"
+                "priority=0, "
+                "category='一区', "
+                "name='测试一区C', "
+                "realname='测试一区C', "
+                "ip='47.100.222.229', "
+                "port=12003, "
+                "httpPort=0, "
+                "clientid=1, "
+                "serverid=1, "
+                "description='正常运行中...', "
+                "onlinePlayerNum=0, "
+                "status=1, "
+                "lastNotifyOnlineNumTime=0, "
+                "serverType=1, "
+                "serverUrl='http://47.100.222.229:8003'}");
             
-            // Patch server status in JSON format (status=6 -> status=1)
-            int jsonPatchCount = 0;
-            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
-                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
-                    // Change status from 6 to 1, or any other value to 1
-                    DLOG(@"[PROTO-PATCH] Found 'status=' at offset %zu, setting to 1", i);
-                    data[i+7] = '1';
-                    jsonPatchCount++;
-                }
-            }
-            if (jsonPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d JSON status values to 1", jsonPatchCount);
-            }
+            memcpy(buf, fakeResp, ret);
+            free(fakeResp);
             
-            // Patch server status in binary format (00 00 00 06 -> 00 00 00 01)
-            int binaryPatchCount = 0;
-            for (size_t i = 16; i + 4 < (size_t)ret; i++) {
-                if (data[i] == 0x00 && data[i+1] == 0x00 && 
-                    data[i+2] == 0x00 && data[i+3] == 0x06) {
-                    // Check if followed by valid server data
-                    size_t ipStart = i + 8;
-                    if (ipStart + 4 < (size_t)ret && 
-                        (data[ipStart] == 0x34 || data[ipStart] == 0x31 || data[ipStart] == 0x30)) {
-                        DLOG(@"[PROTO-PATCH] Found binary status=6 at offset %zu, changing to 1", i);
-                        data[i+3] = 0x01;
-                        binaryPatchCount++;
-                    }
-                }
-            }
-            if (binaryPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d binary server status values from 6 to 1", binaryPatchCount);
-            }
-            
-            // Also patch short binary status markers (00 06 -> 00 01) in the tail section
-            int shortBinaryPatchCount = 0;
-            for (size_t i = 350; i + 2 < (size_t)ret; i++) {
-                if (data[i] == 0x00 && data[i+1] == 0x06) {
-                    DLOG(@"[PROTO-PATCH] Found short binary status 06 at offset %zu, changing to 01", i);
-                    data[i+1] = 0x01;
-                    shortBinaryPatchCount++;
-                }
-            }
-            if (shortBinaryPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d short binary status markers from 06 to 01", shortBinaryPatchCount);
-            }
-            
-            // Patch serverType=2 to serverType=1 in JSON
-            int serverTypePatchCount = 0;
-            for (size_t i = 0; i + 10 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
-                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverType=2' at offset %zu, changing to 1", i);
-                    data[i+11] = '1';
-                    serverTypePatchCount++;
-                }
-            }
-            if (serverTypePatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d serverType values from 2 to 1", serverTypePatchCount);
-            }
-            
-            // Patch serverid=0 to serverid=1
-            int serveridPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
-                    serveridPatchCount++;
-                }
-            }
-            if (serveridPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d serverid values from 0 to 1", serveridPatchCount);
-            }
-            
-            // Patch category='......' to category='默认' (same length: 6 bytes)
-            // '......' = 0x2E 0x2E 0x2E 0x2E 0x2E 0x2E
-            // '默认' = E7 94 B0 E9 BB 98 (UTF-8)
-            // Try replacing with '一区' = E4 B8 80 E5 8C BA (6 bytes) - "One District"
-            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};  // '......'
-            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};  // '一区'
-            
-            for (size_t i = 0; i + sizeof(oldCat) <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
-                    DLOG(@"[PROTO-PATCH] Found category='......' at offset %zu, replacing with '一区'", i);
-                    memcpy(data + i, newCat, sizeof(newCat));
-                }
-            }
-            
-            // Patch clientid=0 to clientid=1
-            int clientidPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
-                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
-                    clientidPatchCount++;
-                }
-            }
-            if (clientidPatchCount > 0) {
-                DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
-            }
-            
-            // Replace "服务器维护中" with "正常运行中" in description field (same length: 18 bytes)
-            // E6 9C 8D E5 8A A1 E5 99 A8 (服务器) E7 BB B4 E6 8A A4 (维护) E4 B8 AD (中)
-            // Replace "维护" (E7 BB B4 E6 8A A4) with "运行" (E8 BF 90 E8 A1 8C) - same length: 6 bytes
-            const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};  // "维护"
-            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};    // "运行"
-            
-            for (size_t i = 0; i + sizeof(oldMaint) <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldMaint, sizeof(oldMaint)) == 0) {
-                    DLOG(@"[PROTO-PATCH] Found '维护' at offset %zu, replacing with '运行'", i);
-                    memcpy(data + i, newRun, sizeof(newRun));
-                }
-            }
-            
-            // Replace old test server IP with auth server IP (workaround for old accounts)
-            // Old IP: 47.100.204.160 -> New IP: 47.100.222.229
-            const char *oldIP = "47.100.204.160";
-            const char *newIP = "47.100.222.229";
-            size_t oldIPLen = strlen(oldIP);  // 15 bytes
-            size_t newIPLen = strlen(newIP);  // 15 bytes
-            
-            if (oldIPLen == newIPLen) {  // Same length, can do in-place replacement
-                for (size_t i = 0; i + oldIPLen <= (size_t)ret; i++) {
-                    if (memcmp(data + i, oldIP, oldIPLen) == 0) {
-                        DLOG(@"[PROTO-PATCH] Found old server IP at offset %zu, replacing with auth server IP", i);
-                        memcpy(data + i, newIP, newIPLen);
-                        break;  // Only replace first occurrence
-                    }
-                }
-                
-                // Also replace in serverUrl field
-                for (size_t i = 0; i + oldIPLen <= (size_t)ret; i++) {
-                    if (memcmp(data + i, oldIP, oldIPLen) == 0) {
-                        DLOG(@"[PROTO-PATCH] Found old IP in serverUrl at offset %zu, replacing", i);
-                        memcpy(data + i, newIP, newIPLen);
-                        break;
-                    }
-                }
-            } else {
-                DLOG(@"[PROTO-PATCH] IP length mismatch (%zu != %zu), skipping replacement", oldIPLen, newIPLen);
-            }
+            DLOG(@"[PROTO] Replaced server list with fake response (%zd bytes)", ret);
         }
         
         if (ret >= 16) {
