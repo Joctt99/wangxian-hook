@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.60 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.61 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.60 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.61 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.60 诊断面板";
+            lbl.text = @"WXHook v34.61 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -956,64 +956,45 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         }
         
         if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - applying full patch");
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            if (status4 != 0) {
-                DLOG(@"[PROTO-RF-PATCH] Protocol status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 4);
-            }
-            unsigned char *data = (unsigned char *)buf;
+            DLOG(@"[PROTO-RF] Server list response 0x802EE113 - replacing with fake complete response");
             
-            // Patch server count
-            if (ret >= 16 && data[12] == 0x01) {
-                DLOG(@"[PROTO-RF-PATCH] Server count 1 -> 5");
-                data[12] = 0x05;
-            }
+            // Build a complete fake server list response from scratch
+            // Keep the same length as original (ret bytes)
+            uint8_t *fakeResp = (uint8_t *)malloc(ret);
+            if (!fakeResp) return ret;
+            memset(fakeResp, 0, ret);
             
-            // Patch status=6 to status=1 in JSON
-            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
-                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=') {
-                    data[i+7] = '1';
-                }
-            }
+            // Packet length and command - same as original
+            memcpy(fakeResp, p, 8);
+            // Status = 0 (success)
+            fakeResp[8] = 0; fakeResp[9] = 0; fakeResp[10] = 0; fakeResp[11] = 0;
+            // Server count = 1
+            fakeResp[12] = 0; fakeResp[13] = 0; fakeResp[14] = 0; fakeResp[15] = 1;
             
-            // Patch serverType=2 to 1
-            for (size_t i = 0; i + 11 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
-                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
-                    data[i+11] = '1';
-                }
-            }
+            // Build server info JSON string at offset 16
+            snprintf((char *)fakeResp + 16, ret - 16,
+                "/MieshiServerInfo{"
+                "priority=0, "
+                "category='一区', "
+                "name='测试一区C', "
+                "realname='测试一区C', "
+                "ip='47.100.222.229', "
+                "port=12003, "
+                "httpPort=0, "
+                "clientid=1, "
+                "serverid=1, "
+                "description='正常运行中...', "
+                "onlinePlayerNum=0, "
+                "status=1, "
+                "lastNotifyOnlineNumTime=0, "
+                "serverType=1, "
+                "serverUrl='http://47.100.222.229:8003'}");
             
-            // Patch IP
-            const char *oldIP = "47.100.204.160";
-            const char *newIP = "47.100.222.229";
-            for (size_t i = 0; i + 15 <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldIP, 15) == 0) {
-                    memcpy(data + i, newIP, 15);
-                }
-            }
+            memcpy(buf, fakeResp, ret);
+            free(fakeResp);
             
-            // Patch category='......' to '一区'
-            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
-            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
-            for (size_t i = 0; i + sizeof(oldCat) <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
-                    memcpy(data + i, newCat, sizeof(newCat));
-                }
-            }
-            
-            // Replace "维护" with "运行"
-            const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};
-            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
-            for (size_t i = 0; i + sizeof(oldMaint) <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldMaint, sizeof(oldMaint)) == 0) {
-                    memcpy(data + i, newRun, sizeof(newRun));
-                }
-            }
+            DLOG(@"[PROTO-RF] Replaced server list with fake response (%zd bytes)", ret);
+            return ret;
         }
     }
     
