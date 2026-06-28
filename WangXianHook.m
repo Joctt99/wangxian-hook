@@ -1553,22 +1553,6 @@ static void entry(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
     
-    // === Hook MieshiServerInfo class to trace server list parsing ===
-    Class srvCls = NSClassFromString(@"MieshiServerInfo");
-    if (srvCls) {
-        _log(@"[INIT] Found MieshiServerInfo class, dumping methods...");
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(srvCls, &mcount);
-        for (unsigned int i = 0; i < mcount && i < 50; i++) {
-            Method method = methods[i];
-            NSString *selName = NSStringFromSelector(method_getName(method));
-            _log(@"[MIESHI] -[%@ %@]", srvCls, selName);
-        }
-        if (methods) free(methods);
-    } else {
-        _log(@"[INIT] MieshiServerInfo class NOT found");
-    }
-    
     // Dump NSUserDefaults
     @try {
         NSDictionary *allDefaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
