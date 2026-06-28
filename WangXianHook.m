@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.55 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.56 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.55 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.56 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.55 诊断面板";
+            lbl.text = @"WXHook v34.56 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -647,6 +647,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             if (clientidPatchCount > 0) {
                 DLOG(@"[PROTO-PATCH] Patched %d clientid values from 0 to 1", clientidPatchCount);
+            }
+            
+            // Replace "服务器维护中" with "正常运行中" in description field (same length: 18 bytes)
+            // E6 9C 8D E5 8A A1 E5 99 A8 (服务器) E7 BB B4 E6 8A A4 (维护) E4 B8 AD (中)
+            // Replace "维护" (E7 BB B4 E6 8A A4) with "运行" (E8 BF 90 E8 A1 A1) - same length: 6 bytes
+            const unsigned char oldMaint[] = {0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4};  // "维护"
+            const unsigned char newRun[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0xA1};    // "运行"
+            
+            for (size_t i = 0; i + sizeof(oldMaint) <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldMaint, sizeof(oldMaint)) == 0) {
+                    DLOG(@"[PROTO-PATCH] Found '维护' at offset %zu, replacing with '运行'", i);
+                    memcpy(data + i, newRun, sizeof(newRun));
+                }
             }
             
             // Replace old test server IP with auth server IP (workaround for old accounts)
