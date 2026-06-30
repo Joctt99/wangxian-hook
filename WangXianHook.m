@@ -362,17 +362,6 @@ static NSArray *hook_arrayWithObjects(Class self, SEL _cmd, const id *objects, u
     return ret;
 }
 
-static NSUInteger (*orig_arrayCount)(id, SEL);
-static NSUInteger hook_arrayCount(id self, SEL _cmd) {
-    NSUInteger ret = orig_arrayCount(self, _cmd);
-    NSString *classStr = NSStringFromClass([self class]);
-    if ([classStr containsString:@"Server"] || [classStr containsString:@"server"] || 
-        [classStr containsString:@"List"] || [classStr containsString:@"list"]) {
-        DLOG(@"[DIAG-ARRAY] -[%@ count] -> %lu", classStr, (unsigned long)ret);
-    }
-    return ret;
-}
-
 static NSUInteger (*orig_tableViewNumberOfRows)(id, SEL, UITableView *, NSInteger);
 static NSUInteger hook_tableViewNumberOfRows(id self, SEL _cmd, UITableView *tableView, NSInteger section) {
     NSUInteger ret = orig_tableViewNumberOfRows(self, _cmd, tableView, section);
