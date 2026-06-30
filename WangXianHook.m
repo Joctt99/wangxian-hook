@@ -1917,14 +1917,14 @@ static void entry(void) {
             }
             
             if (hookImp) {
-                Method hookMethod = class_getInstanceMethod([self class], sel);
-                if (!hookMethod) {
-                    class_addMethod(msiCls, sel, hookImp, method_getTypeEncoding(origMethod));
-                    hookMethod = class_getInstanceMethod(msiCls, sel);
-                }
-                if (hookMethod) {
-                    method_exchangeImplementations(origMethod, hookMethod);
-                    DLOG(@"[MSI-HOOK] Hooked: %@", selName);
+                Method existingMethod = class_getInstanceMethod(msiCls, sel);
+                if (existingMethod) {
+                    class_addMethod(msiCls, sel, hookImp, method_getTypeEncoding(existingMethod));
+                    Method newMethod = class_getInstanceMethod(msiCls, sel);
+                    if (newMethod) {
+                        method_exchangeImplementations(existingMethod, newMethod);
+                        DLOG(@"[MSI-HOOK] Hooked: %@", selName);
+                    }
                 }
             }
         }
