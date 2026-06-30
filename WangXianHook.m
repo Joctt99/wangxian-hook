@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.65 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.66 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.65 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.66 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.65 诊断面板";
+            lbl.text = @"WXHook v34.66 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1362,6 +1362,81 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 #pragma mark - Observation-only hooks (log, don't modify)
 // ============================================================
 
+// UITableView data source hooks - trace server list display
+static NSInteger (*orig_numberOfRows)(id, SEL, NSInteger) = NULL;
+static NSInteger hook_numberOfRows(id self, SEL _cmd, NSInteger section) {
+    NSInteger ret = orig_numberOfRows ? orig_numberOfRows(self, _cmd, section) : 0;
+    NSString *cls = NSStringFromClass([self class]);
+    if ([cls containsString:@"Server"] || [cls containsString:@"server"] || 
+        [cls containsString:@"List"] || [cls containsString:@"list"] ||
+        [cls containsString:@"Table"] || [cls containsString:@"table"]) {
+        DLOG(@"[TABLE] numberOfRowsInSection:%ld -> %ld class=%@", (long)section, (long)ret, cls);
+    }
+    return ret;
+}
+
+static NSInteger (*orig_numberOfSections)(id, SEL) = NULL;
+static NSInteger hook_numberOfSections(id self, SEL _cmd) {
+    NSInteger ret = orig_numberOfSections ? orig_numberOfSections(self, _cmd) : 0;
+    NSString *cls = NSStringFromClass([self class]);
+    if ([cls containsString:@"Server"] || [cls containsString:@"server"] || 
+        [cls containsString:@"List"] || [cls containsString:@"list"]) {
+        DLOG(@"[TABLE] numberOfSections -> %ld class=%@", (long)ret, cls);
+    }
+    return ret;
+}
+
+// NSArray count - trace server list array size
+static NSUInteger (*orig_arrayCount)(id, SEL) = NULL;
+static NSUInteger hook_arrayCount(id self, SEL _cmd) {
+    NSUInteger ret = orig_arrayCount ? orig_arrayCount(self, _cmd) : 0;
+    NSString *cls = NSStringFromClass([self class]);
+    // Only log arrays that might be server list
+    if (ret > 0) {
+        // Check if this array contains server-like objects
+        @try {
+            id firstObj = [self objectAtIndex:0];
+            if (firstObj) {
+                NSString *objCls = NSStringFromClass([firstObj class]);
+                if ([objCls containsString:@"Server"] || [objCls containsString:@"server"] ||
+                    [objCls containsString:@"Info"] || [objCls containsString:@"info"]) {
+                    DLOG(@"[ARRAY] count=%lu class=%@ elements=%@", (unsigned long)ret, cls, objCls);
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return ret;
+}
+
+// NSDictionary objectForKey: - trace server list parsing
+static id (*orig_dictObjectForKey)(id, SEL, id) = NULL;
+static id hook_dictObjectForKey(id self, SEL _cmd, id key) {
+    id ret = orig_dictObjectForKey ? orig_dictObjectForKey(self, _cmd, key) : nil;
+    NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
+    // Log server-related keys
+    if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
+        [keyStr containsString:@"status"] || [keyStr containsString:@"Status"] ||
+        [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
+        NSString *retCls = ret ? NSStringFromClass([ret class]) : @"nil";
+        DLOG(@"[DICT] objectForKey:'%@' -> %@ (%@)", keyStr, ret ?: @"nil", retCls);
+    }
+    return ret;
+}
+
+// NSArray arrayForKey: - for JSON parsing
+static id (*orig_arrayForKey)(id, SEL, id) = NULL;
+static id hook_arrayForKey(id self, SEL _cmd, id key) {
+    id ret = orig_arrayForKey ? orig_arrayForKey(self, _cmd, key) : nil;
+    NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
+    if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
+        [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
+        NSUInteger cnt = 0;
+        if ([ret isKindOfClass:[NSArray class]]) cnt = [ret count];
+        DLOG(@"[DICT] arrayForKey:'%@' -> count=%lu", keyStr, (unsigned long)cnt);
+    }
+    return ret;
+}
+
 // NSURLSession.dataTaskWithRequest:completionHandler: - observe only
 typedef NSURLSessionDataTask *(*DTReqCompIMP)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
 static DTReqCompIMP orig_dtwrc = NULL;
@@ -1485,6 +1560,31 @@ static void entry(void) {
     if (vcCls) {
         Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
         if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe"); }
+    }
+    
+    // === DIAGNOSTIC: UITableView data source hooks ===
+    Class tvCls = [UITableView class];
+    if (tvCls) {
+        Method m = class_getInstanceMethod(tvCls, @selector(numberOfRowsInSection:));
+        if (m) { orig_numberOfRows = (NSInteger (*)(id, SEL, NSInteger))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfRows); _log(@"[INIT] UITableView.numberOfRowsInSection: observe"); }
+        m = class_getInstanceMethod(tvCls, @selector(numberOfSections));
+        if (m) { orig_numberOfSections = (NSInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfSections); _log(@"[INIT] UITableView.numberOfSections: observe"); }
+    }
+    
+    // === DIAGNOSTIC: NSArray count hook ===
+    Class arrCls = [NSArray class];
+    if (arrCls) {
+        Method m = class_getInstanceMethod(arrCls, @selector(count));
+        if (m) { orig_arrayCount = (NSUInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_arrayCount); _log(@"[INIT] NSArray.count: observe"); }
+    }
+    
+    // === DIAGNOSTIC: NSDictionary hooks ===
+    Class dictCls = [NSDictionary class];
+    if (dictCls) {
+        Method m = class_getInstanceMethod(dictCls, @selector(objectForKey:));
+        if (m) { orig_dictObjectForKey = (id (*)(id, SEL, id))method_getImplementation(m); method_setImplementation(m, (IMP)hook_dictObjectForKey); _log(@"[INIT] NSDictionary.objectForKey: observe"); }
+        m = class_getInstanceMethod(dictCls, @selector(arrayForKey:));
+        if (m) { orig_arrayForKey = (id (*)(id, SEL, id))method_getImplementation(m); method_setImplementation(m, (IMP)hook_arrayForKey); _log(@"[INIT] NSDictionary.arrayForKey: observe"); }
     }
     
     // === IMMEDIATE: Hook SignatureKit (must run before original +load) ===
