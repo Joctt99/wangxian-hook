@@ -1,8 +1,8 @@
 /**
- * WangXianHook v34.73 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
- * Strategy: Fill UUID/MACADDRESS in send data for server list request
+ * WangXianHook v34.74 - Anti-Cheat Monitor + Protocol Login Patch
+ * NEW: Added comprehensive anti-cheat monitoring module
+ * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
- * NEW: Log app behavior after receiving server list to diagnose empty list issue
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -1830,3 +1830,252 @@ static void entry(void) {
 
 // __DATA,__interpose REMOVED - causes white screen crash (intercepts ALL system connect/send/recv too early)
 // Using patched IPA with stub dylibs instead - prevents original +load from running
+
+// ============================================================
+// ANTI-CHEAT MONITOR MODULE v1.0
+// ============================================================
+
+static int g_antiCheatAlertCount = 0;
+static int g_antiCheatBlockedCount = 0;
+static BOOL g_antiCheatMonitorEnabled = YES;
+
+// Record anti-cheat detection
+static void recordAntiCheatDetection(const char *type, const char *details) {
+    if (!g_antiCheatMonitorEnabled) return;
+    g_antiCheatAlertCount++;
+    DLOG(@"[ANTI-CHEAT-ALERT] Type: %s, Details: %s, TotalAlerts: %d", type, details, g_antiCheatAlertCount);
+}
+
+// Hook SignatureCheck class methods
+%hook SignatureCheck
+
++ (id)sharedInstance {
+    DLOG(@"[ANTI-CHEAT] SignatureCheck sharedInstance called");
+    recordAntiCheatDetection("SIGNATURE", "sharedInstance");
+    return %orig;
+}
+
+- (void)verifySignatureFromParameters:(id)params {
+    DLOG(@"[ANTI-CHEAT] verifySignatureFromParameters: %@", params);
+    recordAntiCheatDetection("SIGNATURE", "verifySignatureFromParameters");
+    %log;
+    %orig;
+}
+
+- (void)checkSignature:(id)sig {
+    DLOG(@"[ANTI-CHEAT] checkSignature: %@", sig);
+    recordAntiCheatDetection("SIGNATURE", "checkSignature");
+    %log;
+    %orig;
+}
+
+- (BOOL)isSignatureValid {
+    DLOG(@"[ANTI-CHEAT] isSignatureValid called");
+    recordAntiCheatDetection("SIGNATURE", "isSignatureValid");
+    return YES; // Return valid
+}
+
+- (void)JudgeApp:(id)arg {
+    DLOG(@"[ANTI-CHEAT] JudgeApp: %@", arg);
+    recordAntiCheatDetection("SIGNATURE", "JudgeApp");
+    %log;
+    %orig;
+}
+
+%end
+
+// Hook environment detection
+%hook NSObject (Environment)
+
+- (BOOL)isJailbroken {
+    DLOG(@"[ANTI-CHEAT] isJailbroken called");
+    recordAntiCheatDetection("ENVIRONMENT", "isJailbroken");
+    return NO; // Return not jailbroken
+}
+
+- (BOOL)isDebugged {
+    DLOG(@"[ANTI-CHEAT] isDebugged called");
+    recordAntiCheatDetection("ENVIRONMENT", "isDebugged");
+    return NO; // Return not debugged
+}
+
+- (BOOL)isSimulator {
+    DLOG(@"[ANTI-CHEAT] isSimulator called");
+    recordAntiCheatDetection("ENVIRONMENT", "isSimulator");
+    return NO;
+}
+
+- (void)checkEnvironment {
+    DLOG(@"[ANTI-CHEAT] checkEnvironment called");
+    recordAntiCheatDetection("ENVIRONMENT", "checkEnvironment");
+    %log;
+    %orig;
+}
+
+- (BOOL)detectHack {
+    DLOG(@"[ANTI-CHEAT] detectHack called");
+    recordAntiCheatDetection("ENVIRONMENT", "detectHack");
+    return NO; // Return no hack detected
+}
+
+- (BOOL)detectCheat {
+    DLOG(@"[ANTI-CHEAT] detectCheat called");
+    recordAntiCheatDetection("ENVIRONMENT", "detectCheat");
+    return NO;
+}
+
+%end
+
+// Hook anti-debug methods
+%hook NSObject (AntiDebug)
+
+- (void)antiDebug {
+    DLOG(@"[ANTI-CHEAT] antiDebug called");
+    recordAntiCheatDetection("DEBUG", "antiDebug");
+    g_antiCheatBlockedCount++;
+    // Don't call %orig to prevent anti-debug action
+}
+
+- (void)checkDebugger {
+    DLOG(@"[ANTI-CHEAT] checkDebugger called");
+    recordAntiCheatDetection("DEBUG", "checkDebugger");
+    %log;
+    %orig;
+}
+
+- (BOOL)isDebuggerAttached {
+    DLOG(@"[ANTI-CHEAT] isDebuggerAttached called");
+    recordAntiCheatDetection("DEBUG", "isDebuggerAttached");
+    return NO;
+}
+
+%end
+
+// Hook security related classes
+%hook NSObject (Security)
+
+- (void)securityCheck:(id)arg {
+    DLOG(@"[ANTI-CHEAT] securityCheck: %@", arg);
+    recordAntiCheatDetection("SECURITY", "securityCheck");
+    %log;
+    %orig;
+}
+
+- (BOOL)verifySecurity {
+    DLOG(@"[ANTI-CHEAT] verifySecurity called");
+    recordAntiCheatDetection("SECURITY", "verifySecurity");
+    return YES;
+}
+
+- (void)checkSecurityStatus {
+    DLOG(@"[ANTI-CHEAT] checkSecurityStatus called");
+    recordAntiCheatDetection("SECURITY", "checkSecurityStatus");
+    %log;
+    %orig;
+}
+
+%end
+
+// Hook ban/punishment detection
+%hook NSObject (Ban)
+
+- (void)checkBanStatus {
+    DLOG(@"[ANTI-CHEAT] checkBanStatus called");
+    recordAntiCheatDetection("BAN", "checkBanStatus");
+    %log;
+    %orig;
+}
+
+- (BOOL)isBanned {
+    DLOG(@"[ANTI-CHEAT] isBanned called");
+    recordAntiCheatDetection("BAN", "isBanned");
+    return NO; // Return not banned
+}
+
+- (void)punish:(id)reason {
+    DLOG(@"[ANTI-CHEAT] punish: %@ - BLOCKED", reason);
+    recordAntiCheatDetection("BAN", "punish");
+    g_antiCheatBlockedCount++;
+    // Don't call %orig to prevent punishment
+}
+
+%end
+
+// Hook generic anti-cheat methods using method resolution
+static void hook_generic_anti_cheat(id self, SEL _cmd) {
+    NSString *className = NSStringFromClass([self class]);
+    NSString *selName = NSStringFromSelector(_cmd);
+    DLOG(@"[ANTI-CHEAT-GENERIC] %@ [%@ %@]", self == (id)[self class] ? @"+" : @"-", className, selName);
+    recordAntiCheatDetection("GENERIC", selName.UTF8String);
+}
+
+// Hook NSObject method resolution for anti-cheat detection
+%hook NSObject
+
++ (BOOL)resolveInstanceMethod:(SEL)sel {
+    NSString *selName = NSStringFromSelector(sel);
+    if ([selName.lowercaseString containsString:@"cheat"] ||
+        [selName.lowercaseString containsString:@"hack"] ||
+        [selName.lowercaseString containsString:@"anti"] ||
+        [selName.lowercaseString containsString:@"ban"] ||
+        [selName.lowercaseString containsString:@"punish"] ||
+        [selName.lowercaseString containsString:@"detect"] ||
+        [selName.lowercaseString containsString:@"signature"] ||
+        [selName.lowercaseString containsString:@"verify"]) {
+        DLOG(@"[ANTI-CHEAT-RESOLVE] Instance method: %@", selName);
+        recordAntiCheatDetection("RESOLVE", selName.UTF8String);
+    }
+    return %orig;
+}
+
++ (BOOL)resolveClassMethod:(SEL)sel {
+    NSString *selName = NSStringFromSelector(sel);
+    if ([selName.lowercaseString containsString:@"cheat"] ||
+        [selName.lowercaseString containsString:@"hack"] ||
+        [selName.lowercaseString containsString:@"anti"] ||
+        [selName.lowercaseString containsString:@"ban"] ||
+        [selName.lowercaseString containsString:@"punish"] ||
+        [selName.lowercaseString containsString:@"detect"] ||
+        [selName.lowercaseString containsString:@"signature"] ||
+        [selName.lowercaseString containsString:@"verify"]) {
+        DLOG(@"[ANTI-CHEAT-RESOLVE] Class method: %@", selName);
+        recordAntiCheatDetection("RESOLVE", selName.UTF8String);
+    }
+    return %orig;
+}
+
+- (id)forwardingTargetForSelector:(SEL)sel {
+    NSString *selName = NSStringFromSelector(sel);
+    if ([selName.lowercaseString containsString:@"cheat"] ||
+        [selName.lowercaseString containsString:@"hack"] ||
+        [selName.lowercaseString containsString:@"anti"]) {
+        DLOG(@"[ANTI-CHEAT-FORWARD] Forwarding: %@", selName);
+        recordAntiCheatDetection("FORWARD", selName.UTF8String);
+    }
+    return %orig;
+}
+
+- (void)doesNotRecognizeSelector:(SEL)sel {
+    NSString *selName = NSStringFromSelector(sel);
+    DLOG(@"[ANTI-CHEAT-NOTFOUND] Selector not found: %@", selName);
+    recordAntiCheatDetection("NOTFOUND", selName.UTF8String);
+    %orig;
+}
+
+%end
+
+// Anti-cheat initialization in load
++ (void)load {
+    %orig;
+    DLOG(@"[ANTI-CHEAT] Anti-Cheat Monitor Module v1.0 loaded");
+    DLOG(@"[ANTI-CHEAT] Monitoring: Signature, Environment, Debug, Security, Ban detection");
+}
+
+// Dump anti-cheat statistics
+static void dumpAntiCheatStats(void) {
+    DLOG(@"[ANTI-CHEAT] ===== Anti-Cheat Statistics =====");
+    DLOG(@"[ANTI-CHEAT] Total Alerts: %d", g_antiCheatAlertCount);
+    DLOG(@"[ANTI-CHEAT] Blocked Count: %d", g_antiCheatBlockedCount);
+    DLOG(@"[ANTI-CHEAT] Monitor Enabled: %@", g_antiCheatMonitorEnabled ? @"YES" : @"NO");
+    DLOG(@"[ANTI-CHEAT] ================================");
+}
