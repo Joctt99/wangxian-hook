@@ -309,11 +309,53 @@ static UILabel *g_statusLbl = nil;
     });
 }
 - (void)shareLog {
-    NSURL *fileURL = [NSURL fileURLWithPath:g_logPath];
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
-    UIViewController *topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-    [topVC presentViewController:avc animated:YES completion:nil];
+    @try {
+        if (!g_logPath) {
+            DLOG(@"[SHARE] Error: log path is nil");
+            return;
+        }
+        
+        NSURL *fileURL = [NSURL fileURLWithPath:g_logPath];
+        if (!fileURL) {
+            DLOG(@"[SHARE] Error: file URL is nil");
+            return;
+        }
+        
+        if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
+            DLOG(@"[SHARE] Error: log file does not exist");
+            return;
+        }
+        
+        UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+        
+        UIViewController *topVC = nil;
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *win in scene.windows) {
+                    if (win.isKeyWindow && win.rootViewController) {
+                        topVC = win.rootViewController;
+                        while (topVC.presentedViewController) {
+                            topVC = topVC.presentedViewController;
+                        }
+                        break;
+                    }
+                }
+                if (topVC) break;
+            }
+        }
+        
+        if (!topVC) {
+            DLOG(@"[SHARE] Error: could not find top view controller");
+            return;
+        }
+        
+        DLOG(@"[SHARE] Presenting activity view controller from %@", NSStringFromClass([topVC class]));
+        [topVC presentViewController:avc animated:YES completion:^{
+            DLOG(@"[SHARE] Presented successfully");
+        }];
+    } @catch (NSException *e) {
+        DLOG(@"[SHARE] Exception: %@", e);
+    }
 }
 - (void)refreshLog {
     NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
@@ -328,10 +370,7 @@ static UILabel *g_statusLbl = nil;
 #pragma mark - MieshiServerInfo hooks (trace server list parsing)
 // ============================================================
 
-static id hook_msi_generic(id self, SEL _cmd, ...) {
-    NSString *selName = NSStringFromSelector(_cmd);
-    DLOG(@"[MSI-CALL] -[%@ %@]", NSStringFromClass([self class]), selName);
-    
+static void msi_log_properties(id self) {
     @try {
         unsigned int count = 0;
         objc_property_t *props = class_copyPropertyList([self class], &count);
@@ -346,15 +385,47 @@ static id hook_msi_generic(id self, SEL _cmd, ...) {
     } @catch (NSException *e) {
         DLOG(@"[MSI-PROP] Exception: %@", e);
     }
-    
-    va_list args;
-    va_start(args, _cmd);
-    id ret = ((id (*)(id, SEL, va_list))objc_msgSend)(self, _cmd, args);
-    va_end(args);
-    
+}
+
+static id msi_init_hook(id self, SEL _cmd) {
+    id ret = ((id(*)(id, SEL))objc_msgSend)(self, _cmd);
     if (ret) {
-        DLOG(@"[MSI-RET] %@ -> %@", selName, ret);
+        DLOG(@"[MSI-CALL] -[%@ init] -> %p", NSStringFromClass([self class]), ret);
+        msi_log_properties(ret);
     }
+    return ret;
+}
+
+static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
+    id ret = ((id(*)(id, SEL, NSDictionary*))objc_msgSend)(self, _cmd, dict);
+    if (ret) {
+        DLOG(@"[MSI-CALL] -[%@ initWithDictionary:] -> %p", NSStringFromClass([self class]), ret);
+        if (dict) {
+            DLOG(@"[MSI-DICT] Dictionary keys: %@", [dict allKeys]);
+            for (NSString *key in dict) {
+                DLOG(@"[MSI-DICT]   %@ = %@", key, dict[key]);
+            }
+        }
+        msi_log_properties(ret);
+    }
+    return ret;
+}
+
+static NSNumber *msi_status_hook(id self, SEL _cmd) {
+    NSNumber *ret = ((NSNumber*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
+    return ret;
+}
+
+static NSString *msi_string_hook(id self, SEL _cmd) {
+    NSString *ret = ((NSString*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
+    return ret;
+}
+
+static NSInteger msi_int_hook(id self, SEL _cmd) {
+    NSInteger ret = ((NSInteger(*)(id, SEL))objc_msgSend)(self, _cmd);
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %ld", NSStringFromClass([self class]), NSStringFromSelector(_cmd), (long)ret);
     return ret;
 }
 
@@ -1759,6 +1830,52 @@ static void entry(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
     
+    // === IMMEDIATE: Version check bypass hooks ===
+    // Based on observed version status codes: 58, 64, 73
+    NSArray *versionCheckClasses = @[
+        @"VersionManager", @"AppVersion", @"GameVersion", @"UpdateManager",
+        @"VersionChecker", @"VersionVerify", @"ClientVersion", @"GameClient"
+    ];
+    
+    for (NSString *clsName in versionCheckClasses) {
+        Class cls = NSClassFromString(clsName);
+        if (cls) {
+            DLOG(@"[VER-CHK] Found version check class: %@", clsName);
+            
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(cls, &mcount);
+            for (unsigned int i = 0; i < mcount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *selName = NSStringFromSelector(sel);
+                
+                if ([selName containsString:@"version"] || [selName containsString:@"Version"] ||
+                    [selName containsString:@"check"] || [selName containsString:@"Check"] ||
+                    [selName containsString:@"verify"] || [selName containsString:@"Verify"] ||
+                    [selName containsString:@"update"] || [selName containsString:@"Update"] ||
+                    [selName containsString:@"status"] || [selName containsString:@"Status"]) {
+                    DLOG(@"[VER-CHK] Instance method to monitor: -[%@ %@]", clsName, selName);
+                }
+            }
+            if (methods) free(methods);
+            
+            Class metaCls = object_getClass(cls);
+            Method *classMethods = class_copyMethodList(metaCls, &mcount);
+            for (unsigned int i = 0; i < mcount; i++) {
+                SEL sel = method_getName(classMethods[i]);
+                NSString *selName = NSStringFromSelector(sel);
+                
+                if ([selName containsString:@"version"] || [selName containsString:@"Version"] ||
+                    [selName containsString:@"check"] || [selName containsString:@"Check"] ||
+                    [selName containsString:@"verify"] || [selName containsString:@"Verify"] ||
+                    [selName containsString:@"update"] || [selName containsString:@"Update"] ||
+                    [selName containsString:@"status"] || [selName containsString:@"Status"]) {
+                    DLOG(@"[VER-CHK] Class method to monitor: +[%@ %@]", clsName, selName);
+                }
+            }
+            if (classMethods) free(classMethods);
+        }
+    }
+    
     // === IMMEDIATE: Hook MieshiServerInfo class to trace server list parsing ===
     Class msiCls = NSClassFromString(@"MieshiServerInfo");
     if (msiCls) {
@@ -1771,14 +1888,35 @@ static void entry(void) {
             NSString *selName = NSStringFromSelector(sel);
             DLOG(@"[MSI] -[%@ %@]", NSStringFromClass(msiCls), selName);
             
-            if ([selName containsString:@"init"] || [selName containsString:@"Status"] || 
-                [selName containsString:@"status"] || [selName containsString:@"server"] ||
-                [selName containsString:@"Server"] || [selName containsString:@"ip"] ||
-                [selName containsString:@"IP"] || [selName containsString:@"category"]) {
-                DLOG(@"[MSI-HOOK] Attempting to hook: %@", selName);
-                IMP origImp = method_getImplementation(methods[i]);
-                if (origImp) {
-                    method_setImplementation(methods[i], (IMP)hook_msi_generic);
+            Method origMethod = class_getInstanceMethod(msiCls, sel);
+            if (!origMethod) continue;
+            
+            IMP origImp = method_getImplementation(origMethod);
+            IMP hookImp = NULL;
+            
+            if ([selName isEqualToString:@"init"]) {
+                hookImp = (IMP)msi_init_hook;
+            } else if ([selName isEqualToString:@"initWithDictionary:"]) {
+                hookImp = (IMP)msi_initWithDict_hook;
+            } else if ([selName isEqualToString:@"status"] || [selName isEqualToString:@"statusValue"]) {
+                hookImp = (IMP)msi_status_hook;
+            } else if ([selName isEqualToString:@"name"] || [selName isEqualToString:@"realname"] ||
+                       [selName isEqualToString:@"ip"] || [selName isEqualToString:@"serverUrl"] ||
+                       [selName isEqualToString:@"category"]) {
+                hookImp = (IMP)msi_string_hook;
+            } else if ([selName isEqualToString:@"serverid"] || [selName isEqualToString:@"priority"] ||
+                       [selName isEqualToString:@"port"] || [selName isEqualToString:@"serverType"]) {
+                hookImp = (IMP)msi_int_hook;
+            }
+            
+            if (hookImp) {
+                Method hookMethod = class_getInstanceMethod([self class], sel);
+                if (!hookMethod) {
+                    class_addMethod(msiCls, sel, hookImp, method_getTypeEncoding(origMethod));
+                    hookMethod = class_getInstanceMethod(msiCls, sel);
+                }
+                if (hookMethod) {
+                    method_exchangeImplementations(origMethod, hookMethod);
                     DLOG(@"[MSI-HOOK] Hooked: %@", selName);
                 }
             }
