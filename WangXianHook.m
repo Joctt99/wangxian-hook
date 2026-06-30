@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.71 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.72 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -22,12 +22,23 @@ static BOOL g_logEnabled = YES; // logging toggle
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
-    NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
-    if (data) {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-        if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-    }
-    NSLog(@"[WXHook] %@", msg);
+    
+    @try {
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:g_logPath error:nil];
+        unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+        if (size > 500 * 1024) {
+            [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            _log(@"[LOG] File too large (>500KB), truncated");
+            return;
+        }
+        
+        NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
+        if (data) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+        }
+        NSLog(@"[WXHook] %@", msg);
+    } @catch (NSException *e) {}
 }
 
 static void log_init(void) {
@@ -35,7 +46,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.71 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.72 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +182,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.71 诊断面板";
+            lbl.text = @"WXHook v34.72 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -739,14 +750,23 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                     ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
                 DLOG(@"[PROTO] Status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
                 
-                // Only patch offset 8-11 (main status) to 0
-                // Keep offset 12-15 as-is (may indicate server count or sub-status)
-                if (status8 != 0) {
-                    DLOG(@"[PROTO-PATCH] Status %u -> 0", status8);
-                    ((unsigned char *)buf)[8] = 0;
-                    ((unsigned char *)buf)[9] = 0;
-                    ((unsigned char *)buf)[10] = 0;
-                    ((unsigned char *)buf)[11] = 0;
+                // Patch ALL status fields to 0 for version response
+                // Status 3 indicates version mismatch or verification failure
+                // We need to force success so the app continues to send server list request
+                if (status8 != 0 || status12 != 0) {
+                    DLOG(@"[PROTO-PATCH] Version response status %u/%u -> 0 (force success)", status8, status12);
+                    memset((unsigned char *)buf + 8, 0, 8);
+                }
+                
+                // Also check for any other non-zero 4-byte status fields after version string
+                // Response format: [len][cmd][status1][status2][version][...][status3][extra]
+                for (size_t i = 24; i + 4 <= (size_t)ret; i += 4) {
+                    uint32_t st = ((uint32_t)p[i] << 24) | ((uint32_t)p[i+1] << 16) |
+                                   ((uint32_t)p[i+2] << 8) | (uint32_t)p[i+3];
+                    if (st != 0 && st != 974) {
+                        DLOG(@"[PROTO-PATCH] Found additional status %u at offset %zu -> 0", st, i);
+                        memset((unsigned char *)buf + i, 0, 4);
+                    }
                 }
             }
         }
