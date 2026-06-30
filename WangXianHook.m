@@ -329,20 +329,27 @@ static UILabel *g_statusLbl = nil;
         UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
         
         UIViewController *topVC = nil;
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *win in scene.windows) {
-                    if (win.isKeyWindow && win.rootViewController) {
-                        topVC = win.rootViewController;
-                        while (topVC.presentedViewController) {
-                            topVC = topVC.presentedViewController;
+            if (@available(iOS 13.0, *)) {
+                for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                    if (scene.activationState == UISceneActivationStateForegroundActive) {
+                        for (UIWindow *win in scene.windows) {
+                            if (win.isKeyWindow && win.rootViewController) {
+                                topVC = win.rootViewController;
+                                while (topVC.presentedViewController) {
+                                    topVC = topVC.presentedViewController;
+                                }
+                                break;
+                            }
                         }
-                        break;
+                        if (topVC) break;
                     }
                 }
-                if (topVC) break;
+            } else {
+                topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+                while (topVC.presentedViewController) {
+                    topVC = topVC.presentedViewController;
+                }
             }
-        }
         
         if (!topVC) {
             DLOG(@"[SHARE] Error: could not find top view controller");
@@ -2000,10 +2007,14 @@ static void entry(void) {
     // === DEFERRED: Create UI button only ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = nil;
-        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if (s.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *win in s.windows) { if (win.isKeyWindow) { w = win; break; } }
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if (s.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *win in s.windows) { if (win.isKeyWindow) { w = win; break; } }
+                }
             }
+        } else {
+            w = [UIApplication sharedApplication].keyWindow;
         }
         if (!w) return;
         g_handler = [[WXHandler alloc] init];
