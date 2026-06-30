@@ -1884,9 +1884,10 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 
 %end
 
-// Hook environment detection
+// Hook NSObject for all anti-cheat detections (MERGED)
 %hook NSObject
 
+// Environment detection
 - (BOOL)isJailbroken {
     DLOG(@"[ANTI-CHEAT] isJailbroken called");
     recordAntiCheatDetection("ENVIRONMENT", "isJailbroken");
@@ -1915,7 +1916,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 - (BOOL)detectHack {
     DLOG(@"[ANTI-CHEAT] detectHack called");
     recordAntiCheatDetection("ENVIRONMENT", "detectHack");
-    return NO; // Return no hack detected
+    return NO;
 }
 
 - (BOOL)detectCheat {
@@ -1924,11 +1925,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
     return NO;
 }
 
-%end
-
-// Hook anti-debug methods
-%hook NSObject
-
+// Anti-debug
 - (void)antiDebug {
     DLOG(@"[ANTI-CHEAT] antiDebug called");
     recordAntiCheatDetection("DEBUG", "antiDebug");
@@ -1949,11 +1946,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
     return NO;
 }
 
-%end
-
-// Hook security related classes
-%hook NSObject
-
+// Security
 - (void)securityCheck:(id)arg {
     DLOG(@"[ANTI-CHEAT] securityCheck: %@", arg);
     recordAntiCheatDetection("SECURITY", "securityCheck");
@@ -1974,11 +1967,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
     %orig;
 }
 
-%end
-
-// Hook ban/punishment detection
-%hook NSObject
-
+// Ban detection
 - (void)checkBanStatus {
     DLOG(@"[ANTI-CHEAT] checkBanStatus called");
     recordAntiCheatDetection("BAN", "checkBanStatus");
@@ -1989,7 +1978,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 - (BOOL)isBanned {
     DLOG(@"[ANTI-CHEAT] isBanned called");
     recordAntiCheatDetection("BAN", "isBanned");
-    return NO; // Return not banned
+    return NO;
 }
 
 - (void)punish:(id)reason {
@@ -1999,19 +1988,7 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
     // Don't call %orig to prevent punishment
 }
 
-%end
-
-// Hook generic anti-cheat methods using method resolution
-static void hook_generic_anti_cheat(id self, SEL _cmd) {
-    NSString *className = NSStringFromClass([self class]);
-    NSString *selName = NSStringFromSelector(_cmd);
-    DLOG(@"[ANTI-CHEAT-GENERIC] %@ [%@ %@]", self == (id)[self class] ? @"+" : @"-", className, selName);
-    recordAntiCheatDetection("GENERIC", selName.UTF8String);
-}
-
-// Hook NSObject method resolution for anti-cheat detection
-%hook NSObject
-
+// Method resolution hooks
 + (BOOL)resolveInstanceMethod:(SEL)sel {
     NSString *selName = NSStringFromSelector(sel);
     if ([selName.lowercaseString containsString:@"cheat"] ||
