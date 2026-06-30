@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.70 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.71 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -35,7 +35,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.70 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.71 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -171,7 +171,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.70 诊断面板";
+            lbl.text = @"WXHook v34.71 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -345,6 +345,74 @@ static id hook_msi_generic(id self, SEL _cmd, ...) {
         DLOG(@"[MSI-RET] %@ -> %@", selName, ret);
     }
     return ret;
+}
+
+#pragma mark - Deep Diagnostics (trace server list display)
+// ============================================================
+
+static NSArray *(*orig_arrayWithObjects)(Class, SEL, const id *, unsigned int);
+static NSArray *hook_arrayWithObjects(Class self, SEL _cmd, const id *objects, unsigned int count) {
+    NSArray *ret = orig_arrayWithObjects(self, _cmd, objects, count);
+    DLOG(@"[DIAG-ARRAY] +[NSArray arrayWithObjects:] count=%u", count);
+    for (unsigned int i = 0; i < count && i < 5; i++) {
+        if (objects[i]) {
+            DLOG(@"[DIAG-ARRAY]   obj[%u] = %@ (%@)", i, objects[i], NSStringFromClass([objects[i] class]));
+        }
+    }
+    return ret;
+}
+
+static NSUInteger (*orig_arrayCount)(id, SEL);
+static NSUInteger hook_arrayCount(id self, SEL _cmd) {
+    NSUInteger ret = orig_arrayCount(self, _cmd);
+    NSString *classStr = NSStringFromClass([self class]);
+    if ([classStr containsString:@"Server"] || [classStr containsString:@"server"] || 
+        [classStr containsString:@"List"] || [classStr containsString:@"list"]) {
+        DLOG(@"[DIAG-ARRAY] -[%@ count] -> %lu", classStr, (unsigned long)ret);
+    }
+    return ret;
+}
+
+static NSUInteger (*orig_tableViewNumberOfRows)(id, SEL, UITableView *, NSInteger);
+static NSUInteger hook_tableViewNumberOfRows(id self, SEL _cmd, UITableView *tableView, NSInteger section) {
+    NSUInteger ret = orig_tableViewNumberOfRows(self, _cmd, tableView, section);
+    DLOG(@"[DIAG-TABLE] -[DataSource numberOfRowsInSection:%ld] -> %lu", (long)section, (unsigned long)ret);
+    return ret;
+}
+
+static NSInteger (*orig_tableViewNumberOfSections)(id, SEL, UITableView *);
+static NSInteger hook_tableViewNumberOfSections(id self, SEL _cmd, UITableView *tableView) {
+    NSInteger ret = orig_tableViewNumberOfSections(self, _cmd, tableView);
+    DLOG(@"[DIAG-TABLE] -[DataSource numberOfSections] -> %ld", (long)ret);
+    return ret;
+}
+
+static void (*orig_alertViewShow)(id, SEL);
+static void hook_alertViewShow(id self, SEL _cmd) {
+    NSString *title = [self performSelector:@selector(title)];
+    NSString *msg = [self performSelector:@selector(message)];
+    DLOG(@"[DIAG-ALERT] UIAlertView show: title='%@' msg='%@'", title, msg);
+    
+    NSArray *stack = [NSThread callStackSymbols];
+    for (NSUInteger i = 0; i < [stack count] && i < 20; i++) {
+        DLOG(@"[DIAG-ALERT-STACK] %@", stack[i]);
+    }
+    
+    orig_alertViewShow(self, _cmd);
+}
+
+static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
+static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
+    NSString *title = [self performSelector:@selector(title)];
+    NSString *msg = [self performSelector:@selector(message)];
+    DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
+    
+    NSArray *stack = [NSThread callStackSymbols];
+    for (NSUInteger i = 0; i < [stack count] && i < 20; i++) {
+        DLOG(@"[DIAG-ALERT-STACK] %@", stack[i]);
+    }
+    
+    orig_alertControllerPresent(self, _cmd, animated, completion);
 }
 
 // ============================================================
@@ -1574,6 +1642,20 @@ static void entry(void) {
         if (m) { orig_numberOfRows = (NSInteger (*)(id, SEL, NSInteger))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfRows); _log(@"[INIT] UITableView.numberOfRowsInSection: observe"); }
         m = class_getInstanceMethod(tvCls, @selector(numberOfSections));
         if (m) { orig_numberOfSections = (NSInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfSections); _log(@"[INIT] UITableView.numberOfSections: observe"); }
+    }
+    
+    // === DIAGNOSTIC: UIAlertView show hook ===
+    Class alertCls = [UIAlertView class];
+    if (alertCls) {
+        Method m = class_getInstanceMethod(alertCls, @selector(show));
+        if (m) { orig_alertViewShow = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertViewShow); _log(@"[INIT] UIAlertView.show: hook"); }
+    }
+    
+    // === DIAGNOSTIC: UIAlertController hook ===
+    Class alertCtrlCls = [UIAlertController class];
+    if (alertCtrlCls) {
+        Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
+        if (m) { orig_alertControllerPresent = (void (*)(id, SEL, BOOL, dispatch_block_t))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertControllerPresent); _log(@"[INIT] UIAlertController.present: hook"); }
     }
     
     // === DIAGNOSTIC: NSArray count hook ===
