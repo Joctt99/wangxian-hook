@@ -1884,8 +1884,17 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 
 %end
 
-// Hook environment detection
-%hook NSObject (Environment)
+// Hook environment detection (using category syntax)
+@interface NSObject (EnvDetection)
+- (BOOL)isJailbroken;
+- (BOOL)isDebugged;
+- (BOOL)isSimulator;
+- (void)checkEnvironment;
+- (BOOL)detectHack;
+- (BOOL)detectCheat;
+@end
+
+%hook NSObject
 
 - (BOOL)isJailbroken {
     DLOG(@"[ANTI-CHEAT] isJailbroken called");
@@ -1927,7 +1936,13 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 %end
 
 // Hook anti-debug methods
-%hook NSObject (AntiDebug)
+@interface NSObject (AntiDebug)
+- (void)antiDebug;
+- (void)checkDebugger;
+- (BOOL)isDebuggerAttached;
+@end
+
+%hook NSObject
 
 - (void)antiDebug {
     DLOG(@"[ANTI-CHEAT] antiDebug called");
@@ -1952,7 +1967,13 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 %end
 
 // Hook security related classes
-%hook NSObject (Security)
+@interface NSObject (SecurityHook)
+- (void)securityCheck:(id)arg;
+- (BOOL)verifySecurity;
+- (void)checkSecurityStatus;
+@end
+
+%hook NSObject
 
 - (void)securityCheck:(id)arg {
     DLOG(@"[ANTI-CHEAT] securityCheck: %@", arg);
@@ -1977,7 +1998,13 @@ static void recordAntiCheatDetection(const char *type, const char *details) {
 %end
 
 // Hook ban/punishment detection
-%hook NSObject (Ban)
+@interface NSObject (BanDetection)
+- (void)checkBanStatus;
+- (BOOL)isBanned;
+- (void)punish:(id)reason;
+@end
+
+%hook NSObject
 
 - (void)checkBanStatus {
     DLOG(@"[ANTI-CHEAT] checkBanStatus called");
