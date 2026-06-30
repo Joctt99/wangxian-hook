@@ -1510,28 +1510,6 @@ static NSInteger hook_numberOfSections(id self, SEL _cmd) {
     return ret;
 }
 
-// NSArray count - trace server list array size
-static NSUInteger (*orig_arrayCount)(id, SEL) = NULL;
-static NSUInteger hook_arrayCount(id self, SEL _cmd) {
-    NSUInteger ret = orig_arrayCount ? orig_arrayCount(self, _cmd) : 0;
-    NSString *cls = NSStringFromClass([self class]);
-    // Only log arrays that might be server list
-    if (ret > 0) {
-        // Check if this array contains server-like objects
-        @try {
-            id firstObj = [self objectAtIndex:0];
-            if (firstObj) {
-                NSString *objCls = NSStringFromClass([firstObj class]);
-                if ([objCls containsString:@"Server"] || [objCls containsString:@"server"] ||
-                    [objCls containsString:@"Info"] || [objCls containsString:@"info"]) {
-                    DLOG(@"[ARRAY] count=%lu class=%@ elements=%@", (unsigned long)ret, cls, objCls);
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    return ret;
-}
-
 // NSDictionary objectForKey: - trace server list parsing
 static id (*orig_dictObjectForKey)(id, SEL, id) = NULL;
 static id hook_dictObjectForKey(id self, SEL _cmd, id key) {
@@ -1707,13 +1685,6 @@ static void entry(void) {
     if (alertCtrlCls) {
         Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
         if (m) { orig_alertControllerPresent = (void (*)(id, SEL, BOOL, dispatch_block_t))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertControllerPresent); _log(@"[INIT] UIAlertController.present: hook"); }
-    }
-    
-    // === DIAGNOSTIC: NSArray count hook ===
-    Class arrCls = [NSArray class];
-    if (arrCls) {
-        Method m = class_getInstanceMethod(arrCls, @selector(count));
-        if (m) { orig_arrayCount = (NSUInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_arrayCount); _log(@"[INIT] NSArray.count: observe"); }
     }
     
     // === DIAGNOSTIC: NSDictionary hooks ===
