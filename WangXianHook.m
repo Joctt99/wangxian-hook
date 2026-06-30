@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.72 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
+ * WangXianHook v34.73 - Anti-Cheat Bypass + DYLD Hiding + Protocol Login Patch
  * Strategy: Fill UUID/MACADDRESS in send data for server list request
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  * NEW: Log app behavior after receiving server list to diagnose empty list issue
@@ -46,7 +46,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.72 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.73 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -182,7 +182,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.72 诊断面板";
+            lbl.text = @"WXHook v34.73 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -727,6 +727,22 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
+            // 9. Patch description '服务器维护中...' to '运行'
+            // UTF-8: 服务器维护中... = E6 9C 8D E5 8A A1 E5 99 A8 E7 BB B4 E6 8A A4 E4 B8 AD 2E 2E 2E
+            // UTF-8: 运行 = E8 BF 90 E8 A1 8C
+            const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
+                                             0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
+                                             0x2E, 0x2E, 0x2E};
+            const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
+            for (size_t i = 0; i + 21 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldDesc, 21) == 0) {
+                    DLOG(@"[PROTO-PATCH] Found '服务器维护中...' at offset %zu, replacing with '运行'", i);
+                    memcpy(data + i, newDesc, 6);
+                    // Fill remaining space with spaces
+                    for (size_t j = 6; j < 21; j++) data[i+j] = ' ';
+                }
+            }
+            
             DLOG(@"[PROTO] Server list patching complete (response #%d, %zd bytes)", serverListCount, ret);
         }
         
@@ -1026,6 +1042,19 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                 }
             }
             
+            // 9. Patch description '服务器维护中...' to '运行'
+            const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
+                                             0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
+                                             0x2E, 0x2E, 0x2E};
+            const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
+            for (size_t i = 0; i + 21 <= (size_t)ret; i++) {
+                if (memcmp(data + i, oldDesc, 21) == 0) {
+                    DLOG(@"[PROTO-RF-PATCH] Found '服务器维护中...' at %zu, replacing with '运行'", i);
+                    memcpy(data + i, newDesc, 6);
+                    for (size_t j = 6; j < 21; j++) data[i+j] = ' ';
+                }
+            }
+            
             DLOG(@"[PROTO-RF] Server list patching complete (response #%d, %zd bytes)", serverListCountRF, ret);
         }
     }
@@ -1106,6 +1135,19 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                 for (size_t i = 0; i + sizeof(oldCat) <= iov->iov_len; i++) {
                     if (memcmp(data + i, oldCat, sizeof(oldCat)) == 0) {
                         memcpy(data + i, newCat, sizeof(newCat));
+                    }
+                }
+                
+                // Patch description '服务器维护中...' to '运行'
+                const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
+                                                 0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
+                                                 0x2E, 0x2E, 0x2E};
+                const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
+                for (size_t i = 0; i + 21 <= iov->iov_len; i++) {
+                    if (memcmp(data + i, oldDesc, 21) == 0) {
+                        DLOG(@"[PROTO-RM-PATCH] Found '服务器维护中...' at %zu, replacing with '运行'", i);
+                        memcpy(data + i, newDesc, 6);
+                        for (size_t j = 6; j < 21; j++) data[i+j] = ' ';
                     }
                 }
             }
