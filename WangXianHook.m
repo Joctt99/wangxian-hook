@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.77 - Fix recv version check bypass
+ * WangXianHook v34.78 - Server info status patch
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.77 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.78 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.77 诊断面板";
+            lbl.text = @"WXHook v34.78 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -993,6 +993,31 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
+            }
+        }
+        
+        if (cmd == 0x802EE100) {
+            DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            unsigned char *payload = (unsigned char *)buf + 8;
+            ssize_t payloadLen = ret - 8;
+            if (payloadLen > 0) {
+                NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
+                DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
+                
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
+                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                
+                NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
+                if (newData && [newData length] <= payloadLen) {
+                    DLOG(@"[PROTO-R-PATCH] Server info patched: status=6->1, serverid=0->1, clientid=0->1");
+                    memcpy(payload, [newData bytes], [newData length]);
+                    memset(payload + [newData length], 0, payloadLen - [newData length]);
+                }
             }
         }
     }
