@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.79 - Fix server info cmd 0x802EE113
+ * WangXianHook v34.80 - Comprehensive protocol patch v2
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.79 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.80 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.79 诊断面板";
+            lbl.text = @"WXHook v34.80 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1004,19 +1004,55 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
                 DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
                 
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
-                jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                if ([jsonStr rangeOfString:@"status="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
+                }
+                if ([jsonStr rangeOfString:@"serverid="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
+                }
+                if ([jsonStr rangeOfString:@"clientid="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                }
                 
                 NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
                 if (newData && [newData length] <= payloadLen) {
-                    DLOG(@"[PROTO-R-PATCH] Server info patched: status=6->1, serverid=0->1, clientid=0->1");
+                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully");
                     memcpy(payload, [newData bytes], [newData length]);
                     memset(payload + [newData length], 0, payloadLen - [newData length]);
+                } else {
+                    DLOG(@"[PROTO-R-PATCH] Server info patch failed: len=%zu vs max=%zd", [newData length], payloadLen);
+                }
+            }
+        }
+        
+        if (cmd == 0x8002A017) {
+            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 16) {
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
+            }
+        }
+        
+        if (cmd == 0x8002A016) {
+            DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 16) {
+                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
+                if (status8 != 0 || status12 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
+                    memset((unsigned char *)buf + 8, 0, 8);
                 }
             }
         }
