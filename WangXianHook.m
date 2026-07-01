@@ -315,45 +315,62 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        NSURL *fileURL = [NSURL fileURLWithPath:g_logPath];
-        if (!fileURL) {
-            DLOG(@"[SHARE] Error: file URL is nil");
+        if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
+            DLOG(@"[SHARE] Error: log file does not exist");
             return;
         }
         
-        if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
-            DLOG(@"[SHARE] Error: log file does not exist");
+        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wxhook_export.log"];
+        NSError *copyError = nil;
+        BOOL copySuccess = [[NSFileManager defaultManager] copyItemAtPath:g_logPath toPath:tempPath error:&copyError];
+        if (!copySuccess) {
+            DLOG(@"[SHARE] Error: failed to copy log file: %@", copyError);
+            return;
+        }
+        
+        NSURL *fileURL = [NSURL fileURLWithPath:tempPath];
+        if (!fileURL) {
+            DLOG(@"[SHARE] Error: file URL is nil");
             return;
         }
         
         UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
         
         UIViewController *topVC = nil;
-            if (@available(iOS 13.0, *)) {
-                for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                    if (scene.activationState == UISceneActivationStateForegroundActive) {
-                        for (UIWindow *win in scene.windows) {
-                            if (win.isKeyWindow && win.rootViewController) {
-                                topVC = win.rootViewController;
-                                while (topVC.presentedViewController) {
-                                    topVC = topVC.presentedViewController;
-                                }
-                                break;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *win in scene.windows) {
+                        if (win.isKeyWindow && win.rootViewController) {
+                            topVC = win.rootViewController;
+                            while (topVC.presentedViewController) {
+                                topVC = topVC.presentedViewController;
                             }
+                            break;
                         }
-                        if (topVC) break;
                     }
-                }
-            } else {
-                topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-                while (topVC.presentedViewController) {
-                    topVC = topVC.presentedViewController;
+                    if (topVC) break;
                 }
             }
+        } else {
+            topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+            while (topVC.presentedViewController) {
+                topVC = topVC.presentedViewController;
+            }
+        }
         
         if (!topVC) {
             DLOG(@"[SHARE] Error: could not find top view controller");
             return;
+        }
+        
+        if (avc.popoverPresentationController) {
+            avc.popoverPresentationController.sourceView = g_panel ?: g_btn;
+            if (g_panel) {
+                avc.popoverPresentationController.sourceRect = CGRectMake(g_panel.bounds.size.width - 60, 8, 50, 28);
+            } else if (g_btn) {
+                avc.popoverPresentationController.sourceRect = g_btn.bounds;
+            }
         }
         
         DLOG(@"[SHARE] Presenting activity view controller from %@", NSStringFromClass([topVC class]));
@@ -377,6 +394,10 @@ static UILabel *g_statusLbl = nil;
 #pragma mark - MieshiServerInfo hooks (trace server list parsing)
 // ============================================================
 
+static IMP orig_msi_init = NULL;
+static IMP orig_msi_initWithDict = NULL;
+static IMP orig_msi_status = NULL;
+
 static void msi_log_properties(id self) {
     @try {
         unsigned int count = 0;
@@ -395,7 +416,8 @@ static void msi_log_properties(id self) {
 }
 
 static id msi_init_hook(id self, SEL _cmd) {
-    id ret = ((id(*)(id, SEL))objc_msgSend)(self, _cmd);
+    id (*origFunc)(id, SEL) = (id(*)(id, SEL))orig_msi_init;
+    id ret = origFunc(self, _cmd);
     if (ret) {
         DLOG(@"[MSI-CALL] -[%@ init] -> %p", NSStringFromClass([self class]), ret);
         msi_log_properties(ret);
@@ -404,7 +426,8 @@ static id msi_init_hook(id self, SEL _cmd) {
 }
 
 static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
-    id ret = ((id(*)(id, SEL, NSDictionary*))objc_msgSend)(self, _cmd, dict);
+    id (*origFunc)(id, SEL, NSDictionary*) = (id(*)(id, SEL, NSDictionary*))orig_msi_initWithDict;
+    id ret = origFunc(self, _cmd, dict);
     if (ret) {
         DLOG(@"[MSI-CALL] -[%@ initWithDictionary:] -> %p", NSStringFromClass([self class]), ret);
         if (dict) {
@@ -419,7 +442,8 @@ static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
 }
 
 static NSNumber *msi_status_hook(id self, SEL _cmd) {
-    NSNumber *ret = ((NSNumber*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    NSNumber *(*origFunc)(id, SEL) = (NSNumber*(*)(id, SEL))orig_msi_status;
+    NSNumber *ret = origFunc(self, _cmd);
     DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
     return ret;
 }
@@ -1894,41 +1918,35 @@ static void entry(void) {
             SEL sel = method_getName(methods[i]);
             NSString *selName = NSStringFromSelector(sel);
             DLOG(@"[MSI] -[%@ %@]", NSStringFromClass(msiCls), selName);
-            
-            Method origMethod = class_getInstanceMethod(msiCls, sel);
-            if (!origMethod) continue;
-            
-            IMP origImp = method_getImplementation(origMethod);
-            IMP hookImp = NULL;
-            
-            if ([selName isEqualToString:@"init"]) {
-                hookImp = (IMP)msi_init_hook;
-            } else if ([selName isEqualToString:@"initWithDictionary:"]) {
-                hookImp = (IMP)msi_initWithDict_hook;
-            } else if ([selName isEqualToString:@"status"] || [selName isEqualToString:@"statusValue"]) {
-                hookImp = (IMP)msi_status_hook;
-            } else if ([selName isEqualToString:@"name"] || [selName isEqualToString:@"realname"] ||
-                       [selName isEqualToString:@"ip"] || [selName isEqualToString:@"serverUrl"] ||
-                       [selName isEqualToString:@"category"]) {
-                hookImp = (IMP)msi_string_hook;
-            } else if ([selName isEqualToString:@"serverid"] || [selName isEqualToString:@"priority"] ||
-                       [selName isEqualToString:@"port"] || [selName isEqualToString:@"serverType"]) {
-                hookImp = (IMP)msi_int_hook;
-            }
-            
-            if (hookImp) {
-                Method existingMethod = class_getInstanceMethod(msiCls, sel);
-                if (existingMethod) {
-                    class_addMethod(msiCls, sel, hookImp, method_getTypeEncoding(existingMethod));
-                    Method newMethod = class_getInstanceMethod(msiCls, sel);
-                    if (newMethod) {
-                        method_exchangeImplementations(existingMethod, newMethod);
-                        DLOG(@"[MSI-HOOK] Hooked: %@", selName);
-                    }
-                }
-            }
         }
         if (methods) free(methods);
+        
+        Method m_init = class_getInstanceMethod(msiCls, @selector(init));
+        if (m_init) {
+            orig_msi_init = method_getImplementation(m_init);
+            method_setImplementation(m_init, (IMP)msi_init_hook);
+            DLOG(@"[MSI-HOOK] Hooked: init");
+        }
+        
+        Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
+        if (m_initDict) {
+            orig_msi_initWithDict = method_getImplementation(m_initDict);
+            method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
+            DLOG(@"[MSI-HOOK] Hooked: initWithDictionary:");
+        }
+        
+        Method m_status = class_getInstanceMethod(msiCls, @selector(status));
+        if (m_status) {
+            orig_msi_status = method_getImplementation(m_status);
+            method_setImplementation(m_status, (IMP)msi_status_hook);
+            DLOG(@"[MSI-HOOK] Hooked: status");
+        }
+        
+        Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
+        if (m_statusValue) {
+            method_setImplementation(m_statusValue, (IMP)msi_status_hook);
+            DLOG(@"[MSI-HOOK] Hooked: statusValue");
+        }
     } else {
         DLOG(@"[MSI] MieshiServerInfo class NOT found!");
     }
@@ -2028,6 +2046,52 @@ static void entry(void) {
         [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:g_btn];
         _log(@"[UI] Button created");
+    });
+    
+    // === DEFERRED: Delayed MieshiServerInfo hook (class may load later) ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class msiCls = NSClassFromString(@"MieshiServerInfo");
+        if (msiCls) {
+            DLOG(@"[MSI-DELAYED] MieshiServerInfo class FOUND at delay hook!");
+            
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(msiCls, &mcount);
+            for (unsigned int i = 0; i < mcount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *selName = NSStringFromSelector(sel);
+                DLOG(@"[MSI-DELAYED] -[%@ %@]", NSStringFromClass(msiCls), selName);
+            }
+            if (methods) free(methods);
+            
+            Method m_init = class_getInstanceMethod(msiCls, @selector(init));
+            if (m_init) {
+                orig_msi_init = method_getImplementation(m_init);
+                method_setImplementation(m_init, (IMP)msi_init_hook);
+                DLOG(@"[MSI-HOOK] Delayed hook: init");
+            }
+            
+            Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
+            if (m_initDict) {
+                orig_msi_initWithDict = method_getImplementation(m_initDict);
+                method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
+                DLOG(@"[MSI-HOOK] Delayed hook: initWithDictionary:");
+            }
+            
+            Method m_status = class_getInstanceMethod(msiCls, @selector(status));
+            if (m_status) {
+                orig_msi_status = method_getImplementation(m_status);
+                method_setImplementation(m_status, (IMP)msi_status_hook);
+                DLOG(@"[MSI-HOOK] Delayed hook: status");
+            }
+            
+            Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
+            if (m_statusValue) {
+                method_setImplementation(m_statusValue, (IMP)msi_status_hook);
+                DLOG(@"[MSI-HOOK] Delayed hook: statusValue");
+            }
+        } else {
+            DLOG(@"[MSI-DELAYED] MieshiServerInfo class STILL not found!");
+        }
     });
 }
 
