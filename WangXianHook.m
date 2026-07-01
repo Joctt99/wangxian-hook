@@ -1,6 +1,6 @@
 /**
- * WangXianHook v34.83 - Full stack hooks: NSURLSession + NSJSON + Mock server inject
- * NEW: Added comprehensive anti-cheat monitoring module
+ * WangXianHook v34.84 - FORCE server list display via UITableView DataSource hooks
+ * NEW: Force fake server cells when real server list is empty
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.83 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.84 FORCE Server List ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.83 诊断面板";
+            lbl.text = @"WXHook v34.84 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -507,12 +507,32 @@ static NSString *msi_string_hook(id self, SEL _cmd);
 static NSInteger msi_int_hook(id self, SEL _cmd);
 
 // ============================================================
-#pragma mark - UITableView DataSource hooks (debug server list)
+#pragma mark - UITableView DataSource hooks (force server list)
 // ============================================================
 
 static IMP orig_tableView_numberOfRows = NULL;
 static IMP orig_tableView_cellForRow = NULL;
 static IMP orig_tableView_numberOfSections = NULL;
+
+static NSMutableArray *fakeServerList = nil;
+
+static void initFakeServerList(void) {
+    if (fakeServerList) return;
+    fakeServerList = [NSMutableArray arrayWithArray:@[
+        @{@"serverid": @1, @"name": @"测试服务器1", @"ip": @"47.100.222.229", @"port": @5678, @"status": @1},
+        @{@"serverid": @2, @"name": @"测试服务器2", @"ip": @"47.100.222.229", @"port": @5679, @"status": @1},
+        @{@"serverid": @3, @"name": @"测试服务器3", @"ip": @"47.100.222.229", @"port": @5680, @"status": @1},
+    ]];
+    DLOG(@"[FAKE-SERVER] Initialized fake server list: %@", fakeServerList);
+}
+
+static BOOL isServerListDataSource(id self) {
+    Class cls = [self class];
+    NSString *clsName = NSStringFromClass(cls);
+    return ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
+            [clsName containsString:@"List"] || [clsName containsString:@"list"] ||
+            [clsName containsString:@"Login"] || [clsName containsString:@"login"]);
+}
 
 static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section) {
     NSInteger (*origFunc)(id, SEL, NSInteger) = (NSInteger(*)(id, SEL, NSInteger))orig_tableView_numberOfRows;
@@ -520,9 +540,15 @@ static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section
     
     Class cls = [self class];
     NSString *clsName = NSStringFromClass(cls);
-    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
-        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
-        DLOG(@"[TV-CALL] -[%@ numberOfRowsInSection:%ld] -> %ld", clsName, (long)section, (long)ret);
+    
+    if (isServerListDataSource(self)) {
+        DLOG(@"[TV-CALL] -[%@ numberOfRowsInSection:%ld] -> %ld (original)", clsName, (long)section, (long)ret);
+        
+        if (ret == 0) {
+            initFakeServerList();
+            ret = fakeServerList.count;
+            DLOG(@"[TV-PATCH] -[%@ numberOfRowsInSection:%ld] FORCE -> %ld (fake)", clsName, (long)section, (long)ret);
+        }
     }
     return ret;
 }
@@ -533,12 +559,26 @@ static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPat
     
     Class cls = [self class];
     NSString *clsName = NSStringFromClass(cls);
-    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
-        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
+    
+    if (isServerListDataSource(self)) {
         NSString *text = @"";
         if (ret && ret.textLabel) text = ret.textLabel.text ?: @"";
         DLOG(@"[TV-CALL] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@'", clsName, 
              (long)indexPath.section, (long)indexPath.row, text);
+        
+        if (!ret || (ret && [text isEqualToString:@""])) {
+            DLOG(@"[TV-PATCH] Creating fake cell for server list");
+            ret = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            if (ret) {
+                initFakeServerList();
+                if (indexPath.row < fakeServerList.count) {
+                    NSDictionary *server = fakeServerList[indexPath.row];
+                    ret.textLabel.text = server[@"name"] ?: @"测试服务器";
+                    ret.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                    DLOG(@"[TV-PATCH] Created fake cell: %@", server[@"name"]);
+                }
+            }
+        }
     }
     return ret;
 }
@@ -549,9 +589,13 @@ static NSInteger hook_numberOfSections(id self, SEL _cmd) {
     
     Class cls = [self class];
     NSString *clsName = NSStringFromClass(cls);
-    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
-        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
+    
+    if (isServerListDataSource(self)) {
         DLOG(@"[TV-CALL] -[%@ numberOfSections] -> %ld", clsName, (long)ret);
+        if (ret == 0) {
+            ret = 1;
+            DLOG(@"[TV-PATCH] -[%@ numberOfSections] FORCE -> 1", clsName);
+        }
     }
     return ret;
 }
