@@ -452,63 +452,6 @@ static NSInteger hook_numberOfSections(id self, SEL _cmd) {
     return ret;
 }
 
-static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
-    Class msiCls = NSClassFromString(@"MieshiServerInfo");
-    if (msiCls) {
-        DLOG(@"[MSI-RETRY] MieshiServerInfo class FOUND at attempt #%d!", attempt);
-        
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(msiCls, &mcount);
-        for (unsigned int i = 0; i < mcount; i++) {
-            SEL sel = method_getName(methods[i]);
-            NSString *selName = NSStringFromSelector(sel);
-            DLOG(@"[MSI-RETRY] -[%@ %@]", NSStringFromClass(msiCls), selName);
-        }
-        if (methods) free(methods);
-        
-        if (!orig_msi_init) {
-            Method m_init = class_getInstanceMethod(msiCls, @selector(init));
-            if (m_init) {
-                orig_msi_init = method_getImplementation(m_init);
-                method_setImplementation(m_init, (IMP)msi_init_hook);
-                DLOG(@"[MSI-HOOK] Hooked: init");
-            }
-        }
-        
-        if (!orig_msi_initWithDict) {
-            Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
-            if (m_initDict) {
-                orig_msi_initWithDict = method_getImplementation(m_initDict);
-                method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
-                DLOG(@"[MSI-HOOK] Hooked: initWithDictionary:");
-            }
-        }
-        
-        if (!orig_msi_status) {
-            Method m_status = class_getInstanceMethod(msiCls, @selector(status));
-            if (m_status) {
-                orig_msi_status = method_getImplementation(m_status);
-                method_setImplementation(m_status, (IMP)msi_status_hook);
-                DLOG(@"[MSI-HOOK] Hooked: status");
-            }
-        }
-        
-        Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
-        if (m_statusValue) {
-            method_setImplementation(m_statusValue, (IMP)msi_status_hook);
-            DLOG(@"[MSI-HOOK] Hooked: statusValue");
-        }
-    } else {
-        DLOG(@"[MSI-RETRY] MieshiServerInfo class not found at attempt #%d", attempt);
-        if (attempt < 3) {
-            double delays[] = {2.0, 5.0, 10.0};
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                tryHookMieshiServerInfo(attempt + 1);
-            });
-        }
-    }
-}
-
 // ============================================================
 #pragma mark - MieshiServerInfo helper
 // ============================================================
@@ -573,6 +516,63 @@ static NSInteger msi_int_hook(id self, SEL _cmd) {
     NSInteger ret = ((NSInteger(*)(id, SEL))objc_msgSend)(self, _cmd);
     DLOG(@"[MSI-CALL] -[%@ %@] -> %ld", NSStringFromClass([self class]), NSStringFromSelector(_cmd), (long)ret);
     return ret;
+}
+
+static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
+    Class msiCls = NSClassFromString(@"MieshiServerInfo");
+    if (msiCls) {
+        DLOG(@"[MSI-RETRY] MieshiServerInfo class FOUND at attempt #%d!", attempt);
+        
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(msiCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            SEL sel = method_getName(methods[i]);
+            NSString *selName = NSStringFromSelector(sel);
+            DLOG(@"[MSI-RETRY] -[%@ %@]", NSStringFromClass(msiCls), selName);
+        }
+        if (methods) free(methods);
+        
+        if (!orig_msi_init) {
+            Method m_init = class_getInstanceMethod(msiCls, @selector(init));
+            if (m_init) {
+                orig_msi_init = method_getImplementation(m_init);
+                method_setImplementation(m_init, (IMP)msi_init_hook);
+                DLOG(@"[MSI-HOOK] Hooked: init");
+            }
+        }
+        
+        if (!orig_msi_initWithDict) {
+            Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
+            if (m_initDict) {
+                orig_msi_initWithDict = method_getImplementation(m_initDict);
+                method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
+                DLOG(@"[MSI-HOOK] Hooked: initWithDictionary:");
+            }
+        }
+        
+        if (!orig_msi_status) {
+            Method m_status = class_getInstanceMethod(msiCls, @selector(status));
+            if (m_status) {
+                orig_msi_status = method_getImplementation(m_status);
+                method_setImplementation(m_status, (IMP)msi_status_hook);
+                DLOG(@"[MSI-HOOK] Hooked: status");
+            }
+        }
+        
+        Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
+        if (m_statusValue) {
+            method_setImplementation(m_statusValue, (IMP)msi_status_hook);
+            DLOG(@"[MSI-HOOK] Hooked: statusValue");
+        }
+    } else {
+        DLOG(@"[MSI-RETRY] MieshiServerInfo class not found at attempt #%d", attempt);
+        if (attempt < 3) {
+            double delays[] = {2.0, 5.0, 10.0};
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                tryHookMieshiServerInfo(attempt + 1);
+            });
+        }
+    }
 }
 
 #pragma mark - Deep Diagnostics (trace server list display)
@@ -1498,6 +1498,7 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 
 // UITableView data source hooks - trace server list display
 static NSInteger (*orig_numberOfRows)(id, SEL, NSInteger) = NULL;
+static NSInteger (*orig_numberOfSections)(id, SEL) = NULL;
 static NSInteger hook_numberOfRows(id self, SEL _cmd, NSInteger section) {
     NSInteger ret = orig_numberOfRows ? orig_numberOfRows(self, _cmd, section) : 0;
     NSString *cls = NSStringFromClass([self class]);
