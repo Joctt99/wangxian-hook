@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.76 - Version Check Bypass + Alert Block
+ * WangXianHook v34.77 - Fix recv version check bypass
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.76 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.77 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.76 诊断面板";
+            lbl.text = @"WXHook v34.77 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -977,6 +977,23 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             ssize_t payloadLen = ret - 8;
             BOOL isGzip = (payloadLen >= 3 && payload[0] == 0x1F && payload[1] == 0x8B && payload[2] == 0x08);
             DLOG(@"[PROTO] Resource response 0x%08X isGzip=%d payloadLen=%zd", cmd, isGzip, payloadLen);
+        }
+        
+        if (cmd == 0x802EE120 || cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check status %u -> 0 (bypass)", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
+            }
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                ((unsigned char *)buf)[12] = 0;
+            }
         }
     }
     
