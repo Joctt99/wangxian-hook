@@ -17,6 +17,7 @@ CFLAGS += -framework UIKit
 CFLAGS += -framework CoreFoundation
 CFLAGS += -framework Security
 CFLAGS += -lobjc
+CFLAGS += -lz
 CFLAGS += -dynamiclib
 CFLAGS += -O2
 CFLAGS += -fobjc-arc
