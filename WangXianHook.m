@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.81 - Server info patch in both hook_recv and hook_read
+ * WangXianHook v34.82 - Enhanced server info patch with detailed logging
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.81 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.82 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.81 诊断面板";
+            lbl.text = @"WXHook v34.82 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1000,32 +1000,65 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
+            DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
+            
             if (payloadLen > 0) {
                 NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
                 DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
                 
-                if ([jsonStr rangeOfString:@"status="].location != NSNotFound) {
+                BOOL patched = NO;
+                
+                if ([jsonStr rangeOfString:@"status=6"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=6 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=5"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=5 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=4"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=4 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=3"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=3 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=2"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=2 -> status=1");
+                    patched = YES;
                 }
-                if ([jsonStr rangeOfString:@"serverid="].location != NSNotFound) {
+                if ([jsonStr rangeOfString:@"serverid=0"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
+                    DLOG(@"[PROTO-R-PATCH] serverid=0 -> serverid=1");
+                    patched = YES;
                 }
-                if ([jsonStr rangeOfString:@"clientid="].location != NSNotFound) {
+                if ([jsonStr rangeOfString:@"clientid=0"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                    DLOG(@"[PROTO-R-PATCH] clientid=0 -> clientid=1");
+                    patched = YES;
                 }
                 
-                NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
-                if (newData && [newData length] <= payloadLen) {
-                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully");
-                    memcpy(payload, [newData bytes], [newData length]);
-                    memset(payload + [newData length], 0, payloadLen - [newData length]);
+                if (patched) {
+                    NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
+                    if (newData && [newData length] <= payloadLen) {
+                        DLOG(@"[PROTO-R-PATCH] Server info patched successfully: len=%zu", [newData length]);
+                        memcpy(payload, [newData bytes], [newData length]);
+                        memset(payload + [newData length], 0, payloadLen - [newData length]);
+                        DLOG(@"[PROTO-R-PATCH] Server info patched: %@", jsonStr);
+                    } else {
+                        DLOG(@"[PROTO-R-PATCH] Server info patch failed: newLen=%zu vs max=%zd", [newData length], payloadLen);
+                    }
                 } else {
-                    DLOG(@"[PROTO-R-PATCH] Server info patch failed: len=%zu vs max=%zd", [newData length], payloadLen);
+                    DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
                 }
+            } else {
+                DLOG(@"[PROTO-R-PATCH] Server info payload empty");
             }
         }
         
@@ -1142,32 +1175,65 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
+            DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
+            
             if (payloadLen > 0) {
                 NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
                 DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
                 
-                if ([jsonStr rangeOfString:@"status="].location != NSNotFound) {
+                BOOL patched = NO;
+                
+                if ([jsonStr rangeOfString:@"status=6"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=6 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=5"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=5 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=4"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=4 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=3"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=3 -> status=1");
+                    patched = YES;
+                }
+                if ([jsonStr rangeOfString:@"status=2"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
+                    DLOG(@"[PROTO-R-PATCH] status=2 -> status=1");
+                    patched = YES;
                 }
-                if ([jsonStr rangeOfString:@"serverid="].location != NSNotFound) {
+                if ([jsonStr rangeOfString:@"serverid=0"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
+                    DLOG(@"[PROTO-R-PATCH] serverid=0 -> serverid=1");
+                    patched = YES;
                 }
-                if ([jsonStr rangeOfString:@"clientid="].location != NSNotFound) {
+                if ([jsonStr rangeOfString:@"clientid=0"].location != NSNotFound) {
                     jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                    DLOG(@"[PROTO-R-PATCH] clientid=0 -> clientid=1");
+                    patched = YES;
                 }
                 
-                NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
-                if (newData && [newData length] <= payloadLen) {
-                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully");
-                    memcpy(payload, [newData bytes], [newData length]);
-                    memset(payload + [newData length], 0, payloadLen - [newData length]);
+                if (patched) {
+                    NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
+                    if (newData && [newData length] <= payloadLen) {
+                        DLOG(@"[PROTO-R-PATCH] Server info patched successfully: len=%zu", [newData length]);
+                        memcpy(payload, [newData bytes], [newData length]);
+                        memset(payload + [newData length], 0, payloadLen - [newData length]);
+                        DLOG(@"[PROTO-R-PATCH] Server info patched: %@", jsonStr);
+                    } else {
+                        DLOG(@"[PROTO-R-PATCH] Server info patch failed: newLen=%zu vs max=%zd", [newData length], payloadLen);
+                    }
                 } else {
-                    DLOG(@"[PROTO-R-PATCH] Server info patch failed: len=%zu vs max=%zd", [newData length], payloadLen);
+                    DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
                 }
+            } else {
+                DLOG(@"[PROTO-R-PATCH] Server info payload empty");
             }
         }
         
