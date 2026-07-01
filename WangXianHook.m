@@ -448,7 +448,7 @@ static void installJSONSerializationHook(void) {
 #pragma mark - NSURLSessionDataDelegate hooks
 // ============================================================
 
-static IMP orig_urlSessionDataTaskDidReceiveData = NULL;
+static void (*orig_urlSessionDataTaskDidReceiveData)(id, SEL, NSURLSession*, NSURLSessionDataTask*, NSData*) = NULL;
 
 static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
     DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu", (unsigned long)[data length]);
