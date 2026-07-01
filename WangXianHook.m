@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <zlib.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -46,7 +47,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.73 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.74 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -693,6 +694,40 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
+        unsigned char *payload = (unsigned char *)buf + 8;
+        ssize_t payloadLen = ret - 8;
+        BOOL isGzip = (payloadLen >= 3 && payload[0] == 0x1F && payload[1] == 0x8B && payload[2] == 0x08);
+        DLOG(@"[PROTO] cmd=0x%08X isGzip=%d payloadLen=%zd", cmd, isGzip, payloadLen);
+        
+        unsigned char *decompressedData = NULL;
+        uLongf decompressedLen = 0;
+        
+        if (isGzip) {
+            unsigned char *gzipData = payload;
+            uLongf gzipLen = (uLongf)payloadLen;
+            decompressedLen = gzipLen * 10;
+            decompressedData = malloc(decompressedLen);
+            if (decompressedData) {
+                int retCode = uncompress(decompressedData, &decompressedLen, gzipData, gzipLen);
+                if (retCode != Z_OK) {
+                    DLOG(@"[GZIP] uncompress failed: %d", retCode);
+                    free(decompressedData);
+                    decompressedData = NULL;
+                } else {
+                    DLOG(@"[GZIP] Decompressed: %lu -> %lu bytes", gzipLen, decompressedLen);
+                    NSMutableString *hexPreview = [NSMutableString string];
+                    size_t previewLen = decompressedLen > 128 ? 128 : decompressedLen;
+                    for (size_t i = 0; i < previewLen; i++) {
+                        [hexPreview appendFormat:@"%02X ", decompressedData[i]];
+                    }
+                    DLOG(@"[GZIP] Decompressed preview: %@", hexPreview);
+                }
+            }
+        }
+        
+        unsigned char *patchData = decompressedData ? decompressedData : payload;
+        size_t patchLen = decompressedData ? decompressedLen : payloadLen;
+        
         // When receiving heartbeat from auth server (instead of game server response),
         // DISABLED: fake login response causes app to hang/crash
         // if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
@@ -742,153 +777,123 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
 
-        if (cmd == 0x802EE113) {
-            DLOG(@"[PROTO] Server list response 0x802EE113 - pktLen=%u ret=%zd", pktLenBE, ret);
+        if (cmd == 0x802EE113 || cmd == 0x8002A017) {
+            DLOG(@"[PROTO] Server/list response 0x%08X - pktLen=%u ret=%zd isGzip=%d", cmd, pktLenBE, ret, isGzip);
             
-            // Track server list response count
             static int serverListCount = 0;
             serverListCount++;
             DLOG(@"[PROTO] Server list response #%d", serverListCount);
             
-            // 1. Patch protocol status at offset 8-11 to 0
             ((unsigned char *)buf)[8] = 0;
             ((unsigned char *)buf)[9] = 0;
             ((unsigned char *)buf)[10] = 0;
             ((unsigned char *)buf)[11] = 0;
             DLOG(@"[PROTO-PATCH] Protocol status set to 0");
             
-            unsigned char *data = (unsigned char *)buf;
-            
-            // 3. Patch JSON status=6 to status=1 (for ALL responses)
             int statusPatchCount = 0;
-            for (size_t i = 0; i + 7 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 't' && data[i+2] == 'a' && data[i+3] == 't' && 
-                    data[i+4] == 'u' && data[i+5] == 's' && data[i+6] == '=' && data[i+7] == '6') {
+            for (size_t i = 0; i + 7 < patchLen; i++) {
+                if (patchData[i] == 's' && patchData[i+1] == 't' && patchData[i+2] == 'a' && patchData[i+3] == 't' && 
+                    patchData[i+4] == 'u' && patchData[i+5] == 's' && patchData[i+6] == '=' && patchData[i+7] == '6') {
                     DLOG(@"[PROTO-PATCH] Found 'status=6' at offset %zu, changing to 1", i);
-                    data[i+7] = '1';
+                    patchData[i+7] = '1';
                     statusPatchCount++;
                 }
             }
             if (statusPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d JSON status values", statusPatchCount);
             
-            // 4. Patch serverType=2 to serverType=1 (for ALL responses)
             int serverTypePatchCount = 0;
-            for (size_t i = 0; i + 11 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'T' && data[i+7] == 'y' &&
-                    data[i+8] == 'p' && data[i+9] == 'e' && data[i+10] == '=' && data[i+11] == '2') {
+            for (size_t i = 0; i + 11 < patchLen; i++) {
+                if (patchData[i] == 's' && patchData[i+1] == 'e' && patchData[i+2] == 'r' && patchData[i+3] == 'v' && 
+                    patchData[i+4] == 'e' && patchData[i+5] == 'r' && patchData[i+6] == 'T' && patchData[i+7] == 'y' &&
+                    patchData[i+8] == 'p' && patchData[i+9] == 'e' && patchData[i+10] == '=' && patchData[i+11] == '2') {
                     DLOG(@"[PROTO-PATCH] Found 'serverType=2' at offset %zu, changing to 1", i);
-                    data[i+11] = '1';
+                    patchData[i+11] = '1';
                     serverTypePatchCount++;
                 }
             }
             if (serverTypePatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverType values", serverTypePatchCount);
             
-            // 5. Patch clientid=0 to clientid=1 (for ALL responses)
             int clientidPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 'c' && data[i+1] == 'l' && data[i+2] == 'i' && data[i+3] == 'e' && 
-                    data[i+4] == 'n' && data[i+5] == 't' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
+            for (size_t i = 0; i + 9 < patchLen; i++) {
+                if (patchData[i] == 'c' && patchData[i+1] == 'l' && patchData[i+2] == 'i' && patchData[i+3] == 'e' && 
+                    patchData[i+4] == 'n' && patchData[i+5] == 't' && patchData[i+6] == 'i' && patchData[i+7] == 'd' &&
+                    patchData[i+8] == '=' && patchData[i+9] == '0') {
                     DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
+                    patchData[i+9] = '1';
                     clientidPatchCount++;
                 }
             }
             if (clientidPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d clientid values", clientidPatchCount);
             
-            // 6. Patch serverid=0 to serverid=1 (for ALL responses)
             int serveridPatchCount = 0;
-            for (size_t i = 0; i + 9 < (size_t)ret; i++) {
-                if (data[i] == 's' && data[i+1] == 'e' && data[i+2] == 'r' && data[i+3] == 'v' && 
-                    data[i+4] == 'e' && data[i+5] == 'r' && data[i+6] == 'i' && data[i+7] == 'd' &&
-                    data[i+8] == '=' && data[i+9] == '0') {
+            for (size_t i = 0; i + 9 < patchLen; i++) {
+                if (patchData[i] == 's' && patchData[i+1] == 'e' && patchData[i+2] == 'r' && patchData[i+3] == 'v' && 
+                    patchData[i+4] == 'e' && patchData[i+5] == 'r' && patchData[i+6] == 'i' && patchData[i+7] == 'd' &&
+                    patchData[i+8] == '=' && patchData[i+9] == '0') {
                     DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
-                    data[i+9] = '1';
+                    patchData[i+9] = '1';
                     serveridPatchCount++;
                 }
             }
             if (serveridPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverid values", serveridPatchCount);
             
-            // 7. Replace old test server IP (with quotes)
             const char *oldIP = "'47.100.204.160'";
             const char *newIP = "'47.100.222.229'";
-            for (size_t i = 0; i + 16 <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldIP, 16) == 0) {
+            for (size_t i = 0; i + 16 <= patchLen; i++) {
+                if (memcmp(patchData + i, oldIP, 16) == 0) {
                     DLOG(@"[PROTO-PATCH] Found old IP at offset %zu, replacing", i);
-                    memcpy(data + i, newIP, 16);
+                    memcpy(patchData + i, newIP, 16);
                 }
             }
             
-            // 8. Patch category '......' to '一区'
             const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
             const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
-            for (size_t i = 0; i + 6 <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldCat, 6) == 0) {
-                    memcpy(data + i, newCat, 6);
+            for (size_t i = 0; i + 6 <= patchLen; i++) {
+                if (memcmp(patchData + i, oldCat, 6) == 0) {
+                    memcpy(patchData + i, newCat, 6);
                 }
             }
             
-            // 9. Patch description '服务器维护中...' to '运行'
-            // UTF-8: 服务器维护中... = E6 9C 8D E5 8A A1 E5 99 A8 E7 BB B4 E6 8A A4 E4 B8 AD 2E 2E 2E
-            // UTF-8: 运行 = E8 BF 90 E8 A1 8C
             const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
                                              0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
                                              0x2E, 0x2E, 0x2E};
             const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
-            for (size_t i = 0; i + 21 <= (size_t)ret; i++) {
-                if (memcmp(data + i, oldDesc, 21) == 0) {
+            for (size_t i = 0; i + 21 <= patchLen; i++) {
+                if (memcmp(patchData + i, oldDesc, 21) == 0) {
                     DLOG(@"[PROTO-PATCH] Found '服务器维护中...' at offset %zu, replacing with '运行'", i);
-                    memcpy(data + i, newDesc, 6);
-                    // Fill remaining space with spaces
-                    for (size_t j = 6; j < 21; j++) data[i+j] = ' ';
+                    memcpy(patchData + i, newDesc, 6);
+                    for (size_t j = 6; j < 21; j++) patchData[i+j] = ' ';
                 }
+            }
+            
+            if (isGzip && decompressedData) {
+                uLongf compressedLen = (uLongf)(ret - 8) * 2;
+                unsigned char *compressedData = malloc(compressedLen);
+                if (compressedData) {
+                    int retCode = compress(compressedData, &compressedLen, decompressedData, decompressedLen);
+                    if (retCode == Z_OK) {
+                        DLOG(@"[GZIP] Re-compressed: %lu -> %lu bytes", decompressedLen, compressedLen);
+                        if (compressedLen <= (size_t)(ret - 8)) {
+                            memcpy((unsigned char *)buf + 8, compressedData, compressedLen);
+                            uint32_t newLen = 8 + (uint32_t)compressedLen;
+                            ((unsigned char *)buf)[0] = (newLen >> 24) & 0xFF;
+                            ((unsigned char *)buf)[1] = (newLen >> 16) & 0xFF;
+                            ((unsigned char *)buf)[2] = (newLen >> 8) & 0xFF;
+                            ((unsigned char *)buf)[3] = newLen & 0xFF;
+                            DLOG(@"[GZIP] Updated packet length: %u -> %u", pktLenBE, newLen);
+                        } else {
+                            DLOG(@"[GZIP] Compressed data too large!");
+                        }
+                    } else {
+                        DLOG(@"[GZIP] Re-compress failed: %d", retCode);
+                    }
+                    free(compressedData);
+                }
+                free(decompressedData);
             }
             
             DLOG(@"[PROTO] Server list patching complete (response #%d, %zd bytes)", serverListCount, ret);
         }
-        
-        if (ret >= 16) {
-            if (cmd == 0x8002A017) {
-                DLOG(@"[PROTO] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO] Login status at offset 12-15: %u (0x%08X)", status, status);
-                if (status != 0) {
-                    DLOG(@"[PROTO-PATCH] Login status %u -> 0 (force success)", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
-                }
-            }
-            
-            if (cmd == 0x8002A016) {
-                DLOG(@"[PROTO] Version/server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO] Status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
-                
-                // Patch ALL status fields to 0 for version response
-                // Status 3 indicates version mismatch or verification failure
-                // We need to force success so the app continues to send server list request
-                if (status8 != 0 || status12 != 0) {
-                    DLOG(@"[PROTO-PATCH] Version response status %u/%u -> 0 (force success)", status8, status12);
-                    memset((unsigned char *)buf + 8, 0, 8);
-                }
-                
-                // Also check for any other non-zero 4-byte status fields after version string
-                // Response format: [len][cmd][status1][status2][version][...][status3][extra]
-                for (size_t i = 24; i + 4 <= (size_t)ret; i += 4) {
-                    uint32_t st = ((uint32_t)p[i] << 24) | ((uint32_t)p[i+1] << 16) |
-                                   ((uint32_t)p[i+2] << 8) | (uint32_t)p[i+3];
-                    if (st != 0 && st != 974) {
-                        DLOG(@"[PROTO-PATCH] Found additional status %u at offset %zu -> 0", st, i);
-                        memset((unsigned char *)buf + i, 0, 4);
-                    }
-                }
-            }
-        }
-    }
     
     if (port == 5678) {
         static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
