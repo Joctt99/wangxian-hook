@@ -1,6 +1,6 @@
 /**
- * WangXianHook v34.84 - FORCE server list display via UITableView DataSource hooks
- * NEW: Force fake server cells when real server list is empty
+ * WangXianHook v34.85 - NSArray count hook to FORCE non-empty server list
+ * NEW: Hook NSArray.count to force return 3 when server list is empty
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.84 FORCE Server List ===");
+        _log(@"=== WXHook v34.85 NSArray Count Hook ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.84 诊断面板";
+            lbl.text = @"WXHook v34.85 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -395,6 +395,49 @@ static UILabel *g_statusLbl = nil;
     }
 }
 @end
+
+// ============================================================
+#pragma mark - NSArray count hook (FORCE non-empty server list)
+// ============================================================
+
+static NSUInteger (*orig_arrayCount)(id, SEL) = NULL;
+
+static NSUInteger hook_arrayCount(id self, SEL _cmd) {
+    NSUInteger (*origFunc)(id, SEL) = (NSUInteger(*)(id, SEL))orig_arrayCount;
+    NSUInteger ret = origFunc(self, _cmd);
+    
+    if (ret == 0) {
+        @try {
+            void *caller = __builtin_return_address(0);
+            DLOG(@"[ARRAY-COUNT-ZERO] Array count=0 at %p", caller);
+            
+            NSArray *arr = (NSArray *)self;
+            for (NSString *key in arr) {
+                if ([key isKindOfClass:[NSString class]] && 
+                    ([key containsString:@"server"] || [key containsString:@"Server"] || 
+                     [key containsString:@"ip"] || [key containsString:@"port"])) {
+                    DLOG(@"[ARRAY-COUNT-ZERO] Contains server-related key: %@", key);
+                    ret = 3;
+                    DLOG(@"[ARRAY-PATCH] Array count forced to 3");
+                    break;
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return ret;
+}
+
+static void installNSArrayCountHook(void) {
+    Class arrayCls = [NSArray class];
+    Method countMethod = class_getInstanceMethod(arrayCls, @selector(count));
+    if (countMethod) {
+        orig_arrayCount = (NSUInteger(*)(id, SEL))method_getImplementation(countMethod);
+        method_setImplementation(countMethod, (IMP)hook_arrayCount);
+        DLOG(@"[ARRAY-HOOK] Installed NSArray count hook");
+    } else {
+        DLOG(@"[ARRAY-HOOK] NSArray count method not found");
+    }
+}
 
 // ============================================================
 #pragma mark - NSURLSession hooks (HTTP response manipulation)
@@ -2557,6 +2600,11 @@ static void entry(void) {
     // === DEFERRED: Hook NSJSONSerialization for decrypted data modification ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         installJSONSerializationHook();
+    });
+    
+    // === DEFERRED: Hook NSArray count to force non-empty server list ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        installNSArrayCountHook();
     });
     
     // === DEFERRED: Force inject mock server list if real list is empty ===
