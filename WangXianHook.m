@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.80 - Comprehensive protocol patch v2
+ * WangXianHook v34.81 - Server info patch in both hook_recv and hook_read
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.80 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.81 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.80 诊断面板";
+            lbl.text = @"WXHook v34.81 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1135,6 +1135,39 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             if (status4 != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
                 memset((unsigned char *)buf + 8, 0, 8);
+            }
+        }
+        
+        if (cmd == 0x802EE100 || cmd == 0x802EE113) {
+            DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            unsigned char *payload = (unsigned char *)buf + 8;
+            ssize_t payloadLen = ret - 8;
+            if (payloadLen > 0) {
+                NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
+                DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
+                
+                if ([jsonStr rangeOfString:@"status="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
+                }
+                if ([jsonStr rangeOfString:@"serverid="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
+                }
+                if ([jsonStr rangeOfString:@"clientid="].location != NSNotFound) {
+                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
+                }
+                
+                NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
+                if (newData && [newData length] <= payloadLen) {
+                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully");
+                    memcpy(payload, [newData bytes], [newData length]);
+                    memset(payload + [newData length], 0, payloadLen - [newData length]);
+                } else {
+                    DLOG(@"[PROTO-R-PATCH] Server info patch failed: len=%zu vs max=%zd", [newData length], payloadLen);
+                }
             }
         }
         
