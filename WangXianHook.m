@@ -467,21 +467,26 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
 }
 
 static void installNSURLSessionHooks(void) {
-    Class delegateCls = NSClassFromString(@"NSURLSessionDataDelegate");
-    if (!delegateCls) {
-        DLOG(@"[HTTP-HOOK] NSURLSessionDataDelegate protocol not found");
+    Class sessionCls = [NSURLSession class];
+    if (!sessionCls) {
+        DLOG(@"[HTTP-HOOK] NSURLSession class not found");
         return;
     }
     
-    Method didReceiveData = class_getInstanceMethod(delegateCls, @selector(urlSession:dataTask:didReceiveData:));
-    if (!didReceiveData) {
-        DLOG(@"[HTTP-HOOK] urlSession:dataTask:didReceiveData: not found");
-        return;
+    Method dataTaskMethod = class_getInstanceMethod(sessionCls, @selector(dataTaskWithRequest:completionHandler:));
+    if (!dataTaskMethod) {
+        DLOG(@"[HTTP-HOOK] dataTaskWithRequest:completionHandler: not found");
+    } else {
+        DLOG(@"[HTTP-HOOK] NSURLSession dataTaskWithRequest:completionHandler: found");
     }
     
-    orig_urlSessionDataTaskDidReceiveData = method_getImplementation(didReceiveData);
-    method_setImplementation(didReceiveData, (IMP)hook_urlSessionDataTaskDidReceiveData);
-    DLOG(@"[HTTP-HOOK] Installed NSURLSessionDataDelegate hook");
+    Class dataTaskCls = NSClassFromString(@"__NSCFLocalDataTask");
+    if (!dataTaskCls) dataTaskCls = NSClassFromString(@"__NSCFLNetworkDataTask");
+    if (!dataTaskCls) dataTaskCls = NSClassFromString(@"NSURLSessionDataTask");
+    
+    if (dataTaskCls) {
+        DLOG(@"[HTTP-HOOK] NSURLSessionDataTask class found: %@", NSStringFromClass(dataTaskCls));
+    }
 }
 
 // ============================================================
