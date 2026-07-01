@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.74 - Anti-Cheat Monitor + Protocol Login Patch
+ * WangXianHook v34.75 - Anti-Cheat Monitor + Protocol Login Patch
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.74 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.75 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -186,7 +186,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.73 诊断面板";
+            lbl.text = @"WXHook v34.75 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -484,16 +484,82 @@ static id msi_init_hook(id self, SEL _cmd) {
 }
 
 static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
-    id (*origFunc)(id, SEL, NSDictionary*) = (id(*)(id, SEL, NSDictionary*))orig_msi_initWithDict;
-    id ret = origFunc(self, _cmd, dict);
-    if (ret) {
-        DLOG(@"[MSI-CALL] -[%@ initWithDictionary:] -> %p", NSStringFromClass([self class]), ret);
-        if (dict) {
-            DLOG(@"[MSI-DICT] Dictionary keys: %@", [dict allKeys]);
-            for (NSString *key in dict) {
-                DLOG(@"[MSI-DICT]   %@ = %@", key, dict[key]);
+    NSMutableDictionary *mutDict = nil;
+    if (dict) {
+        mutDict = [dict mutableCopy];
+        
+        if ([mutDict objectForKey:@"status"]) {
+            NSNumber *status = mutDict[@"status"];
+            if ([status isKindOfClass:[NSNumber class]] && [status intValue] != 1) {
+                DLOG(@"[MSI-PATCH] status=%@ -> 1", status);
+                mutDict[@"status"] = @1;
             }
         }
+        
+        if ([mutDict objectForKey:@"serverType"]) {
+            NSNumber *serverType = mutDict[@"serverType"];
+            if ([serverType isKindOfClass:[NSNumber class]] && [serverType intValue] != 1) {
+                DLOG(@"[MSI-PATCH] serverType=%@ -> 1", serverType);
+                mutDict[@"serverType"] = @1;
+            }
+        }
+        
+        if ([mutDict objectForKey:@"clientid"]) {
+            NSNumber *clientid = mutDict[@"clientid"];
+            if ([clientid isKindOfClass:[NSNumber class]] && [clientid intValue] != 1) {
+                DLOG(@"[MSI-PATCH] clientid=%@ -> 1", clientid);
+                mutDict[@"clientid"] = @1;
+            }
+        }
+        
+        if ([mutDict objectForKey:@"serverid"]) {
+            NSNumber *serverid = mutDict[@"serverid"];
+            if ([serverid isKindOfClass:[NSNumber class]] && [serverid intValue] != 1) {
+                DLOG(@"[MSI-PATCH] serverid=%@ -> 1", serverid);
+                mutDict[@"serverid"] = @1;
+            }
+        }
+        
+        if ([mutDict objectForKey:@"ip"]) {
+            NSString *ip = mutDict[@"ip"];
+            if ([ip isKindOfClass:[NSString class]] && ![ip isEqualToString:@"47.100.222.229"]) {
+                DLOG(@"[MSI-PATCH] ip=%@ -> 47.100.222.229", ip);
+                mutDict[@"ip"] = @"47.100.222.229";
+            }
+        }
+        
+        if ([mutDict objectForKey:@"category"]) {
+            NSString *category = mutDict[@"category"];
+            if ([category isKindOfClass:[NSString class]]) {
+                BOOL isAllDots = YES;
+                for (NSInteger i = 0; i < category.length; i++) {
+                    if ([category characterAtIndex:i] != '.') { isAllDots = NO; break; }
+                }
+                if (isAllDots || [category length] == 0) {
+                    DLOG(@"[MSI-PATCH] category=%@ -> 一区", category);
+                    mutDict[@"category"] = @"一区";
+                }
+            }
+        }
+        
+        if ([mutDict objectForKey:@"description"]) {
+            NSString *desc = mutDict[@"description"];
+            if ([desc isKindOfClass:[NSString class]] && [desc containsString:@"维护"]) {
+                DLOG(@"[MSI-PATCH] description=%@ -> 运行", desc);
+                mutDict[@"description"] = @"运行";
+            }
+        }
+        
+        DLOG(@"[MSI-CALL] -[%@ initWithDictionary:] (patched) -> %@", NSStringFromClass([self class]), [mutDict allKeys]);
+        for (NSString *key in mutDict) {
+            DLOG(@"[MSI-DICT]   %@ = %@", key, mutDict[key]);
+        }
+    }
+    
+    id (*origFunc)(id, SEL, NSDictionary*) = (id(*)(id, SEL, NSDictionary*))orig_msi_initWithDict;
+    id ret = origFunc(self, _cmd, mutDict ?: dict);
+    
+    if (ret) {
         msi_log_properties(ret);
     }
     return ret;
@@ -502,6 +568,46 @@ static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
 static NSNumber *msi_status_hook(id self, SEL _cmd) {
     NSNumber *(*origFunc)(id, SEL) = (NSNumber*(*)(id, SEL))orig_msi_status;
     NSNumber *ret = origFunc(self, _cmd);
+    if (ret && [ret intValue] != 1) {
+        DLOG(@"[MSI-PATCH-STATUS] status=%@ -> 1 (property access)", ret);
+        return @1;
+    }
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
+    return ret;
+}
+
+static NSString *msi_ip_hook(id self, SEL _cmd) {
+    NSString *ret = ((NSString*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    if (ret && ![ret isEqualToString:@"47.100.222.229"]) {
+        DLOG(@"[MSI-PATCH-IP] ip=%@ -> 47.100.222.229 (property access)", ret);
+        return @"47.100.222.229";
+    }
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
+    return ret;
+}
+
+static NSString *msi_category_hook(id self, SEL _cmd) {
+    NSString *ret = ((NSString*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    if (ret) {
+        BOOL isAllDots = YES;
+        for (NSInteger i = 0; i < ret.length; i++) {
+            if ([ret characterAtIndex:i] != '.') { isAllDots = NO; break; }
+        }
+        if (isAllDots || [ret length] == 0) {
+            DLOG(@"[MSI-PATCH-CAT] category=%@ -> 一区 (property access)", ret);
+            return @"一区";
+        }
+    }
+    DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
+    return ret;
+}
+
+static NSNumber *msi_serverType_hook(id self, SEL _cmd) {
+    NSNumber *ret = ((NSNumber*(*)(id, SEL))objc_msgSend)(self, _cmd);
+    if (ret && [ret intValue] != 1) {
+        DLOG(@"[MSI-PATCH-TYPE] serverType=%@ -> 1 (property access)", ret);
+        return @1;
+    }
     DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
     return ret;
 }
@@ -563,6 +669,36 @@ static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
         if (m_statusValue) {
             method_setImplementation(m_statusValue, (IMP)msi_status_hook);
             DLOG(@"[MSI-HOOK] Hooked: statusValue");
+        }
+        
+        Method m_ip = class_getInstanceMethod(msiCls, @selector(ip));
+        if (m_ip) {
+            method_setImplementation(m_ip, (IMP)msi_ip_hook);
+            DLOG(@"[MSI-HOOK] Hooked: ip");
+        }
+        
+        Method m_category = class_getInstanceMethod(msiCls, @selector(category));
+        if (m_category) {
+            method_setImplementation(m_category, (IMP)msi_category_hook);
+            DLOG(@"[MSI-HOOK] Hooked: category");
+        }
+        
+        Method m_serverType = class_getInstanceMethod(msiCls, @selector(serverType));
+        if (m_serverType) {
+            method_setImplementation(m_serverType, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: serverType");
+        }
+        
+        Method m_serverId = class_getInstanceMethod(msiCls, @selector(serverid));
+        if (m_serverId) {
+            method_setImplementation(m_serverId, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: serverid");
+        }
+        
+        Method m_clientId = class_getInstanceMethod(msiCls, @selector(clientid));
+        if (m_clientId) {
+            method_setImplementation(m_clientId, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: clientid");
         }
     } else {
         DLOG(@"[MSI-RETRY] MieshiServerInfo class not found at attempt #%d", attempt);
@@ -1844,6 +1980,36 @@ static void entry(void) {
         if (m_statusValue) {
             method_setImplementation(m_statusValue, (IMP)msi_status_hook);
             DLOG(@"[MSI-HOOK] Hooked: statusValue");
+        }
+        
+        Method m_ip = class_getInstanceMethod(msiCls, @selector(ip));
+        if (m_ip) {
+            method_setImplementation(m_ip, (IMP)msi_ip_hook);
+            DLOG(@"[MSI-HOOK] Hooked: ip");
+        }
+        
+        Method m_category = class_getInstanceMethod(msiCls, @selector(category));
+        if (m_category) {
+            method_setImplementation(m_category, (IMP)msi_category_hook);
+            DLOG(@"[MSI-HOOK] Hooked: category");
+        }
+        
+        Method m_serverType = class_getInstanceMethod(msiCls, @selector(serverType));
+        if (m_serverType) {
+            method_setImplementation(m_serverType, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: serverType");
+        }
+        
+        Method m_serverId = class_getInstanceMethod(msiCls, @selector(serverid));
+        if (m_serverId) {
+            method_setImplementation(m_serverId, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: serverid");
+        }
+        
+        Method m_clientId = class_getInstanceMethod(msiCls, @selector(clientid));
+        if (m_clientId) {
+            method_setImplementation(m_clientId, (IMP)msi_serverType_hook);
+            DLOG(@"[MSI-HOOK] Hooked: clientid");
         }
     } else {
         DLOG(@"[MSI] MieshiServerInfo class NOT found!");
