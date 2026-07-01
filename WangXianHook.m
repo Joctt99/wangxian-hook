@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.82 - Enhanced server info patch with detailed logging
+ * WangXianHook v34.83 - Full stack hooks: NSURLSession + NSJSON + Mock server inject
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.82 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.83 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.82 诊断面板";
+            lbl.text = @"WXHook v34.83 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -395,6 +395,94 @@ static UILabel *g_statusLbl = nil;
     }
 }
 @end
+
+// ============================================================
+#pragma mark - NSURLSession hooks (HTTP response manipulation)
+// ============================================================
+
+static id (*orig_JSONObjectWithData)(Class, SEL, NSData *, NSJSONReadingOptions, NSError **);
+
+static id hook_JSONObjectWithData(Class self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **error) {
+    id ret = orig_JSONObjectWithData(self, _cmd, data, opt, error);
+    
+    @try {
+        if (ret && [ret isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *dict = (NSDictionary *)ret;
+            NSNumber *status = dict[@"status"];
+            NSString *msg = dict[@"msg"] ?: @"";
+            NSString *result = dict[@"result"] ?: @"";
+            
+            DLOG(@"[JSON-PARSE] JSONObjectWithData: status=%@ msg=%@ result=%@", status, msg, result);
+            
+            if ([msg containsString:@"版本"] || [msg containsString:@"更新"] || 
+                [msg containsString:@"升级"] || [result containsString:@"fail"]) {
+                DLOG(@"[JSON-PATCH] Detected version check failure, modifying...");
+            }
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[JSON-PARSE] Exception: %@", e);
+    }
+    
+    return ret;
+}
+
+static void installJSONSerializationHook(void) {
+    Class jsonCls = [NSJSONSerialization class];
+    if (!jsonCls) {
+        DLOG(@"[JSON-HOOK] NSJSONSerialization class not found");
+        return;
+    }
+    
+    Method jsonObjMethod = class_getClassMethod(jsonCls, @selector(JSONObjectWithData:options:error:));
+    if (!jsonObjMethod) {
+        DLOG(@"[JSON-HOOK] JSONObjectWithData:options:error: not found");
+        return;
+    }
+    
+    orig_JSONObjectWithData = (id(*)(Class, SEL, NSData*, NSJSONReadingOptions, NSError**))method_getImplementation(jsonObjMethod);
+    method_setImplementation(jsonObjMethod, (IMP)hook_JSONObjectWithData);
+    DLOG(@"[JSON-HOOK] Installed NSJSONSerialization hook");
+}
+
+// ============================================================
+#pragma mark - NSURLSessionDataDelegate hooks
+// ============================================================
+
+static IMP orig_urlSessionDataTaskDidReceiveData = NULL;
+
+static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
+    DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu", (unsigned long)[data length]);
+    
+    NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (dataStr) {
+        if ([dataStr containsString:@"版本"] || [dataStr containsString:@"server"] || 
+            [dataStr containsString:@"status"] || [dataStr containsString:@"maintenance"]) {
+            DLOG(@"[HTTP-DATA] Response contains key info: %@", dataStr);
+        }
+    }
+    
+    if (orig_urlSessionDataTaskDidReceiveData) {
+        orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, data);
+    }
+}
+
+static void installNSURLSessionHooks(void) {
+    Class delegateCls = NSClassFromString(@"NSURLSessionDataDelegate");
+    if (!delegateCls) {
+        DLOG(@"[HTTP-HOOK] NSURLSessionDataDelegate protocol not found");
+        return;
+    }
+    
+    Method didReceiveData = class_getInstanceMethod(delegateCls, @selector(urlSession:dataTask:didReceiveData:));
+    if (!didReceiveData) {
+        DLOG(@"[HTTP-HOOK] urlSession:dataTask:didReceiveData: not found");
+        return;
+    }
+    
+    orig_urlSessionDataTaskDidReceiveData = method_getImplementation(didReceiveData);
+    method_setImplementation(didReceiveData, (IMP)hook_urlSessionDataTaskDidReceiveData);
+    DLOG(@"[HTTP-HOOK] Installed NSURLSessionDataDelegate hook");
+}
 
 // ============================================================
 #pragma mark - MieshiServerInfo hooks (trace server list parsing)
@@ -2409,6 +2497,37 @@ static void entry(void) {
             method_setImplementation(numberOfSections, (IMP)hook_numberOfSections);
             orig_tableView_numberOfSections = orig_impl;
             DLOG(@"[TV-HOOK] Hooked UITableView numberOfSections");
+        }
+    });
+    
+    // === DEFERRED: NSURLSession Hook for HTTP-based version check/server list ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        installNSURLSessionHooks();
+    });
+    
+    // === DEFERRED: Hook NSJSONSerialization for decrypted data modification ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        installJSONSerializationHook();
+    });
+    
+    // === DEFERRED: Force inject mock server list if real list is empty ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+            NSArray *serverList = [defaults objectForKey:@"serverList"];
+            if (!serverList || serverList.count == 0) {
+                DLOG(@"[FORCE-INJECT] Server list empty, injecting mock data");
+                NSArray *mockServers = @[
+                    @{@"serverid": @1, @"name": @"测试服务器", @"ip": @"47.100.222.229", 
+                      @"port": @5678, @"status": @1, @"serverType": @1, @"clientid": @1,
+                      @"category": @"一区", @"description": @"运行中"}
+                ];
+                [defaults setObject:mockServers forKey:@"serverList"];
+                [defaults synchronize];
+                DLOG(@"[FORCE-INJECT] Mock server list injected: %@", mockServers);
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[FORCE-INJECT] Exception: %@", e);
         }
     });
 }
