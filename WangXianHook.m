@@ -27,9 +27,12 @@ static void _log(NSString *msg) {
     @try {
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:g_logPath error:nil];
         unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
-        if (size > 500 * 1024) {
+        if (size > 5 * 1024 * 1024) {
+            NSString *oldLogPath = [g_logPath stringByAppendingString:@".old"];
+            [[NSFileManager defaultManager] removeItemAtPath:oldLogPath error:nil];
+            [[NSFileManager defaultManager] copyItemAtPath:g_logPath toPath:oldLogPath error:nil];
             [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            _log(@"[LOG] File too large (>500KB), truncated");
+            _log(@"[LOG] File too large (>5MB), rotated to .old");
             return;
         }
         
@@ -399,6 +402,60 @@ static IMP orig_msi_init = NULL;
 static IMP orig_msi_initWithDict = NULL;
 static IMP orig_msi_status = NULL;
 
+// ============================================================
+#pragma mark - UITableView DataSource hooks (debug server list)
+// ============================================================
+
+static IMP orig_tableView_numberOfRows = NULL;
+static IMP orig_tableView_cellForRow = NULL;
+static IMP orig_tableView_numberOfSections = NULL;
+
+static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section) {
+    NSInteger (*origFunc)(id, SEL, NSInteger) = (NSInteger(*)(id, SEL, NSInteger))orig_tableView_numberOfRows;
+    NSInteger ret = origFunc(self, _cmd, section);
+    
+    Class cls = [self class];
+    NSString *clsName = NSStringFromClass(cls);
+    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
+        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
+        DLOG(@"[TV-CALL] -[%@ numberOfRowsInSection:%ld] -> %ld", clsName, (long)section, (long)ret);
+    }
+    return ret;
+}
+
+static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
+    UITableViewCell *(*origFunc)(id, SEL, NSIndexPath*) = (UITableViewCell*(*)(id, SEL, NSIndexPath*))orig_tableView_cellForRow;
+    UITableViewCell *ret = origFunc(self, _cmd, indexPath);
+    
+    Class cls = [self class];
+    NSString *clsName = NSStringFromClass(cls);
+    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
+        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
+        NSString *text = @"";
+        if (ret && ret.textLabel) text = ret.textLabel.text ?: @"";
+        DLOG(@"[TV-CALL] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@'", clsName, 
+             (long)indexPath.section, (long)indexPath.row, text);
+    }
+    return ret;
+}
+
+static NSInteger hook_numberOfSections(id self, SEL _cmd) {
+    NSInteger (*origFunc)(id, SEL) = (NSInteger(*)(id, SEL))orig_tableView_numberOfSections;
+    NSInteger ret = origFunc(self, _cmd);
+    
+    Class cls = [self class];
+    NSString *clsName = NSStringFromClass(cls);
+    if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
+        [clsName containsString:@"List"] || [clsName containsString:@"list"]) {
+        DLOG(@"[TV-CALL] -[%@ numberOfSections] -> %ld", clsName, (long)ret);
+    }
+    return ret;
+}
+
+// ============================================================
+#pragma mark - MieshiServerInfo helper
+// ============================================================
+
 static void msi_log_properties(id self) {
     @try {
         unsigned int count = 0;
@@ -686,230 +743,18 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
-    // Version check response: ret >= 13 (0x802EE118 = 13 bytes)
-    if (port == 5678 && ret >= 13) {
+    if (port == 5678 && ret >= 8) {
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        unsigned char *payload = (unsigned char *)buf + 8;
-        ssize_t payloadLen = ret - 8;
-        BOOL isGzip = (payloadLen >= 3 && payload[0] == 0x1F && payload[1] == 0x8B && payload[2] == 0x08);
-        DLOG(@"[PROTO] cmd=0x%08X isGzip=%d payloadLen=%zd", cmd, isGzip, payloadLen);
-        
-        unsigned char *decompressedData = NULL;
-        uLongf decompressedLen = 0;
-        
-        if (isGzip) {
-            unsigned char *gzipData = payload;
-            uLongf gzipLen = (uLongf)payloadLen;
-            decompressedLen = gzipLen * 10;
-            decompressedData = malloc(decompressedLen);
-            if (decompressedData) {
-                int retCode = uncompress(decompressedData, &decompressedLen, gzipData, gzipLen);
-                if (retCode != Z_OK) {
-                    DLOG(@"[GZIP] uncompress failed: %d", retCode);
-                    free(decompressedData);
-                    decompressedData = NULL;
-                } else {
-                    DLOG(@"[GZIP] Decompressed: %lu -> %lu bytes", gzipLen, decompressedLen);
-                    NSMutableString *hexPreview = [NSMutableString string];
-                    size_t previewLen = decompressedLen > 128 ? 128 : decompressedLen;
-                    for (size_t i = 0; i < previewLen; i++) {
-                        [hexPreview appendFormat:@"%02X ", decompressedData[i]];
-                    }
-                    DLOG(@"[GZIP] Decompressed preview: %@", hexPreview);
-                }
-            }
-        }
-        
-        unsigned char *patchData = decompressedData ? decompressedData : payload;
-        size_t patchLen = decompressedData ? decompressedLen : payloadLen;
-        
-        // When receiving heartbeat from auth server (instead of game server response),
-        // DISABLED: fake login response causes app to hang/crash
-        // if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
-        //     DLOG(@"[PROTO-PATCH] Got heartbeat from auth server, IGNORING");
-        // }
-        
-        // DISABLED: login failure patch causes app to hang/crash
-        // if (cmd == 0x76666669 || cmd == 0x7666669A) {
-        //     DLOG(@"[PROTO-PATCH] Got login failure from auth server, IGNORING");
-        // }
-        
-        if (cmd == 0x802EE118) {
-            DLOG(@"[PROTO] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-            if (status4 != 0) {
-                DLOG(@"[PROTO-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 4);
-            }
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
-                ((unsigned char *)buf)[12] = 0;
-            }
-        }
-
-        if (cmd == 0x0000E011) {
-            DLOG(@"[PROTO] Server info response 0x0000E011 pktLen=%u ret=%zd", pktLenBE, ret);
-        }
-
-        if (cmd == 0x802EE121) {
-            DLOG(@"[PROTO] Version check response 0x802EE121 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-            if (status4 != 0) {
-                DLOG(@"[PROTO-PATCH] Version check 4-byte status %u -> 0", status4);
-                ((unsigned char *)buf)[8] = 0;
-                ((unsigned char *)buf)[9] = 0;
-                ((unsigned char *)buf)[10] = 0;
-                ((unsigned char *)buf)[11] = 0;
-            }
-            // Also clear offset 12-15 (another status field) and message string
-            if (ret > 16) {
-                DLOG(@"[PROTO-PATCH] Clearing version check message (offset 12 onwards)");
-                memset((unsigned char *)buf + 12, 0, ret - 12);
-            }
-        }
-
-        if (cmd == 0x802EE113 || cmd == 0x8002A017) {
-            DLOG(@"[PROTO] Server/list response 0x%08X - pktLen=%u ret=%zd isGzip=%d", cmd, pktLenBE, ret, isGzip);
-            
-            static int serverListCount = 0;
-            serverListCount++;
-            DLOG(@"[PROTO] Server list response #%d", serverListCount);
-            
-            ((unsigned char *)buf)[8] = 0;
-            ((unsigned char *)buf)[9] = 0;
-            ((unsigned char *)buf)[10] = 0;
-            ((unsigned char *)buf)[11] = 0;
-            DLOG(@"[PROTO-PATCH] Protocol status set to 0");
-            
-            int statusPatchCount = 0;
-            for (size_t i = 0; i + 7 < patchLen; i++) {
-                if (patchData[i] == 's' && patchData[i+1] == 't' && patchData[i+2] == 'a' && patchData[i+3] == 't' && 
-                    patchData[i+4] == 'u' && patchData[i+5] == 's' && patchData[i+6] == '=' && patchData[i+7] == '6') {
-                    DLOG(@"[PROTO-PATCH] Found 'status=6' at offset %zu, changing to 1", i);
-                    patchData[i+7] = '1';
-                    statusPatchCount++;
-                }
-            }
-            if (statusPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d JSON status values", statusPatchCount);
-            
-            int serverTypePatchCount = 0;
-            for (size_t i = 0; i + 11 < patchLen; i++) {
-                if (patchData[i] == 's' && patchData[i+1] == 'e' && patchData[i+2] == 'r' && patchData[i+3] == 'v' && 
-                    patchData[i+4] == 'e' && patchData[i+5] == 'r' && patchData[i+6] == 'T' && patchData[i+7] == 'y' &&
-                    patchData[i+8] == 'p' && patchData[i+9] == 'e' && patchData[i+10] == '=' && patchData[i+11] == '2') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverType=2' at offset %zu, changing to 1", i);
-                    patchData[i+11] = '1';
-                    serverTypePatchCount++;
-                }
-            }
-            if (serverTypePatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverType values", serverTypePatchCount);
-            
-            int clientidPatchCount = 0;
-            for (size_t i = 0; i + 9 < patchLen; i++) {
-                if (patchData[i] == 'c' && patchData[i+1] == 'l' && patchData[i+2] == 'i' && patchData[i+3] == 'e' && 
-                    patchData[i+4] == 'n' && patchData[i+5] == 't' && patchData[i+6] == 'i' && patchData[i+7] == 'd' &&
-                    patchData[i+8] == '=' && patchData[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'clientid=0' at offset %zu, changing to 1", i);
-                    patchData[i+9] = '1';
-                    clientidPatchCount++;
-                }
-            }
-            if (clientidPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d clientid values", clientidPatchCount);
-            
-            int serveridPatchCount = 0;
-            for (size_t i = 0; i + 9 < patchLen; i++) {
-                if (patchData[i] == 's' && patchData[i+1] == 'e' && patchData[i+2] == 'r' && patchData[i+3] == 'v' && 
-                    patchData[i+4] == 'e' && patchData[i+5] == 'r' && patchData[i+6] == 'i' && patchData[i+7] == 'd' &&
-                    patchData[i+8] == '=' && patchData[i+9] == '0') {
-                    DLOG(@"[PROTO-PATCH] Found 'serverid=0' at offset %zu, changing to 1", i);
-                    patchData[i+9] = '1';
-                    serveridPatchCount++;
-                }
-            }
-            if (serveridPatchCount > 0) DLOG(@"[PROTO-PATCH] Patched %d serverid values", serveridPatchCount);
-            
-            const char *oldIP = "'47.100.204.160'";
-            const char *newIP = "'47.100.222.229'";
-            for (size_t i = 0; i + 16 <= patchLen; i++) {
-                if (memcmp(patchData + i, oldIP, 16) == 0) {
-                    DLOG(@"[PROTO-PATCH] Found old IP at offset %zu, replacing", i);
-                    memcpy(patchData + i, newIP, 16);
-                }
-            }
-            
-            const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
-            const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
-            for (size_t i = 0; i + 6 <= patchLen; i++) {
-                if (memcmp(patchData + i, oldCat, 6) == 0) {
-                    memcpy(patchData + i, newCat, 6);
-                }
-            }
-            
-            const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
-                                             0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
-                                             0x2E, 0x2E, 0x2E};
-            const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
-            for (size_t i = 0; i + 21 <= patchLen; i++) {
-                if (memcmp(patchData + i, oldDesc, 21) == 0) {
-                    DLOG(@"[PROTO-PATCH] Found '服务器维护中...' at offset %zu, replacing with '运行'", i);
-                    memcpy(patchData + i, newDesc, 6);
-                    for (size_t j = 6; j < 21; j++) patchData[i+j] = ' ';
-                }
-            }
-            
-            if (isGzip && decompressedData) {
-                uLongf compressedLen = (uLongf)(ret - 8) * 2;
-                unsigned char *compressedData = malloc(compressedLen);
-                if (compressedData) {
-                    int retCode = compress(compressedData, &compressedLen, decompressedData, decompressedLen);
-                    if (retCode == Z_OK) {
-                        DLOG(@"[GZIP] Re-compressed: %lu -> %lu bytes", decompressedLen, compressedLen);
-                        if (compressedLen <= (size_t)(ret - 8)) {
-                            memcpy((unsigned char *)buf + 8, compressedData, compressedLen);
-                            uint32_t newLen = 8 + (uint32_t)compressedLen;
-                            ((unsigned char *)buf)[0] = (newLen >> 24) & 0xFF;
-                            ((unsigned char *)buf)[1] = (newLen >> 16) & 0xFF;
-                            ((unsigned char *)buf)[2] = (newLen >> 8) & 0xFF;
-                            ((unsigned char *)buf)[3] = newLen & 0xFF;
-                            DLOG(@"[GZIP] Updated packet length: %u -> %u", pktLenBE, newLen);
-                        } else {
-                            DLOG(@"[GZIP] Compressed data too large!");
-                        }
-                    } else {
-                        DLOG(@"[GZIP] Re-compress failed: %d", retCode);
-                    }
-                    free(compressedData);
-                }
-                free(decompressedData);
-            }
-            
-            DLOG(@"[PROTO] Server list patching complete (response #%d, %zd bytes)", serverListCount, ret);
-        }
-    }
-    
-    if (port == 5678) {
-        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                DLOG(@"[PATCH] Detected '版本过低' in server response at offset %zd, neutralizing", i);
-                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-            }
-        }
-        static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-            if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                DLOG(@"[PATCH] Detected '当前版本' in server response at offset %zd, neutralizing", i);
-                memset((unsigned char *)buf + i, ' ', sizeof(curVer));
-            }
+        if (cmd == 0x07777777 || cmd == 0x87777777) {
+            unsigned char *payload = (unsigned char *)buf + 8;
+            ssize_t payloadLen = ret - 8;
+            BOOL isGzip = (payloadLen >= 3 && payload[0] == 0x1F && payload[1] == 0x8B && payload[2] == 0x08);
+            DLOG(@"[PROTO] Resource response 0x%08X isGzip=%d payloadLen=%zd", cmd, isGzip, payloadLen);
         }
     }
     
@@ -2028,6 +1873,69 @@ static void entry(void) {
         }
     }
     
+    // === DECODE-SEARCH: Search for decode/decrypt/parse methods ===
+    // This helps find where protocol data is decoded after receiving
+    DLOG(@"[DECODE-SEARCH] Starting scan for decode/decrypt/parse methods...");
+    
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    if (allClasses) {
+        NSArray *decodeKeywords = @[
+            @"decrypt", @"Decrypt", @"DECRYPT",
+            @"decode", @"Decode", @"DECODE",
+            @"parse", @"Parse", @"PARSE",
+            @"unpack", @"Unpack", @"UNPACK",
+            @"decompress", @"Decompress", @"DECOMPRESS",
+            @"decipher", @"Decipher", @"DECIPHER",
+            @"decodePacket", @"decodeData", @"parsePacket",
+            @"processPacket", @"handlePacket", @"readPacket",
+            @"decodeServer", @"parseServer", @"serverList"
+        ];
+        
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class cls = allClasses[i];
+            NSString *clsName = NSStringFromClass(cls);
+            
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(cls, &mcount);
+            if (methods) {
+                for (unsigned int j = 0; j < mcount; j++) {
+                    SEL sel = method_getName(methods[j]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    
+                    for (NSString *keyword in decodeKeywords) {
+                        if ([selName containsString:keyword]) {
+                            DLOG(@"[DECODE-FOUND] Class: %@, Method: -[%@ %@]", 
+                                 clsName, clsName, selName);
+                            break;
+                        }
+                    }
+                }
+                free(methods);
+            }
+            
+            Class metaCls = object_getClass(cls);
+            Method *classMethods = class_copyMethodList(metaCls, &mcount);
+            if (classMethods) {
+                for (unsigned int j = 0; j < mcount; j++) {
+                    SEL sel = method_getName(classMethods[j]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    
+                    for (NSString *keyword in decodeKeywords) {
+                        if ([selName containsString:keyword]) {
+                            DLOG(@"[DECODE-FOUND] Class: %@, Method: +[%@ %@]", 
+                                 clsName, clsName, selName);
+                            break;
+                        }
+                    }
+                }
+                free(classMethods);
+            }
+        }
+        free(allClasses);
+    }
+    DLOG(@"[DECODE-SEARCH] Scan completed.");
+    
     // === DEFERRED: Create UI button only ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = nil;
@@ -2054,49 +1962,92 @@ static void entry(void) {
         _log(@"[UI] Button created");
     });
     
-    // === DEFERRED: Delayed MieshiServerInfo hook (class may load later) ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // === DEFERRED: Multi-stage MieshiServerInfo hook (class may load later) ===
+    static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
         Class msiCls = NSClassFromString(@"MieshiServerInfo");
         if (msiCls) {
-            DLOG(@"[MSI-DELAYED] MieshiServerInfo class FOUND at delay hook!");
+            DLOG(@"[MSI-RETRY] MieshiServerInfo class FOUND at attempt #%d!", attempt);
             
             unsigned int mcount = 0;
             Method *methods = class_copyMethodList(msiCls, &mcount);
             for (unsigned int i = 0; i < mcount; i++) {
                 SEL sel = method_getName(methods[i]);
                 NSString *selName = NSStringFromSelector(sel);
-                DLOG(@"[MSI-DELAYED] -[%@ %@]", NSStringFromClass(msiCls), selName);
+                DLOG(@"[MSI-RETRY] -[%@ %@]", NSStringFromClass(msiCls), selName);
             }
             if (methods) free(methods);
             
-            Method m_init = class_getInstanceMethod(msiCls, @selector(init));
-            if (m_init) {
-                orig_msi_init = method_getImplementation(m_init);
-                method_setImplementation(m_init, (IMP)msi_init_hook);
-                DLOG(@"[MSI-HOOK] Delayed hook: init");
+            if (!orig_msi_init) {
+                Method m_init = class_getInstanceMethod(msiCls, @selector(init));
+                if (m_init) {
+                    orig_msi_init = method_getImplementation(m_init);
+                    method_setImplementation(m_init, (IMP)msi_init_hook);
+                    DLOG(@"[MSI-HOOK] Hooked: init");
+                }
             }
             
-            Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
-            if (m_initDict) {
-                orig_msi_initWithDict = method_getImplementation(m_initDict);
-                method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
-                DLOG(@"[MSI-HOOK] Delayed hook: initWithDictionary:");
+            if (!orig_msi_initWithDict) {
+                Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
+                if (m_initDict) {
+                    orig_msi_initWithDict = method_getImplementation(m_initDict);
+                    method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
+                    DLOG(@"[MSI-HOOK] Hooked: initWithDictionary:");
+                }
             }
             
-            Method m_status = class_getInstanceMethod(msiCls, @selector(status));
-            if (m_status) {
-                orig_msi_status = method_getImplementation(m_status);
-                method_setImplementation(m_status, (IMP)msi_status_hook);
-                DLOG(@"[MSI-HOOK] Delayed hook: status");
+            if (!orig_msi_status) {
+                Method m_status = class_getInstanceMethod(msiCls, @selector(status));
+                if (m_status) {
+                    orig_msi_status = method_getImplementation(m_status);
+                    method_setImplementation(m_status, (IMP)msi_status_hook);
+                    DLOG(@"[MSI-HOOK] Hooked: status");
+                }
             }
             
             Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
             if (m_statusValue) {
                 method_setImplementation(m_statusValue, (IMP)msi_status_hook);
-                DLOG(@"[MSI-HOOK] Delayed hook: statusValue");
+                DLOG(@"[MSI-HOOK] Hooked: statusValue");
             }
         } else {
-            DLOG(@"[MSI-DELAYED] MieshiServerInfo class STILL not found!");
+            DLOG(@"[MSI-RETRY] MieshiServerInfo class not found at attempt #%d", attempt);
+            if (attempt < 3) {
+                double delays[] = {2.0, 5.0, 10.0};
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    tryHookMieshiServerInfo(attempt + 1);
+                });
+            }
+        }
+    }
+    
+    tryHookMieshiServerInfo(0);
+    
+    // === DEFERRED: UITableView DataSource Hook for server list debugging ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class tableViewCls = [UITableView class];
+        
+        Method numberOfRows = class_getInstanceMethod(tableViewCls, @selector(numberOfRowsInSection:));
+        if (numberOfRows) {
+            IMP orig_impl = method_getImplementation(numberOfRows);
+            method_setImplementation(numberOfRows, (IMP)hook_numberOfRowsInSection);
+            orig_tableView_numberOfRows = orig_impl;
+            DLOG(@"[TV-HOOK] Hooked UITableView numberOfRowsInSection:");
+        }
+        
+        Method cellForRow = class_getInstanceMethod(tableViewCls, @selector(cellForRowAtIndexPath:));
+        if (cellForRow) {
+            IMP orig_impl = method_getImplementation(cellForRow);
+            method_setImplementation(cellForRow, (IMP)hook_cellForRowAtIndexPath);
+            orig_tableView_cellForRow = orig_impl;
+            DLOG(@"[TV-HOOK] Hooked UITableView cellForRowAtIndexPath:");
+        }
+        
+        Method numberOfSections = class_getInstanceMethod(tableViewCls, @selector(numberOfSections));
+        if (numberOfSections) {
+            IMP orig_impl = method_getImplementation(numberOfSections);
+            method_setImplementation(numberOfSections, (IMP)hook_numberOfSections);
+            orig_tableView_numberOfSections = orig_impl;
+            DLOG(@"[TV-HOOK] Hooked UITableView numberOfSections");
         }
     });
 }
