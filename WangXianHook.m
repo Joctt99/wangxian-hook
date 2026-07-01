@@ -402,6 +402,15 @@ static IMP orig_msi_init = NULL;
 static IMP orig_msi_initWithDict = NULL;
 static IMP orig_msi_status = NULL;
 
+static id msi_init_hook(id self, SEL _cmd);
+static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict);
+static NSNumber *msi_status_hook(id self, SEL _cmd);
+static NSString *msi_ip_hook(id self, SEL _cmd);
+static NSString *msi_category_hook(id self, SEL _cmd);
+static NSNumber *msi_serverType_hook(id self, SEL _cmd);
+static NSString *msi_string_hook(id self, SEL _cmd);
+static NSInteger msi_int_hook(id self, SEL _cmd);
+
 // ============================================================
 #pragma mark - UITableView DataSource hooks (debug server list)
 // ============================================================
