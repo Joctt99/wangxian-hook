@@ -894,6 +894,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             DLOG(@"[PROTO] Server list patching complete (response #%d, %zd bytes)", serverListCount, ret);
         }
+    }
     
     if (port == 5678) {
         static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
