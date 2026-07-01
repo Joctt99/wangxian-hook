@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.75 - Anti-Cheat Monitor + Protocol Login Patch
+ * WangXianHook v34.76 - Version Check Bypass + Alert Block
  * NEW: Added comprehensive anti-cheat monitoring module
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
@@ -50,7 +50,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.75 Full Protocol Patch ===");
+        _log(@"=== WXHook v34.76 Full Protocol Patch ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -73,12 +73,14 @@ static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
 }
 
-// 3. handleAppInfoResult: - LOG + pass through
+// 3. handleAppInfoResult: - LOG + pass through (call original to process fake result)
 typedef void (*HandleResultIMP)(id, SEL, id);
 static HandleResultIMP orig_handleResult = NULL;
 static void hook_handleResult(id self, SEL _cmd, id result) {
-    DLOG(@"[SK] handleAppInfoResult: BLOCKED: %@", result);
-    // Don't call original - prevent anti-cheat result processing
+    DLOG(@"[SK] handleAppInfoResult: %@", result);
+    if (orig_handleResult) {
+        orig_handleResult(self, _cmd, result);
+    }
 }
 
 // 4. judgeAppInfoWithBaseUrl: - BYPASS
@@ -186,7 +188,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.75 诊断面板";
+            lbl.text = @"WXHook v34.76 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -760,6 +762,15 @@ static void hook_alertViewShow(id self, SEL _cmd) {
         DLOG(@"[DIAG-ALERT-STACK] %@", stack[i]);
     }
     
+    NSString *lowerMsg = [msg lowercaseString];
+    NSString *lowerTitle = [title lowercaseString];
+    if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
+        [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+        [lowerMsg containsString:@"升级"]) {
+        DLOG(@"[ALERT-BLOCK] Blocked version check alert: title='%@' msg='%@'", title, msg);
+        return;
+    }
+    
     orig_alertViewShow(self, _cmd);
 }
 
@@ -772,6 +783,15 @@ static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispat
     NSArray *stack = [NSThread callStackSymbols];
     for (NSUInteger i = 0; i < [stack count] && i < 20; i++) {
         DLOG(@"[DIAG-ALERT-STACK] %@", stack[i]);
+    }
+    
+    NSString *lowerMsg = [msg lowercaseString];
+    NSString *lowerTitle = [title lowercaseString];
+    if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
+        [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+        [lowerMsg containsString:@"升级"]) {
+        DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
+        return;
     }
     
     orig_alertControllerPresent(self, _cmd, animated, completion);
