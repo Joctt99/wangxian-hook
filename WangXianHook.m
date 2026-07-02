@@ -1,5 +1,5 @@
 /**
- * WangXianHook v34.86 - Fix binary data corruption + LOG button + export crash
+ * WangXianHook v34.87 - Fix createLogButton + LOG button retry + export crash
  * FIX: Byte-level patching instead of string replacement to avoid binary corruption
  * FIX: LOG button retry mechanism for window creation
  * FIX: Export crash fix - truncate to 500KB + safer presentation
@@ -52,7 +52,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.86 Binary Patch Fix ===");
+        _log(@"=== WXHook v34.87 Binary Patch Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -190,7 +190,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.86 诊断面板";
+            lbl.text = @"WXHook v34.87 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
