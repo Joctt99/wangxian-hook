@@ -836,7 +836,7 @@ static void createLogButton(UIWindow *w) {
     [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [w addSubview:g_btn];
     [w bringSubviewToFront:g_btn];
-    _log(@"[UI] Button created on window: %@", w);
+    _log(@"[UI] Button created on window");
 }
 
 static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
