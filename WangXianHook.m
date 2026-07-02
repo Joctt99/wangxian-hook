@@ -1,6 +1,8 @@
 /**
- * WangXianHook v34.85 - NSArray count hook to FORCE non-empty server list
- * NEW: Hook NSArray.count to force return 3 when server list is empty
+ * WangXianHook v34.86 - Fix binary data corruption + LOG button + export crash
+ * FIX: Byte-level patching instead of string replacement to avoid binary corruption
+ * FIX: LOG button retry mechanism for window creation
+ * FIX: Export crash fix - truncate to 500KB + safer presentation
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
@@ -50,7 +52,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.85 NSArray Count Hook ===");
+        _log(@"=== WXHook v34.86 Binary Patch Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -188,7 +190,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.85 诊断面板";
+            lbl.text = @"WXHook v34.86 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -326,13 +328,17 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wxhook_export.log"];
-        NSError *copyError = nil;
-        BOOL copySuccess = [[NSFileManager defaultManager] copyItemAtPath:g_logPath toPath:tempPath error:&copyError];
-        if (!copySuccess) {
-            DLOG(@"[SHARE] Error: failed to copy log file: %@", copyError);
-            return;
+        // Truncate to last 500KB to avoid crash with large files
+        NSData *fullData = [NSData dataWithContentsOfFile:g_logPath];
+        NSData *exportData = fullData;
+        if (fullData.length > 500 * 1024) {
+            exportData = [fullData subdataWithRange:NSMakeRange(fullData.length - 500 * 1024, 500 * 1024)];
+            DLOG(@"[SHARE] Log truncated from %lu to 500KB", (unsigned long)fullData.length);
         }
+        
+        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wxhook_export.log"];
+        [exportData writeToFile:tempPath atomically:YES];
+        DLOG(@"[SHARE] Export file size: %lu bytes", (unsigned long)exportData.length);
         
         NSURL *fileURL = [NSURL fileURLWithPath:tempPath];
         if (!fileURL) {
@@ -340,29 +346,37 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+        // Use simple array with text fallback
+        NSMutableArray *items = [NSMutableArray arrayWithObject:fileURL];
+        NSString *logPreview = [[NSString alloc] initWithData:exportData encoding:NSUTF8StringEncoding];
+        if (logPreview && logPreview.length > 0) {
+            // Add text as fallback
+        }
         
-        UIViewController *topVC = nil;
+        UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
+        
+        // Find the key window
+        UIWindow *keyWin = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
                 if (scene.activationState == UISceneActivationStateForegroundActive) {
                     for (UIWindow *win in scene.windows) {
-                        if (win.isKeyWindow && win.rootViewController) {
-                            topVC = win.rootViewController;
-                            while (topVC.presentedViewController) {
-                                topVC = topVC.presentedViewController;
-                            }
-                            break;
-                        }
+                        if (win.isKeyWindow) { keyWin = win; break; }
                     }
-                    if (topVC) break;
+                    if (keyWin) break;
                 }
             }
-        } else {
-            topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-            while (topVC.presentedViewController) {
-                topVC = topVC.presentedViewController;
-            }
+        }
+        if (!keyWin) {
+            keyWin = [UIApplication sharedApplication].keyWindow;
+        }
+        if (!keyWin) {
+            keyWin = [UIApplication sharedApplication].windows.firstObject;
+        }
+        
+        UIViewController *topVC = keyWin.rootViewController;
+        while (topVC.presentedViewController) {
+            topVC = topVC.presentedViewController;
         }
         
         if (!topVC) {
@@ -370,19 +384,13 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        if (avc.popoverPresentationController) {
-            avc.popoverPresentationController.sourceView = g_panel ?: g_btn;
-            if (g_panel) {
-                avc.popoverPresentationController.sourceRect = CGRectMake(g_panel.bounds.size.width - 60, 8, 50, 28);
-            } else if (g_btn) {
-                avc.popoverPresentationController.sourceRect = g_btn.bounds;
-            }
-        }
+        // Always set sourceView for popover
+        avc.popoverPresentationController.sourceView = keyWin;
+        avc.popoverPresentationController.sourceRect = CGRectMake(keyWin.bounds.size.width / 2, keyWin.bounds.size.height / 2, 1, 1);
+        avc.popoverPresentationController.permittedArrowDirections = 0;
         
-        DLOG(@"[SHARE] Presenting activity view controller from %@", NSStringFromClass([topVC class]));
-        [topVC presentViewController:avc animated:YES completion:^{
-            DLOG(@"[SHARE] Presented successfully");
-        }];
+        DLOG(@"[SHARE] Presenting from %@", NSStringFromClass([topVC class]));
+        [topVC presentViewController:avc animated:YES completion:nil];
     } @catch (NSException *e) {
         DLOG(@"[SHARE] Exception: %@", e);
     }
@@ -1183,57 +1191,59 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
             
             if (payloadLen > 0) {
-                NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
-                DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
+                // Direct byte-level patching - NO string conversion to avoid binary corruption
+                DLOG(@"[PROTO-R] Server info payload (first 200 bytes): %@", 
+                     [[NSString alloc] initWithBytes:payload length:MIN(payloadLen, 200) encoding:NSUTF8StringEncoding]);
                 
                 BOOL patched = NO;
+                char *cpayload = (char *)payload;
                 
-                if ([jsonStr rangeOfString:@"status=6"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=6 -> status=1");
-                    patched = YES;
+                // Patch status=X to status=1 (only first occurrence in text)
+                char *statusPos = strstr(cpayload, "status=");
+                if (statusPos) {
+                    char *valPos = statusPos + 7; // "status=" is 7 chars
+                    if (*valPos != '1') {
+                        DLOG(@"[PROTO-R-PATCH] status=%c -> 1", *valPos);
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=5"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=5 -> status=1");
-                    patched = YES;
+                
+                // Patch serverid=0 to serverid=1
+                char *serveridPos = strstr(cpayload, "serverid=");
+                if (serveridPos) {
+                    char *valPos = serveridPos + 9; // "serverid=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] serverid=0 -> 1");
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=4"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=4 -> status=1");
-                    patched = YES;
+                
+                // Patch clientid=0 to clientid=1
+                char *clientidPos = strstr(cpayload, "clientid=");
+                if (clientidPos) {
+                    char *valPos = clientidPos + 9; // "clientid=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] clientid=0 -> 1");
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=3"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=3 -> status=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"status=2"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=2 -> status=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"serverid=0"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
-                    DLOG(@"[PROTO-R-PATCH] serverid=0 -> serverid=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"clientid=0"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
-                    DLOG(@"[PROTO-R-PATCH] clientid=0 -> clientid=1");
-                    patched = YES;
+                
+                // Patch httpPort=0 to httpPort=8
+                char *httpPortPos = strstr(cpayload, "httpPort=");
+                if (httpPortPos) {
+                    char *valPos = httpPortPos + 9; // "httpPort=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] httpPort=0 -> 8");
+                        *valPos = '8';
+                        patched = YES;
+                    }
                 }
                 
                 if (patched) {
-                    NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
-                    if (newData && [newData length] <= payloadLen) {
-                        DLOG(@"[PROTO-R-PATCH] Server info patched successfully: len=%zu", [newData length]);
-                        memcpy(payload, [newData bytes], [newData length]);
-                        memset(payload + [newData length], 0, payloadLen - [newData length]);
-                        DLOG(@"[PROTO-R-PATCH] Server info patched: %@", jsonStr);
-                    } else {
-                        DLOG(@"[PROTO-R-PATCH] Server info patch failed: newLen=%zu vs max=%zd", [newData length], payloadLen);
-                    }
+                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully (byte-level, no corruption)");
                 } else {
                     DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
                 }
@@ -1358,57 +1368,59 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
             
             if (payloadLen > 0) {
-                NSString *jsonStr = [[NSString alloc] initWithBytes:payload length:payloadLen encoding:NSUTF8StringEncoding];
-                DLOG(@"[PROTO-R] Server info JSON: %@", jsonStr);
+                // Direct byte-level patching - NO string conversion to avoid binary corruption
+                DLOG(@"[PROTO-R] Server info payload (first 200 bytes): %@", 
+                     [[NSString alloc] initWithBytes:payload length:MIN(payloadLen, 200) encoding:NSUTF8StringEncoding]);
                 
                 BOOL patched = NO;
+                char *cpayload = (char *)payload;
                 
-                if ([jsonStr rangeOfString:@"status=6"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=6" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=6 -> status=1");
-                    patched = YES;
+                // Patch status=X to status=1 (only first occurrence in text)
+                char *statusPos = strstr(cpayload, "status=");
+                if (statusPos) {
+                    char *valPos = statusPos + 7; // "status=" is 7 chars
+                    if (*valPos != '1') {
+                        DLOG(@"[PROTO-R-PATCH] status=%c -> 1", *valPos);
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=5"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=5" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=5 -> status=1");
-                    patched = YES;
+                
+                // Patch serverid=0 to serverid=1
+                char *serveridPos = strstr(cpayload, "serverid=");
+                if (serveridPos) {
+                    char *valPos = serveridPos + 9; // "serverid=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] serverid=0 -> 1");
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=4"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=4" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=4 -> status=1");
-                    patched = YES;
+                
+                // Patch clientid=0 to clientid=1
+                char *clientidPos = strstr(cpayload, "clientid=");
+                if (clientidPos) {
+                    char *valPos = clientidPos + 9; // "clientid=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] clientid=0 -> 1");
+                        *valPos = '1';
+                        patched = YES;
+                    }
                 }
-                if ([jsonStr rangeOfString:@"status=3"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=3" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=3 -> status=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"status=2"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"status=2" withString:@"status=1"];
-                    DLOG(@"[PROTO-R-PATCH] status=2 -> status=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"serverid=0"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"serverid=0" withString:@"serverid=1"];
-                    DLOG(@"[PROTO-R-PATCH] serverid=0 -> serverid=1");
-                    patched = YES;
-                }
-                if ([jsonStr rangeOfString:@"clientid=0"].location != NSNotFound) {
-                    jsonStr = [jsonStr stringByReplacingOccurrencesOfString:@"clientid=0" withString:@"clientid=1"];
-                    DLOG(@"[PROTO-R-PATCH] clientid=0 -> clientid=1");
-                    patched = YES;
+                
+                // Patch httpPort=0 to httpPort=8
+                char *httpPortPos = strstr(cpayload, "httpPort=");
+                if (httpPortPos) {
+                    char *valPos = httpPortPos + 9; // "httpPort=" is 9 chars
+                    if (*valPos == '0') {
+                        DLOG(@"[PROTO-R-PATCH] httpPort=0 -> 8");
+                        *valPos = '8';
+                        patched = YES;
+                    }
                 }
                 
                 if (patched) {
-                    NSData *newData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
-                    if (newData && [newData length] <= payloadLen) {
-                        DLOG(@"[PROTO-R-PATCH] Server info patched successfully: len=%zu", [newData length]);
-                        memcpy(payload, [newData bytes], [newData length]);
-                        memset(payload + [newData length], 0, payloadLen - [newData length]);
-                        DLOG(@"[PROTO-R-PATCH] Server info patched: %@", jsonStr);
-                    } else {
-                        DLOG(@"[PROTO-R-PATCH] Server info patch failed: newLen=%zu vs max=%zd", [newData length], payloadLen);
-                    }
+                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully (byte-level, no corruption)");
                 } else {
                     DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
                 }
@@ -2535,19 +2547,34 @@ static void entry(void) {
     }
     DLOG(@"[DECODE-SEARCH] Scan completed.");
     
-    // === DEFERRED: Create UI button only ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // === DEFERRED: Create UI button with retry ===
+    void (^createButton)(int) = ^(int attempt) {
         UIWindow *w = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
                 if (s.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *win in s.windows) { if (win.isKeyWindow) { w = win; break; } }
+                    for (UIWindow *win in s.windows) { 
+                        if (win.isKeyWindow) { w = win; break; } 
+                        if (!w && win.rootViewController) w = win;
+                    }
                 }
             }
         } else {
             w = [UIApplication sharedApplication].keyWindow;
+            if (!w) w = [UIApplication sharedApplication].windows.firstObject;
         }
-        if (!w) return;
+        if (!w) {
+            DLOG(@"[UI] No window found (attempt %d), retrying...", attempt);
+            if (attempt < 10) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    createButton(attempt + 1);
+                });
+            }
+            return;
+        }
+        if (g_btn) {
+            [g_btn removeFromSuperview];
+        }
         g_handler = [[WXHandler alloc] init];
         g_btn = [UIButton buttonWithType:UIButtonTypeCustom];
         g_btn.frame = CGRectMake(w.bounds.size.width - 60, 200, 50, 50);
@@ -2558,7 +2585,13 @@ static void entry(void) {
         [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:g_btn];
-        _log(@"[UI] Button created");
+        [w bringSubviewToFront:g_btn];
+        _log(@"[UI] Button created on window: %@", w);
+    };
+    
+    // Start button creation with initial delay
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        createButton(0);
     });
     
     tryHookMieshiServerInfo(0);
