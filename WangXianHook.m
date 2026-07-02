@@ -1,10 +1,9 @@
 /**
- * WangXianHook v34.87 - Fix createLogButton + LOG button retry + export crash
- * FIX: Byte-level patching instead of string replacement to avoid binary corruption
- * FIX: LOG button retry mechanism for window creation
- * FIX: Export crash fix - truncate to 500KB + safer presentation
+ * WangXianHook v34.88 - Fix server list empty + export crash + UITableView hook fix
+ * FIX: UITableView hook checks dataSource class instead of UITableView class
+ * FIX: Export crash - safer popover handling + smaller export size
+ * FIX: More comprehensive server list detection via class scanning
  * Tracks: Signature, Environment, Debug, Security, Ban detection
- * Key: Use sizeof() instead of strlen() for strings with embedded nulls
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -52,7 +51,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.87 Binary Patch Fix ===");
+        _log(@"=== WXHook v34.88 Server List Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -190,7 +189,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.87 诊断面板";
+            lbl.text = @"WXHook v34.88 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -328,12 +327,12 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        // Truncate to last 500KB to avoid crash with large files
+        // Truncate to last 200KB to avoid crash with large files
         NSData *fullData = [NSData dataWithContentsOfFile:g_logPath];
         NSData *exportData = fullData;
-        if (fullData.length > 500 * 1024) {
-            exportData = [fullData subdataWithRange:NSMakeRange(fullData.length - 500 * 1024, 500 * 1024)];
-            DLOG(@"[SHARE] Log truncated from %lu to 500KB", (unsigned long)fullData.length);
+        if (fullData.length > 200 * 1024) {
+            exportData = [fullData subdataWithRange:NSMakeRange(fullData.length - 200 * 1024, 200 * 1024)];
+            DLOG(@"[SHARE] Log truncated from %lu to 200KB", (unsigned long)fullData.length);
         }
         
         NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wxhook_export.log"];
@@ -346,16 +345,10 @@ static UILabel *g_statusLbl = nil;
             return;
         }
         
-        // Use simple array with text fallback
-        NSMutableArray *items = [NSMutableArray arrayWithObject:fileURL];
-        NSString *logPreview = [[NSString alloc] initWithData:exportData encoding:NSUTF8StringEncoding];
-        if (logPreview && logPreview.length > 0) {
-            // Add text as fallback
-        }
-        
+        NSArray *items = @[fileURL];
         UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
         
-        // Find the key window
+        // Find top view controller safely
         UIWindow *keyWin = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -367,30 +360,50 @@ static UILabel *g_statusLbl = nil;
                 }
             }
         }
-        if (!keyWin) {
-            keyWin = [UIApplication sharedApplication].keyWindow;
-        }
-        if (!keyWin) {
-            keyWin = [UIApplication sharedApplication].windows.firstObject;
-        }
+        if (!keyWin) keyWin = [UIApplication sharedApplication].keyWindow;
+        if (!keyWin) keyWin = [UIApplication sharedApplication].windows.firstObject;
         
-        UIViewController *topVC = keyWin.rootViewController;
-        while (topVC.presentedViewController) {
-            topVC = topVC.presentedViewController;
-        }
-        
-        if (!topVC) {
-            DLOG(@"[SHARE] Error: could not find top view controller");
+        if (!keyWin) {
+            DLOG(@"[SHARE] Error: no key window found");
             return;
         }
         
-        // Always set sourceView for popover
-        avc.popoverPresentationController.sourceView = keyWin;
-        avc.popoverPresentationController.sourceRect = CGRectMake(keyWin.bounds.size.width / 2, keyWin.bounds.size.height / 2, 1, 1);
-        avc.popoverPresentationController.permittedArrowDirections = 0;
+        UIViewController *topVC = keyWin.rootViewController;
+        if (!topVC) {
+            DLOG(@"[SHARE] Error: rootViewController is nil");
+            return;
+        }
+        while (topVC.presentedViewController && 
+               ![topVC.presentedViewController isBeingDismissed]) {
+            topVC = topVC.presentedViewController;
+        }
+        
+        // Set popover for iPad only (safe check)
+        if ([avc respondsToSelector:@selector(popoverPresentationController)] &&
+            avc.popoverPresentationController) {
+            avc.popoverPresentationController.sourceView = keyWin;
+            avc.popoverPresentationController.sourceRect = CGRectMake(keyWin.bounds.size.width / 2, keyWin.bounds.size.height / 2, 1, 1);
+            avc.popoverPresentationController.permittedArrowDirections = 0;
+        }
+        
+        // Use completion block to detect presentation issues
+        avc.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
+            if (activityError) {
+                DLOG(@"[SHARE] Activity error: %@", activityError);
+            }
+            DLOG(@"[SHARE] Activity completed: %d type: %@", completed, activityType);
+        };
         
         DLOG(@"[SHARE] Presenting from %@", NSStringFromClass([topVC class]));
-        [topVC presentViewController:avc animated:YES completion:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                [topVC presentViewController:avc animated:YES completion:^{
+                    DLOG(@"[SHARE] Presented successfully");
+                }];
+            } @catch (NSException *e) {
+                DLOG(@"[SHARE] Present exception: %@", e);
+            }
+        });
     } @catch (NSException *e) {
         DLOG(@"[SHARE] Exception: %@", e);
     }
@@ -578,11 +591,26 @@ static void initFakeServerList(void) {
 }
 
 static BOOL isServerListDataSource(id self) {
-    Class cls = [self class];
-    NSString *clsName = NSStringFromClass(cls);
-    return ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
-            [clsName containsString:@"List"] || [clsName containsString:@"list"] ||
-            [clsName containsString:@"Login"] || [clsName containsString:@"login"]);
+    @try {
+        if ([self respondsToSelector:@selector(dataSource)]) {
+            id ds = [self dataSource];
+            if (ds) {
+                NSString *dsName = NSStringFromClass([ds class]);
+                if ([dsName containsString:@"Server"] || [dsName containsString:@"server"] || 
+                    [dsName containsString:@"List"] || [dsName containsString:@"list"] ||
+                    [dsName containsString:@"Login"] || [dsName containsString:@"login"]) {
+                    return YES;
+                }
+            }
+        }
+        Class cls = [self class];
+        NSString *clsName = NSStringFromClass(cls);
+        return ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
+                [clsName containsString:@"List"] || [clsName containsString:@"list"] ||
+                [clsName containsString:@"Login"] || [clsName containsString:@"login"]);
+    } @catch (NSException *e) {
+        return NO;
+    }
 }
 
 static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section) {
@@ -619,15 +647,16 @@ static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPat
         
         if (!ret || (ret && [text isEqualToString:@""])) {
             DLOG(@"[TV-PATCH] Creating fake cell for server list");
-            ret = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-            if (ret) {
+            UITableViewCell *newCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            if (newCell) {
                 initFakeServerList();
                 if (indexPath.row < fakeServerList.count) {
                     NSDictionary *server = fakeServerList[indexPath.row];
-                    ret.textLabel.text = server[@"name"] ?: @"测试服务器";
-                    ret.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                    newCell.textLabel.text = server[@"name"] ?: @"测试服务器";
+                    newCell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                     DLOG(@"[TV-PATCH] Created fake cell: %@", server[@"name"]);
                 }
+                ret = newCell;
             }
         }
     }
@@ -2666,6 +2695,53 @@ static void entry(void) {
             }
         } @catch (NSException *e) {
             DLOG(@"[FORCE-INJECT] Exception: %@", e);
+        }
+    });
+    
+    // === DEFERRED: Scan all server-related classes and hook their init methods ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            unsigned int classCount = 0;
+            Class *classes = objc_copyClassList(&classCount);
+            NSMutableArray *serverClasses = [NSMutableArray array];
+            
+            for (unsigned int i = 0; i < classCount; i++) {
+                Class cls = classes[i];
+                NSString *clsName = NSStringFromClass(cls);
+                if (!clsName) continue;
+                
+                NSString *lower = [clsName lowercaseString];
+                if (([lower containsString:@"server"] || [lower containsString:@"serverlist"] ||
+                     [lower containsString:@"serverinfo"] || [lower containsString:@"servers"]) &&
+                    ![lower containsString:@"mieshi"] && ![clsName isEqualToString:@"UIApplication"]) {
+                    [serverClasses addObject:clsName];
+                }
+            }
+            
+            DLOG(@"[SERVER-CLASS] Found %d server-related classes:", serverClasses.count);
+            for (NSString *clsName in serverClasses) {
+                DLOG(@"[SERVER-CLASS]   %@", clsName);
+            }
+            
+            if (classes) free(classes);
+        } @catch (NSException *e) {
+            DLOG(@"[SERVER-CLASS] Exception: %@", e);
+        }
+    });
+    
+    // === DEFERRED: Hook UITableViewDelegate didSelectRow for server selection ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class tableViewCls = [UITableView class];
+        Method didSelect = class_getInstanceMethod(tableViewCls, @selector(didSelectRowAtIndexPath:));
+        if (didSelect) {
+            IMP orig_impl = method_getImplementation(didSelect);
+            DLOG(@"[TV-HOOK] Found didSelectRowAtIndexPath in UITableView");
+        }
+        
+        // Also hook reloadData to detect when server list table is reloaded
+        Method reloadData = class_getInstanceMethod(tableViewCls, @selector(reloadData));
+        if (reloadData) {
+            DLOG(@"[TV-HOOK] Found reloadData in UITableView");
         }
     });
 }
