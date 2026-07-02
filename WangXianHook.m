@@ -823,6 +823,22 @@ static NSInteger msi_int_hook(id self, SEL _cmd) {
     return ret;
 }
 
+static void createLogButton(UIWindow *w) {
+    if (!w || g_btn) return;
+    g_handler = [[WXHandler alloc] init];
+    g_btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    g_btn.frame = CGRectMake(w.bounds.size.width - 60, 200, 50, 50);
+    g_btn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
+    g_btn.layer.cornerRadius = 25;
+    g_btn.titleLabel.font = [UIFont systemFontOfSize:10];
+    [g_btn setTitle:@"LOG" forState:UIControlStateNormal];
+    [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    [w addSubview:g_btn];
+    [w bringSubviewToFront:g_btn];
+    _log(@"[UI] Button created on window: %@", w);
+}
+
 static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
     Class msiCls = NSClassFromString(@"MieshiServerInfo");
     if (msiCls) {
@@ -2548,7 +2564,7 @@ static void entry(void) {
     DLOG(@"[DECODE-SEARCH] Scan completed.");
     
     // === DEFERRED: Create UI button with retry ===
-    void (^createButton)(int) = ^(int attempt) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -2559,39 +2575,31 @@ static void entry(void) {
                     }
                 }
             }
+        }
+        if (!w) w = [UIApplication sharedApplication].keyWindow;
+        if (!w) w = [UIApplication sharedApplication].windows.firstObject;
+        
+        if (w) {
+            createLogButton(w);
         } else {
-            w = [UIApplication sharedApplication].keyWindow;
-            if (!w) w = [UIApplication sharedApplication].windows.firstObject;
+            DLOG(@"[UI] No window at 0.5s, retry at 2s");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIWindow *w2 = [UIApplication sharedApplication].windows.firstObject;
+                if (w2) {
+                    createLogButton(w2);
+                } else {
+                    DLOG(@"[UI] No window at 2s, retry at 5s");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        UIWindow *w3 = [UIApplication sharedApplication].windows.firstObject;
+                        if (w3) {
+                            createLogButton(w3);
+                        } else {
+                            DLOG(@"[UI] No window found after 5s, giving up");
+                        }
+                    });
+                }
+            });
         }
-        if (!w) {
-            DLOG(@"[UI] No window found (attempt %d), retrying...", attempt);
-            if (attempt < 10) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    createButton(attempt + 1);
-                });
-            }
-            return;
-        }
-        if (g_btn) {
-            [g_btn removeFromSuperview];
-        }
-        g_handler = [[WXHandler alloc] init];
-        g_btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        g_btn.frame = CGRectMake(w.bounds.size.width - 60, 200, 50, 50);
-        g_btn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
-        g_btn.layer.cornerRadius = 25;
-        g_btn.titleLabel.font = [UIFont systemFontOfSize:10];
-        [g_btn setTitle:@"LOG" forState:UIControlStateNormal];
-        [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-        [w addSubview:g_btn];
-        [w bringSubviewToFront:g_btn];
-        _log(@"[UI] Button created on window: %@", w);
-    };
-    
-    // Start button creation with initial delay
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        createButton(0);
     });
     
     tryHookMieshiServerInfo(0);
