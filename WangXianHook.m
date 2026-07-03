@@ -1908,7 +1908,7 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                             
                             uint32_t newPktLen = htonl((uint32_t)(8 + compressedLen));
                             memcpy(iov->iov_base, &newPktLen, 4);
-                            DLog(@"[PROTO-RM-PATCH] Packet length: %u -> %u", pktLenBE, 8 + (uint32_t)compressedLen);
+                            DLOG(@"[PROTO-RM-PATCH] Packet length: %u -> %u", pktLenBE, 8 + (uint32_t)compressedLen);
                             ret = 8 + compressedLen;
                         } else {
                             DLOG(@"[GZIP-RM] Compression failed or too large");
