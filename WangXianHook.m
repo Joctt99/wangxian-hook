@@ -1,8 +1,9 @@
 /**
- * WangXianHook v34.89 - Fix server list with correct class names
- * FIX: Changed MieshiServerInfo to ServerInfoForClient (real class name)
- * FIX: Added hook for LoginModuleMessageHandlerImpl.handle_NEW_QUERY_SERVER_LIST_RES
- * FIX: Updated CLogin class hooks for server list management
+ * WangXianHook v34.90 - Fix server list with gzip support
+ * FIX: Removed port == 5678 restriction, handle all game server responses
+ * FIX: Added gzip decompression/compression for server list responses
+ * FIX: Removed ret >= 4096 skip in hook_read
+ * FIX: Protocol patches now apply to ALL server ports
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -51,7 +52,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.89 Server Info Fix ===");
+        _log(@"=== WXHook v34.90 Server List Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -189,7 +190,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.89 诊断面板";
+            lbl.text = @"WXHook v34.90 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1031,6 +1032,109 @@ static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispat
 }
 
 // ============================================================
+#pragma mark - Gzip utilities
+// ============================================================
+
+static BOOL isGzipData(const unsigned char *data, size_t len) {
+    return (len >= 3 && data[0] == 0x1F && data[1] == 0x8B && data[2] == 0x08);
+}
+
+static unsigned char *gzipDecompress(const unsigned char *data, size_t len, size_t *outLen) {
+    if (!data || len < 10 || !isGzipData(data, len)) return NULL;
+    
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    
+    if (inflateInit2(&strm, MAX_WBITS + 16) != Z_OK) return NULL;
+    
+    strm.next_in = (Bytef *)data;
+    strm.avail_in = len;
+    
+    size_t bufSize = len * 4;
+    unsigned char *buf = malloc(bufSize);
+    if (!buf) { inflateEnd(&strm); return NULL; }
+    
+    unsigned char *outBuf = buf;
+    size_t totalOut = 0;
+    
+    do {
+        strm.next_out = (Bytef *)buf;
+        strm.avail_out = bufSize;
+        
+        int ret = inflate(&strm, Z_NO_FLUSH);
+        
+        size_t produced = bufSize - strm.avail_out;
+        if (produced > 0) {
+            totalOut += produced;
+            unsigned char *newBuf = realloc(outBuf, totalOut + bufSize);
+            if (!newBuf) { free(outBuf); inflateEnd(&strm); return NULL; }
+            buf = newBuf + totalOut - produced;
+            outBuf = newBuf;
+        }
+        
+        if (ret == Z_STREAM_END) break;
+        if (ret != Z_OK) { free(outBuf); inflateEnd(&strm); return NULL; }
+        
+    } while (strm.avail_in > 0);
+    
+    inflateEnd(&strm);
+    
+    unsigned char *finalBuf = realloc(outBuf, totalOut + 1);
+    if (finalBuf) {
+        finalBuf[totalOut] = '\0';
+        *outLen = totalOut;
+        return finalBuf;
+    }
+    
+    free(outBuf);
+    return NULL;
+}
+
+static unsigned char *gzipCompress(const unsigned char *data, size_t len, size_t *outLen) {
+    if (!data || len == 0) return NULL;
+    
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    
+    if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) return NULL;
+    
+    strm.next_in = (Bytef *)data;
+    strm.avail_in = len;
+    
+    size_t bufSize = len + (len / 10) + 12;
+    unsigned char *buf = malloc(bufSize);
+    if (!buf) { deflateEnd(&strm); return NULL; }
+    
+    unsigned char *outBuf = buf;
+    size_t totalOut = 0;
+    
+    do {
+        strm.next_out = (Bytef *)buf;
+        strm.avail_out = bufSize;
+        
+        int ret = deflate(&strm, Z_FINISH);
+        
+        size_t produced = bufSize - strm.avail_out;
+        if (produced > 0) {
+            totalOut += produced;
+            unsigned char *newBuf = realloc(outBuf, totalOut + bufSize);
+            if (!newBuf) { free(outBuf); deflateEnd(&strm); return NULL; }
+            buf = newBuf + totalOut - produced;
+            outBuf = newBuf;
+        }
+        
+        if (ret == Z_STREAM_END) break;
+        if (ret != Z_OK) { free(outBuf); deflateEnd(&strm); return NULL; }
+        
+    } while (strm.avail_in > 0);
+    
+    deflateEnd(&strm);
+    
+    *outLen = totalOut;
+    return outBuf;
+}
+
+// ============================================================
 #pragma mark - BSD socket hooks (detect game network traffic)
 // ============================================================
 
@@ -1176,6 +1280,93 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     return ret;
 }
 
+static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
+    if (!payload || payloadLen == 0) return;
+    
+    BOOL patched = NO;
+    char *cpayload = (char *)payload;
+    
+    for (size_t i = 0; i + 7 < payloadLen; i++) {
+        if (cpayload[i] == 's' && cpayload[i+1] == 't' && cpayload[i+2] == 'a' && 
+            cpayload[i+3] == 't' && cpayload[i+4] == 'u' && cpayload[i+5] == 's' && 
+            cpayload[i+6] == '=' && cpayload[i+7] != '1') {
+            DLOG(@"[PROTO-PATCH] Found status=%c at offset %zu, changing to 1", cpayload[i+7], i);
+            cpayload[i+7] = '1';
+            patched = YES;
+        }
+    }
+    
+    for (size_t i = 0; i + 9 < payloadLen; i++) {
+        if (cpayload[i] == 's' && cpayload[i+1] == 'e' && cpayload[i+2] == 'r' && 
+            cpayload[i+3] == 'v' && cpayload[i+4] == 'e' && cpayload[i+5] == 'r' && 
+            cpayload[i+6] == 'i' && cpayload[i+7] == 'd' && cpayload[i+8] == '=' && 
+            cpayload[i+9] == '0') {
+            DLOG(@"[PROTO-PATCH] Found serverid=0 at offset %zu, changing to 1", i);
+            cpayload[i+9] = '1';
+            patched = YES;
+        }
+    }
+    
+    for (size_t i = 0; i + 9 < payloadLen; i++) {
+        if (cpayload[i] == 'c' && cpayload[i+1] == 'l' && cpayload[i+2] == 'i' && 
+            cpayload[i+3] == 'e' && cpayload[i+4] == 'n' && cpayload[i+5] == 't' && 
+            cpayload[i+6] == 'i' && cpayload[i+7] == 'd' && cpayload[i+8] == '=' && 
+            cpayload[i+9] == '0') {
+            DLOG(@"[PROTO-PATCH] Found clientid=0 at offset %zu, changing to 1", i);
+            cpayload[i+9] = '1';
+            patched = YES;
+        }
+    }
+    
+    for (size_t i = 0; i + 11 < payloadLen; i++) {
+        if (cpayload[i] == 's' && cpayload[i+1] == 'e' && cpayload[i+2] == 'r' && 
+            cpayload[i+3] == 'v' && cpayload[i+4] == 'e' && cpayload[i+5] == 'r' && 
+            cpayload[i+6] == 'T' && cpayload[i+7] == 'y' && cpayload[i+8] == 'p' && 
+            cpayload[i+9] == 'e' && cpayload[i+10] == '=' && cpayload[i+11] == '2') {
+            DLOG(@"[PROTO-PATCH] Found serverType=2 at offset %zu, changing to 1", i);
+            cpayload[i+11] = '1';
+            patched = YES;
+        }
+    }
+    
+    const char *oldIP = "47.100.204.160";
+    const char *newIP = "47.100.222.229";
+    for (size_t i = 0; i + 15 <= payloadLen; i++) {
+        if (memcmp(payload + i, oldIP, 15) == 0) {
+            DLOG(@"[PROTO-PATCH] Found old IP at offset %zu, replacing", i);
+            memcpy(payload + i, newIP, 15);
+            patched = YES;
+        }
+    }
+    
+    const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
+    const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+    for (size_t i = 0; i + 6 <= payloadLen; i++) {
+        if (memcmp(payload + i, oldCat, 6) == 0) {
+            DLOG(@"[PROTO-PATCH] Found '......' at offset %zu, replacing with '一区'", i);
+            memcpy(payload + i, newCat, 6);
+            patched = YES;
+        }
+    }
+    
+    const unsigned char oldDesc[] = {0xE6, 0x9C, 0x8D, 0xE5, 0x8A, 0xA1, 0xE5, 0x99, 0xA8, 
+                                     0xE7, 0xBB, 0xB4, 0xE6, 0x8A, 0xA4, 0xE4, 0xB8, 0xAD, 
+                                     0x2E, 0x2E, 0x2E};
+    const unsigned char newDesc[] = {0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C};
+    for (size_t i = 0; i + 21 <= payloadLen; i++) {
+        if (memcmp(payload + i, oldDesc, 21) == 0) {
+            DLOG(@"[PROTO-PATCH] Found '服务器维护中...' at offset %zu, replacing with '运行'", i);
+            memcpy(payload + i, newDesc, 6);
+            for (size_t j = 6; j < 21; j++) payload[i+j] = ' ';
+            patched = YES;
+        }
+    }
+    
+    if (patched) {
+        DLOG(@"[PROTO-PATCH] Server list patched successfully");
+    }
+}
+
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
@@ -1191,26 +1382,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     
     NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
     NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
-    size_t showLen = ret > 1024 ? 1024 : (size_t)ret;
+    size_t showLen = ret > 256 ? 256 : (size_t)ret;
     for (size_t i = 0; i < showLen; i++) {
         [hex appendFormat:@"%02X ", p[i]];
         [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
     }
     DLOG(@"[RECV] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
-    if (port == 5678 && ret >= 8) {
+    if (ret >= 8) {
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-        
-        if (cmd == 0x07777777 || cmd == 0x87777777) {
-            unsigned char *payload = (unsigned char *)buf + 8;
-            ssize_t payloadLen = ret - 8;
-            BOOL isGzip = (payloadLen >= 3 && payload[0] == 0x1F && payload[1] == 0x8B && payload[2] == 0x08);
-            DLOG(@"[PROTO] Resource response 0x%08X isGzip=%d payloadLen=%zd", cmd, isGzip, payloadLen);
-        }
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
@@ -1229,98 +1413,85 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113) {
-            DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+            DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
-            DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
             
             if (payloadLen > 0) {
-                // Direct byte-level patching - NO string conversion to avoid binary corruption
-                DLOG(@"[PROTO-R] Server info payload (first 200 bytes): %@", 
-                     [[NSString alloc] initWithBytes:payload length:MIN(payloadLen, 200) encoding:NSUTF8StringEncoding]);
+                BOOL isGzip = isGzipData(payload, payloadLen);
+                DLOG(@"[PROTO-R] Payload isGzip=%d len=%zd", isGzip, payloadLen);
                 
-                BOOL patched = NO;
-                char *cpayload = (char *)payload;
-                
-                // Patch status=X to status=1 (only first occurrence in text)
-                char *statusPos = strstr(cpayload, "status=");
-                if (statusPos) {
-                    char *valPos = statusPos + 7; // "status=" is 7 chars
-                    if (*valPos != '1') {
-                        DLOG(@"[PROTO-R-PATCH] status=%c -> 1", *valPos);
-                        *valPos = '1';
-                        patched = YES;
+                if (isGzip) {
+                    size_t decompressedLen = 0;
+                    unsigned char *decompressed = gzipDecompress(payload, payloadLen, &decompressedLen);
+                    if (decompressed) {
+                        DLOG(@"[GZIP] Decompressed from %zd to %zd bytes", payloadLen, decompressedLen);
+                        DLOG(@"[GZIP] Decompressed content (first 200 bytes): %@", 
+                             [[NSString alloc] initWithBytes:decompressed length:MIN(decompressedLen, 200) encoding:NSUTF8StringEncoding]);
+                        
+                        applyServerListPatch(decompressed, decompressedLen);
+                        
+                        size_t compressedLen = 0;
+                        unsigned char *compressed = gzipCompress(decompressed, decompressedLen, &compressedLen);
+                        free(decompressed);
+                        
+                        if (compressed && compressedLen <= len - 8) {
+                            DLOG(@"[GZIP] Recompressed from %zd to %zd bytes", decompressedLen, compressedLen);
+                            memcpy(payload, compressed, compressedLen);
+                            free(compressed);
+                            
+                            uint32_t newPktLen = htonl((uint32_t)(8 + compressedLen));
+                            memcpy(buf, &newPktLen, 4);
+                            DLOG(@"[PROTO-R-PATCH] Updated packet length: %u -> %u", pktLenBE, 8 + (uint32_t)compressedLen);
+                            ret = 8 + compressedLen;
+                        } else {
+                            DLOG(@"[GZIP] Compression failed or too large");
+                        }
+                    } else {
+                        DLOG(@"[GZIP] Decompression failed");
+                        applyServerListPatch(payload, payloadLen);
                     }
-                }
-                
-                // Patch serverid=0 to serverid=1
-                char *serveridPos = strstr(cpayload, "serverid=");
-                if (serveridPos) {
-                    char *valPos = serveridPos + 9; // "serverid=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] serverid=0 -> 1");
-                        *valPos = '1';
-                        patched = YES;
-                    }
-                }
-                
-                // Patch clientid=0 to clientid=1
-                char *clientidPos = strstr(cpayload, "clientid=");
-                if (clientidPos) {
-                    char *valPos = clientidPos + 9; // "clientid=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] clientid=0 -> 1");
-                        *valPos = '1';
-                        patched = YES;
-                    }
-                }
-                
-                // Patch httpPort=0 to httpPort=8
-                char *httpPortPos = strstr(cpayload, "httpPort=");
-                if (httpPortPos) {
-                    char *valPos = httpPortPos + 9; // "httpPort=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] httpPort=0 -> 8");
-                        *valPos = '8';
-                        patched = YES;
-                    }
-                }
-                
-                if (patched) {
-                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully (byte-level, no corruption)");
                 } else {
-                    DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
-                }
-            } else {
-                DLOG(@"[PROTO-R-PATCH] Server info payload empty");
-            }
-        }
-        
-        if (cmd == 0x8002A017) {
-            DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            if (ret >= 16) {
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
-                if (status != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
+                    applyServerListPatch(payload, payloadLen);
                 }
             }
-        }
-        
-        if (cmd == 0x8002A016) {
-            DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            if (ret >= 16) {
-                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
-                if (status8 != 0 || status12 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
-                    memset((unsigned char *)buf + 8, 0, 8);
+            
+            if (cmd == 0x8002A017) {
+                if (ret >= 16) {
+                    uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                      ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                    if (status != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                        memset((unsigned char *)buf + 12, 0, 4);
+                    }
+                }
+            }
+            
+            if (cmd == 0x8002A016) {
+                if (ret >= 16) {
+                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                        ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
+                    if (status8 != 0 || status12 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
+                        memset((unsigned char *)buf + 8, 0, 8);
+                    }
+                }
+            }
+            
+            if (cmd == 0x802EE113 || cmd == 0x802EE100) {
+                if (ret >= 12) {
+                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] Server info status at offset 8-11: %u", status8);
+                    if (status8 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server info status %u -> 0", status8);
+                        memset((unsigned char *)buf + 8, 0, 4);
+                    }
                 }
             }
         }
@@ -1355,7 +1526,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     if (!orig_read || !buf) return -1;
     
     ssize_t ret = orig_read(fd, buf, len);
-    if (ret <= 0 || ret >= 4096) return ret;
+    if (ret <= 0) return ret;
     
     const char *host = getHostForFd(fd);
     if (!host) return ret;
@@ -1365,156 +1536,133 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
     
     NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
     NSMutableString *ascii = [NSMutableString stringWithCapacity:ret];
-    size_t showLen = ret > 128 ? 128 : (size_t)ret;
+    size_t showLen = ret > 256 ? 256 : (size_t)ret;
     for (size_t i = 0; i < showLen; i++) {
         [hex appendFormat:@"%02X ", p[i]];
         [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
     }
     DLOG(@"[READ] fd=%d %s:%d ret=%zd\n  hex: %@\n  txt: %@", fd, host, port, ret, hex, ascii);
     
-    // Version check response: ret >= 13
-    if (port == 5678 && ret >= 13) {
+    if (ret >= 8) {
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-R] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE118) {
-            DLOG(@"[PROTO-R] Version check response 0x802EE118 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-            if (status4 != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 4);
+        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
             }
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
         }
-
-        if (cmd == 0x802EE121) {
-            DLOG(@"[PROTO-R] Version check response 0x802EE121 pktLen=%u ret=%zd", pktLenBE, ret);
-            uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-            DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-            if (status4 != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                memset((unsigned char *)buf + 8, 0, 8);
-            }
-        }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113) {
-            DLOG(@"[PROTO-R] Server info response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+            DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
-            DLOG(@"[PROTO-R] Server info payload len=%zd", payloadLen);
             
             if (payloadLen > 0) {
-                // Direct byte-level patching - NO string conversion to avoid binary corruption
-                DLOG(@"[PROTO-R] Server info payload (first 200 bytes): %@", 
-                     [[NSString alloc] initWithBytes:payload length:MIN(payloadLen, 200) encoding:NSUTF8StringEncoding]);
+                BOOL isGzip = isGzipData(payload, payloadLen);
+                DLOG(@"[PROTO-R] Payload isGzip=%d len=%zd", isGzip, payloadLen);
                 
-                BOOL patched = NO;
-                char *cpayload = (char *)payload;
-                
-                // Patch status=X to status=1 (only first occurrence in text)
-                char *statusPos = strstr(cpayload, "status=");
-                if (statusPos) {
-                    char *valPos = statusPos + 7; // "status=" is 7 chars
-                    if (*valPos != '1') {
-                        DLOG(@"[PROTO-R-PATCH] status=%c -> 1", *valPos);
-                        *valPos = '1';
-                        patched = YES;
+                if (isGzip) {
+                    size_t decompressedLen = 0;
+                    unsigned char *decompressed = gzipDecompress(payload, payloadLen, &decompressedLen);
+                    if (decompressed) {
+                        DLOG(@"[GZIP] Decompressed from %zd to %zd bytes", payloadLen, decompressedLen);
+                        DLOG(@"[GZIP] Decompressed content (first 200 bytes): %@", 
+                             [[NSString alloc] initWithBytes:decompressed length:MIN(decompressedLen, 200) encoding:NSUTF8StringEncoding]);
+                        
+                        applyServerListPatch(decompressed, decompressedLen);
+                        
+                        size_t compressedLen = 0;
+                        unsigned char *compressed = gzipCompress(decompressed, decompressedLen, &compressedLen);
+                        free(decompressed);
+                        
+                        if (compressed && compressedLen <= len - 8) {
+                            DLOG(@"[GZIP] Recompressed from %zd to %zd bytes", decompressedLen, compressedLen);
+                            memcpy(payload, compressed, compressedLen);
+                            free(compressed);
+                            
+                            uint32_t newPktLen = htonl((uint32_t)(8 + compressedLen));
+                            memcpy(buf, &newPktLen, 4);
+                            DLOG(@"[PROTO-R-PATCH] Updated packet length: %u -> %u", pktLenBE, 8 + (uint32_t)compressedLen);
+                            ret = 8 + compressedLen;
+                        } else {
+                            DLOG(@"[GZIP] Compression failed or too large");
+                        }
+                    } else {
+                        DLOG(@"[GZIP] Decompression failed");
+                        applyServerListPatch(payload, payloadLen);
                     }
-                }
-                
-                // Patch serverid=0 to serverid=1
-                char *serveridPos = strstr(cpayload, "serverid=");
-                if (serveridPos) {
-                    char *valPos = serveridPos + 9; // "serverid=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] serverid=0 -> 1");
-                        *valPos = '1';
-                        patched = YES;
-                    }
-                }
-                
-                // Patch clientid=0 to clientid=1
-                char *clientidPos = strstr(cpayload, "clientid=");
-                if (clientidPos) {
-                    char *valPos = clientidPos + 9; // "clientid=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] clientid=0 -> 1");
-                        *valPos = '1';
-                        patched = YES;
-                    }
-                }
-                
-                // Patch httpPort=0 to httpPort=8
-                char *httpPortPos = strstr(cpayload, "httpPort=");
-                if (httpPortPos) {
-                    char *valPos = httpPortPos + 9; // "httpPort=" is 9 chars
-                    if (*valPos == '0') {
-                        DLOG(@"[PROTO-R-PATCH] httpPort=0 -> 8");
-                        *valPos = '8';
-                        patched = YES;
-                    }
-                }
-                
-                if (patched) {
-                    DLOG(@"[PROTO-R-PATCH] Server info patched successfully (byte-level, no corruption)");
                 } else {
-                    DLOG(@"[PROTO-R-PATCH] Server info no changes needed");
+                    applyServerListPatch(payload, payloadLen);
                 }
-            } else {
-                DLOG(@"[PROTO-R-PATCH] Server info payload empty");
             }
-        }
-        
-        if (ret >= 16) {
+            
             if (cmd == 0x8002A017) {
-                DLOG(@"[PROTO-R] Login response 0x8002A017 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
-                if (status != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
+                if (ret >= 16) {
+                    uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                      ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                    if (status != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                        memset((unsigned char *)buf + 12, 0, 4);
+                    }
                 }
             }
             
             if (cmd == 0x8002A016) {
-                DLOG(@"[PROTO-R] Server list response 0x8002A016 pktLen=%u ret=%zd", pktLenBE, ret);
-                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                DLOG(@"[PROTO-R] Server list status at offset 8-11: %u (0x%08X), offset 12-15: %u (0x%08X)", status8, status8, status12, status12);
-                if (status8 != 0 || status12 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0 (force success)", status8, status12);
-                    memset((unsigned char *)buf + 8, 0, 8);
+                if (ret >= 16) {
+                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                        ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
+                    if (status8 != 0 || status12 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
+                        memset((unsigned char *)buf + 8, 0, 8);
+                    }
+                }
+            }
+            
+            if (cmd == 0x802EE113 || cmd == 0x802EE100) {
+                if (ret >= 12) {
+                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] Server info status at offset 8-11: %u", status8);
+                    if (status8 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server info status %u -> 0", status8);
+                        memset((unsigned char *)buf + 8, 0, 4);
+                    }
                 }
             }
         }
     }
     
-    if (port == 5678) {
-        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
-                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-            }
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
         }
-        static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-            if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
-                memset((unsigned char *)buf + i, ' ', sizeof(curVer));
-            }
+    }
+    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+            DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
         }
     }
     
