@@ -1,8 +1,8 @@
 /**
- * WangXianHook v34.88 - Fix server list empty + export crash + UITableView hook fix
- * FIX: UITableView hook checks dataSource class instead of UITableView class
- * FIX: Export crash - safer popover handling + smaller export size
- * FIX: More comprehensive server list detection via class scanning
+ * WangXianHook v34.89 - Fix server list with correct class names
+ * FIX: Changed MieshiServerInfo to ServerInfoForClient (real class name)
+ * FIX: Added hook for LoginModuleMessageHandlerImpl.handle_NEW_QUERY_SERVER_LIST_RES
+ * FIX: Updated CLogin class hooks for server list management
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -51,7 +51,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.88 Server List Fix ===");
+        _log(@"=== WXHook v34.89 Server Info Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -189,7 +189,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.88 诊断面板";
+            lbl.text = @"WXHook v34.89 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -554,7 +554,7 @@ static void installNSURLSessionHooks(void) {
 }
 
 // ============================================================
-#pragma mark - MieshiServerInfo hooks (trace server list parsing)
+#pragma mark - ServerInfoForClient hooks (trace server list parsing)
 // ============================================================
 
 static IMP orig_msi_init = NULL;
@@ -681,7 +681,7 @@ static NSInteger hook_numberOfSections(id self, SEL _cmd) {
 }
 
 // ============================================================
-#pragma mark - MieshiServerInfo helper
+#pragma mark - ServerInfoForClient helper
 // ============================================================
 
 static void msi_log_properties(id self) {
@@ -869,9 +869,9 @@ static void createLogButton(UIWindow *w) {
 }
 
 static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
-    Class msiCls = NSClassFromString(@"MieshiServerInfo");
+    Class msiCls = NSClassFromString(@"ServerInfoForClient");
     if (msiCls) {
-        DLOG(@"[MSI-RETRY] MieshiServerInfo class FOUND at attempt #%d!", attempt);
+        DLOG(@"[MSI-RETRY] ServerInfoForClient class FOUND at attempt #%d!", attempt);
         
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(msiCls, &mcount);
@@ -945,7 +945,7 @@ static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
             DLOG(@"[MSI-HOOK] Hooked: clientid");
         }
     } else {
-        DLOG(@"[MSI-RETRY] MieshiServerInfo class not found at attempt #%d", attempt);
+        DLOG(@"[MSI-RETRY] ServerInfoForClient class not found at attempt #%d", attempt);
         if (attempt < 3) {
             double delays[] = {2.0, 5.0, 10.0};
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -2384,10 +2384,10 @@ static void entry(void) {
         }
     }
     
-    // === IMMEDIATE: Hook MieshiServerInfo class to trace server list parsing ===
-    Class msiCls = NSClassFromString(@"MieshiServerInfo");
+    // === IMMEDIATE: Hook ServerInfoForClient class to trace server list parsing ===
+    Class msiCls = NSClassFromString(@"ServerInfoForClient");
     if (msiCls) {
-        DLOG(@"[MSI] MieshiServerInfo class FOUND!");
+        DLOG(@"[MSI] ServerInfoForClient class FOUND!");
         
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(msiCls, &mcount);
@@ -2455,7 +2455,7 @@ static void entry(void) {
             DLOG(@"[MSI-HOOK] Hooked: clientid");
         }
     } else {
-        DLOG(@"[MSI] MieshiServerInfo class NOT found!");
+        DLOG(@"[MSI] ServerInfoForClient class NOT found!");
     }
     
     // Dump NSUserDefaults
@@ -2742,6 +2742,74 @@ static void entry(void) {
         Method reloadData = class_getInstanceMethod(tableViewCls, @selector(reloadData));
         if (reloadData) {
             DLOG(@"[TV-HOOK] Found reloadData in UITableView");
+        }
+    });
+    
+    // === DEFERRED: Hook LoginModuleMessageHandlerImpl for server list response ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            Class lmhiCls = NSClassFromString(@"LoginModuleMessageHandlerImpl");
+            if (lmhiCls) {
+                DLOG(@"[LMHI] LoginModuleMessageHandlerImpl class FOUND!");
+                
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(lmhiCls, &mcount);
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    if ([selName containsString:@"SERVER_LIST"] || 
+                        [selName containsString:@"server"] || 
+                        [selName containsString:@"Server"]) {
+                        DLOG(@"[LMHI-METHOD] -[%@ %@]", NSStringFromClass(lmhiCls), selName);
+                        
+                        IMP orig = method_getImplementation(methods[i]);
+                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
+                            DLOG(@"[LMHI-CALL] -[%@ %@] called", NSStringFromClass([self class]), selName);
+                            va_list args;
+                            va_start(args, _cmd);
+                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
+                            va_end(args);
+                            DLOG(@"[LMHI-CALL] -[%@ %@] returned: %@", NSStringFromClass([self class]), selName, result ?: @"nil");
+                            return result;
+                        });
+                        method_setImplementation(methods[i], new_impl);
+                        DLOG(@"[LMHI-HOOK] Hooked: %@", selName);
+                    }
+                }
+                if (methods) free(methods);
+            } else {
+                DLOG(@"[LMHI] LoginModuleMessageHandlerImpl class NOT found!");
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[LMHI] Exception: %@", e);
+        }
+    });
+    
+    // === DEFERRED: Hook CLogin for server list UI ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            Class cLoginCls = NSClassFromString(@"CLogin");
+            if (cLoginCls) {
+                DLOG(@"[CLOGIN] CLogin class FOUND!");
+                
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(cLoginCls, &mcount);
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    if ([selName containsString:@"server"] || 
+                        [selName containsString:@"Server"] ||
+                        [selName containsString:@"ServerList"] ||
+                        [selName containsString:@"updateServer"]) {
+                        DLOG(@"[CLOGIN-METHOD] -[%@ %@]", NSStringFromClass(cLoginCls), selName);
+                    }
+                }
+                if (methods) free(methods);
+            } else {
+                DLOG(@"[CLOGIN] CLogin class NOT found!");
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[CLOGIN] Exception: %@", e);
         }
     });
 }
