@@ -1,8 +1,8 @@
 /**
- * WangXianHook v34.93 - Fix server list with improved garbage detection
- * FIX: Improved garbage name detection - now counts dots and valid chars
- * FIX: Name/realname is garbage if dots >= 50% or valid chars < 3
- * FIX: Lowered minimum name length threshold from 13 to 6
+ * WangXianHook v34.94 - FIX: Stop zeroing sequence ID (offset 8-11)
+ * FIX: Removed zeroing offset 8-11 in hook_recv/hook_recvfrom/hook_recvmsg
+ * FIX: This was causing client to drop server list responses (sequence mismatch)
+ * FIX: Only modify status at offset 12+ which is correct status field
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -1522,15 +1522,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check status %u -> 0 (bypass)", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
-                }
-            }
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
@@ -1595,26 +1586,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             if (cmd == 0x8002A016) {
                 if (ret >= 16) {
-                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
-                    if (status8 != 0 || status12 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
-                        memset((unsigned char *)buf + 8, 0, 8);
-                    }
-                }
-            }
-            
-            if (cmd == 0x802EE113 || cmd == 0x802EE100) {
-                if (ret >= 12) {
-                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] Server info status at offset 8-11: %u", status8);
-                    if (status8 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server info status %u -> 0", status8);
-                        memset((unsigned char *)buf + 8, 0, 4);
+                    DLOG(@"[PROTO-R] Server list status: offset 12-15=%u", status12);
+                    if (status12 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
+                        memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
             }
@@ -1749,26 +1726,12 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             
             if (cmd == 0x8002A016) {
                 if (ret >= 16) {
-                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Server list status: offset 8-11=%u, offset 12-15=%u", status8, status12);
-                    if (status8 != 0 || status12 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server list status %u/%u -> 0", status8, status12);
-                        memset((unsigned char *)buf + 8, 0, 8);
-                    }
-                }
-            }
-            
-            if (cmd == 0x802EE113 || cmd == 0x802EE100) {
-                if (ret >= 12) {
-                    uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] Server info status at offset 8-11: %u", status8);
-                    if (status8 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server info status %u -> 0", status8);
-                        memset((unsigned char *)buf + 8, 0, 4);
+                    DLOG(@"[PROTO-R] Server list status: offset 12-15=%u", status12);
+                    if (status12 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
+                        memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
             }
@@ -1839,14 +1802,6 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-RF-PATCH] Version status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
-                }
-            }
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-RF-PATCH] Version status byte %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
@@ -1894,15 +1849,6 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                     }
                 } else {
                     applyServerListPatch(payload, payloadLen);
-                }
-            }
-            
-            if (ret >= 12) {
-                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status8 != 0) {
-                    DLOG(@"[PROTO-RF-PATCH] Status at offset 8-11: %u -> 0", status8);
-                    memset((unsigned char *)buf + 8, 0, 4);
                 }
             }
             
@@ -1988,14 +1934,6 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
-            if (iov->iov_len >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-RM-PATCH] Version status %u -> 0", status4);
-                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
-                }
-            }
             if (iov->iov_len >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-RM-PATCH] Version status byte %u -> 0", p[12]);
                 ((unsigned char *)iov->iov_base)[12] = 0;
@@ -2043,15 +1981,6 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                     }
                 } else {
                     applyServerListPatch(payload, payloadLen);
-                }
-            }
-            
-            if (iov->iov_len >= 12) {
-                uint32_t status8 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status8 != 0) {
-                    DLOG(@"[PROTO-RM-PATCH] Status at offset 8-11: %u -> 0", status8);
-                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
                 }
             }
             
