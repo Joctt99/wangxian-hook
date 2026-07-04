@@ -1,9 +1,9 @@
 /**
- * WangXianHook v34.91 - Fix server list with full UDP/gzip support
- * FIX: Removed port restriction from ALL socket hooks (recv/read/recvfrom/recvmsg)
- * FIX: Added gzip decompression/compression to recvfrom and recvmsg
- * FIX: Added UDP source address tracking in recvfrom and recvmsg
- * FIX: Unified server list patching via applyServerListPatch()
+ * WangXianHook v34.92 - Fix server list with garbage name replacement
+ * FIX: Added garbage name/realname/category/description detection and replacement
+ * FIX: Changed category patch from pattern matching to field-based replacement
+ * FIX: Changed name/realname patch to detect and replace garbage Chinese characters
+ * FIX: Added onlinePlayerNum=0 → 100 patch
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -52,7 +52,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.91 Server List Fix ===");
+        _log(@"=== WXHook v34.92 Server List Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -190,7 +190,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.91 诊断面板";
+            lbl.text = @"WXHook v34.92 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1339,13 +1339,85 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
         }
     }
     
-    const unsigned char oldCat[] = {0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E};
     const unsigned char newCat[] = {0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA};
+    for (size_t i = 0; i + 11 <= payloadLen; i++) {
+        if (cpayload[i] == 'c' && cpayload[i+1] == 'a' && cpayload[i+2] == 't' && 
+            cpayload[i+3] == 'e' && cpayload[i+4] == 'g' && cpayload[i+5] == 'o' && 
+            cpayload[i+6] == 'r' && cpayload[i+7] == 'y' && cpayload[i+8] == '=' && 
+            cpayload[i+9] == '\'') {
+            size_t endIdx = i + 10;
+            while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
+            if (endIdx < payloadLen) {
+                size_t catLen = endIdx - (i + 10);
+                if (catLen >= 6) {
+                    DLOG(@"[PROTO-PATCH] Found category field at offset %zu, replacing with '一区'", i);
+                    memcpy(payload + i + 10, newCat, 6);
+                    for (size_t j = 6; j < catLen; j++) payload[i+10+j] = ' ';
+                    patched = YES;
+                }
+            }
+        }
+    }
+    
+    const unsigned char newName[] = {0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61};
     for (size_t i = 0; i + 6 <= payloadLen; i++) {
-        if (memcmp(payload + i, oldCat, 6) == 0) {
-            DLOG(@"[PROTO-PATCH] Found '......' at offset %zu, replacing with '一区'", i);
-            memcpy(payload + i, newCat, 6);
-            patched = YES;
+        if (cpayload[i] == 'n' && cpayload[i+1] == 'a' && cpayload[i+2] == 'm' && 
+            cpayload[i+3] == 'e' && cpayload[i+4] == '=' && cpayload[i+5] == '\'') {
+            size_t endIdx = i + 6;
+            while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
+            if (endIdx < payloadLen) {
+                size_t nameLen = endIdx - (i + 6);
+                if (nameLen >= 13) {
+                    BOOL isGarbage = YES;
+                    for (size_t j = 0; j < nameLen && j < 20; j++) {
+                        unsigned char ch = payload[i+6+j];
+                        if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0xE4 && ch <= 0xE9)) {
+                            if (ch != '.' && ch != '\x00') {
+                                isGarbage = NO;
+                                break;
+                            }
+                        }
+                    }
+                    if (isGarbage || nameLen < 6) {
+                        DLOG(@"[PROTO-PATCH] Found garbage name at offset %zu, replacing with '最新测试a'", i);
+                        memcpy(payload + i + 6, newName, 13);
+                        for (size_t j = 13; j < nameLen; j++) payload[i+6+j] = ' ';
+                        patched = YES;
+                    }
+                }
+            }
+        }
+    }
+    
+    const unsigned char newRealName[] = {0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61};
+    for (size_t i = 0; i + 10 <= payloadLen; i++) {
+        if (cpayload[i] == 'r' && cpayload[i+1] == 'e' && cpayload[i+2] == 'a' && 
+            cpayload[i+3] == 'l' && cpayload[i+4] == 'n' && cpayload[i+5] == 'a' && 
+            cpayload[i+6] == 'm' && cpayload[i+7] == 'e' && cpayload[i+8] == '=' && 
+            cpayload[i+9] == '\'') {
+            size_t endIdx = i + 10;
+            while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
+            if (endIdx < payloadLen) {
+                size_t nameLen = endIdx - (i + 10);
+                if (nameLen >= 13) {
+                    BOOL isGarbage = YES;
+                    for (size_t j = 0; j < nameLen && j < 20; j++) {
+                        unsigned char ch = payload[i+10+j];
+                        if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0xE4 && ch <= 0xE9)) {
+                            if (ch != '.' && ch != '\x00') {
+                                isGarbage = NO;
+                                break;
+                            }
+                        }
+                    }
+                    if (isGarbage || nameLen < 6) {
+                        DLOG(@"[PROTO-PATCH] Found garbage realname at offset %zu, replacing with '最新测试a'", i);
+                        memcpy(payload + i + 10, newRealName, 13);
+                        for (size_t j = 13; j < nameLen; j++) payload[i+10+j] = ' ';
+                        patched = YES;
+                    }
+                }
+            }
         }
     }
     
@@ -1358,6 +1430,55 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
             DLOG(@"[PROTO-PATCH] Found '服务器维护中...' at offset %zu, replacing with '运行'", i);
             memcpy(payload + i, newDesc, 6);
             for (size_t j = 6; j < 21; j++) payload[i+j] = ' ';
+            patched = YES;
+        }
+    }
+    
+    for (size_t i = 0; i + 17 <= payloadLen; i++) {
+        if (cpayload[i] == 'd' && cpayload[i+1] == 'e' && cpayload[i+2] == 's' && 
+            cpayload[i+3] == 'c' && cpayload[i+4] == 'r' && cpayload[i+5] == 'i' && 
+            cpayload[i+6] == 'p' && cpayload[i+7] == 't' && cpayload[i+8] == 'i' && 
+            cpayload[i+9] == 'o' && cpayload[i+10] == 'n' && cpayload[i+11] == '=' && 
+            cpayload[i+12] == '\'') {
+            size_t endIdx = i + 13;
+            while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
+            if (endIdx < payloadLen) {
+                size_t descLen = endIdx - (i + 13);
+                if (descLen >= 6) {
+                    BOOL isGarbage = YES;
+                    for (size_t j = 0; j < descLen && j < 20; j++) {
+                        unsigned char ch = payload[i+13+j];
+                        if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0xE4 && ch <= 0xE9)) {
+                            isGarbage = NO;
+                            break;
+                        }
+                    }
+                    if (isGarbage) {
+                        DLOG(@"[PROTO-PATCH] Found garbage description at offset %zu, replacing with '运行'", i);
+                        memcpy(payload + i + 13, newDesc, 6);
+                        for (size_t j = 6; j < descLen; j++) payload[i+13+j] = ' ';
+                        patched = YES;
+                    }
+                }
+            }
+        }
+    }
+    
+    for (size_t i = 0; i + 16 <= payloadLen; i++) {
+        if (cpayload[i] == 'o' && cpayload[i+1] == 'n' && cpayload[i+2] == 'l' && 
+            cpayload[i+3] == 'i' && cpayload[i+4] == 'n' && cpayload[i+5] == 'e' && 
+            cpayload[i+6] == 'P' && cpayload[i+7] == 'l' && cpayload[i+8] == 'a' && 
+            cpayload[i+9] == 'y' && cpayload[i+10] == 'e' && cpayload[i+11] == 'r' && 
+            cpayload[i+12] == 'N' && cpayload[i+13] == 'u' && cpayload[i+14] == 'm' && 
+            cpayload[i+15] == '=' && cpayload[i+16] == '0') {
+            DLOG(@"[PROTO-PATCH] Found onlinePlayerNum=0 at offset %zu, changing to 100", i);
+            cpayload[i+16] = '1';
+            if (i + 17 < payloadLen && cpayload[i+17] == ',') {
+                cpayload[i+17] = '0';
+                cpayload[i+18] = '0';
+            } else {
+                cpayload[i+17] = '0';
+            }
             patched = YES;
         }
     }
