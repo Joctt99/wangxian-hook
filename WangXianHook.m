@@ -1,5 +1,6 @@
 /**
- * WangXianHook v34.95 - FIX: Generate fake server list when server returns empty
+ * WangXianHook v34.96 - FIX: Enhanced NSURLSession interception + fake server list
+ * FIX: Generate fake server list when server returns empty in recv/recvfrom/recvmsg
  * FIX: Stop zeroing sequence ID (offset 8-11)
  * FIX: Removed zeroing offset 8-11 in hook_recv/hook_recvfrom/hook_recvmsg
  * FIX: This was causing client to drop server list responses (sequence mismatch)
@@ -52,7 +53,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.95 Fake Server List ===");
+        _log(@"=== WXHook v34.96 Enhanced NSURLSession + Fake Server ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -190,7 +191,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.93 诊断面板";
+            lbl.text = @"WXHook v34.95 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2448,24 +2449,57 @@ static id hook_arrayForKey(id self, SEL _cmd, id key) {
     return ret;
 }
 
-// NSURLSession.dataTaskWithRequest:completionHandler: - observe only
+// NSURLSession.dataTaskWithRequest:completionHandler: - intercept and modify responses
 typedef NSURLSessionDataTask *(*DTReqCompIMP)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
 static DTReqCompIMP orig_dtwrc = NULL;
 static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, void (^comp)(NSData *, NSURLResponse *, NSError *)) {
     NSString *url = req.URL.absoluteString;
     DLOG(@"[NET] URL: %@", url);
     
-    // Wrap completion handler to observe response (don't modify)
+    // Wrap completion handler to intercept and modify response
     void (^wrappedComp)(NSData *, NSURLResponse *, NSError *) = comp;
     if (comp) {
         wrappedComp = [^(NSData *data, NSURLResponse *resp, NSError *err) {
             NSHTTPURLResponse *httpResp = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
             DLOG(@"[NET] Response: status=%ld url=%@ err=%@ bodyLen=%lu",
                  httpResp ? (long)httpResp.statusCode : -1, url, err, (unsigned long)data.length);
-            if (data && data.length > 0 && data.length < 2000) {
+            
+            if (data && data.length > 0) {
                 NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (body) DLOG(@"[NET] Body: %@", body);
+                
+                if (body) {
+                    DLOG(@"[NET] Body: %@", body);
+                    
+                    // Check if this is a server list response
+                    BOOL isServerList = ([body containsString:@"server"] || [body containsString:@"servers"] || 
+                                        [body containsString:@"serverCount"] || [body containsString:@"serverid"]);
+                    
+                    // Check if response indicates empty/no servers
+                    BOOL isEmptyList = ([body containsString:@"\"serverCount\":0"] || 
+                                        [body containsString:@"\"servers\":[]"] ||
+                                        [body containsString:@"\"status\":5"] ||
+                                        [body containsString:@"\"result\":\"fail\""]);
+                    
+                    if (isServerList && isEmptyList) {
+                        DLOG(@"[NET-PATCH] Server list is empty, replacing with fake data");
+                        NSString *fakeServerList = @"{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                        data = [fakeServerList dataUsingEncoding:NSUTF8StringEncoding];
+                        DLOG(@"[NET-PATCH] Replaced with fake server list, new len=%lu", (unsigned long)data.length);
+                    }
+                    
+                    // Check for version error
+                    if ([body containsString:@"版本"] || [body containsString:@"更新"] || 
+                        [body containsString:@"升级"] || [body containsString:@"版本过低"]) {
+                        DLOG(@"[NET-PATCH] Detected version error, modifying...");
+                        body = [body stringByReplacingOccurrencesOfString:@"\"status\":5" withString:@"\"status\":0"];
+                        body = [body stringByReplacingOccurrencesOfString:@"\"result\":\"fail\"" withString:@"\"result\":\"success\""];
+                        body = [body stringByReplacingOccurrencesOfString:@"版本过低" withString:@""];
+                        body = [body stringByReplacingOccurrencesOfString:@"请更新" withString:@""];
+                        data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                    }
+                }
             }
+            
             comp(data, resp, err);
         } copy];
     }
