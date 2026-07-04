@@ -1,5 +1,6 @@
 /**
- * WangXianHook v34.94 - FIX: Stop zeroing sequence ID (offset 8-11)
+ * WangXianHook v34.95 - FIX: Generate fake server list when server returns empty
+ * FIX: Stop zeroing sequence ID (offset 8-11)
  * FIX: Removed zeroing offset 8-11 in hook_recv/hook_recvfrom/hook_recvmsg
  * FIX: This was causing client to drop server list responses (sequence mismatch)
  * FIX: Only modify status at offset 12+ which is correct status field
@@ -51,7 +52,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.93 Server List Fix ===");
+        _log(@"=== WXHook v34.95 Fake Server List ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -1594,6 +1595,22 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
+                
+                ssize_t payloadLen = ret - 8;
+                if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
+                    DLOG(@"[PROTO-R-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                    size_t fakeLen = strlen(fakeServerList);
+                    if (fakeLen + 8 <= len) {
+                        memcpy(buf + 8, fakeServerList, fakeLen);
+                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                        memcpy(buf, &newPktLen, 4);
+                        ret = 8 + fakeLen;
+                        DLOG(@"[PROTO-R-PATCH] Replaced with fake server list, new len=%zd", ret);
+                    } else {
+                        DLOG(@"[PROTO-R-PATCH] Buffer too small for fake list, need %zu but have %zu", fakeLen + 8, len);
+                    }
+                }
             }
         }
     }
@@ -1734,6 +1751,22 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
+                
+                ssize_t payloadLen = ret - 8;
+                if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
+                    DLOG(@"[PROTO-R-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                    size_t fakeLen = strlen(fakeServerList);
+                    if (fakeLen + 8 <= len) {
+                        memcpy(buf + 8, fakeServerList, fakeLen);
+                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                        memcpy(buf, &newPktLen, 4);
+                        ret = 8 + fakeLen;
+                        DLOG(@"[PROTO-R-PATCH] Replaced with fake server list, new len=%zd", ret);
+                    } else {
+                        DLOG(@"[PROTO-R-PATCH] Buffer too small for fake list, need %zu but have %zu", fakeLen + 8, len);
+                    }
+                }
             }
         }
     }
@@ -1868,6 +1901,20 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                     DLOG(@"[PROTO-RF-PATCH] Server list status at 12-15: %u -> 0", status12);
                     memset((unsigned char *)buf + 12, 0, 4);
                 }
+                
+                ssize_t payloadLen = ret - 8;
+                if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
+                    DLOG(@"[PROTO-RF-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                    size_t fakeLen = strlen(fakeServerList);
+                    if (fakeLen + 8 <= len) {
+                        memcpy(buf + 8, fakeServerList, fakeLen);
+                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                        memcpy(buf, &newPktLen, 4);
+                        ret = 8 + fakeLen;
+                        DLOG(@"[PROTO-RF-PATCH] Replaced with fake server list, new len=%zd", ret);
+                    }
+                }
             }
         }
     }
@@ -1999,6 +2046,20 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                 if (status12 != 0) {
                     DLOG(@"[PROTO-RM-PATCH] Server list status at 12-15: %u -> 0", status12);
                     memset((unsigned char *)iov->iov_base + 12, 0, 4);
+                }
+                
+                ssize_t payloadLen = MIN((ssize_t)iov->iov_len - 8, ret - 8);
+                if (payloadLen < 50 || !strstr((char *)iov->iov_base + 8, "server")) {
+                    DLOG(@"[PROTO-RM-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                    size_t fakeLen = strlen(fakeServerList);
+                    if (fakeLen + 8 <= iov->iov_len) {
+                        memcpy(iov->iov_base + 8, fakeServerList, fakeLen);
+                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                        memcpy(iov->iov_base, &newPktLen, 4);
+                        ret = 8 + fakeLen;
+                        DLOG(@"[PROTO-RM-PATCH] Replaced with fake server list, new len=%zd", ret);
+                    }
                 }
             }
         }
