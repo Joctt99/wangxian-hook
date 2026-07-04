@@ -1,9 +1,8 @@
 /**
- * WangXianHook v34.92 - Fix server list with garbage name replacement
- * FIX: Added garbage name/realname/category/description detection and replacement
- * FIX: Changed category patch from pattern matching to field-based replacement
- * FIX: Changed name/realname patch to detect and replace garbage Chinese characters
- * FIX: Added onlinePlayerNum=0 → 100 patch
+ * WangXianHook v34.93 - Fix server list with improved garbage detection
+ * FIX: Improved garbage name detection - now counts dots and valid chars
+ * FIX: Name/realname is garbage if dots >= 50% or valid chars < 3
+ * FIX: Lowered minimum name length threshold from 13 to 6
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -52,7 +51,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.92 Server List Fix ===");
+        _log(@"=== WXHook v34.93 Server List Fix ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -190,7 +189,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v34.92 诊断面板";
+            lbl.text = @"WXHook v34.93 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1367,19 +1366,21 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
             while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
             if (endIdx < payloadLen) {
                 size_t nameLen = endIdx - (i + 6);
-                if (nameLen >= 13) {
-                    BOOL isGarbage = YES;
-                    for (size_t j = 0; j < nameLen && j < 20; j++) {
+                if (nameLen >= 6) {
+                    size_t validCharCount = 0;
+                    size_t dotCount = 0;
+                    for (size_t j = 0; j < nameLen && j < 30; j++) {
                         unsigned char ch = payload[i+6+j];
-                        if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0xE4 && ch <= 0xE9)) {
-                            if (ch != '.' && ch != '\x00') {
-                                isGarbage = NO;
-                                break;
-                            }
+                        if (ch == '.') {
+                            dotCount++;
+                        } else if ((ch >= 0xE4 && ch <= 0xE9) || (ch >= 'a' && ch <= 'z') || 
+                                   (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                            validCharCount++;
                         }
                     }
-                    if (isGarbage || nameLen < 6) {
-                        DLOG(@"[PROTO-PATCH] Found garbage name at offset %zu, replacing with '最新测试a'", i);
+                    if (dotCount >= nameLen / 2 || validCharCount < 3) {
+                        DLOG(@"[PROTO-PATCH] Found garbage name (dots=%zu, valid=%zu) at offset %zu, replacing", 
+                             dotCount, validCharCount, i);
                         memcpy(payload + i + 6, newName, 13);
                         for (size_t j = 13; j < nameLen; j++) payload[i+6+j] = ' ';
                         patched = YES;
@@ -1399,19 +1400,21 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
             while (endIdx < payloadLen && cpayload[endIdx] != '\'') endIdx++;
             if (endIdx < payloadLen) {
                 size_t nameLen = endIdx - (i + 10);
-                if (nameLen >= 13) {
-                    BOOL isGarbage = YES;
-                    for (size_t j = 0; j < nameLen && j < 20; j++) {
+                if (nameLen >= 6) {
+                    size_t validCharCount = 0;
+                    size_t dotCount = 0;
+                    for (size_t j = 0; j < nameLen && j < 30; j++) {
                         unsigned char ch = payload[i+10+j];
-                        if ((ch >= 0x20 && ch < 0x7F) || (ch >= 0xE4 && ch <= 0xE9)) {
-                            if (ch != '.' && ch != '\x00') {
-                                isGarbage = NO;
-                                break;
-                            }
+                        if (ch == '.') {
+                            dotCount++;
+                        } else if ((ch >= 0xE4 && ch <= 0xE9) || (ch >= 'a' && ch <= 'z') || 
+                                   (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                            validCharCount++;
                         }
                     }
-                    if (isGarbage || nameLen < 6) {
-                        DLOG(@"[PROTO-PATCH] Found garbage realname at offset %zu, replacing with '最新测试a'", i);
+                    if (dotCount >= nameLen / 2 || validCharCount < 3) {
+                        DLOG(@"[PROTO-PATCH] Found garbage realname (dots=%zu, valid=%zu) at offset %zu, replacing", 
+                             dotCount, validCharCount, i);
                         memcpy(payload + i + 10, newRealName, 13);
                         for (size_t j = 13; j < nameLen; j++) payload[i+10+j] = ' ';
                         patched = YES;
