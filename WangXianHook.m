@@ -170,6 +170,7 @@ static void hook_scExit(id self, SEL _cmd) {
 - (void)toggle;
 - (void)clearLog;
 - (void)toggleLogging;
+- (void)handleTripleTap:(UITapGestureRecognizer *)gesture;
 @end
 
 static UIButton *g_btn = nil;
@@ -415,6 +416,16 @@ static UILabel *g_statusLbl = nil;
     g_tv.text = content;
     if (content.length > 0) {
         [g_tv scrollRangeToVisible:NSMakeRange(content.length - 1, 0)];
+    }
+}
+- (void)handleTripleTap:(UITapGestureRecognizer *)gesture {
+    if (g_btn) {
+        g_btn.hidden = !g_btn.hidden;
+        if (!g_btn.hidden) {
+            DLOG(@"[UI] Log button shown via triple-tap");
+        } else {
+            DLOG(@"[UI] Log button hidden via triple-tap");
+        }
     }
 }
 @end
@@ -859,15 +870,40 @@ static void createLogButton(UIWindow *w) {
     g_handler = [[WXHandler alloc] init];
     g_btn = [UIButton buttonWithType:UIButtonTypeCustom];
     g_btn.frame = CGRectMake(w.bounds.size.width - 60, 200, 50, 50);
-    g_btn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
     g_btn.layer.cornerRadius = 25;
+    g_btn.clipsToBounds = YES;
+    
+    NSString *imagePath = [[NSBundle mainBundle] pathForResource:@"123" ofType:@"jpg"];
+    if (imagePath && [[NSFileManager defaultManager] fileExistsAtPath:imagePath]) {
+        UIImage *btnImage = [UIImage imageWithContentsOfFile:imagePath];
+        if (btnImage) {
+            btnImage = [btnImage imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+            [g_btn setImage:btnImage forState:UIControlStateNormal];
+            g_btn.imageView.contentMode = UIViewContentModeScaleAspectFill;
+            DLOG(@"[UI] Log button using custom image: %@", imagePath);
+        } else {
+            [g_btn setTitle:@"LOG" forState:UIControlStateNormal];
+            [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            g_btn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
+        }
+    } else {
+        [g_btn setTitle:@"LOG" forState:UIControlStateNormal];
+        [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        g_btn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
+    }
+    
     g_btn.titleLabel.font = [UIFont systemFontOfSize:10];
-    [g_btn setTitle:@"LOG" forState:UIControlStateNormal];
-    [g_btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    g_btn.hidden = YES;
     [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [w addSubview:g_btn];
     [w bringSubviewToFront:g_btn];
-    _log(@"[UI] Button created on window");
+    
+    UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:g_handler action:@selector(handleTripleTap:)];
+    tripleTap.numberOfTapsRequired = 2;
+    tripleTap.numberOfTouchesRequired = 3;
+    [w addGestureRecognizer:tripleTap];
+    
+    _log(@"[UI] Button created on window (hidden, triple-tap to show)");
 }
 
 static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
