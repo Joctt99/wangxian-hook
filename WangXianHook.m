@@ -1,6 +1,8 @@
 /**
- * WangXianHook v34.96 - FIX: Enhanced NSURLSession interception + fake server list
- * FIX: Generate fake server list when server returns empty in recv/recvfrom/recvmsg
+ * WangXianHook v34.97 - FIX: Enhanced debug logging for binary protocol analysis
+ * FIX: Removed JSON fake server list (C++ binary protocol doesn't parse JSON)
+ * FIX: Added detailed hex dump for 0x8002A016 response to analyze binary format
+ * FIX: Need user logs to understand ServerInfoForClient binary structure
  * FIX: Stop zeroing sequence ID (offset 8-11)
  * FIX: Removed zeroing offset 8-11 in hook_recv/hook_recvfrom/hook_recvmsg
  * FIX: This was causing client to drop server list responses (sequence mismatch)
@@ -53,7 +55,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.96 Enhanced NSURLSession + Fake Server ===");
+        _log(@"=== WXHook v34.97 Binary Protocol Debug Analysis ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -1587,29 +1589,64 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             if (cmd == 0x8002A016) {
+                DLOG(@"[PROTO-R] === NEW_QUERY_SERVER_LIST_RES (0x8002A016) ===");
+                DLOG(@"[PROTO-R] Full packet length: %zd bytes", ret);
+                
+                NSMutableString *fullHex = [NSMutableString stringWithCapacity:ret * 3];
+                NSMutableString *fullAscii = [NSMutableString stringWithCapacity:ret];
+                for (size_t i = 0; i < (size_t)ret; i++) {
+                    [fullHex appendFormat:@"%02X ", p[i]];
+                    [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+                }
+                DLOG(@"[PROTO-R] Full hex dump:\n%@", fullHex);
+                DLOG(@"[PROTO-R] ASCII dump:\n%@", fullAscii);
+                
+                if (ret >= 8) {
+                    uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                    DLOG(@"[PROTO-R] pktLen (BE): %u", pktLenBE);
+                    DLOG(@"[PROTO-R] cmd: 0x%08X", cmd);
+                }
+                
+                if (ret >= 12) {
+                    uint32_t seqId = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                      ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] sequence ID (offset 8-11): %u (0x%08X)", seqId, seqId);
+                }
+                
                 if (ret >= 16) {
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Server list status: offset 12-15=%u", status12);
+                    DLOG(@"[PROTO-R] status (offset 12-15): %u (0x%08X)", status12, status12);
                     if (status12 != 0) {
                         DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
                 
+                if (ret >= 20) {
+                    uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
+                                           ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
+                    DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
+                }
+                
                 ssize_t payloadLen = ret - 8;
-                if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
-                    DLOG(@"[PROTO-R-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
-                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
-                    size_t fakeLen = strlen(fakeServerList);
-                    if (fakeLen + 8 <= len) {
-                        memcpy(buf + 8, fakeServerList, fakeLen);
-                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
-                        memcpy(buf, &newPktLen, 4);
-                        ret = 8 + fakeLen;
-                        DLOG(@"[PROTO-R-PATCH] Replaced with fake server list, new len=%zd", ret);
-                    } else {
-                        DLOG(@"[PROTO-R-PATCH] Buffer too small for fake list, need %zu but have %zu", fakeLen + 8, len);
+                if (payloadLen < 50) {
+                    DLOG(@"[PROTO-R-DEBUG] Server list payload too small (%zd bytes) - server may return error", payloadLen);
+                }
+                
+                if (!strstr((char *)buf + 8, "server")) {
+                    DLOG(@"[PROTO-R-DEBUG] No 'server' string in payload - likely binary format");
+                    const unsigned char *payload = (const unsigned char *)buf + 8;
+                    if (payloadLen >= 4) {
+                        uint32_t statusField = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                                               ((uint32_t)payload[2] << 8)  | (uint32_t)payload[3];
+                        DLOG(@"[PROTO-R-DEBUG] First 4 bytes of payload (status?): %u (0x%08X)", statusField, statusField);
+                    }
+                    if (payloadLen >= 8) {
+                        uint32_t countField = ((uint32_t)payload[4] << 24) | ((uint32_t)payload[5] << 16) |
+                                              ((uint32_t)payload[6] << 8)  | (uint32_t)payload[7];
+                        DLOG(@"[PROTO-R-DEBUG] Bytes 4-7 of payload (count?): %u", countField);
                     }
                 }
             }
@@ -1743,29 +1780,64 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             }
             
             if (cmd == 0x8002A016) {
+                DLOG(@"[PROTO-R] === NEW_QUERY_SERVER_LIST_RES (0x8002A016) ===");
+                DLOG(@"[PROTO-R] Full packet length: %zd bytes", ret);
+                
+                NSMutableString *fullHex = [NSMutableString stringWithCapacity:ret * 3];
+                NSMutableString *fullAscii = [NSMutableString stringWithCapacity:ret];
+                for (size_t i = 0; i < (size_t)ret; i++) {
+                    [fullHex appendFormat:@"%02X ", p[i]];
+                    [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+                }
+                DLOG(@"[PROTO-R] Full hex dump:\n%@", fullHex);
+                DLOG(@"[PROTO-R] ASCII dump:\n%@", fullAscii);
+                
+                if (ret >= 8) {
+                    uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                    DLOG(@"[PROTO-R] pktLen (BE): %u", pktLenBE);
+                    DLOG(@"[PROTO-R] cmd: 0x%08X", cmd);
+                }
+                
+                if (ret >= 12) {
+                    uint32_t seqId = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                      ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] sequence ID (offset 8-11): %u (0x%08X)", seqId, seqId);
+                }
+                
                 if (ret >= 16) {
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Server list status: offset 12-15=%u", status12);
+                    DLOG(@"[PROTO-R] status (offset 12-15): %u (0x%08X)", status12, status12);
                     if (status12 != 0) {
                         DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
                 
+                if (ret >= 20) {
+                    uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
+                                           ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
+                    DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
+                }
+                
                 ssize_t payloadLen = ret - 8;
-                if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
-                    DLOG(@"[PROTO-R-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
-                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
-                    size_t fakeLen = strlen(fakeServerList);
-                    if (fakeLen + 8 <= len) {
-                        memcpy(buf + 8, fakeServerList, fakeLen);
-                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
-                        memcpy(buf, &newPktLen, 4);
-                        ret = 8 + fakeLen;
-                        DLOG(@"[PROTO-R-PATCH] Replaced with fake server list, new len=%zd", ret);
-                    } else {
-                        DLOG(@"[PROTO-R-PATCH] Buffer too small for fake list, need %zu but have %zu", fakeLen + 8, len);
+                if (payloadLen < 50) {
+                    DLOG(@"[PROTO-R-DEBUG] Server list payload too small (%zd bytes) - server may return error", payloadLen);
+                }
+                
+                if (!strstr((char *)buf + 8, "server")) {
+                    DLOG(@"[PROTO-R-DEBUG] No 'server' string in payload - likely binary format");
+                    const unsigned char *payload = (const unsigned char *)buf + 8;
+                    if (payloadLen >= 4) {
+                        uint32_t statusField = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                                               ((uint32_t)payload[2] << 8)  | (uint32_t)payload[3];
+                        DLOG(@"[PROTO-R-DEBUG] First 4 bytes of payload (status?): %u (0x%08X)", statusField, statusField);
+                    }
+                    if (payloadLen >= 8) {
+                        uint32_t countField = ((uint32_t)payload[4] << 24) | ((uint32_t)payload[5] << 16) |
+                                              ((uint32_t)payload[6] << 8)  | (uint32_t)payload[7];
+                        DLOG(@"[PROTO-R-DEBUG] Bytes 4-7 of payload (count?): %u", countField);
                     }
                 }
             }
