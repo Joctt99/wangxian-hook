@@ -1,12 +1,10 @@
 /**
- * WangXianHook v34.97 - FIX: Enhanced debug logging for binary protocol analysis
- * FIX: Removed JSON fake server list (C++ binary protocol doesn't parse JSON)
- * FIX: Added detailed hex dump for 0x8002A016 response to analyze binary format
- * FIX: Need user logs to understand ServerInfoForClient binary structure
+ * WangXianHook v34.98 - FIX: Enhanced server connection handling
+ * FIX: Added comprehensive login response (0x8002A017) patching
+ * FIX: Added connection failure fallback for game servers
+ * FIX: Enhanced logging for all protocol responses
+ * FIX: Handle "network disconnected" errors by patching connection responses
  * FIX: Stop zeroing sequence ID (offset 8-11)
- * FIX: Removed zeroing offset 8-11 in hook_recv/hook_recvfrom/hook_recvmsg
- * FIX: This was causing client to drop server list responses (sequence mismatch)
- * FIX: Only modify status at offset 12+ which is correct status field
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -1524,15 +1522,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE120 || cmd == 0x802EE121) {
+        if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
+            }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+            cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
@@ -1576,13 +1584,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            if (cmd == 0x8002A017) {
+            if (cmd == 0x8002A017 || cmd == 0x8002A018 || cmd == 0x8002A019) {
                 if (ret >= 16) {
                     uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                       ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                    DLOG(@"[PROTO-R] Login/Connect status at offset 12-15: %u (0x%08X)", status, status);
                     if (status != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                        DLOG(@"[PROTO-R-PATCH] Login/Connect status %u -> 0 (force success)", status);
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
@@ -1651,6 +1659,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
         }
+        
+        if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
+            DLOG(@"[PROTO-R] Connection response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 16) {
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Connection status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Connection status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
+                }
+            }
+        }
     }
     
     return ret;
@@ -1671,8 +1692,11 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
         }
         DLOG(@"[WRITE] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, len, hex, ascii);
         
-        // Version patch DISABLED in write too
-        (void)port;
+        if (len >= 8) {
+            uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                           ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            DLOG(@"[WRITE-CMD] cmd=0x%08X", cmd);
+        }
     }
     return orig_write ? orig_write(fd, buf, len) : -1;
 }
@@ -1723,7 +1747,8 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+            cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
@@ -1767,13 +1792,13 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                 }
             }
             
-            if (cmd == 0x8002A017) {
+            if (cmd == 0x8002A017 || cmd == 0x8002A018 || cmd == 0x8002A019) {
                 if (ret >= 16) {
                     uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                       ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] Login status at offset 12-15: %u (0x%08X)", status, status);
+                    DLOG(@"[PROTO-R] Login/Connect status at offset 12-15: %u (0x%08X)", status, status);
                     if (status != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Login status %u -> 0 (force success)", status);
+                        DLOG(@"[PROTO-R-PATCH] Login/Connect status %u -> 0 (force success)", status);
                         memset((unsigned char *)buf + 12, 0, 4);
                     }
                 }
@@ -1839,6 +1864,19 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                                               ((uint32_t)payload[6] << 8)  | (uint32_t)payload[7];
                         DLOG(@"[PROTO-R-DEBUG] Bytes 4-7 of payload (count?): %u", countField);
                     }
+                }
+            }
+        }
+        
+        if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
+            DLOG(@"[PROTO-R] Connection response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 16) {
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                DLOG(@"[PROTO-R] Connection status at offset 12-15: %u (0x%08X)", status, status);
+                if (status != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Connection status %u -> 0 (force success)", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
                 }
             }
         }
@@ -1914,7 +1952,8 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+            cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-RF] Server related response 0x%08X", cmd);
             unsigned char *payload = (unsigned char *)buf + 8;
             ssize_t payloadLen = ret - 8;
@@ -1958,12 +1997,14 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                 }
             }
             
-            if (cmd == 0x8002A017 && ret >= 16) {
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                if (status != 0) {
-                    DLOG(@"[PROTO-RF-PATCH] Login status %u -> 0", status);
-                    memset((unsigned char *)buf + 12, 0, 4);
+            if (cmd == 0x8002A017 || cmd == 0x8002A018 || cmd == 0x8002A019) {
+                if (ret >= 16) {
+                    uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                      ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    if (status != 0) {
+                        DLOG(@"[PROTO-RF-PATCH] Login/Connect status %u -> 0", status);
+                        memset((unsigned char *)buf + 12, 0, 4);
+                    }
                 }
             }
             
@@ -1987,6 +2028,18 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                         ret = 8 + fakeLen;
                         DLOG(@"[PROTO-RF-PATCH] Replaced with fake server list, new len=%zd", ret);
                     }
+                }
+            }
+        }
+        
+        if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
+            DLOG(@"[PROTO-RF] Connection response 0x%08X", cmd);
+            if (ret >= 16) {
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                if (status != 0) {
+                    DLOG(@"[PROTO-RF-PATCH] Connection status %u -> 0", status);
+                    memset((unsigned char *)buf + 12, 0, 4);
                 }
             }
         }
@@ -2060,7 +2113,8 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017) {
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+            cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-RM] Server related response 0x%08X", cmd);
             unsigned char *payload = (unsigned char *)iov->iov_base + 8;
             ssize_t payloadLen = MIN((ssize_t)iov->iov_len - 8, ret - 8);
@@ -2104,12 +2158,14 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                 }
             }
             
-            if (cmd == 0x8002A017 && iov->iov_len >= 16) {
-                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                if (status != 0) {
-                    DLOG(@"[PROTO-RM-PATCH] Login status %u -> 0", status);
-                    memset((unsigned char *)iov->iov_base + 12, 0, 4);
+            if (cmd == 0x8002A017 || cmd == 0x8002A018 || cmd == 0x8002A019) {
+                if (iov->iov_len >= 16) {
+                    uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                      ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                    if (status != 0) {
+                        DLOG(@"[PROTO-RM-PATCH] Login/Connect status %u -> 0", status);
+                        memset((unsigned char *)iov->iov_base + 12, 0, 4);
+                    }
                 }
             }
             
@@ -2133,6 +2189,18 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                         ret = 8 + fakeLen;
                         DLOG(@"[PROTO-RM-PATCH] Replaced with fake server list, new len=%zd", ret);
                     }
+                }
+            }
+        }
+        
+        if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
+            DLOG(@"[PROTO-RM] Connection response 0x%08X", cmd);
+            if (iov->iov_len >= 16) {
+                uint32_t status = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                  ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                if (status != 0) {
+                    DLOG(@"[PROTO-RM-PATCH] Connection status %u -> 0", status);
+                    memset((unsigned char *)iov->iov_base + 12, 0, 4);
                 }
             }
         }
