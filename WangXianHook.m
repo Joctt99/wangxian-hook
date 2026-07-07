@@ -1590,9 +1590,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            BOOL hadError = NO;
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
+                hadError = YES;
             }
             if (ret >= 12) {
                 uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
@@ -1601,7 +1603,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (status4 != 0) {
                     DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
                     memset((unsigned char *)buf + 8, 0, 4);
+                    hadError = YES;
                 }
+            }
+            // CRITICAL: Clear error messages from payload (e.g. "身体版本过低", "登录失败")
+            // The game client reads these messages and shows "网络中断" even if status is patched to 0
+            if (hadError && ret > 13) {
+                DLOG(@"[PROTO-R-PATCH] Clearing error messages from version check payload (%zd bytes)", ret - 13);
+                memset((unsigned char *)buf + 13, 0, ret - 13);
             }
         }
         
@@ -1920,9 +1929,24 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
+            BOOL hadError = NO;
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-RF-PATCH] Version status byte %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
+                hadError = YES;
+            }
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-RF-PATCH] Version 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                    hadError = YES;
+                }
+            }
+            if (hadError && ret > 13) {
+                DLOG(@"[PROTO-RF-PATCH] Clearing error messages from payload (%zd bytes)", ret - 13);
+                memset((unsigned char *)buf + 13, 0, ret - 13);
             }
         }
         
@@ -2081,9 +2105,24 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
+            BOOL hadError = NO;
             if (iov->iov_len >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-RM-PATCH] Version status byte %u -> 0", p[12]);
                 ((unsigned char *)iov->iov_base)[12] = 0;
+                hadError = YES;
+            }
+            if (iov->iov_len >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-RM-PATCH] Version 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
+                    hadError = YES;
+                }
+            }
+            if (hadError && ret > 13) {
+                DLOG(@"[PROTO-RM-PATCH] Clearing error messages from payload (%zd bytes)", ret - 13);
+                memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
             }
         }
         
