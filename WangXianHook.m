@@ -1605,7 +1605,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A017 ||
             cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
@@ -1662,76 +1662,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
+            // 0x8002A016 is a VERSION INFO response (NOT server list).
+            // Payload contains: [status(4B)][version string][platform string]
+            // e.g. status=5, version="7.6.0", platform="974"
+            // DO NOT modify this packet - patching offset 16-19 corrupts the version string!
             if (cmd == 0x8002A016) {
-                DLOG(@"[PROTO-R] === NEW_QUERY_SERVER_LIST_RES (0x8002A016) ===");
-                DLOG(@"[PROTO-R] Full packet length: %zd bytes", ret);
-                
-                NSMutableString *fullHex = [NSMutableString stringWithCapacity:ret * 3];
-                NSMutableString *fullAscii = [NSMutableString stringWithCapacity:ret];
-                for (size_t i = 0; i < (size_t)ret; i++) {
-                    [fullHex appendFormat:@"%02X ", p[i]];
-                    [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
-                }
-                DLOG(@"[PROTO-R] Full hex dump:\n%@", fullHex);
-                DLOG(@"[PROTO-R] ASCII dump:\n%@", fullAscii);
-                
-                if (ret >= 8) {
-                    uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-                    DLOG(@"[PROTO-R] pktLen (BE): %u", pktLenBE);
-                    DLOG(@"[PROTO-R] cmd: 0x%08X", cmd);
-                }
-                
-                if (ret >= 12) {
-                    uint32_t seqId = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                      ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] sequence ID (offset 8-11): %u (0x%08X)", seqId, seqId);
-                }
-                
+                DLOG(@"[PROTO-R] === VERSION INFO RES (0x8002A016) - READ ONLY, no patching ===");
                 if (ret >= 16) {
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] status (offset 12-15): %u (0x%08X)", status12, status12);
-                    if (status12 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
-                        memset((unsigned char *)buf + 12, 0, 4);
-                    }
+                    DLOG(@"[PROTO-R] Version info status: %u", status12);
                 }
-                
-                if (ret >= 20) {
-                    uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
-                                           ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
-                    DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
-                    
-                    if (serverCount == 0 || serverCount > 1000000) {
-                        DLOG(@"[PROTO-R-PATCH] serverCount %u is invalid, changing to 1", serverCount);
-                        uint32_t newCount = htonl(1);
-                        memcpy((unsigned char *)buf + 16, &newCount, 4);
-                    }
-                }
-                
-                ssize_t payloadLen = ret - 8;
-                if (payloadLen < 50) {
-                    DLOG(@"[PROTO-R-DEBUG] Server list payload too small (%zd bytes) - server may return error", payloadLen);
-                }
-                
-                if (!strstr((char *)buf + 8, "server")) {
-                    DLOG(@"[PROTO-R-DEBUG] No 'server' string in payload - likely binary format");
-                    const unsigned char *payload = (const unsigned char *)buf + 8;
-                    if (payloadLen >= 4) {
-                        uint32_t statusField = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
-                                               ((uint32_t)payload[2] << 8)  | (uint32_t)payload[3];
-                        DLOG(@"[PROTO-R-DEBUG] First 4 bytes of payload (status?): %u (0x%08X)", statusField, statusField);
-                    }
-                    if (payloadLen >= 8) {
-                        uint32_t countField = ((uint32_t)payload[4] << 24) | ((uint32_t)payload[5] << 16) |
-                                              ((uint32_t)payload[6] << 8)  | (uint32_t)payload[7];
-                        DLOG(@"[PROTO-R-DEBUG] Bytes 4-7 of payload (count?): %u", countField);
-                    }
+                if (ret > 16) {
+                    NSString *infoStr = [[NSString alloc] initWithBytes:p+16 length:ret-16 encoding:NSUTF8StringEncoding];
+                    DLOG(@"[PROTO-R] Version info data: %@", infoStr ?: @"<binary>");
                 }
             }
         }
-        
+
         if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
             DLOG(@"[PROTO-R] Connection response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             if (ret >= 16) {
@@ -1819,7 +1767,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A017 ||
             cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-R] Server related response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *payload = (unsigned char *)buf + 8;
@@ -1876,76 +1824,24 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                 }
             }
             
+            // 0x8002A016 is a VERSION INFO response (NOT server list).
+            // Payload contains: [status(4B)][version string][platform string]
+            // e.g. status=5, version="7.6.0", platform="974"
+            // DO NOT modify this packet - patching offset 16-19 corrupts the version string!
             if (cmd == 0x8002A016) {
-                DLOG(@"[PROTO-R] === NEW_QUERY_SERVER_LIST_RES (0x8002A016) ===");
-                DLOG(@"[PROTO-R] Full packet length: %zd bytes", ret);
-                
-                NSMutableString *fullHex = [NSMutableString stringWithCapacity:ret * 3];
-                NSMutableString *fullAscii = [NSMutableString stringWithCapacity:ret];
-                for (size_t i = 0; i < (size_t)ret; i++) {
-                    [fullHex appendFormat:@"%02X ", p[i]];
-                    [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
-                }
-                DLOG(@"[PROTO-R] Full hex dump:\n%@", fullHex);
-                DLOG(@"[PROTO-R] ASCII dump:\n%@", fullAscii);
-                
-                if (ret >= 8) {
-                    uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-                    DLOG(@"[PROTO-R] pktLen (BE): %u", pktLenBE);
-                    DLOG(@"[PROTO-R] cmd: 0x%08X", cmd);
-                }
-                
-                if (ret >= 12) {
-                    uint32_t seqId = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                      ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] sequence ID (offset 8-11): %u (0x%08X)", seqId, seqId);
-                }
-                
+                DLOG(@"[PROTO-R] === VERSION INFO RES (0x8002A016) - READ ONLY, no patching ===");
                 if (ret >= 16) {
                     uint32_t status12 = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
                                         ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                    DLOG(@"[PROTO-R] status (offset 12-15): %u (0x%08X)", status12, status12);
-                    if (status12 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Server list status %u -> 0", status12);
-                        memset((unsigned char *)buf + 12, 0, 4);
-                    }
+                    DLOG(@"[PROTO-R] Version info status: %u", status12);
                 }
-                
-                if (ret >= 20) {
-                    uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
-                                           ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
-                    DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
-                    
-                    if (serverCount == 0 || serverCount > 1000000) {
-                        DLOG(@"[PROTO-R-PATCH] serverCount %u is invalid, changing to 1", serverCount);
-                        uint32_t newCount = htonl(1);
-                        memcpy((unsigned char *)buf + 16, &newCount, 4);
-                    }
-                }
-                
-                ssize_t payloadLen = ret - 8;
-                if (payloadLen < 50) {
-                    DLOG(@"[PROTO-R-DEBUG] Server list payload too small (%zd bytes) - server may return error", payloadLen);
-                }
-                
-                if (!strstr((char *)buf + 8, "server")) {
-                    DLOG(@"[PROTO-R-DEBUG] No 'server' string in payload - likely binary format");
-                    const unsigned char *payload = (const unsigned char *)buf + 8;
-                    if (payloadLen >= 4) {
-                        uint32_t statusField = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
-                                               ((uint32_t)payload[2] << 8)  | (uint32_t)payload[3];
-                        DLOG(@"[PROTO-R-DEBUG] First 4 bytes of payload (status?): %u (0x%08X)", statusField, statusField);
-                    }
-                    if (payloadLen >= 8) {
-                        uint32_t countField = ((uint32_t)payload[4] << 24) | ((uint32_t)payload[5] << 16) |
-                                              ((uint32_t)payload[6] << 8)  | (uint32_t)payload[7];
-                        DLOG(@"[PROTO-R-DEBUG] Bytes 4-7 of payload (count?): %u", countField);
-                    }
+                if (ret > 16) {
+                    NSString *infoStr = [[NSString alloc] initWithBytes:p+16 length:ret-16 encoding:NSUTF8StringEncoding];
+                    DLOG(@"[PROTO-R] Version info data: %@", infoStr ?: @"<binary>");
                 }
             }
         }
-        
+
         if (cmd == 0x8002A020 || cmd == 0x8002A021 || cmd == 0x8002A022) {
             DLOG(@"[PROTO-R] Connection response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             if (ret >= 16) {
@@ -2030,7 +1926,7 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A017 ||
             cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-RF] Server related response 0x%08X", cmd);
             unsigned char *payload = (unsigned char *)buf + 8;
@@ -2191,7 +2087,7 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
             }
         }
         
-        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A016 || cmd == 0x8002A017 ||
+        if (cmd == 0x802EE100 || cmd == 0x802EE113 || cmd == 0x8002A017 ||
             cmd == 0x8002A018 || cmd == 0x8002A019 || cmd == 0x8002A020 || cmd == 0x8002A021) {
             DLOG(@"[PROTO-RM] Server related response 0x%08X", cmd);
             unsigned char *payload = (unsigned char *)iov->iov_base + 8;
