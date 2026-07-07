@@ -1,18 +1,15 @@
 /**
- * WangXianHook v35.07 - UNIFIED NETWORK FIX: Final stability improvements for all signing tools
+ * WangXianHook v35.08 - KEYBOARD INPUT FIX: Fixed crash when switching input method via long press
+ * FIX: REMOVED NSArray count hook - was causing crashes during keyboard input/IME switching
+ * FIX: Optimized NSDictionary objectForKey hook with limited logging to prevent performance issues
+ * FIX: Added keyboard protection with UIKeyboard notifications and gesture conflict prevention
+ * FIX: Set requiresExclusiveTouchType=NO on gesture recognizers to avoid blocking system gestures
+ * FIX: Set userInteractionEnabled=NO on hidden log button to prevent accidental interaction
  * FIX: Enhanced socket hook initialization with dlsym fallback for ALL hooks (connect, send, recv, recvfrom, recvmsg, write, read, close)
  * FIX: Added close() hook for proper fd cleanup and tracking
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
- * FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
- * FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues
- * FIX: Added fallback for recvfrom/recvmsg socket hooks
- * FIX: Enhanced server connection handling
- * FIX: Added comprehensive login response (0x8002A017) patching
- * FIX: Enhanced logging for all protocol responses
- * FIX: Handle "network disconnected" errors by patching connection responses
- * FIX: Stop zeroing sequence ID (offset 8-11)
  * Tracks: Signature, Environment, Debug, Security, Ban detection
  */
 #import <Foundation/Foundation.h>
@@ -63,7 +60,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.07 ===");
+        _log(@"=== WXHook v35.08 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -190,6 +187,46 @@ static UITextView *g_tv = nil;
 static WXHandler *g_handler = nil;
 static UILabel *g_statusLbl = nil;
 
+static BOOL g_isKeyboardActive = NO;
+
+static void keyboardWillShow(NSNotification *notification) {
+    g_isKeyboardActive = YES;
+    DLOG(@"[KB] Keyboard will show");
+}
+
+static void keyboardWillHide(NSNotification *notification) {
+    g_isKeyboardActive = NO;
+    DLOG(@"[KB] Keyboard will hide");
+}
+
+static void keyboardDidShow(NSNotification *notification) {
+    DLOG(@"[KB] Keyboard did show");
+}
+
+static void keyboardDidHide(NSNotification *notification) {
+    DLOG(@"[KB] Keyboard did hide");
+}
+
+static void installKeyboardProtection(void) {
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillShowNotification 
+                                                      object:nil 
+                                                       queue:nil 
+                                                  usingBlock:^(NSNotification *note) { keyboardWillShow(note); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification 
+                                                      object:nil 
+                                                       queue:nil 
+                                                  usingBlock:^(NSNotification *note) { keyboardWillHide(note); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification 
+                                                      object:nil 
+                                                       queue:nil 
+                                                  usingBlock:^(NSNotification *note) { keyboardDidShow(note); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification 
+                                                      object:nil 
+                                                       queue:nil 
+                                                  usingBlock:^(NSNotification *note) { keyboardDidHide(note); }];
+    DLOG(@"[KB] Keyboard protection installed");
+}
+
 @implementation WXHandler
 - (void)toggle {
     self.showing = !self.showing;
@@ -203,7 +240,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.07 诊断面板";
+            lbl.text = @"WXHook v35.08 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -442,47 +479,9 @@ static UILabel *g_statusLbl = nil;
 @end
 
 // ============================================================
-#pragma mark - NSArray count hook (FORCE non-empty server list)
+// NOTE: NSArray count hook REMOVED - causes crashes during keyboard input
+// Server list handling is now done at the protocol level (hook_recv/recvfrom/recvmsg)
 // ============================================================
-
-static NSUInteger (*orig_arrayCount)(id, SEL) = NULL;
-
-static NSUInteger hook_arrayCount(id self, SEL _cmd) {
-    NSUInteger (*origFunc)(id, SEL) = (NSUInteger(*)(id, SEL))orig_arrayCount;
-    NSUInteger ret = origFunc(self, _cmd);
-    
-    if (ret == 0) {
-        @try {
-            void *caller = __builtin_return_address(0);
-            DLOG(@"[ARRAY-COUNT-ZERO] Array count=0 at %p", caller);
-            
-            NSArray *arr = (NSArray *)self;
-            for (NSString *key in arr) {
-                if ([key isKindOfClass:[NSString class]] && 
-                    ([key containsString:@"server"] || [key containsString:@"Server"] || 
-                     [key containsString:@"ip"] || [key containsString:@"port"])) {
-                    DLOG(@"[ARRAY-COUNT-ZERO] Contains server-related key: %@", key);
-                    ret = 3;
-                    DLOG(@"[ARRAY-PATCH] Array count forced to 3");
-                    break;
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    return ret;
-}
-
-static void installNSArrayCountHook(void) {
-    Class arrayCls = [NSArray class];
-    Method countMethod = class_getInstanceMethod(arrayCls, @selector(count));
-    if (countMethod) {
-        orig_arrayCount = (NSUInteger(*)(id, SEL))method_getImplementation(countMethod);
-        method_setImplementation(countMethod, (IMP)hook_arrayCount);
-        DLOG(@"[ARRAY-HOOK] Installed NSArray count hook");
-    } else {
-        DLOG(@"[ARRAY-HOOK] NSArray count method not found");
-    }
-}
 
 // ============================================================
 #pragma mark - NSURLSession hooks (HTTP response manipulation)
@@ -902,6 +901,7 @@ static void createLogButton(UIWindow *w) {
     
     g_btn.titleLabel.font = [UIFont systemFontOfSize:10];
     g_btn.hidden = YES;
+    g_btn.userInteractionEnabled = NO;
     [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [w addSubview:g_btn];
     [w bringSubviewToFront:g_btn];
@@ -912,6 +912,7 @@ static void createLogButton(UIWindow *w) {
     tripleTap.cancelsTouchesInView = NO;
     tripleTap.delaysTouchesEnded = NO;
     tripleTap.delaysTouchesBegan = NO;
+    tripleTap.requiresExclusiveTouchType = NO;
     [w addGestureRecognizer:tripleTap];
     
     _log(@"[UI] Button created on window (hidden, triple-tap to show)");
@@ -2643,31 +2644,40 @@ static NSInteger hook_numberOfRows(id self, SEL _cmd, NSInteger section) {
     return ret;
 }
 
-// NSDictionary objectForKey: - trace server list parsing
+// NSDictionary objectForKey: - trace server list parsing (minimal logging)
 static id (*orig_dictObjectForKey)(id, SEL, id) = NULL;
+static int g_dictLogCount = 0;
 static id hook_dictObjectForKey(id self, SEL _cmd, id key) {
     id ret = orig_dictObjectForKey ? orig_dictObjectForKey(self, _cmd, key) : nil;
-    NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
-    // Log server-related keys
-    if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
-        [keyStr containsString:@"status"] || [keyStr containsString:@"Status"] ||
-        [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
-        NSString *retCls = ret ? NSStringFromClass([ret class]) : @"nil";
-        DLOG(@"[DICT] objectForKey:'%@' -> %@ (%@)", keyStr, ret ?: @"nil", retCls);
+    // Limit logging to first 30 calls to avoid performance issues during keyboard input
+    if (g_dictLogCount < 30) {
+        NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
+        if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
+            [keyStr containsString:@"status"] || [keyStr containsString:@"Status"] ||
+            [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
+            NSString *retCls = ret ? NSStringFromClass([ret class]) : @"nil";
+            DLOG(@"[DICT] objectForKey:'%@' -> %@ (%@)", keyStr, ret ?: @"nil", retCls);
+            g_dictLogCount++;
+        }
     }
     return ret;
 }
 
-// NSArray arrayForKey: - for JSON parsing
+// NSArray arrayForKey: - for JSON parsing (minimal logging)
 static id (*orig_arrayForKey)(id, SEL, id) = NULL;
+static int g_arrayLogCount = 0;
 static id hook_arrayForKey(id self, SEL _cmd, id key) {
     id ret = orig_arrayForKey ? orig_arrayForKey(self, _cmd, key) : nil;
-    NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
-    if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
-        [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
-        NSUInteger cnt = 0;
-        if ([ret isKindOfClass:[NSArray class]]) cnt = [ret count];
-        DLOG(@"[DICT] arrayForKey:'%@' -> count=%lu", keyStr, (unsigned long)cnt);
+    // Limit logging to first 20 calls to avoid performance issues during keyboard input
+    if (g_arrayLogCount < 20) {
+        NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
+        if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
+            [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
+            NSUInteger cnt = 0;
+            if ([ret isKindOfClass:[NSArray class]]) cnt = [ret count];
+            DLOG(@"[DICT] arrayForKey:'%@' -> count=%lu", keyStr, (unsigned long)cnt);
+            g_arrayLogCount++;
+        }
     }
     return ret;
 }
@@ -2797,6 +2807,7 @@ static void installAllHooks(void) {
     DLOG(@"[ACT] Installing all hooks...");
     
     installSecurityHooks();
+    installKeyboardProtection();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
