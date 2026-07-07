@@ -1,5 +1,6 @@
 /**
- * WangXianHook v35.04 - FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
+ * WangXianHook v35.05 - FIX: Fixed NSDictionary containsString crash (result can be NSDictionary, not always NSString)
+ * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
  * FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
  * FIX: trackFd now updates existing fd entries instead of appending duplicates
  * FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues
@@ -59,7 +60,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.04 ===");
+        _log(@"=== WXHook v35.05 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -199,7 +200,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.04 诊断面板";
+            lbl.text = @"WXHook v35.05 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -498,8 +499,12 @@ static id hook_JSONObjectWithData(Class self, SEL _cmd, NSData *data, NSJSONRead
             
             DLOG(@"[JSON-PARSE] JSONObjectWithData: status=%@ msg=%@ result=%@", status, msg, result);
             
+            BOOL hasFail = NO;
+            if ([result isKindOfClass:[NSString class]]) {
+                hasFail = [(NSString *)result containsString:@"fail"];
+            }
             if ([msg containsString:@"版本"] || [msg containsString:@"更新"] || 
-                [msg containsString:@"升级"] || [result containsString:@"fail"]) {
+                [msg containsString:@"升级"] || hasFail) {
                 DLOG(@"[JSON-PATCH] Detected version check failure, modifying...");
             }
         }
