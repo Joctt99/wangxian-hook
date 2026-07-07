@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.17 - IDFV HOOK: Hook identifierForVendor to return stable UUID when iOS returns nil (fixes empty UUID on iPhone 14)
+ * WangXianHook v35.18 - IDFA HOOK: Hook ASIdentifierManager advertisingIdentifier + isTrackingEnabled to fix empty UUID when user denies app tracking
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.17 ===");
+        _log(@"=== WXHook v35.18 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -282,6 +282,98 @@ static void installIdentifierForVendorHook(void) {
     _log(@"[INIT] identifierForVendor hooked");
 }
 
+// ============================================================
+#pragma mark - Advertising Identifier Hook (IDFA)
+// ============================================================
+
+static NSUUID *(*orig_advertisingId)(id, SEL) = NULL;
+static BOOL (*orig_isTrackingEnabled)(id, SEL) = NULL;
+
+static NSUUID *hook_advertisingId(id self, SEL _cmd) {
+    NSUUID *orig = orig_advertisingId ? orig_advertisingId(self, _cmd) : nil;
+    NSString *uuidStr = orig ? [orig UUIDString] : @"(nil)";
+    
+    // All-zero UUID means tracking denied - generate a stable fake UUID
+    BOOL isZero = YES;
+    if (orig) {
+        uuid_t uuidBytes;
+        [orig getUUIDBytes:uuidBytes];
+        for (int i = 0; i < 16; i++) {
+            if (uuidBytes[i] != 0) { isZero = NO; break; }
+        }
+    }
+    
+    if (!orig || isZero) {
+        DLOG(@"[IDFA] advertisingIdentifier is zero/nil (tracking denied), returning fake UUID");
+        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.sqage.wangxianapp";
+        const char *cStr = [bundleId UTF8String];
+        unsigned char hash[16];
+        CC_MD5(cStr, (CC_LONG)strlen(cStr), hash);
+        // Tweak byte 6 to make it different from IDFV fake UUID
+        hash[6] = (hash[6] & 0x0F) | 0x40;
+        NSString *fakeUUIDStr = [NSString stringWithFormat:@"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+            hash[0],hash[1],hash[2],hash[3], hash[4],hash[5], hash[6],hash[7],
+            hash[8],hash[9], hash[10],hash[11],hash[12],hash[13],hash[14],hash[15]];
+        NSUUID *fakeUUID = [[NSUUID alloc] initWithUUIDString:fakeUUIDStr];
+        DLOG(@"[IDFA] Generated fake UUID from bundleId: %@", fakeUUIDStr);
+        return fakeUUID;
+    }
+    
+    static int idfaLogCount = 0;
+    if (idfaLogCount < 5) {
+        DLOG(@"[IDFA] advertisingIdentifier: %@", uuidStr);
+        idfaLogCount++;
+    }
+    return orig;
+}
+
+static BOOL hook_isTrackingEnabled(id self, SEL _cmd) {
+    BOOL orig = orig_isTrackingEnabled ? orig_isTrackingEnabled(self, _cmd) : NO;
+    DLOG(@"[IDFA] isTrackingEnabled: %d (returning YES)", orig);
+    return YES;
+}
+
+static void installAdvertisingIdentifierHook(void) {
+    Class idManagerCls = NSClassFromString(@"ASIdentifierManager");
+    if (!idManagerCls) {
+        DLOG(@"[IDFA] ASIdentifierManager class not found");
+        return;
+    }
+    
+    // Hook sharedManager (class method) to ensure the singleton exists
+    Method sharedMgr = class_getClassMethod(idManagerCls, @selector(sharedManager));
+    if (!sharedMgr) {
+        DLOG(@"[IDFA] sharedManager not found");
+        return;
+    }
+    
+    // Get the shared instance first
+    id sharedMgrInstance = ((id(*)(id, SEL))method_getImplementation(sharedMgr))(idManagerCls, @selector(sharedManager));
+    if (!sharedMgrInstance) {
+        DLOG(@"[IDFA] sharedManager returned nil");
+        return;
+    }
+    
+    // Hook advertisingIdentifier (instance method)
+    Method m = class_getInstanceMethod(idManagerCls, @selector(advertisingIdentifier));
+    if (m) {
+        orig_advertisingId = (NSUUID *(*)(id, SEL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_advertisingId);
+        _log(@"[INIT] advertisingIdentifier hooked");
+    } else {
+        DLOG(@"[IDFA] advertisingIdentifier method not found");
+    }
+    
+    // Hook isAdvertisingTrackingEnabled / trackingAuthorizationStatus
+    SEL trackingSel = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
+    Method tm = class_getInstanceMethod(idManagerCls, trackingSel);
+    if (tm) {
+        orig_isTrackingEnabled = (BOOL (*)(id, SEL))method_getImplementation(tm);
+        method_setImplementation(tm, (IMP)hook_isTrackingEnabled);
+        _log(@"[INIT] isAdvertisingTrackingEnabled hooked");
+    }
+}
+
 @implementation WXHandler
 - (void)toggle {
     self.showing = !self.showing;
@@ -295,7 +387,7 @@ static void installIdentifierForVendorHook(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.17 诊断面板";
+            lbl.text = @"WXHook v35.18 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2880,6 +2972,7 @@ static void installAllHooks(void) {
     installSecurityHooks();
     installKeyboardProtection();
     installIdentifierForVendorHook();
+    installAdvertisingIdentifierHook();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
