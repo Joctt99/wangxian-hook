@@ -24,6 +24,7 @@
 static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
+static void installAllHooks(void);
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
