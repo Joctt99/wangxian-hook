@@ -23,6 +23,7 @@
 
 static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
+static BOOL g_isActivated = NO; // activation status
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -48,13 +49,125 @@ static void _log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
+static NSString *getUDID(void) {
+    NSString *udid = nil;
+    @try {
+        udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    } @catch (NSException *e) {}
+    
+    if (!udid) {
+        @try {
+            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+            udid = [defaults stringForKey:@"WXHookUDID"];
+            if (!udid) {
+                CFUUIDRef uuidRef = CFUUIDCreate(NULL);
+                udid = (__bridge_transfer NSString *)CFUUIDCreateString(NULL, uuidRef);
+                CFRelease(uuidRef);
+                [defaults setObject:udid forKey:@"WXHookUDID"];
+                [defaults synchronize];
+            }
+        } @catch (NSException *e) {}
+    }
+    
+    return udid ?: @"UNKNOWN";
+}
+
+static BOOL checkActivation(NSString *udid) {
+    NSString *activationFile = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook_activated"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:activationFile]) {
+        NSString *savedUDID = [NSString stringWithContentsOfFile:activationFile encoding:NSUTF8StringEncoding error:nil];
+        if ([savedUDID isEqualToString:udid]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void saveActivation(NSString *udid) {
+    NSString *activationFile = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook_activated"];
+    [udid writeToFile:activationFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static BOOL verifyLicenseKey(NSString *key, NSString *udid) {
+    if (!key || key.length != 32) return NO;
+    
+    NSString *expectedKey = [udid uppercaseString];
+    expectedKey = [expectedKey stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    
+    return [key isEqualToString:expectedKey];
+}
+
+static void showActivationDialog(void) {
+    NSString *udid = getUDID();
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UDID激活" 
+                                                                   message:[NSString stringWithFormat:@"您的UDID: %@\n\n请输入激活码", udid]
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"请输入32位激活码";
+        textField.keyboardType = UIKeyboardTypeASCIICapable;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    }];
+    
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" 
+                                                           style:UIAlertActionStyleCancel 
+                                                         handler:^(UIAlertAction *action) {
+                                                             exit(0);
+                                                         }];
+    
+    UIAlertAction *activateAction = [UIAlertAction actionWithTitle:@"激活" 
+                                                              style:UIAlertActionStyleDefault 
+                                                            handler:^(UIAlertAction *action) {
+                                                                UITextField *textField = alert.textFields.firstObject;
+                                                                NSString *key = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                                                                
+                                                                if (verifyLicenseKey(key, udid)) {
+                                                                    saveActivation(udid);
+                                                                    g_isActivated = YES;
+                                                                    DLOG(@"[ACT] Activation successful for UDID: %@", udid);
+                                                                    installAllHooks();
+                                                                } else {
+                                                                    showActivationDialog();
+                                                                }
+                                                            }];
+    
+    [alert addAction:cancelAction];
+    [alert addAction:activateAction];
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [[UIApplication sharedApplication] keyWindow];
+        if (!w) {
+            NSArray *windows = [[UIApplication sharedApplication] windows];
+            if (windows.count > 0) w = windows[0];
+        }
+        if (w && w.rootViewController) {
+            [w.rootViewController presentViewController:alert animated:YES completion:nil];
+        } else {
+            [NSThread sleepForTimeInterval:1.0];
+            showActivationDialog();
+        }
+    });
+}
+
 static void log_init(void) {
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook.log"];
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.97 Binary Protocol Debug Analysis ===");
+        _log(@"=== WXHook v34.99 UDID Activation ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
+        
+        NSString *udid = getUDID();
+        _log([NSString stringWithFormat:@"UDID: %@", udid]);
+        
+        if (checkActivation(udid)) {
+            g_isActivated = YES;
+            _log(@"[ACT] Already activated");
+        } else {
+            _log(@"[ACT] Not activated, showing dialog");
+            showActivationDialog();
+        }
     }
 }
 
@@ -2733,10 +2846,24 @@ __attribute__((constructor))
 static void entry(void) {
     log_init();
     
-    // === IMMEDIATE: Anti-cheat bypass (diagnostic) ===
+    if (!g_isActivated) {
+        DLOG(@"[ACT] Not activated, waiting for activation...");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!g_isActivated) {
+                DLOG(@"[ACT] Still not activated after 3 seconds");
+            }
+        });
+        return;
+    }
+    
+    installAllHooks();
+}
+
+static void installAllHooks(void) {
+    DLOG(@"[ACT] Installing all hooks...");
+    
     installSecurityHooks();
     
-    // Save original connect() via RTLD_NEXT as fallback
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
@@ -2744,7 +2871,6 @@ static void entry(void) {
     orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
     
-    // Install socket hooks via universal fishhook (all images)
     installSocketHooks();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
