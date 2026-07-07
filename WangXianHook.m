@@ -3285,11 +3285,6 @@ static void installAllHooks(void) {
         installJSONSerializationHook();
     });
     
-    // === DEFERRED: Hook NSArray count to force non-empty server list ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        installNSArrayCountHook();
-    });
-    
     // === DEFERRED: Force inject mock server list if real list is empty ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try {
