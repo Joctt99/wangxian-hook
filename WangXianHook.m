@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.16 - DEVICE AUTH FIX: Patch md5xor.com ispass=NO -> YES in both completion handler and delegate mode
+ * WangXianHook v35.17 - IDFV HOOK: Hook identifierForVendor to return stable UUID when iOS returns nil (fixes empty UUID on iPhone 14)
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <zlib.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -61,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.16 ===");
+        _log(@"=== WXHook v35.17 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -229,6 +230,58 @@ static void installKeyboardProtection(void) {
     DLOG(@"[KB] Keyboard protection installed");
 }
 
+// ============================================================
+#pragma mark - Device UUID Hook (identifierForVendor)
+// ============================================================
+
+static NSUUID *(*orig_idfv)(id, SEL) = NULL;
+
+static NSUUID *hook_idfv(id self, SEL _cmd) {
+    NSUUID *orig = orig_idfv ? orig_idfv(self, _cmd) : nil;
+    NSString *uuidStr = orig ? [orig UUIDString] : @"(nil)";
+    
+    // If original returns nil or empty, generate a stable fake UUID
+    if (!orig || [[orig UUIDString] length] == 0) {
+        DLOG(@"[IDFV] Original identifierForVendor is nil/empty, returning fake UUID");
+        // Use a stable UUID derived from bundle identifier hash so it's consistent across launches
+        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.sqage.wangxianapp";
+        // Simple deterministic UUID: use MD5 of bundle id
+        const char *cStr = [bundleId UTF8String];
+        unsigned char hash[16];
+        CC_MD5(cStr, (CC_LONG)strlen(cStr), hash);
+        NSString *fakeUUIDStr = [NSString stringWithFormat:@"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+            hash[0],hash[1],hash[2],hash[3], hash[4],hash[5], hash[6],hash[7],
+            hash[8],hash[9], hash[10],hash[11],hash[12],hash[13],hash[14],hash[15]];
+        NSUUID *fakeUUID = [[NSUUID alloc] initWithUUIDString:fakeUUIDStr];
+        DLOG(@"[IDFV] Generated fake UUID from bundleId: %@", fakeUUIDStr);
+        return fakeUUID;
+    }
+    
+    // Log first few calls to confirm value
+    static int idfvLogCount = 0;
+    if (idfvLogCount < 5) {
+        DLOG(@"[IDFV] identifierForVendor: %@", uuidStr);
+        idfvLogCount++;
+    }
+    return orig;
+}
+
+static void installIdentifierForVendorHook(void) {
+    Class deviceCls = [UIDevice class];
+    if (!deviceCls) {
+        DLOG(@"[IDFV] UIDevice class not found");
+        return;
+    }
+    Method m = class_getInstanceMethod(deviceCls, @selector(identifierForVendor));
+    if (!m) {
+        DLOG(@"[IDFV] identifierForVendor method not found");
+        return;
+    }
+    orig_idfv = (NSUUID *(*)(id, SEL))method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_idfv);
+    _log(@"[INIT] identifierForVendor hooked");
+}
+
 @implementation WXHandler
 - (void)toggle {
     self.showing = !self.showing;
@@ -242,7 +295,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.16 诊断面板";
+            lbl.text = @"WXHook v35.17 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2826,6 +2879,7 @@ static void installAllHooks(void) {
     
     installSecurityHooks();
     installKeyboardProtection();
+    installIdentifierForVendorHook();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
