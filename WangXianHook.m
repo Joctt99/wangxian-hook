@@ -1,6 +1,7 @@
 /**
- * WangXianHook v35.01 - FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues in Fujian
- * FIX: Removed server IP redirect logic that forced connections to blocked servers
+ * WangXianHook v35.03 - FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
+ * FIX: trackFd now updates existing fd entries instead of appending duplicates
+ * FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues
  * FIX: Added fallback for recvfrom/recvmsg socket hooks
  * FIX: Enhanced server connection handling
  * FIX: Added comprehensive login response (0x8002A017) patching
@@ -57,7 +58,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.01 ===");
+        _log(@"=== WXHook v35.03 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -197,7 +198,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.01 诊断面板";
+            lbl.text = @"WXHook v35.03 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1198,6 +1199,15 @@ static int g_trackedPorts[MAX_TRACKED_FDS];
 static int g_trackedCount = 0;
 
 static void trackFd(int fd, const char *host, int port) {
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd) {
+            DLOG(@"[FD-UPDATE] fd=%d updated from %s:%d to %s:%d", fd, 
+                 g_trackedHosts[i], g_trackedPorts[i], host, port);
+            strncpy(g_trackedHosts[i], host, 63);
+            g_trackedPorts[i] = port;
+            return;
+        }
+    }
     if (g_trackedCount >= MAX_TRACKED_FDS) return;
     g_trackedFds[g_trackedCount] = fd;
     strncpy(g_trackedHosts[g_trackedCount], host, 63);
