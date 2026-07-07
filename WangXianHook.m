@@ -26,7 +26,7 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-static NSString *const kAllowedUDID = @"__WXHOOK_UDID_PLACEHOLDER__";
+static NSString *const kInfoPlistUDIDKey = @"WXHookAllowedUDID";
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -81,16 +81,19 @@ static BOOL checkUDIDActivation(void) {
     NSString *currentUDID = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     if (!currentUDID) currentUDID = @"UNKNOWN";
     
-    DLOG(@"[ACT] Current device UDID: %@", currentUDID);
-    DLOG(@"[ACT] Allowed UDID: %@", kAllowedUDID);
+    NSDictionary *infoPlist = [[NSBundle mainBundle] infoDictionary];
+    NSString *allowedUDID = [infoPlist objectForKey:kInfoPlistUDIDKey];
     
-    if ([kAllowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
-        DLOG(@"[ACT] ERROR: UDID placeholder not replaced! Hook disabled.");
-        showActivationFailedAlert(@"UDID未绑定，请在重签名时使用脚本替换UDID占位符。\n\n命令示例:\npython replace_udid.py WangXianHook.dylib \"您的设备UDID\"", currentUDID);
+    DLOG(@"[ACT] Current device UDID: %@", currentUDID);
+    DLOG(@"[ACT] Allowed UDID from Info.plist: %@", allowedUDID ?: @"NOT SET");
+    
+    if (!allowedUDID || allowedUDID.length == 0 || [allowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
+        DLOG(@"[ACT] ERROR: UDID not set in Info.plist! Hook disabled.");
+        showActivationFailedAlert(@"UDID未配置，请在重签名时在Info.plist中添加 WXHookAllowedUDID 键并设置为设备UDID。", currentUDID);
         return NO;
     }
     
-    NSString *allowedNormalized = [[kAllowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    NSString *allowedNormalized = [[allowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     NSString *currentNormalized = [[currentUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     
     BOOL matches = [allowedNormalized isEqualToString:currentNormalized];
