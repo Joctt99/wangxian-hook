@@ -1,8 +1,11 @@
 /**
- * WangXianHook v35.05 - FIX: Fixed NSDictionary containsString crash (result can be NSDictionary, not always NSString)
+ * WangXianHook v35.07 - UNIFIED NETWORK FIX: Final stability improvements for all signing tools
+ * FIX: Enhanced socket hook initialization with dlsym fallback for ALL hooks (connect, send, recv, recvfrom, recvmsg, write, read, close)
+ * FIX: Added close() hook for proper fd cleanup and tracking
+ * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
+ * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
  * FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
- * FIX: trackFd now updates existing fd entries instead of appending duplicates
  * FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues
  * FIX: Added fallback for recvfrom/recvmsg socket hooks
  * FIX: Enhanced server connection handling
@@ -60,7 +63,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.05 ===");
+        _log(@"=== WXHook v35.07 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -200,7 +203,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.05 诊断面板";
+            lbl.text = @"WXHook v35.07 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -503,8 +506,13 @@ static id hook_JSONObjectWithData(Class self, SEL _cmd, NSData *data, NSJSONRead
             if ([result isKindOfClass:[NSString class]]) {
                 hasFail = [(NSString *)result containsString:@"fail"];
             }
-            if ([msg containsString:@"版本"] || [msg containsString:@"更新"] || 
-                [msg containsString:@"升级"] || hasFail) {
+            BOOL hasVersionMsg = NO;
+            if ([msg isKindOfClass:[NSString class]]) {
+                hasVersionMsg = [(NSString *)msg containsString:@"版本"] || 
+                               [(NSString *)msg containsString:@"更新"] || 
+                               [(NSString *)msg containsString:@"升级"];
+            }
+            if (hasVersionMsg || hasFail) {
                 DLOG(@"[JSON-PATCH] Detected version check failure, modifying...");
             }
         }
@@ -1191,6 +1199,7 @@ typedef ssize_t (*WriteFunc)(int, const void *, size_t);
 typedef ssize_t (*ReadFunc)(int, void *, size_t);
 typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
+typedef int (*CloseFunc)(int);
 
 static ConnectFunc orig_connect = NULL;
 static SendFunc orig_send = NULL;
@@ -1199,13 +1208,27 @@ static RecvfromFunc orig_recvfrom = NULL;
 static RecvmsgFunc orig_recvmsg = NULL;
 static WriteFunc orig_write = NULL;
 static ReadFunc orig_read = NULL;
+static CloseFunc orig_close = NULL;
 
-// Track connected fds for data capture
-#define MAX_TRACKED_FDS 32
+#define MAX_TRACKED_FDS 64
 static int g_trackedFds[MAX_TRACKED_FDS];
 static char g_trackedHosts[MAX_TRACKED_FDS][64];
 static int g_trackedPorts[MAX_TRACKED_FDS];
 static int g_trackedCount = 0;
+static BOOL g_trackedActive[MAX_TRACKED_FDS];
+
+static void clearTrackedFd(int fd) {
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd) {
+            DLOG(@"[FD-CLOSE] fd=%d %s:%d removed from tracking", fd, g_trackedHosts[i], g_trackedPorts[i]);
+            g_trackedActive[i] = NO;
+            g_trackedFds[i] = -1;
+            g_trackedHosts[i][0] = '\0';
+            g_trackedPorts[i] = 0;
+            return;
+        }
+    }
+}
 
 static void trackFd(int fd, const char *host, int port) {
     for (int i = 0; i < g_trackedCount; i++) {
@@ -1214,26 +1237,41 @@ static void trackFd(int fd, const char *host, int port) {
                  g_trackedHosts[i], g_trackedPorts[i], host, port);
             strncpy(g_trackedHosts[i], host, 63);
             g_trackedPorts[i] = port;
+            g_trackedActive[i] = YES;
             return;
         }
     }
-    if (g_trackedCount >= MAX_TRACKED_FDS) return;
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == -1) {
+            g_trackedFds[i] = fd;
+            strncpy(g_trackedHosts[i], host, 63);
+            g_trackedPorts[i] = port;
+            g_trackedActive[i] = YES;
+            DLOG(@"[FD-REUSE] fd=%d %s:%d reused slot %d", fd, host, port, i);
+            return;
+        }
+    }
+    if (g_trackedCount >= MAX_TRACKED_FDS) {
+        DLOG(@"[FD-ERROR] Max tracked fds reached (%d)", MAX_TRACKED_FDS);
+        return;
+    }
     g_trackedFds[g_trackedCount] = fd;
     strncpy(g_trackedHosts[g_trackedCount], host, 63);
     g_trackedPorts[g_trackedCount] = port;
+    g_trackedActive[g_trackedCount] = YES;
     g_trackedCount++;
 }
 
 static const char *getHostForFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
-        if (g_trackedFds[i] == fd) return g_trackedHosts[i];
+        if (g_trackedFds[i] == fd && g_trackedActive[i]) return g_trackedHosts[i];
     }
     return NULL;
 }
 
 static int getPortForFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
-        if (g_trackedFds[i] == fd) return g_trackedPorts[i];
+        if (g_trackedFds[i] == fd && g_trackedActive[i]) return g_trackedPorts[i];
     }
     return 0;
 }
@@ -1249,6 +1287,12 @@ static void updateFdHostPort(int fd, const char *host, int port) {
     }
     // Not found, add new entry
     trackFd(fd, host, port);
+}
+
+static int hook_close(int fd) {
+    if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    clearTrackedFd(fd);
+    return orig_close ? orig_close(fd) : -1;
 }
 
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -2312,8 +2356,11 @@ static void installSocketHooks(void) {
     orig_connect = NULL;
     orig_send = NULL;
     orig_recv = NULL;
+    orig_recvfrom = NULL;
+    orig_recvmsg = NULL;
     orig_write = NULL;
     orig_read = NULL;
+    orig_close = NULL;
     
     int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
     int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
@@ -2322,9 +2369,24 @@ static void installSocketHooks(void) {
     int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
     int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
     int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
+    int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
     
-    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d", c, s, r, rf, rm, w, rd);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
+    if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
+    if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+    if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+    if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+    if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d", c, s, r, rf, rm, w, rd, cl);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p", 
+         orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close);
+    
+    if (!orig_connect) DLOG(@"[SOCK-ERROR] connect hook failed - network monitoring disabled!");
+    if (!orig_send) DLOG(@"[SOCK-ERROR] send hook failed - outgoing data monitoring disabled!");
+    if (!orig_recv) DLOG(@"[SOCK-ERROR] recv hook failed - incoming data monitoring disabled!");
 }
 
 // ============================================================
