@@ -1702,6 +1702,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
                                            ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
                     DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
+                    
+                    if (serverCount == 0 || serverCount > 1000000) {
+                        DLOG(@"[PROTO-R-PATCH] serverCount %u is invalid, changing to 1", serverCount);
+                        uint32_t newCount = htonl(1);
+                        memcpy((unsigned char *)buf + 16, &newCount, 4);
+                    }
                 }
                 
                 ssize_t payloadLen = ret - 8;
@@ -1910,6 +1916,12 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     uint32_t serverCount = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
                                            ((uint32_t)p[18] << 8)  | (uint32_t)p[19];
                     DLOG(@"[PROTO-R] serverCount (offset 16-19): %u", serverCount);
+                    
+                    if (serverCount == 0 || serverCount > 1000000) {
+                        DLOG(@"[PROTO-R-PATCH] serverCount %u is invalid, changing to 1", serverCount);
+                        uint32_t newCount = htonl(1);
+                        memcpy((unsigned char *)buf + 16, &newCount, 4);
+                    }
                 }
                 
                 ssize_t payloadLen = ret - 8;
