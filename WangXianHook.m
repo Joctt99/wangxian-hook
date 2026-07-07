@@ -1,7 +1,9 @@
 /**
- * WangXianHook v34.98 - FIX: Enhanced server connection handling
+ * WangXianHook v35.01 - FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues in Fujian
+ * FIX: Removed server IP redirect logic that forced connections to blocked servers
+ * FIX: Added fallback for recvfrom/recvmsg socket hooks
+ * FIX: Enhanced server connection handling
  * FIX: Added comprehensive login response (0x8002A017) patching
- * FIX: Added connection failure fallback for game servers
  * FIX: Enhanced logging for all protocol responses
  * FIX: Handle "network disconnected" errors by patching connection responses
  * FIX: Stop zeroing sequence ID (offset 8-11)
