@@ -98,6 +98,147 @@ static BOOL verifyLicenseKey(NSString *key, NSString *udid) {
     return [key isEqualToString:expectedKey];
 }
 
+@interface ActivationViewController : UIViewController
+@property (nonatomic, copy) NSString *udid;
+@property (nonatomic, strong) UITextField *keyField;
+@end
+
+@implementation ActivationViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+    
+    CGFloat screenW = self.view.bounds.size.width;
+    CGFloat screenH = self.view.bounds.size.height;
+    CGFloat dialogW = screenW - 60;
+    CGFloat dialogH = 320;
+    
+    UIView *dialog = [[UIView alloc] initWithFrame:CGRectMake((screenW - dialogW) / 2, (screenH - dialogH) / 2, dialogW, dialogH)];
+    dialog.backgroundColor = [UIColor whiteColor];
+    dialog.layer.cornerRadius = 16;
+    dialog.layer.shadowColor = [[UIColor blackColor] CGColor];
+    dialog.layer.shadowOpacity = 0.3;
+    dialog.layer.shadowRadius = 10;
+    [self.view addSubview:dialog];
+    
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, dialogW - 40, 30)];
+    titleLabel.text = @"UDID激活";
+    titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    titleLabel.textColor = [UIColor blackColor];
+    titleLabel.textAlignment = NSTextAlignmentCenter;
+    [dialog addSubview:titleLabel];
+    
+    UILabel *udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, dialogW - 40, 20)];
+    udidLabel.text = @"您的UDID:";
+    udidLabel.font = [UIFont systemFontOfSize:14];
+    udidLabel.textColor = [UIColor grayColor];
+    [dialog addSubview:udidLabel];
+    
+    UIButton *udidBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    udidBtn.frame = CGRectMake(20, 85, dialogW - 40, 40);
+    udidBtn.backgroundColor = [[UIColor lightGrayColor] colorWithAlphaComponent:0.2];
+    udidBtn.layer.cornerRadius = 8;
+    [udidBtn setTitle:self.udid forState:UIControlStateNormal];
+    [udidBtn setTitleColor:[UIColor blueColor] forState:UIControlStateNormal];
+    udidBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    udidBtn.titleLabel.numberOfLines = 2;
+    udidBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
+    [udidBtn addTarget:self action:@selector(copyUDID:) forControlEvents:UIControlEventTouchUpInside];
+    [dialog addSubview:udidBtn];
+    
+    UILabel *copyHint = [[UILabel alloc] initWithFrame:CGRectMake(20, 130, dialogW - 40, 20)];
+    copyHint.text = @"点击UDID可复制到剪贴板";
+    copyHint.font = [UIFont systemFontOfSize:12];
+    copyHint.textColor = [UIColor lightGrayColor];
+    copyHint.textAlignment = NSTextAlignmentCenter;
+    [dialog addSubview:copyHint];
+    
+    self.keyField = [[UITextField alloc] initWithFrame:CGRectMake(20, 170, dialogW - 40, 44)];
+    self.keyField.placeholder = @"请输入32位激活码";
+    self.keyField.keyboardType = UIKeyboardTypeASCIICapable;
+    self.keyField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    self.keyField.borderStyle = UITextBorderStyleRoundedRect;
+    self.keyField.font = [UIFont systemFontOfSize:14];
+    [dialog addSubview:self.keyField];
+    
+    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    cancelBtn.frame = CGRectMake(20, 230, (dialogW - 50) / 2, 44);
+    [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
+    cancelBtn.titleLabel.font = [UIFont systemFontOfSize:16];
+    [cancelBtn addTarget:self action:@selector(cancelActivation) forControlEvents:UIControlEventTouchUpInside];
+    [dialog addSubview:cancelBtn];
+    
+    UIButton *activateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    activateBtn.frame = CGRectMake(20 + (dialogW - 50) / 2 + 30, 230, (dialogW - 50) / 2, 44);
+    activateBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
+    activateBtn.layer.cornerRadius = 8;
+    [activateBtn setTitle:@"激活" forState:UIControlStateNormal];
+    [activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    activateBtn.titleLabel.font = [UIFont systemFontOfSize:16];
+    [activateBtn addTarget:self action:@selector(doActivation) forControlEvents:UIControlEventTouchUpInside];
+    [dialog addSubview:activateBtn];
+    
+    UITapGestureRecognizer *tapOutside = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapOutsideDialog:)];
+    [self.view addGestureRecognizer:tapOutside];
+}
+
+- (void)copyUDID:(UIButton *)btn {
+    UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+    pasteboard.string = self.udid;
+    
+    UIView *superview = btn.superview;
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(20, 145, superview.bounds.size.width - 40, 24)];
+    toast.text = @"已复制到剪贴板";
+    toast.font = [UIFont systemFontOfSize:12];
+    toast.textColor = [UIColor greenColor];
+    toast.textAlignment = NSTextAlignmentCenter;
+    [superview addSubview:toast];
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [toast removeFromSuperview];
+    });
+}
+
+- (void)cancelActivation {
+    [self dismissViewControllerAnimated:YES completion:nil];
+    exit(0);
+}
+
+- (void)doActivation {
+    [self.keyField resignFirstResponder];
+    
+    NSString *key = [self.keyField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    
+    if (verifyLicenseKey(key, self.udid)) {
+        saveActivation(self.udid);
+        g_isActivated = YES;
+        DLOG(@"[ACT] Activation successful for UDID: %@", self.udid);
+        [self dismissViewControllerAnimated:YES completion:^{
+            installAllHooks();
+        }];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:^{
+            showActivationDialog();
+        }];
+    }
+}
+
+- (void)tapOutsideDialog:(UITapGestureRecognizer *)gesture {
+    CGPoint tapPoint = [gesture locationInView:self.view];
+    
+    for (UIView *subview in self.view.subviews) {
+        if (subview.layer.cornerRadius > 0) {
+            if (!CGRectContainsPoint(subview.frame, tapPoint)) {
+                [self.keyField resignFirstResponder];
+            }
+            break;
+        }
+    }
+}
+
+@end
+
 static void showActivationDialog(void) {
     NSString *udid = getUDID();
     
@@ -113,160 +254,18 @@ static void showActivationDialog(void) {
             return;
         }
         
-        CGFloat screenW = w.bounds.size.width;
-        CGFloat screenH = w.bounds.size.height;
-        CGFloat dialogW = screenW - 60;
-        CGFloat dialogH = 320;
+        ActivationViewController *vc = [[ActivationViewController alloc] init];
+        vc.udid = udid;
+        vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
         
-        UIView *overlay = [[UIView alloc] initWithFrame:w.bounds];
-        overlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-        [w addSubview:overlay];
-        
-        UIView *dialog = [[UIView alloc] initWithFrame:CGRectMake((screenW - dialogW) / 2, (screenH - dialogH) / 2, dialogW, dialogH)];
-        dialog.backgroundColor = [UIColor whiteColor];
-        dialog.layer.cornerRadius = 16;
-        dialog.layer.shadowColor = [[UIColor blackColor] CGColor];
-        dialog.layer.shadowOpacity = 0.3;
-        dialog.layer.shadowRadius = 10;
-        [overlay addSubview:dialog];
-        
-        UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, dialogW - 40, 30)];
-        titleLabel.text = @"UDID激活";
-        titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        titleLabel.textColor = [UIColor blackColor];
-        titleLabel.textAlignment = NSTextAlignmentCenter;
-        [dialog addSubview:titleLabel];
-        
-        UILabel *udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, dialogW - 40, 20)];
-        udidLabel.text = @"您的UDID:";
-        udidLabel.font = [UIFont systemFontOfSize:14];
-        udidLabel.textColor = [UIColor grayColor];
-        [dialog addSubview:udidLabel];
-        
-        UIButton *udidBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        udidBtn.frame = CGRectMake(20, 85, dialogW - 40, 40);
-        udidBtn.backgroundColor = [[UIColor lightGrayColor] colorWithAlphaComponent:0.2];
-        udidBtn.layer.cornerRadius = 8;
-        [udidBtn setTitle:udid forState:UIControlStateNormal];
-        [udidBtn setTitleColor:[UIColor blueColor] forState:UIControlStateNormal];
-        udidBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-        udidBtn.titleLabel.numberOfLines = 2;
-        udidBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
-        [udidBtn addTarget:nil action:@selector(copyUDID:) forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(udidBtn, @"udid", udid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [dialog addSubview:udidBtn];
-        
-        UILabel *copyHint = [[UILabel alloc] initWithFrame:CGRectMake(20, 130, dialogW - 40, 20)];
-        copyHint.text = @"点击UDID可复制到剪贴板";
-        copyHint.font = [UIFont systemFontOfSize:12];
-        copyHint.textColor = [UIColor lightGrayColor];
-        copyHint.textAlignment = NSTextAlignmentCenter;
-        [dialog addSubview:copyHint];
-        
-        UITextField *keyField = [[UITextField alloc] initWithFrame:CGRectMake(20, 170, dialogW - 40, 44)];
-        keyField.placeholder = @"请输入32位激活码";
-        keyField.keyboardType = UIKeyboardTypeASCIICapable;
-        keyField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
-        keyField.borderStyle = UITextBorderStyleRoundedRect;
-        keyField.font = [UIFont systemFontOfSize:14];
-        keyField.tag = 1001;
-        [dialog addSubview:keyField];
-        
-        UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        cancelBtn.frame = CGRectMake(20, 230, (dialogW - 50) / 2, 44);
-        [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
-        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:16];
-        [cancelBtn addTarget:nil action:@selector(cancelActivation:) forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(cancelBtn, @"overlay", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [dialog addSubview:cancelBtn];
-        
-        UIButton *activateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        activateBtn.frame = CGRectMake(20 + (dialogW - 50) / 2 + 30, 230, (dialogW - 50) / 2, 44);
-        activateBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
-        activateBtn.layer.cornerRadius = 8;
-        [activateBtn setTitle:@"激活" forState:UIControlStateNormal];
-        [activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        activateBtn.titleLabel.font = [UIFont systemFontOfSize:16];
-        [activateBtn addTarget:nil action:@selector(doActivation:) forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(activateBtn, @"overlay", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(activateBtn, @"keyField", keyField, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(activateBtn, @"udid", udid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [dialog addSubview:activateBtn];
-        
-        UITapGestureRecognizer *tapOutside = [[UITapGestureRecognizer alloc] initWithTarget:nil action:@selector(tapOutsideDialog:)];
-        [overlay addGestureRecognizer:tapOutside];
-        
-        [w bringSubviewToFront:overlay];
+        UIViewController *rootVC = w.rootViewController;
+        if (rootVC) {
+            [rootVC presentViewController:vc animated:YES completion:nil];
+        } else {
+            [NSThread sleepForTimeInterval:1.0];
+            showActivationDialog();
+        }
     });
-}
-
-void copyUDID(UIButton *btn) {
-    NSString *udid = objc_getAssociatedObject(btn, @"udid");
-    if (udid) {
-        UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
-        pasteboard.string = udid;
-        
-        UIView *superview = btn.superview;
-        UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(20, 145, superview.bounds.size.width - 40, 24)];
-        toast.text = @"已复制到剪贴板";
-        toast.font = [UIFont systemFontOfSize:12];
-        toast.textColor = [UIColor greenColor];
-        toast.textAlignment = NSTextAlignmentCenter;
-        [superview addSubview:toast];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [toast removeFromSuperview];
-        });
-    }
-}
-
-void cancelActivation(UIButton *btn) {
-    UIView *overlay = objc_getAssociatedObject(btn, @"overlay");
-    [overlay removeFromSuperview];
-    exit(0);
-}
-
-void doActivation(UIButton *btn) {
-    UIView *overlay = objc_getAssociatedObject(btn, @"overlay");
-    UITextField *keyField = objc_getAssociatedObject(btn, @"keyField");
-    NSString *udid = objc_getAssociatedObject(btn, @"udid");
-    
-    [keyField resignFirstResponder];
-    
-    NSString *key = [keyField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    
-    if (verifyLicenseKey(key, udid)) {
-        saveActivation(udid);
-        g_isActivated = YES;
-        DLOG(@"[ACT] Activation successful for UDID: %@", udid);
-        [overlay removeFromSuperview];
-        installAllHooks();
-    } else {
-        [overlay removeFromSuperview];
-        showActivationDialog();
-    }
-}
-
-void tapOutsideDialog(UITapGestureRecognizer *gesture) {
-    UIView *overlay = gesture.view;
-    CGPoint tapPoint = [gesture locationInView:overlay];
-    
-    UIView *dialog = nil;
-    for (UIView *subview in overlay.subviews) {
-        if (subview.layer.cornerRadius > 0) {
-            dialog = subview;
-            break;
-        }
-    }
-    
-    if (dialog && !CGRectContainsPoint(dialog.frame, tapPoint)) {
-        for (UIView *subview in dialog.subviews) {
-            if ([subview isKindOfClass:[UITextField class]]) {
-                [(UITextField *)subview resignFirstResponder];
-                break;
-            }
-        }
-    }
 }
 
 static void log_init(void) {
