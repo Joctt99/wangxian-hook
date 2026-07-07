@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.15 - UUID FIX v2: Fixed loop boundary bug (i + needleLen <= len) that skipped UUID at buffer end
+ * WangXianHook v35.16 - DEVICE AUTH FIX: Patch md5xor.com ispass=NO -> YES in both completion handler and delegate mode
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -61,7 +61,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.15 ===");
+        _log(@"=== WXHook v35.16 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -242,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.15 诊断面板";
+            lbl.text = @"WXHook v35.16 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -565,8 +565,29 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
     NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (dataStr) {
         if ([dataStr containsString:@"版本"] || [dataStr containsString:@"server"] || 
-            [dataStr containsString:@"status"] || [dataStr containsString:@"maintenance"]) {
+            [dataStr containsString:@"status"] || [dataStr containsString:@"maintenance"] ||
+            [dataStr containsString:@"ispass"] || [dataStr containsString:@"md5xor"]) {
             DLOG(@"[HTTP-DATA] Response contains key info: %@", dataStr);
+        }
+        
+        // CRITICAL: Patch md5xor device auth in delegate mode
+        // Game uses delegate-based NSURLSession, need to modify received data
+        NSURL *taskUrl = dataTask.currentRequest.URL;
+        NSString *urlStr = taskUrl.absoluteString ?: @"";
+        if ([urlStr containsString:@"md5xor"] || [urlStr containsString:@"queryById"] ||
+            [dataStr containsString:@"ispass"]) {
+            DLOG(@"[HTTP-DATA-PATCH] Detected md5xor device auth in delegate mode, forcing ispass=YES");
+            NSString *patched = [dataStr stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+            patched = [patched stringByReplacingOccurrencesOfString:@"\"ispass\":NO" withString:@"\"ispass\":YES"];
+            patched = [patched stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+            patched = [patched stringByReplacingOccurrencesOfString:@"\"test\":NO" withString:@"\"test\":YES"];
+            NSData *patchedData = [patched dataUsingEncoding:NSUTF8StringEncoding];
+            if (patchedData && orig_urlSessionDataTaskDidReceiveData) {
+                DLOG(@"[HTTP-DATA-PATCH] Forwarding patched data (len=%zu -> %zu)", 
+                     (size_t)data.length, (size_t)patchedData.length);
+                orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, patchedData);
+                return;
+            }
         }
     }
     
@@ -2712,6 +2733,20 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         body = [body stringByReplacingOccurrencesOfString:@"版本过低" withString:@""];
                         body = [body stringByReplacingOccurrencesOfString:@"请更新" withString:@""];
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                    }
+                    
+                    // CRITICAL: Patch md5xor.com device authorization - force ispass=YES
+                    // Game queries x.md5xor.com/jeecg-boot/ios/queryById to verify device
+                    // If ispass=NO, game server connection is rejected -> network disconnect
+                    if ([url containsString:@"md5xor.com"] || [url containsString:@"queryById"] || 
+                        [body containsString:@"ispass"]) {
+                        DLOG(@"[NET-PATCH] Detected md5xor device auth, forcing ispass=YES");
+                        body = [body stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+                        body = [body stringByReplacingOccurrencesOfString:@"\"ispass\":NO" withString:@"\"ispass\":YES"];
+                        body = [body stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+                        body = [body stringByReplacingOccurrencesOfString:@"\"test\":NO" withString:@"\"test\":YES"];
+                        data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                        DLOG(@"[NET-PATCH] Patched md5xor response: %@", body);
                     }
                 }
             }
