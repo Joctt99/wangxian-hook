@@ -599,9 +599,9 @@ static NSMutableArray *fakeServerList = nil;
 static void initFakeServerList(void) {
     if (fakeServerList) return;
     fakeServerList = [NSMutableArray arrayWithArray:@[
-        @{@"serverid": @1, @"name": @"测试服务器1", @"ip": @"47.100.222.229", @"port": @5678, @"status": @1},
-        @{@"serverid": @2, @"name": @"测试服务器2", @"ip": @"47.100.222.229", @"port": @5679, @"status": @1},
-        @{@"serverid": @3, @"name": @"测试服务器3", @"ip": @"47.100.222.229", @"port": @5680, @"status": @1},
+        @{@"serverid": @1, @"name": @"测试服务器1", @"ip": @"127.0.0.1", @"port": @5678, @"status": @1},
+        @{@"serverid": @2, @"name": @"测试服务器2", @"ip": @"127.0.0.1", @"port": @5679, @"status": @1},
+        @{@"serverid": @3, @"name": @"测试服务器3", @"ip": @"127.0.0.1", @"port": @5680, @"status": @1},
     ]];
     DLOG(@"[FAKE-SERVER] Initialized fake server list: %@", fakeServerList);
 }
@@ -764,14 +764,6 @@ static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
             }
         }
         
-        if ([mutDict objectForKey:@"ip"]) {
-            NSString *ip = mutDict[@"ip"];
-            if ([ip isKindOfClass:[NSString class]] && ![ip isEqualToString:@"47.100.222.229"]) {
-                DLOG(@"[MSI-PATCH] ip=%@ -> 47.100.222.229", ip);
-                mutDict[@"ip"] = @"47.100.222.229";
-            }
-        }
-        
         if ([mutDict objectForKey:@"category"]) {
             NSString *category = mutDict[@"category"];
             if ([category isKindOfClass:[NSString class]]) {
@@ -822,10 +814,6 @@ static NSNumber *msi_status_hook(id self, SEL _cmd) {
 
 static NSString *msi_ip_hook(id self, SEL _cmd) {
     NSString *ret = ((NSString*(*)(id, SEL))objc_msgSend)(self, _cmd);
-    if (ret && ![ret isEqualToString:@"47.100.222.229"]) {
-        DLOG(@"[MSI-PATCH-IP] ip=%@ -> 47.100.222.229 (property access)", ret);
-        return @"47.100.222.229";
-    }
     DLOG(@"[MSI-CALL] -[%@ %@] -> %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd), ret);
     return ret;
 }
@@ -1265,23 +1253,6 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
     
     int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
     
-    // If game server connection fails, try connecting to auth server instead
-    if (result != 0 && port == 12003) {
-        DLOG(@"[SOCK] Game server %s:%d connection failed (%d), trying auth server", host, port, result);
-        // Create auth server address
-        struct sockaddr_in authAddr;
-        memset(&authAddr, 0, sizeof(authAddr));
-        authAddr.sin_family = AF_INET;
-        authAddr.sin_port = htons(5678);  // Auth server port
-        inet_pton(AF_INET, "47.100.222.229", &authAddr.sin_addr);
-        result = orig_connect(sockfd, (struct sockaddr *)&authAddr, sizeof(authAddr));
-        if (result == 0) {
-            DLOG(@"[SOCK] Redirected game server to auth server successfully!");
-            // Update fd tracking
-            updateFdHostPort(sockfd, "47.100.222.229", 5678);
-        }
-    }
-    
     return result;
 }
 
@@ -1365,16 +1336,6 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
             cpayload[i+9] == 'e' && cpayload[i+10] == '=' && cpayload[i+11] == '2') {
             DLOG(@"[PROTO-PATCH] Found serverType=2 at offset %zu, changing to 1", i);
             cpayload[i+11] = '1';
-            patched = YES;
-        }
-    }
-    
-    const char *oldIP = "47.100.204.160";
-    const char *newIP = "47.100.222.229";
-    for (size_t i = 0; i + 15 <= payloadLen; i++) {
-        if (memcmp(payload + i, oldIP, 15) == 0) {
-            DLOG(@"[PROTO-PATCH] Found old IP at offset %zu, replacing", i);
-            memcpy(payload + i, newIP, 15);
             patched = YES;
         }
     }
@@ -2058,12 +2019,12 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                 ssize_t payloadLen = ret - 8;
                 if (payloadLen < 50 || !strstr((char *)buf + 8, "server")) {
                     DLOG(@"[PROTO-RF-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
-                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
-                    size_t fakeLen = strlen(fakeServerList);
-                    if (fakeLen + 8 <= len) {
-                        memcpy(buf + 8, fakeServerList, fakeLen);
-                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
-                        memcpy(buf, &newPktLen, 4);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"127.0.0.1\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                size_t fakeLen = strlen(fakeServerList);
+                if (fakeLen + 8 <= len) {
+                    memcpy(buf + 8, fakeServerList, fakeLen);
+                    uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                    memcpy(buf, &newPktLen, 4);
                         ret = 8 + fakeLen;
                         DLOG(@"[PROTO-RF-PATCH] Replaced with fake server list, new len=%zd", ret);
                     }
@@ -2219,12 +2180,12 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                 ssize_t payloadLen = MIN((ssize_t)iov->iov_len - 8, ret - 8);
                 if (payloadLen < 50 || !strstr((char *)iov->iov_base + 8, "server")) {
                     DLOG(@"[PROTO-RM-PATCH] Server list payload too small (%zd bytes) or no server data, generating fake list", payloadLen);
-                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
-                    size_t fakeLen = strlen(fakeServerList);
-                    if (fakeLen + 8 <= iov->iov_len) {
-                        memcpy(iov->iov_base + 8, fakeServerList, fakeLen);
-                        uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
-                        memcpy(iov->iov_base, &newPktLen, 4);
+                    const char *fakeServerList = "{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"127.0.0.1\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                size_t fakeLen = strlen(fakeServerList);
+                if (fakeLen + 8 <= iov->iov_len) {
+                    memcpy(iov->iov_base + 8, fakeServerList, fakeLen);
+                    uint32_t newPktLen = htonl((uint32_t)(8 + fakeLen));
+                    memcpy(iov->iov_base, &newPktLen, 4);
                         ret = 8 + fakeLen;
                         DLOG(@"[PROTO-RM-PATCH] Replaced with fake server list, new len=%zd", ret);
                     }
@@ -2661,7 +2622,7 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                     
                     if (isServerList && isEmptyList) {
                         DLOG(@"[NET-PATCH] Server list is empty, replacing with fake data");
-                        NSString *fakeServerList = @"{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
+                        NSString *fakeServerList = @"{\"status\":0,\"serverCount\":1,\"servers\":[{\"serverid\":1,\"name\":\"测试一区\",\"realname\":\"测试一区\",\"category\":\"一区\",\"serverType\":1,\"ip\":\"127.0.0.1\",\"port\":5678,\"status\":1,\"clientid\":1,\"onlinePlayerNum\":100,\"description\":\"运行\"}]}";
                         data = [fakeServerList dataUsingEncoding:NSUTF8StringEncoding];
                         DLOG(@"[NET-PATCH] Replaced with fake server list, new len=%lu", (unsigned long)data.length);
                     }
@@ -3243,7 +3204,7 @@ static void installAllHooks(void) {
             if (!serverList || serverList.count == 0) {
                 DLOG(@"[FORCE-INJECT] Server list empty, injecting mock data");
                 NSArray *mockServers = @[
-                    @{@"serverid": @1, @"name": @"测试服务器", @"ip": @"47.100.222.229", 
+                    @{@"serverid": @1, @"name": @"测试服务器", @"ip": @"127.0.0.1", 
                       @"port": @5678, @"status": @1, @"serverType": @1, @"clientid": @1,
                       @"category": @"一区", @"description": @"运行中"}
                 ];
