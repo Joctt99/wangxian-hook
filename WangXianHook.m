@@ -26,7 +26,10 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-static NSString *const kMobileProvisionPath = @"embedded.mobileprovision";
+static NSString *const kAllowedTeamIDs[] = {
+    @"YOUR_TEAM_ID",
+    NULL
+};
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -52,7 +55,7 @@ static void _log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-static void showActivationFailedAlert(NSString *reason, NSString *currentUDID) {
+static void showActivationFailedAlert(NSString *reason) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = [[UIApplication sharedApplication] keyWindow];
         if (!w) {
@@ -65,7 +68,7 @@ static void showActivationFailedAlert(NSString *reason, NSString *currentUDID) {
         if (!rootVC) return;
         
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Hook未激活" 
-                                                                       message:[NSString stringWithFormat:@"%@\n\n当前设备UDID:\n%@", reason, currentUDID]
+                                                                       message:reason
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         
         UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"确定" 
@@ -77,7 +80,7 @@ static void showActivationFailedAlert(NSString *reason, NSString *currentUDID) {
     });
 }
 
-static NSArray *getProvisionedUDIDs(void) {
+static NSString *getTeamIdentifierFromProvision(void) {
     NSString *provisionPath = [[NSBundle mainBundle] pathForResource:@"embedded" ofType:@"mobileprovision"];
     if (!provisionPath) {
         DLOG(@"[ACT] ERROR: embedded.mobileprovision not found");
@@ -121,50 +124,47 @@ static NSArray *getProvisionedUDIDs(void) {
         return nil;
     }
     
-    NSArray *provisionedDevices = [plistDict objectForKey:@"ProvisionedDevices"];
-    if (provisionedDevices && [provisionedDevices isKindOfClass:[NSArray class]]) {
-        DLOG(@"[ACT] Found %lu provisioned devices", (unsigned long)provisionedDevices.count);
-        return provisionedDevices;
+    NSArray *teamIdentifiers = [plistDict objectForKey:@"TeamIdentifier"];
+    if (teamIdentifiers && [teamIdentifiers isKindOfClass:[NSArray class]] && teamIdentifiers.count > 0) {
+        NSString *teamID = [teamIdentifiers objectAtIndex:0];
+        DLOG(@"[ACT] Found TeamIdentifier: %@", teamID);
+        return teamID;
     }
     
-    DLOG(@"[ACT] WARNING: No ProvisionedDevices found in mobileprovision (enterprise/signing?)");
+    DLOG(@"[ACT] WARNING: No TeamIdentifier found in mobileprovision");
     return nil;
 }
 
-static BOOL checkUDIDActivation(void) {
-    NSString *currentUDID = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    if (!currentUDID) currentUDID = @"UNKNOWN";
+static BOOL checkTeamIDActivation(void) {
+    NSString *currentTeamID = getTeamIdentifierFromProvision();
     
-    DLOG(@"[ACT] Current device UDID: %@", currentUDID);
-    
-    NSArray *allowedUDIDs = getProvisionedUDIDs();
-    
-    if (!allowedUDIDs || allowedUDIDs.count == 0) {
-        DLOG(@"[ACT] WARNING: No provisioned UDIDs found, skipping verification (enterprise signing?)");
+    if (!currentTeamID) {
+        DLOG(@"[ACT] WARNING: Cannot read TeamIdentifier, skipping verification");
         return YES;
     }
     
-    NSString *currentNormalized = [[currentUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    DLOG(@"[ACT] Current TeamIdentifier: %@", currentTeamID);
     
-    BOOL matches = NO;
-    for (NSString *allowedUDID in allowedUDIDs) {
-        NSString *allowedNormalized = [[allowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
-        DLOG(@"[ACT] Checking against provisioned UDID: %@", allowedUDID);
+    for (int i = 0; kAllowedTeamIDs[i] != NULL; i++) {
+        NSString *allowedTeamID = kAllowedTeamIDs[i];
+        DLOG(@"[ACT] Checking against allowed TeamID: %@", allowedTeamID);
         
-        if ([allowedNormalized isEqualToString:currentNormalized]) {
-            matches = YES;
-            break;
+        if ([allowedTeamID isEqualToString:@"YOUR_TEAM_ID"]) {
+            DLOG(@"[ACT] WARNING: TeamID placeholder not replaced! Hook disabled.");
+            showActivationFailedAlert(@"Team ID未配置，请在编译前将 kAllowedTeamIDs 替换为你的开发者Team ID。");
+            return NO;
+        }
+        
+        if ([currentTeamID isEqualToString:allowedTeamID]) {
+            DLOG(@"[ACT] Team ID verification PASSED");
+            return YES;
         }
     }
     
-    DLOG(@"[ACT] UDID verification %@", matches ? @"PASSED" : @"FAILED");
+    DLOG(@"[ACT] Team ID verification FAILED");
+    showActivationFailedAlert(@"签名验证失败，当前应用的签名证书未被授权。\n\n请使用正确签名的IPA文件。");
     
-    if (!matches) {
-        DLOG(@"[ACT] ERROR: UDID not in provisioned list! Hook disabled.");
-        showActivationFailedAlert(@"UDID验证失败，当前设备未在签名证书的设备列表中。\n\n请使用正确签名的IPA文件，或联系开发者添加设备。", currentUDID);
-    }
-    
-    return matches;
+    return NO;
 }
 
 static void log_init(void) {
@@ -172,10 +172,10 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.03 UDID Verification ===");
+        _log(@"=== WXHook v35.07 Team ID Verification ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         
-        g_isActivated = checkUDIDActivation();
+        g_isActivated = checkTeamIDActivation();
     }
 }
 
