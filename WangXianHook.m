@@ -1,5 +1,6 @@
 /**
- * WangXianHook v35.03 - FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
+ * WangXianHook v35.04 - FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
+ * FIX: Fixed fd tracking bug where same fd connected to multiple servers caused wrong host mapping
  * FIX: trackFd now updates existing fd entries instead of appending duplicates
  * FIX: Removed hardcoded overseas IP (47.100.222.229) causing connection issues
  * FIX: Added fallback for recvfrom/recvmsg socket hooks
@@ -58,7 +59,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.03 ===");
+        _log(@"=== WXHook v35.04 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -198,7 +199,7 @@ static UILabel *g_statusLbl = nil;
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.03 诊断面板";
+            lbl.text = @"WXHook v35.04 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -895,6 +896,9 @@ static void createLogButton(UIWindow *w) {
     UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:g_handler action:@selector(handleTripleTap:)];
     tripleTap.numberOfTapsRequired = 2;
     tripleTap.numberOfTouchesRequired = 3;
+    tripleTap.cancelsTouchesInView = NO;
+    tripleTap.delaysTouchesEnded = NO;
+    tripleTap.delaysTouchesBegan = NO;
     [w addGestureRecognizer:tripleTap];
     
     _log(@"[UI] Button created on window (hidden, triple-tap to show)");
