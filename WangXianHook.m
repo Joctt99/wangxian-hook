@@ -2757,9 +2757,11 @@ static void installAllHooks(void) {
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
     orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
     orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-    DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
+    DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
     
     installSocketHooks();
     
