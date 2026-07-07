@@ -25,7 +25,8 @@ static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
-static void showActivationDialog(void);
+
+static NSString *const kAllowedUDID = @"__WXHOOK_UDID_PLACEHOLDER__";
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -51,222 +52,25 @@ static void _log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-static NSString *getUDID(void) {
-    NSString *udid = nil;
-    @try {
-        udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    } @catch (NSException *e) {}
+static BOOL checkUDIDActivation(void) {
+    NSString *currentUDID = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    if (!currentUDID) currentUDID = @"UNKNOWN";
     
-    if (!udid) {
-        @try {
-            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-            udid = [defaults stringForKey:@"WXHookUDID"];
-            if (!udid) {
-                CFUUIDRef uuidRef = CFUUIDCreate(NULL);
-                udid = (__bridge_transfer NSString *)CFUUIDCreateString(NULL, uuidRef);
-                CFRelease(uuidRef);
-                [defaults setObject:udid forKey:@"WXHookUDID"];
-                [defaults synchronize];
-            }
-        } @catch (NSException *e) {}
+    DLOG(@"[ACT] Current device UDID: %@", currentUDID);
+    DLOG(@"[ACT] Allowed UDID: %@", kAllowedUDID);
+    
+    if ([kAllowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
+        DLOG(@"[ACT] ERROR: UDID placeholder not replaced! Hook disabled.");
+        return NO;
     }
     
-    return udid ?: @"UNKNOWN";
-}
-
-static BOOL checkActivation(NSString *udid) {
-    NSString *activationFile = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook_activated"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:activationFile]) {
-        NSString *savedUDID = [NSString stringWithContentsOfFile:activationFile encoding:NSUTF8StringEncoding error:nil];
-        if ([savedUDID isEqualToString:udid]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static void saveActivation(NSString *udid) {
-    NSString *activationFile = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxhook_activated"];
-    [udid writeToFile:activationFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
-static BOOL verifyLicenseKey(NSString *key, NSString *udid) {
-    if (!key || key.length != 32) return NO;
+    NSString *allowedNormalized = [[kAllowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    NSString *currentNormalized = [[currentUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     
-    NSString *expectedKey = [udid uppercaseString];
-    expectedKey = [expectedKey stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    BOOL matches = [allowedNormalized isEqualToString:currentNormalized];
+    DLOG(@"[ACT] UDID verification %@", matches ? @"PASSED" : @"FAILED");
     
-    return [key isEqualToString:expectedKey];
-}
-
-@interface ActivationViewController : UIViewController
-@property (nonatomic, copy) NSString *udid;
-@property (nonatomic, strong) UITextField *keyField;
-@end
-
-@implementation ActivationViewController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-    
-    CGFloat screenW = self.view.bounds.size.width;
-    CGFloat screenH = self.view.bounds.size.height;
-    CGFloat dialogW = screenW - 60;
-    CGFloat dialogH = 320;
-    
-    UIView *dialog = [[UIView alloc] initWithFrame:CGRectMake((screenW - dialogW) / 2, (screenH - dialogH) / 2, dialogW, dialogH)];
-    dialog.backgroundColor = [UIColor whiteColor];
-    dialog.layer.cornerRadius = 16;
-    dialog.layer.shadowColor = [[UIColor blackColor] CGColor];
-    dialog.layer.shadowOpacity = 0.3;
-    dialog.layer.shadowRadius = 10;
-    [self.view addSubview:dialog];
-    
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, dialogW - 40, 30)];
-    titleLabel.text = @"UDID激活";
-    titleLabel.font = [UIFont boldSystemFontOfSize:18];
-    titleLabel.textColor = [UIColor blackColor];
-    titleLabel.textAlignment = NSTextAlignmentCenter;
-    [dialog addSubview:titleLabel];
-    
-    UILabel *udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, dialogW - 40, 20)];
-    udidLabel.text = @"您的UDID:";
-    udidLabel.font = [UIFont systemFontOfSize:14];
-    udidLabel.textColor = [UIColor grayColor];
-    [dialog addSubview:udidLabel];
-    
-    UIButton *udidBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    udidBtn.frame = CGRectMake(20, 85, dialogW - 40, 40);
-    udidBtn.backgroundColor = [[UIColor lightGrayColor] colorWithAlphaComponent:0.2];
-    udidBtn.layer.cornerRadius = 8;
-    [udidBtn setTitle:self.udid forState:UIControlStateNormal];
-    [udidBtn setTitleColor:[UIColor blueColor] forState:UIControlStateNormal];
-    udidBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-    udidBtn.titleLabel.numberOfLines = 2;
-    udidBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
-    [udidBtn addTarget:self action:@selector(copyUDID:) forControlEvents:UIControlEventTouchUpInside];
-    [dialog addSubview:udidBtn];
-    
-    UILabel *copyHint = [[UILabel alloc] initWithFrame:CGRectMake(20, 130, dialogW - 40, 20)];
-    copyHint.text = @"点击UDID可复制到剪贴板";
-    copyHint.font = [UIFont systemFontOfSize:12];
-    copyHint.textColor = [UIColor lightGrayColor];
-    copyHint.textAlignment = NSTextAlignmentCenter;
-    [dialog addSubview:copyHint];
-    
-    self.keyField = [[UITextField alloc] initWithFrame:CGRectMake(20, 170, dialogW - 40, 44)];
-    self.keyField.placeholder = @"请输入32位激活码";
-    self.keyField.keyboardType = UIKeyboardTypeASCIICapable;
-    self.keyField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
-    self.keyField.borderStyle = UITextBorderStyleRoundedRect;
-    self.keyField.font = [UIFont systemFontOfSize:14];
-    [dialog addSubview:self.keyField];
-    
-    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    cancelBtn.frame = CGRectMake(20, 230, (dialogW - 50) / 2, 44);
-    [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
-    cancelBtn.titleLabel.font = [UIFont systemFontOfSize:16];
-    [cancelBtn addTarget:self action:@selector(cancelActivation) forControlEvents:UIControlEventTouchUpInside];
-    [dialog addSubview:cancelBtn];
-    
-    UIButton *activateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    activateBtn.frame = CGRectMake(20 + (dialogW - 50) / 2 + 30, 230, (dialogW - 50) / 2, 44);
-    activateBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
-    activateBtn.layer.cornerRadius = 8;
-    [activateBtn setTitle:@"激活" forState:UIControlStateNormal];
-    [activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    activateBtn.titleLabel.font = [UIFont systemFontOfSize:16];
-    [activateBtn addTarget:self action:@selector(doActivation) forControlEvents:UIControlEventTouchUpInside];
-    [dialog addSubview:activateBtn];
-    
-    UITapGestureRecognizer *tapOutside = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapOutsideDialog:)];
-    [self.view addGestureRecognizer:tapOutside];
-}
-
-- (void)copyUDID:(UIButton *)btn {
-    UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
-    pasteboard.string = self.udid;
-    
-    UIView *superview = btn.superview;
-    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(20, 145, superview.bounds.size.width - 40, 24)];
-    toast.text = @"已复制到剪贴板";
-    toast.font = [UIFont systemFontOfSize:12];
-    toast.textColor = [UIColor greenColor];
-    toast.textAlignment = NSTextAlignmentCenter;
-    [superview addSubview:toast];
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [toast removeFromSuperview];
-    });
-}
-
-- (void)cancelActivation {
-    [self dismissViewControllerAnimated:YES completion:nil];
-    exit(0);
-}
-
-- (void)doActivation {
-    [self.keyField resignFirstResponder];
-    
-    NSString *key = [self.keyField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    
-    if (verifyLicenseKey(key, self.udid)) {
-        saveActivation(self.udid);
-        g_isActivated = YES;
-        DLOG(@"[ACT] Activation successful for UDID: %@", self.udid);
-        [self dismissViewControllerAnimated:YES completion:^{
-            installAllHooks();
-        }];
-    } else {
-        [self dismissViewControllerAnimated:YES completion:^{
-            showActivationDialog();
-        }];
-    }
-}
-
-- (void)tapOutsideDialog:(UITapGestureRecognizer *)gesture {
-    CGPoint tapPoint = [gesture locationInView:self.view];
-    
-    for (UIView *subview in self.view.subviews) {
-        if (subview.layer.cornerRadius > 0) {
-            if (!CGRectContainsPoint(subview.frame, tapPoint)) {
-                [self.keyField resignFirstResponder];
-            }
-            break;
-        }
-    }
-}
-
-@end
-
-static void showActivationDialog(void) {
-    NSString *udid = getUDID();
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = [[UIApplication sharedApplication] keyWindow];
-        if (!w) {
-            NSArray *windows = [[UIApplication sharedApplication] windows];
-            if (windows.count > 0) w = windows[0];
-        }
-        if (!w) {
-            [NSThread sleepForTimeInterval:1.0];
-            showActivationDialog();
-            return;
-        }
-        
-        ActivationViewController *vc = [[ActivationViewController alloc] init];
-        vc.udid = udid;
-        vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-        
-        UIViewController *rootVC = w.rootViewController;
-        if (rootVC) {
-            [rootVC presentViewController:vc animated:YES completion:nil];
-        } else {
-            [NSThread sleepForTimeInterval:1.0];
-            showActivationDialog();
-        }
-    });
+    return matches;
 }
 
 static void log_init(void) {
@@ -274,19 +78,10 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v34.99 UDID Activation ===");
+        _log(@"=== WXHook v35.03 UDID Verification ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         
-        NSString *udid = getUDID();
-        _log([NSString stringWithFormat:@"UDID: %@", udid]);
-        
-        if (checkActivation(udid)) {
-            g_isActivated = YES;
-            _log(@"[ACT] Already activated");
-        } else {
-            _log(@"[ACT] Not activated, showing dialog");
-            showActivationDialog();
-        }
+        g_isActivated = checkUDIDActivation();
     }
 }
 
