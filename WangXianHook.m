@@ -29,8 +29,14 @@ static void installAllHooks(void);
 static NSString *const kValidationAPIURL = @"https://your-api.com/validate";
 static NSString *const kKeychainService = @"com.wangxian.hook.deviceid";
 static NSString *const kKeychainAccount = @"device_id";
-static NSString *const kValidationCacheKey = @"validation_cache";
+static NSString *const kCacheUDIDKey = @"wxhook_udid";
+static NSString *const kCacheValidKey = @"wxhook_valid";
+static NSString *const kCacheTimestampKey = @"wxhook_timestamp";
 static NSTimeInterval const kValidationCacheDuration = 24 * 60 * 60; // 24 hours
+static NSInteger const kMaxRetryCount = 3;
+static NSTimeInterval const kInitialRetryDelay = 1.0; // 1 second
+
+static dispatch_queue_t g_validationQueue = NULL;
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -57,7 +63,7 @@ static void _log(NSString *msg) {
 }
 
 static void showActivationFailedAlert(NSString *reason, NSString *deviceID) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *w = [[UIApplication sharedApplication] keyWindow];
         if (!w) {
             NSArray *windows = [[UIApplication sharedApplication] windows];
@@ -104,7 +110,7 @@ static BOOL saveToKeychain(NSString *service, NSString *account, NSString *value
         OSStatus status = SecItemAdd((__bridge CFDictionaryRef)addQuery, NULL);
         return (status == errSecSuccess);
     } @catch (NSException *e) {
-        DLOG(@"[KEYCHAIN] Save exception: %@", e);
+        DLOG(@"[UDID_DEBUG] Keychain save exception: %@", e);
         return NO;
     }
 }
@@ -129,7 +135,7 @@ static NSString *readFromKeychain(NSString *service, NSString *account) {
         
         return nil;
     } @catch (NSException *e) {
-        DLOG(@"[KEYCHAIN] Read exception: %@", e);
+        DLOG(@"[UDID_DEBUG] Keychain read exception: %@", e);
         return nil;
     }
 }
@@ -138,7 +144,7 @@ static NSString *getPersistentDeviceID(void) {
     NSString *deviceID = readFromKeychain(kKeychainService, kKeychainAccount);
     
     if (deviceID) {
-        DLOG(@"[ACT] Read device ID from Keychain: %@", deviceID);
+        DLOG(@"[UDID_DEBUG] Read device ID from Keychain: %@", deviceID);
         return deviceID;
     }
     
@@ -150,83 +156,153 @@ static NSString *getPersistentDeviceID(void) {
     deviceID = [[idfv uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     
     if (saveToKeychain(kKeychainService, kKeychainAccount, deviceID)) {
-        DLOG(@"[ACT] Saved device ID to Keychain: %@", deviceID);
+        DLOG(@"[UDID_DEBUG] Saved device ID to Keychain: %@", deviceID);
     } else {
-        DLOG(@"[ACT] Failed to save device ID to Keychain");
+        DLOG(@"[UDID_DEBUG] Failed to save device ID to Keychain");
     }
     
     return deviceID;
 }
 
-static BOOL validateWithServer(NSString *deviceID) {
-    NSString *cache = readFromKeychain(kKeychainService, kValidationCacheKey);
-    if (cache) {
-        NSArray *parts = [cache componentsSeparatedByString:@"|"];
-        if (parts.count == 2) {
-            BOOL valid = [parts[0] boolValue];
-            NSTimeInterval timestamp = [parts[1] doubleValue];
-            if (valid && ([[NSDate date] timeIntervalSince1970] - timestamp) < kValidationCacheDuration) {
-                DLOG(@"[ACT] Using cached validation result (valid)");
-                return YES;
-            }
+static void saveValidationCache(NSString *deviceID, BOOL valid) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:deviceID forKey:kCacheUDIDKey];
+    [defaults setBool:valid forKey:kCacheValidKey];
+    [defaults setDouble:[[NSDate date] timeIntervalSince1970] forKey:kCacheTimestampKey];
+    [defaults synchronize];
+    DLOG(@"[UDID_DEBUG] Saved validation cache: deviceID=%@, valid=%d", deviceID, valid);
+}
+
+static BOOL checkValidationCache(NSString *deviceID) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *cachedUDID = [defaults stringForKey:kCacheUDIDKey];
+    BOOL cachedValid = [defaults boolForKey:kCacheValidKey];
+    NSTimeInterval cachedTimestamp = [defaults doubleForKey:kCacheTimestampKey];
+    
+    if (cachedUDID && [cachedUDID isEqualToString:deviceID] && cachedValid) {
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - cachedTimestamp;
+        if (elapsed < kValidationCacheDuration) {
+            DLOG(@"[UDID_DEBUG] Using cached validation (valid, %0.fs ago)", elapsed);
+            return YES;
         }
+        DLOG(@"[UDID_DEBUG] Cache expired (%0.fs ago), revalidating", elapsed);
     }
     
-    DLOG(@"[ACT] Sending validation request for device ID: %@", deviceID);
+    return NO;
+}
+
+static void performValidationWithRetry(NSString *deviceID, NSInteger retryCount, NSTimeInterval delay);
+
+static void performValidation(NSString *deviceID, NSInteger retryCount) {
+    DLOG(@"[UDID_DEBUG] Performing validation attempt %ld/%ld", (long)retryCount, (long)kMaxRetryCount);
     
     NSURL *url = [NSURL URLWithString:kValidationAPIURL];
-    NSURLRequest *request = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:10.0];
+    if (!url) {
+        DLOG(@"[UDID_DEBUG] Invalid API URL");
+        showActivationFailedAlert(@"验证服务器地址配置错误。", deviceID);
+        return;
+    }
     
-    NSMutableURLRequest *mutableRequest = [request mutableCopy];
-    [mutableRequest setHTTPMethod:@"POST"];
-    [mutableRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:10.0];
+    [request setHTTPMethod:@"POST"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     
     NSData *bodyData = [[NSString stringWithFormat:@"{\"udid\":\"%@\"}", deviceID] dataUsingEncoding:NSUTF8StringEncoding];
-    [mutableRequest setHTTPBody:bodyData];
+    [request setHTTPBody:bodyData];
     
-    NSURLResponse *response = nil;
-    NSError *error = nil;
-    NSData *responseData = [NSURLConnection sendSynchronousRequest:mutableRequest returningResponse:&response error:&error];
+    NSURLSession *session = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            DLOG(@"[UDID_DEBUG] Network error: %@", error.localizedDescription);
+            
+            if (retryCount < kMaxRetryCount) {
+                NSTimeInterval delay = kInitialRetryDelay * pow(2, retryCount - 1);
+                DLOG(@"[UDID_DEBUG] Retrying in %.0fs (attempt %ld/%ld)", delay, (long)retryCount + 1, (long)kMaxRetryCount);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), g_validationQueue, ^{
+                    performValidation(deviceID, retryCount + 1);
+                });
+                return;
+            }
+            
+            DLOG(@"[UDID_DEBUG] Max retries exceeded");
+            showActivationFailedAlert(@"网络连接失败，无法验证设备。\n\n请检查网络连接后重试。", deviceID);
+            g_isActivated = NO;
+            return;
+        }
+        
+        if (!data) {
+            DLOG(@"[UDID_DEBUG] Empty response from server");
+            if (retryCount < kMaxRetryCount) {
+                NSTimeInterval delay = kInitialRetryDelay * pow(2, retryCount - 1);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), g_validationQueue, ^{
+                    performValidation(deviceID, retryCount + 1);
+                });
+                return;
+            }
+            showActivationFailedAlert(@"服务器响应为空，无法验证设备。", deviceID);
+            g_isActivated = NO;
+            return;
+        }
+        
+        NSError *jsonError = nil;
+        NSDictionary *result = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+        
+        if (jsonError) {
+            DLOG(@"[UDID_DEBUG] JSON parse error: %@", jsonError.localizedDescription);
+            if (retryCount < kMaxRetryCount) {
+                NSTimeInterval delay = kInitialRetryDelay * pow(2, retryCount - 1);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), g_validationQueue, ^{
+                    performValidation(deviceID, retryCount + 1);
+                });
+                return;
+            }
+            showActivationFailedAlert(@"服务器响应格式错误，无法验证设备。", deviceID);
+            g_isActivated = NO;
+            return;
+        }
+        
+        BOOL valid = [[result objectForKey:@"valid"] boolValue];
+        DLOG(@"[UDID_DEBUG] Server validation result: %@", valid ? @"valid" : @"invalid");
+        
+        if (valid) {
+            saveValidationCache(deviceID, YES);
+            g_isActivated = YES;
+            DLOG(@"[UDID_DEBUG] Validation PASSED, hook enabled");
+        } else {
+            saveValidationCache(deviceID, NO);
+            g_isActivated = NO;
+            showActivationFailedAlert(@"设备未授权，请联系开发者获取授权。", deviceID);
+        }
+    }];
     
-    if (error) {
-        DLOG(@"[ACT] Network error: %@", error.localizedDescription);
-        showActivationFailedAlert(@"网络连接失败，无法验证设备。\n\n请检查网络连接后重试。", deviceID);
-        return NO;
+    [task resume];
+}
+
+static void startValidationAsync(NSString *deviceID) {
+    if (checkValidationCache(deviceID)) {
+        g_isActivated = YES;
+        DLOG(@"[UDID_DEBUG] Cache hit, hook enabled immediately");
+        return;
     }
     
-    if (!responseData) {
-        DLOG(@"[ACT] Empty response from server");
-        showActivationFailedAlert(@"服务器响应为空，无法验证设备。", deviceID);
-        return NO;
+    g_isActivated = NO;
+    
+    if (!g_validationQueue) {
+        g_validationQueue = dispatch_queue_create("com.wangxian.hook.validation", NULL);
     }
     
-    NSError *jsonError = nil;
-    NSDictionary *result = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:&jsonError];
-    
-    if (jsonError) {
-        DLOG(@"[ACT] JSON parse error: %@", jsonError.localizedDescription);
-        showActivationFailedAlert(@"服务器响应格式错误，无法验证设备。", deviceID);
-        return NO;
-    }
-    
-    BOOL valid = [[result objectForKey:@"valid"] boolValue];
-    DLOG(@"[ACT] Server validation result: %@", valid ? @"valid" : @"invalid");
-    
-    if (valid) {
-        NSString *cacheValue = [NSString stringWithFormat:@"1|%.0f", [[NSDate date] timeIntervalSince1970]];
-        saveToKeychain(kKeychainService, kValidationCacheKey, cacheValue);
-        return YES;
-    } else {
-        showActivationFailedAlert(@"设备未授权，请联系开发者获取授权。", deviceID);
-        return NO;
-    }
+    dispatch_async(g_validationQueue, ^{
+        performValidation(deviceID, 1);
+    });
 }
 
 static BOOL checkUDIDActivation(void) {
     NSString *deviceID = getPersistentDeviceID();
-    DLOG(@"[ACT] Persistent device ID: %@", deviceID);
+    DLOG(@"[UDID_DEBUG] Persistent device ID: %@", deviceID);
     
-    return validateWithServer(deviceID);
+    startValidationAsync(deviceID);
+    
+    return YES;
 }
 
 static void log_init(void) {
