@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.12 - UI FIX + NETWORK DISCONNECT FIX
+ * WangXianHook v35.13 - CRITICAL NETWORK FIX: Don't zero out seqId (offset 8-11) in version check responses
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -61,7 +61,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.12 ===");
+        _log(@"=== WXHook v35.13 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -242,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.12 诊断面板";
+            lbl.text = @"WXHook v35.13 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1609,27 +1609,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            BOOL hadError = NO;
             if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                DLOG(@"[PROTO-R-PATCH] Version check status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
-                hadError = YES;
-            }
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
-                    hadError = YES;
+                if (ret > 13) {
+                    DLOG(@"[PROTO-R-PATCH] Clearing error messages from payload (%zd bytes)", ret - 13);
+                    memset((unsigned char *)buf + 13, 0, ret - 13);
                 }
-            }
-            // CRITICAL: Clear error messages from payload (e.g. "身体版本过低", "登录失败")
-            // The game client reads these messages and shows "网络中断" even if status is patched to 0
-            if (hadError && ret > 13) {
-                DLOG(@"[PROTO-R-PATCH] Clearing error messages from version check payload (%zd bytes)", ret - 13);
-                memset((unsigned char *)buf + 13, 0, ret - 13);
             }
         }
         
@@ -1948,24 +1934,12 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
-            BOOL hadError = NO;
             if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RF-PATCH] Version status byte %u -> 0", p[12]);
+                DLOG(@"[PROTO-RF-PATCH] Version status %u -> 0, clearing error messages", p[12]);
                 ((unsigned char *)buf)[12] = 0;
-                hadError = YES;
-            }
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-RF-PATCH] Version 4-byte status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
-                    hadError = YES;
+                if (ret > 13) {
+                    memset((unsigned char *)buf + 13, 0, ret - 13);
                 }
-            }
-            if (hadError && ret > 13) {
-                DLOG(@"[PROTO-RF-PATCH] Clearing error messages from payload (%zd bytes)", ret - 13);
-                memset((unsigned char *)buf + 13, 0, ret - 13);
             }
         }
         
@@ -2124,24 +2098,12 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
         
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
             DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
-            BOOL hadError = NO;
             if (iov->iov_len >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RM-PATCH] Version status byte %u -> 0", p[12]);
+                DLOG(@"[PROTO-RM-PATCH] Version status %u -> 0, clearing error messages", p[12]);
                 ((unsigned char *)iov->iov_base)[12] = 0;
-                hadError = YES;
-            }
-            if (iov->iov_len >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-RM-PATCH] Version 4-byte status %u -> 0", status4);
-                    memset((unsigned char *)iov->iov_base + 8, 0, 4);
-                    hadError = YES;
+                if (ret > 13) {
+                    memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
                 }
-            }
-            if (hadError && ret > 13) {
-                DLOG(@"[PROTO-RM-PATCH] Clearing error messages from payload (%zd bytes)", ret - 13);
-                memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
             }
         }
         
