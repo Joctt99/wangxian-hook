@@ -26,7 +26,11 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-static NSString *const kAllowedUDID = @"__WXHOOK_UDID_PLACEHOLDER__";
+static NSString *const kValidationAPIURL = @"https://your-api.com/validate";
+static NSString *const kKeychainService = @"com.wangxian.hook.deviceid";
+static NSString *const kKeychainAccount = @"device_id";
+static NSString *const kValidationCacheKey = @"validation_cache";
+static NSTimeInterval const kValidationCacheDuration = 24 * 60 * 60; // 24 hours
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -52,7 +56,7 @@ static void _log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-static void showActivationFailedAlert(NSString *reason, NSString *currentID) {
+static void showActivationFailedAlert(NSString *reason, NSString *deviceID) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = [[UIApplication sharedApplication] keyWindow];
         if (!w) {
@@ -65,7 +69,7 @@ static void showActivationFailedAlert(NSString *reason, NSString *currentID) {
         if (!rootVC) return;
         
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Hook未激活" 
-                                                                       message:[NSString stringWithFormat:@"%@\n\n当前设备标识:\n%@", reason, currentID]
+                                                                       message:[NSString stringWithFormat:@"%@\n\n设备ID:\n%@", reason, deviceID]
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         
         UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"确定" 
@@ -77,41 +81,152 @@ static void showActivationFailedAlert(NSString *reason, NSString *currentID) {
     });
 }
 
-static NSString *getDeviceIdentifier(void) {
-    NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    if (idfv) {
-        DLOG(@"[ACT] identifierForVendor: %@", idfv);
-        return [[idfv uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+static BOOL saveToKeychain(NSString *service, NSString *account, NSString *value) {
+    @try {
+        NSData *valueData = [value dataUsingEncoding:NSUTF8StringEncoding];
+        
+        NSDictionary *deleteQuery = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: service,
+            (__bridge id)kSecAttrAccount: account
+        };
+        
+        SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+        
+        NSDictionary *addQuery = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: service,
+            (__bridge id)kSecAttrAccount: account,
+            (__bridge id)kSecValueData: valueData,
+            (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlock
+        };
+        
+        OSStatus status = SecItemAdd((__bridge CFDictionaryRef)addQuery, NULL);
+        return (status == errSecSuccess);
+    } @catch (NSException *e) {
+        DLOG(@"[KEYCHAIN] Save exception: %@", e);
+        return NO;
     }
-    
-    NSString *uuid = [[NSUUID UUID] UUIDString];
-    DLOG(@"[ACT] Using fallback UUID: %@", uuid);
-    return [[uuid uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
 }
 
-static BOOL checkUDIDActivation(void) {
-    NSString *currentID = getDeviceIdentifier();
+static NSString *readFromKeychain(NSString *service, NSString *account) {
+    @try {
+        NSDictionary *query = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService: service,
+            (__bridge id)kSecAttrAccount: account,
+            (__bridge id)kSecReturnData: (__bridge id)kCFBooleanTrue,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+        };
+        
+        CFDataRef dataRef = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&dataRef);
+        
+        if (status == errSecSuccess && dataRef) {
+            NSData *data = (__bridge_transfer NSData *)dataRef;
+            return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        }
+        
+        return nil;
+    } @catch (NSException *e) {
+        DLOG(@"[KEYCHAIN] Read exception: %@", e);
+        return nil;
+    }
+}
+
+static NSString *getPersistentDeviceID(void) {
+    NSString *deviceID = readFromKeychain(kKeychainService, kKeychainAccount);
     
-    DLOG(@"[ACT] Current device identifier: %@", currentID);
-    DLOG(@"[ACT] Allowed UDID in dylib: %@", kAllowedUDID);
+    if (deviceID) {
+        DLOG(@"[ACT] Read device ID from Keychain: %@", deviceID);
+        return deviceID;
+    }
     
-    if ([kAllowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
-        DLOG(@"[ACT] ERROR: UDID placeholder not replaced!");
-        showActivationFailedAlert(@"UDID未绑定，请在重签名时使用脚本替换dylib中的UDID占位符。\n\n命令示例:\npython replace_udid.py WangXianHook.dylib \"您的设备UDID\"", currentID);
+    NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    if (!idfv) {
+        idfv = [[NSUUID UUID] UUIDString];
+    }
+    
+    deviceID = [[idfv uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    
+    if (saveToKeychain(kKeychainService, kKeychainAccount, deviceID)) {
+        DLOG(@"[ACT] Saved device ID to Keychain: %@", deviceID);
+    } else {
+        DLOG(@"[ACT] Failed to save device ID to Keychain");
+    }
+    
+    return deviceID;
+}
+
+static BOOL validateWithServer(NSString *deviceID) {
+    NSString *cache = readFromKeychain(kKeychainService, kValidationCacheKey);
+    if (cache) {
+        NSArray *parts = [cache componentsSeparatedByString:@"|"];
+        if (parts.count == 2) {
+            BOOL valid = [parts[0] boolValue];
+            NSTimeInterval timestamp = [parts[1] doubleValue];
+            if (valid && ([[NSDate date] timeIntervalSince1970] - timestamp) < kValidationCacheDuration) {
+                DLOG(@"[ACT] Using cached validation result (valid)");
+                return YES;
+            }
+        }
+    }
+    
+    DLOG(@"[ACT] Sending validation request for device ID: %@", deviceID);
+    
+    NSURL *url = [NSURL URLWithString:kValidationAPIURL];
+    NSURLRequest *request = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:10.0];
+    
+    NSMutableURLRequest *mutableRequest = [request mutableCopy];
+    [mutableRequest setHTTPMethod:@"POST"];
+    [mutableRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    
+    NSData *bodyData = [[NSString stringWithFormat:@"{\"udid\":\"%@\"}", deviceID] dataUsingEncoding:NSUTF8StringEncoding];
+    [mutableRequest setHTTPBody:bodyData];
+    
+    NSURLResponse *response = nil;
+    NSError *error = nil;
+    NSData *responseData = [NSURLConnection sendSynchronousRequest:mutableRequest returningResponse:&response error:&error];
+    
+    if (error) {
+        DLOG(@"[ACT] Network error: %@", error.localizedDescription);
+        showActivationFailedAlert(@"网络连接失败，无法验证设备。\n\n请检查网络连接后重试。", deviceID);
         return NO;
     }
     
-    NSString *allowedNormalized = [[kAllowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
-    
-    BOOL matches = [currentID isEqualToString:allowedNormalized];
-    DLOG(@"[ACT] UDID verification %@", matches ? @"PASSED" : @"FAILED");
-    
-    if (!matches) {
-        DLOG(@"[ACT] ERROR: UDID mismatch!");
-        showActivationFailedAlert(@"设备验证失败，当前设备未被授权。\n\n请联系开发者获取授权，或使用正确签名的IPA文件。", currentID);
+    if (!responseData) {
+        DLOG(@"[ACT] Empty response from server");
+        showActivationFailedAlert(@"服务器响应为空，无法验证设备。", deviceID);
+        return NO;
     }
     
-    return matches;
+    NSError *jsonError = nil;
+    NSDictionary *result = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:&jsonError];
+    
+    if (jsonError) {
+        DLOG(@"[ACT] JSON parse error: %@", jsonError.localizedDescription);
+        showActivationFailedAlert(@"服务器响应格式错误，无法验证设备。", deviceID);
+        return NO;
+    }
+    
+    BOOL valid = [[result objectForKey:@"valid"] boolValue];
+    DLOG(@"[ACT] Server validation result: %@", valid ? @"valid" : @"invalid");
+    
+    if (valid) {
+        NSString *cacheValue = [NSString stringWithFormat:@"1|%.0f", [[NSDate date] timeIntervalSince1970]];
+        saveToKeychain(kKeychainService, kValidationCacheKey, cacheValue);
+        return YES;
+    } else {
+        showActivationFailedAlert(@"设备未授权，请联系开发者获取授权。", deviceID);
+        return NO;
+    }
+}
+
+static BOOL checkUDIDActivation(void) {
+    NSString *deviceID = getPersistentDeviceID();
+    DLOG(@"[ACT] Persistent device ID: %@", deviceID);
+    
+    return validateWithServer(deviceID);
 }
 
 static void log_init(void) {
@@ -119,7 +234,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.08 UDID Placeholder Verification ===");
+        _log(@"=== WXHook v35.09 Server Validation with Keychain ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         
         g_isActivated = checkUDIDActivation();
