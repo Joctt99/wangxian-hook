@@ -52,6 +52,31 @@ static void _log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
+static void showActivationFailedAlert(NSString *reason, NSString *currentUDID) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *w = [[UIApplication sharedApplication] keyWindow];
+        if (!w) {
+            NSArray *windows = [[UIApplication sharedApplication] windows];
+            if (windows.count > 0) w = windows[0];
+        }
+        if (!w) return;
+        
+        UIViewController *rootVC = w.rootViewController;
+        if (!rootVC) return;
+        
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Hook未激活" 
+                                                                       message:[NSString stringWithFormat:@"%@\n\n当前设备UDID:\n%@", reason, currentUDID]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        
+        UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"确定" 
+                                                           style:UIAlertActionStyleDefault 
+                                                         handler:nil];
+        
+        [alert addAction:okAction];
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    });
+}
+
 static BOOL checkUDIDActivation(void) {
     NSString *currentUDID = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     if (!currentUDID) currentUDID = @"UNKNOWN";
@@ -61,6 +86,7 @@ static BOOL checkUDIDActivation(void) {
     
     if ([kAllowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
         DLOG(@"[ACT] ERROR: UDID placeholder not replaced! Hook disabled.");
+        showActivationFailedAlert(@"UDID未绑定，请在重签名时使用脚本替换UDID占位符。\n\n命令示例:\npython replace_udid.py WangXianHook.dylib \"您的设备UDID\"", currentUDID);
         return NO;
     }
     
@@ -69,6 +95,11 @@ static BOOL checkUDIDActivation(void) {
     
     BOOL matches = [allowedNormalized isEqualToString:currentNormalized];
     DLOG(@"[ACT] UDID verification %@", matches ? @"PASSED" : @"FAILED");
+    
+    if (!matches) {
+        DLOG(@"[ACT] ERROR: UDID mismatch! Hook disabled.");
+        showActivationFailedAlert(@"UDID验证失败，当前设备未被授权。\n\n请联系开发者获取授权，或使用正确的IPA文件。", currentUDID);
+    }
     
     return matches;
 }
