@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.13 - CRITICAL NETWORK FIX: Don't zero out seqId (offset 8-11) in version check responses
+ * WangXianHook v35.14 - UUID FIX: Patch empty UUID in handshake packets to fix game server connection
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -61,7 +61,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.13 ===");
+        _log(@"=== WXHook v35.14 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -242,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.13 诊断面板";
+            lbl.text = @"WXHook v35.14 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1349,14 +1349,69 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     void *sendBuf = (void *)buf;
     size_t sendLen = len;
     
-    if (port == 5678 && len >= 12) {
+    if (len >= 12) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
+        if (port == 5678) {
+            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
+        }
         
-        // UUID/MAC modification disabled - keeping original values for proper account distinction
-        (void)cmd;  // suppress unused warning
+        // Fix empty UUID in handshake packets (0x00FFB005, 0x00EAF016, 0x000EE007)
+        // Some devices return empty UUID which causes game server to reject connection
+        if (cmd == 0x00FFB005 || cmd == 0x00EAF016 || cmd == 0x000EE007) {
+            const char *haystack = (const char *)buf;
+            const char *needle = "UUID=MACADDRESS=";
+            size_t needleLen = strlen(needle);
+            for (size_t i = 0; i + needleLen < len; i++) {
+                if (memcmp(haystack + i, needle, needleLen) == 0) {
+                    size_t uuidFieldLen = 0;
+                    // Find the length byte (2 bytes before "UUID=MACADDRESS=")
+                    if (i >= 2) {
+                        uuidFieldLen = ((uint16_t)haystack[i-2] << 8) | (uint8_t)haystack[i-1];
+                    }
+                    // Check if UUID value is empty (field length == prefix length only)
+                    if (uuidFieldLen == needleLen || (i + needleLen < len && haystack[i + needleLen] == 0)) {
+                        DLOG(@"[SEND-FIX] Empty UUID detected in cmd=0x%08X, generating fake UUID", cmd);
+                        // Generate a consistent fake UUID based on OpenUDID
+                        NSString *fakeUUID = @"B4F45911-6E9F-4733-B6EA-0E64B1763FEC";
+                        const char *uuidStr = [fakeUUID UTF8String];
+                        size_t uuidStrLen = strlen(uuidStr);
+                        size_t newFieldLen = needleLen + uuidStrLen;
+                        size_t newPktLen = len + (newFieldLen - uuidFieldLen);
+                        
+                        unsigned char *newBuf = (unsigned char *)malloc(newPktLen);
+                        if (newBuf) {
+                            // Copy data before UUID field
+                            size_t beforeLen = i - 2;
+                            memcpy(newBuf, buf, beforeLen);
+                            // Update field length (2 bytes big-endian)
+                            newBuf[beforeLen] = (newFieldLen >> 8) & 0xFF;
+                            newBuf[beforeLen + 1] = newFieldLen & 0xFF;
+                            // Copy "UUID=MACADDRESS=" prefix
+                            memcpy(newBuf + beforeLen + 2, needle, needleLen);
+                            // Copy fake UUID value
+                            memcpy(newBuf + beforeLen + 2 + needleLen, uuidStr, uuidStrLen);
+                            // Copy remaining data after old UUID field
+                            size_t afterOffset = i + uuidFieldLen;
+                            size_t afterLen = len - afterOffset;
+                            memcpy(newBuf + beforeLen + 2 + newFieldLen, haystack + afterOffset, afterLen);
+                            // Update packet length (4 bytes big-endian at offset 0)
+                            newBuf[0] = (newPktLen >> 24) & 0xFF;
+                            newBuf[1] = (newPktLen >> 16) & 0xFF;
+                            newBuf[2] = (newPktLen >> 8) & 0xFF;
+                            newBuf[3] = newPktLen & 0xFF;
+                            
+                            sendBuf = newBuf;
+                            sendLen = newPktLen;
+                            DLOG(@"[SEND-FIX] UUID patched: pktLen=%zu -> %zu, fieldLen=%zu -> %zu", 
+                                 len, newPktLen, uuidFieldLen, newFieldLen);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
     
     if (host && sendLen > 0) {
