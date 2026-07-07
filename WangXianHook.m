@@ -1,8 +1,9 @@
 /**
- * WangXianHook v35.08 - KEYBOARD INPUT FIX: Fixed crash when switching input method via long press
- * FIX: REMOVED NSArray count hook - was causing crashes during keyboard input/IME switching
- * FIX: Optimized NSDictionary objectForKey hook with limited logging to prevent performance issues
- * FIX: Added keyboard protection with UIKeyboard notifications and gesture conflict prevention
+ * WangXianHook v35.12 - UI FIX + NETWORK DISCONNECT FIX
+ * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
+ * FIX: Added pan gesture for movable log button (drag to reposition)
+ * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
+ * FIX: Stop corrupting version string in 0x8002A016 (was misidentified as server list response)
  * FIX: Set requiresExclusiveTouchType=NO on gesture recognizers to avoid blocking system gestures
  * FIX: Set userInteractionEnabled=NO on hidden log button to prevent accidental interaction
  * FIX: Enhanced socket hook initialization with dlsym fallback for ALL hooks (connect, send, recv, recvfrom, recvmsg, write, read, close)
@@ -60,7 +61,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.08 ===");
+        _log(@"=== WXHook v35.12 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -179,6 +180,7 @@ static void hook_scExit(id self, SEL _cmd) {
 - (void)clearLog;
 - (void)toggleLogging;
 - (void)handleTripleTap:(UITapGestureRecognizer *)gesture;
+- (void)handlePan:(UIPanGestureRecognizer *)gesture;
 @end
 
 static UIButton *g_btn = nil;
@@ -240,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.08 诊断面板";
+            lbl.text = @"WXHook v35.12 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -475,6 +477,17 @@ static void installKeyboardProtection(void) {
             DLOG(@"[UI] Log button hidden via triple-tap");
         }
     }
+}
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    if (!g_btn || g_btn.hidden) return;
+    UIView *v = gesture.view;
+    CGPoint translation = [gesture translationInView:v.superview];
+    CGPoint newCenter = CGPointMake(v.center.x + translation.x, v.center.y + translation.y);
+    CGRect bounds = v.superview.bounds;
+    newCenter.x = MAX(25, MIN(bounds.size.width - 25, newCenter.x));
+    newCenter.y = MAX(25, MIN(bounds.size.height - 25, newCenter.y));
+    v.center = newCenter;
+    [gesture setTranslation:CGPointZero inView:v.superview];
 }
 @end
 
@@ -901,10 +914,16 @@ static void createLogButton(UIWindow *w) {
     
     g_btn.titleLabel.font = [UIFont systemFontOfSize:10];
     g_btn.hidden = YES;
-    g_btn.userInteractionEnabled = NO;
+    g_btn.userInteractionEnabled = YES;
     [g_btn addTarget:g_handler action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [w addSubview:g_btn];
     [w bringSubviewToFront:g_btn];
+    
+    // Pan gesture for moving the log button (drag to reposition)
+    UIPanGestureRecognizer *panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:g_handler action:@selector(handlePan:)];
+    panGesture.cancelsTouchesInView = NO;
+    panGesture.requiresExclusiveTouchType = NO;
+    [g_btn addGestureRecognizer:panGesture];
     
     UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:g_handler action:@selector(handleTripleTap:)];
     tripleTap.numberOfTapsRequired = 2;
