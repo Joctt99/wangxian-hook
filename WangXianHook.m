@@ -26,7 +26,7 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-static NSString *const kInfoPlistUDIDKey = @"WXHookAllowedUDID";
+static NSString *const kMobileProvisionPath = @"embedded.mobileprovision";
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -77,31 +77,91 @@ static void showActivationFailedAlert(NSString *reason, NSString *currentUDID) {
     });
 }
 
+static NSArray *getProvisionedUDIDs(void) {
+    NSString *provisionPath = [[NSBundle mainBundle] pathForResource:@"embedded" ofType:@"mobileprovision"];
+    if (!provisionPath) {
+        DLOG(@"[ACT] ERROR: embedded.mobileprovision not found");
+        return nil;
+    }
+    
+    NSData *provisionData = [NSData dataWithContentsOfFile:provisionPath];
+    if (!provisionData) {
+        DLOG(@"[ACT] ERROR: Cannot read embedded.mobileprovision");
+        return nil;
+    }
+    
+    NSString *provisionString = [[NSString alloc] initWithData:provisionData encoding:NSASCIIStringEncoding];
+    if (!provisionString) {
+        DLOG(@"[ACT] ERROR: Cannot parse provision string");
+        return nil;
+    }
+    
+    NSRange plistStart = [provisionString rangeOfString:@"<?xml"];
+    NSRange plistEnd = [provisionString rangeOfString:@"</plist>"];
+    
+    if (plistStart.location == NSNotFound || plistEnd.location == NSNotFound) {
+        DLOG(@"[ACT] ERROR: Cannot find plist content in mobileprovision");
+        return nil;
+    }
+    
+    NSRange plistRange = NSMakeRange(plistStart.location, plistEnd.location + 8 - plistStart.location);
+    NSString *plistString = [provisionString substringWithRange:plistRange];
+    NSData *plistData = [plistString dataUsingEncoding:NSUTF8StringEncoding];
+    
+    if (!plistData) {
+        DLOG(@"[ACT] ERROR: Cannot convert plist to data");
+        return nil;
+    }
+    
+    NSError *error = nil;
+    NSDictionary *plistDict = [NSPropertyListSerialization propertyListWithData:plistData options:NSPropertyListImmutable format:nil error:&error];
+    
+    if (error) {
+        DLOG(@"[ACT] ERROR: Failed to parse plist: %@", error.localizedDescription);
+        return nil;
+    }
+    
+    NSArray *provisionedDevices = [plistDict objectForKey:@"ProvisionedDevices"];
+    if (provisionedDevices && [provisionedDevices isKindOfClass:[NSArray class]]) {
+        DLOG(@"[ACT] Found %lu provisioned devices", (unsigned long)provisionedDevices.count);
+        return provisionedDevices;
+    }
+    
+    DLOG(@"[ACT] WARNING: No ProvisionedDevices found in mobileprovision (enterprise/signing?)");
+    return nil;
+}
+
 static BOOL checkUDIDActivation(void) {
     NSString *currentUDID = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     if (!currentUDID) currentUDID = @"UNKNOWN";
     
-    NSDictionary *infoPlist = [[NSBundle mainBundle] infoDictionary];
-    NSString *allowedUDID = [infoPlist objectForKey:kInfoPlistUDIDKey];
-    
     DLOG(@"[ACT] Current device UDID: %@", currentUDID);
-    DLOG(@"[ACT] Allowed UDID from Info.plist: %@", allowedUDID ?: @"NOT SET");
     
-    if (!allowedUDID || allowedUDID.length == 0 || [allowedUDID isEqualToString:@"__WXHOOK_UDID_PLACEHOLDER__"]) {
-        DLOG(@"[ACT] ERROR: UDID not set in Info.plist! Hook disabled.");
-        showActivationFailedAlert(@"UDID未配置，请在重签名时在Info.plist中添加 WXHookAllowedUDID 键并设置为设备UDID。", currentUDID);
-        return NO;
+    NSArray *allowedUDIDs = getProvisionedUDIDs();
+    
+    if (!allowedUDIDs || allowedUDIDs.count == 0) {
+        DLOG(@"[ACT] WARNING: No provisioned UDIDs found, skipping verification (enterprise signing?)");
+        return YES;
     }
     
-    NSString *allowedNormalized = [[allowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     NSString *currentNormalized = [[currentUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
     
-    BOOL matches = [allowedNormalized isEqualToString:currentNormalized];
+    BOOL matches = NO;
+    for (NSString *allowedUDID in allowedUDIDs) {
+        NSString *allowedNormalized = [[allowedUDID uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+        DLOG(@"[ACT] Checking against provisioned UDID: %@", allowedUDID);
+        
+        if ([allowedNormalized isEqualToString:currentNormalized]) {
+            matches = YES;
+            break;
+        }
+    }
+    
     DLOG(@"[ACT] UDID verification %@", matches ? @"PASSED" : @"FAILED");
     
     if (!matches) {
-        DLOG(@"[ACT] ERROR: UDID mismatch! Hook disabled.");
-        showActivationFailedAlert(@"UDID验证失败，当前设备未被授权。\n\n请联系开发者获取授权，或使用正确的IPA文件。", currentUDID);
+        DLOG(@"[ACT] ERROR: UDID not in provisioned list! Hook disabled.");
+        showActivationFailedAlert(@"UDID验证失败，当前设备未在签名证书的设备列表中。\n\n请使用正确签名的IPA文件，或联系开发者添加设备。", currentUDID);
     }
     
     return matches;
