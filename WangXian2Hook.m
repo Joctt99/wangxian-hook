@@ -443,29 +443,31 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             DLOG(@"[PROTO-R] PING RESPONSE cmd=0x%08X", cmd);
         } else if (cmd == 0x800FF012) {
             DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
-            DLOG_HEX(buf, len);
             
-            ssize_t maxPatch = (ssize_t)pktLenBE;
-            if (maxPatch > len) maxPatch = len;
-            
-            const char *fakeServerList = "[{\"serverid\":1,\"serverName\":\"一区\",\"status\":1,\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":12003,\"category\":\"一区\",\"recommend\":1}]";
-            size_t fakeLen = strlen(fakeServerList);
-            
-            if (maxPatch >= 12) {
-                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
-                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Server list status %u -> 1", status4);
+            if (len >= 12) {
+                const char *fakeServerList = "[{\"serverid\":1,\"serverName\":\"一区\",\"status\":1,\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":12003,\"category\":\"一区\",\"recommend\":1}]";
+                size_t fakeLen = strlen(fakeServerList);
+                ssize_t newPktLen = 12 + fakeLen;
+                
+                if (len >= newPktLen) {
+                    buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x01;
+                    
+                    buf[0] = (newPktLen >> 24) & 0xFF;
+                    buf[1] = (newPktLen >> 16) & 0xFF;
+                    buf[2] = (newPktLen >> 8) & 0xFF;
+                    buf[3] = newPktLen & 0xFF;
+                    
+                    memset(buf + 12, 0, len - 12);
+                    memcpy(buf + 12, fakeServerList, fakeLen);
+                    
+                    DLOG(@"[PROTO-R-PATCH] Server list: pktLen=%u -> %zd, status=1, injected fake data", pktLenBE, newPktLen);
+                    DLOG_HEX(buf, newPktLen > 256 ? 256 : newPktLen);
+                    patched = YES;
+                } else {
+                    DLOG(@"[PROTO-R-PATCH] Server list: need %zd bytes, have %zd - patching status only", newPktLen, len);
                     buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x01;
                     patched = YES;
                 }
-            }
-            
-            if (maxPatch > 12 && fakeLen < maxPatch - 12) {
-                DLOG(@"[PROTO-R-PATCH] Replacing server list content with fake data (within pktLen)");
-                memset(buf + 12, 0, maxPatch - 12);
-                memcpy(buf + 12, fakeServerList, fakeLen);
-                patched = YES;
             }
         } else if (cmd == 0x81EFBC8C) {
             DLOG(@"[PROTO-R] LARGE DATA RESPONSE cmd=0x%08X len=%zd", cmd, len);
