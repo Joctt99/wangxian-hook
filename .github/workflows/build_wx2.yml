@@ -1,0 +1,57 @@
+name: Build WangXian2Hook
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'WangXian2Hook.m'
+      - 'Makefile.wx2'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Select Xcode version
+      run: sudo xcode-select -s /Applications/Xcode_15.app/Contents/Developer
+    
+    - name: Verify Xcode installation
+      run: |
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-path
+    
+    - name: Build WangXian2Hook.dylib
+      run: |
+        SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+        CC=$(xcrun --sdk iphoneos --find clang)
+        ARCH=arm64
+        MIN_IOS=12.0
+        
+        $CC -arch $ARCH \
+          -isysroot $SDK_PATH \
+          -miphoneos-version-min=$MIN_IOS \
+          -framework Foundation \
+          -framework UIKit \
+          -framework CoreFoundation \
+          -framework Security \
+          -framework CoreGraphics \
+          -lobjc \
+          -lz \
+          -dynamiclib \
+          -O2 \
+          -fobjc-arc \
+          -o WangXian2Hook.dylib \
+          WangXian2Hook.m
+        
+        echo "Build completed successfully!"
+        ls -la WangXian2Hook.dylib
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WangXian2Hook
+        path: WangXian2Hook.dylib
+        retention-days: 30
