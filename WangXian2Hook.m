@@ -20,6 +20,11 @@ static BOOL g_logHexEnabled = YES;
 static BOOL g_logProtoEnabled = YES;
 static NSUInteger g_logMaxSize = 10 * 1024 * 1024;
 
+static UIButton *g_logBtn = nil;
+static UIView *g_logPanel = nil;
+static UITextView *g_logTextView = nil;
+static UILabel *g_logStatusLbl = nil;
+
 static NSString *_timestamp(void) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"HH:mm:ss.SSS";
@@ -57,6 +62,17 @@ static void _log(NSString *msg) {
             }
         }
         NSLog(@"[WX2Hook] %@", msg);
+        
+        if (g_logTextView && !g_logPanel.hidden) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+                if (content.length > g_logTextView.text.length + 5000) {
+                    content = [content substringFromIndex:content.length - 50000];
+                }
+                g_logTextView.text = content;
+                [g_logTextView scrollRangeToVisible:NSMakeRange(g_logTextView.text.length, 0)];
+            });
+        }
     } @catch (NSException *e) {}
 }
 
@@ -86,10 +102,229 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.5 ===");
+        _log(@"=== WangXian2Hook v2.6 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
+}
+
+#pragma mark - Log Panel UI
+
+@interface WX2Handler : NSObject
+@property (nonatomic) BOOL panelVisible;
+- (void)togglePanel;
+- (void)clearLog;
+- (void)toggleLogging;
+- (void)copyLog;
+- (void)exportLog;
+- (void)refreshLog;
+- (void)handlePan:(UIPanGestureRecognizer *)gesture;
+- (void)handleDoubleTap:(UITapGestureRecognizer *)gesture;
+@end
+
+@implementation WX2Handler
+
+- (void)togglePanel {
+    if (!g_logPanel) {
+        [self createLogPanel];
+    }
+    self.panelVisible = !self.panelVisible;
+    g_logPanel.hidden = !self.panelVisible;
+    
+    if (self.panelVisible) {
+        [self refreshLog];
+        DLOG(@"[UI] Log panel shown");
+    } else {
+        DLOG(@"[UI] Log panel hidden");
+    }
+}
+
+- (void)createLogPanel {
+    UIWindow *w = g_logBtn.window;
+    if (!w) return;
+    
+    CGFloat pw = w.bounds.size.width - 32;
+    CGFloat ph = w.bounds.size.height - 150;
+    
+    g_logPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 100, pw, ph)];
+    g_logPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.95];
+    g_logPanel.layer.cornerRadius = 12;
+    g_logPanel.hidden = YES;
+    
+    UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
+    titleLbl.text = @"WangXian2Hook v2.6 诊断面板";
+    titleLbl.textColor = [UIColor greenColor];
+    titleLbl.font = [UIFont boldSystemFontOfSize:14];
+    [g_logPanel addSubview:titleLbl];
+    
+    g_logStatusLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 34, 80, 20)];
+    g_logStatusLbl.text = @"日志: 开";
+    g_logStatusLbl.textColor = [UIColor greenColor];
+    g_logStatusLbl.font = [UIFont boldSystemFontOfSize:12];
+    [g_logPanel addSubview:g_logStatusLbl];
+    
+    CGFloat bx = pw - 270;
+    
+    UIButton *onOffBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    onOffBtn.frame = CGRectMake(bx, 8, 50, 28);
+    [onOffBtn setTitle:@"开关" forState:UIControlStateNormal];
+    [onOffBtn setTitleColor:[UIColor yellowColor] forState:UIControlStateNormal];
+    [onOffBtn addTarget:self action:@selector(toggleLogging) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:onOffBtn];
+    
+    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clearBtn.frame = CGRectMake(bx + 55, 8, 50, 28);
+    [clearBtn setTitle:@"清除" forState:UIControlStateNormal];
+    [clearBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
+    [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:clearBtn];
+    
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    copyBtn.frame = CGRectMake(bx + 110, 8, 50, 28);
+    [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+    [copyBtn setTitleColor:[UIColor cyanColor] forState:UIControlStateNormal];
+    [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:copyBtn];
+    
+    UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    shareBtn.frame = CGRectMake(bx + 165, 8, 50, 28);
+    [shareBtn setTitle:@"导出" forState:UIControlStateNormal];
+    [shareBtn setTitleColor:[UIColor magentaColor] forState:UIControlStateNormal];
+    [shareBtn addTarget:self action:@selector(exportLog) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:shareBtn];
+    
+    UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    refreshBtn.frame = CGRectMake(bx + 220, 8, 50, 28);
+    [refreshBtn setTitle:@"刷新" forState:UIControlStateNormal];
+    [refreshBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
+    [refreshBtn addTarget:self action:@selector(refreshLog) forControlEvents:UIControlEventTouchUpInside];
+    [g_logPanel addSubview:refreshBtn];
+    
+    g_logTextView = [[UITextView alloc] initWithFrame:CGRectMake(8, 62, pw - 16, ph - 72)];
+    g_logTextView.backgroundColor = [UIColor blackColor];
+    g_logTextView.textColor = [UIColor greenColor];
+    g_logTextView.font = [UIFont fontWithName:@"Menlo" size:11];
+    g_logTextView.editable = NO;
+    [g_logPanel addSubview:g_logTextView];
+    
+    [w addSubview:g_logPanel];
+}
+
+- (void)clearLog {
+    [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    g_logTextView.text = @"(cleared)";
+    g_logEnabled = YES;
+    g_logStatusLbl.text = @"日志: 开";
+    g_logStatusLbl.textColor = [UIColor greenColor];
+    DLOG(@"=== Log cleared ===");
+}
+
+- (void)toggleLogging {
+    g_logEnabled = !g_logEnabled;
+    g_logStatusLbl.text = g_logEnabled ? @"日志: 开" : @"日志: 关";
+    g_logStatusLbl.textColor = g_logEnabled ? [UIColor greenColor] : [UIColor redColor];
+    if (g_logEnabled) {
+        DLOG(@"=== Logging resumed ===");
+    }
+}
+
+- (void)copyLog {
+    NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    [UIPasteboard generalPasteboard].string = content;
+    DLOG(@">>> COPIED %lu chars >>>", (unsigned long)content.length);
+    g_logTextView.text = [NSString stringWithFormat:@">>> COPIED %lu chars to clipboard <<<", (unsigned long)content.length];
+}
+
+- (void)exportLog {
+    if (!g_logPath) {
+        DLOG(@"[EXPORT] Error: log path is nil");
+        return;
+    }
+    
+    if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
+        DLOG(@"[EXPORT] Error: log file does not exist");
+        return;
+    }
+    
+    NSData *fullData = [NSData dataWithContentsOfFile:g_logPath];
+    NSData *exportData = fullData;
+    if (fullData.length > 200 * 1024) {
+        exportData = [fullData subdataWithRange:NSMakeRange(fullData.length - 200 * 1024, 200 * 1024)];
+    }
+    
+    NSString *exportPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wx2hook_export.log"];
+    [exportData writeToFile:exportPath atomically:YES];
+    DLOG(@"[EXPORT] Log exported to: %@", exportPath);
+    g_logTextView.text = [NSString stringWithFormat:@">>> EXPORTED to Documents/wx2hook_export.log <<<"];
+}
+
+- (void)refreshLog {
+    NSString *content = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    g_logTextView.text = content;
+    [g_logTextView scrollRangeToVisible:NSMakeRange(g_logTextView.text.length, 0)];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    if (!g_logBtn || g_logBtn.hidden) return;
+    UIView *v = gesture.view;
+    CGPoint translation = [gesture translationInView:v.superview];
+    CGPoint newCenter = CGPointMake(v.center.x + translation.x, v.center.y + translation.y);
+    CGRect bounds = v.superview.bounds;
+    newCenter.x = MAX(25, MIN(bounds.size.width - 25, newCenter.x));
+    newCenter.y = MAX(25, MIN(bounds.size.height - 25, newCenter.y));
+    v.center = newCenter;
+    [gesture setTranslation:CGPointZero inView:v.superview];
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)gesture {
+    if (g_logBtn) {
+        g_logBtn.hidden = !g_logBtn.hidden;
+        if (!g_logBtn.hidden) {
+            DLOG(@"[UI] Log button shown via double-tap");
+        } else {
+            DLOG(@"[UI] Log button hidden via double-tap");
+            g_logPanel.hidden = YES;
+            self.panelVisible = NO;
+        }
+    }
+}
+
+@end
+
+static void createLogButton(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [[[UIApplication sharedApplication] delegate] window];
+        if (!w || g_logBtn) return;
+        
+        WX2Handler *handler = [[WX2Handler alloc] init];
+        
+        g_logBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        g_logBtn.frame = CGRectMake(w.bounds.size.width - 60, 200, 50, 50);
+        g_logBtn.layer.cornerRadius = 25;
+        g_logBtn.clipsToBounds = YES;
+        
+        [g_logBtn setTitle:@"LOG" forState:UIControlStateNormal];
+        [g_logBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        g_logBtn.backgroundColor = [UIColor colorWithRed:1 green:0.4 blue:0 alpha:0.9];
+        g_logBtn.titleLabel.font = [UIFont systemFontOfSize:10];
+        g_logBtn.hidden = YES;
+        g_logBtn.userInteractionEnabled = YES;
+        
+        [g_logBtn addTarget:handler action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+        [w addSubview:g_logBtn];
+        [w bringSubviewToFront:g_logBtn];
+        
+        UIPanGestureRecognizer *panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:handler action:@selector(handlePan:)];
+        panGesture.cancelsTouchesInView = NO;
+        panGesture.requiresExclusiveTouchType = NO;
+        [g_logBtn addGestureRecognizer:panGesture];
+        
+        UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:handler action:@selector(handleDoubleTap:)];
+        doubleTap.numberOfTapsRequired = 2;
+        [w addGestureRecognizer:doubleTap];
+        
+        DLOG(@"[UI] Log button created (double-tap to show)");
+    });
 }
 
 #pragma mark - Socket Tracking
@@ -149,14 +384,12 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     static const unsigned char needUpdate[] = {0xE8,0xAF,0xB7,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
     static const unsigned char forceUpdate[] = {0xE5,0xBC,0xBA,0x5F,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
     
-    BOOL foundVersionMsg = NO;
     BOOL patched = NO;
     
     for (ssize_t i = 0; i <= len - (ssize_t)sizeof(verLow); i++) {
         if (memcmp(buf + i, verLow, sizeof(verLow)) == 0) {
             DLOG(@"[PATCH] Found '版本过低' at offset %zd", i);
             memset(buf + i, ' ', sizeof(verLow));
-            foundVersionMsg = YES;
             patched = YES;
         }
     }
@@ -165,7 +398,6 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         if (memcmp(buf + i, curVer, sizeof(curVer)) == 0) {
             DLOG(@"[PATCH] Found '当前版本' at offset %zd", i);
             memset(buf + i, ' ', sizeof(curVer));
-            foundVersionMsg = YES;
             patched = YES;
         }
     }
@@ -174,7 +406,6 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         if (memcmp(buf + i, needUpdate, sizeof(needUpdate)) == 0) {
             DLOG(@"[PATCH] Found '请更新' at offset %zd", i);
             memset(buf + i, ' ', sizeof(needUpdate));
-            foundVersionMsg = YES;
             patched = YES;
         }
     }
@@ -183,7 +414,6 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         if (memcmp(buf + i, forceUpdate, sizeof(forceUpdate)) == 0) {
             DLOG(@"[PATCH] Found '强制更新' at offset %zd", i);
             memset(buf + i, ' ', sizeof(forceUpdate));
-            foundVersionMsg = YES;
             patched = YES;
         }
     }
@@ -539,6 +769,10 @@ static void entry(void) {
         Method m = class_getClassMethod(scCls, @selector(exitApplication));
         if (m) { method_setImplementation(m, (IMP)hook_exitApp); DLOG(@"[INIT] SC.exitApplication hooked"); }
     }
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        createLogButton();
+    });
     
     DLOG(@"[INIT] All hooks installed successfully!");
 }
