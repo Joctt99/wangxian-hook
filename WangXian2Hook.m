@@ -102,7 +102,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.6 ===");
+        _log(@"=== WangXian2Hook v2.7 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
@@ -152,7 +152,7 @@ static void log_init(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v2.6 诊断面板";
+    titleLbl.text = @"WangXian2Hook v2.7 诊断面板";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -379,73 +379,100 @@ static ConnectFunc orig_connect = NULL;
 static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     if (!buf || len <= 0) return;
     
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    static const unsigned char needUpdate[] = {0xE8,0xAF,0xB7,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
-    static const unsigned char forceUpdate[] = {0xE5,0xBC,0xBA,0x5F,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
-    
     BOOL patched = NO;
     
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(buf + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH] Found '版本过低' at offset %zd", i);
-            memset(buf + i, ' ', sizeof(verLow));
-            patched = YES;
-        }
-    }
-    
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(curVer); i++) {
-        if (memcmp(buf + i, curVer, sizeof(curVer)) == 0) {
-            DLOG(@"[PATCH] Found '当前版本' at offset %zd", i);
-            memset(buf + i, ' ', sizeof(curVer));
-            patched = YES;
-        }
-    }
-    
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(needUpdate); i++) {
-        if (memcmp(buf + i, needUpdate, sizeof(needUpdate)) == 0) {
-            DLOG(@"[PATCH] Found '请更新' at offset %zd", i);
-            memset(buf + i, ' ', sizeof(needUpdate));
-            patched = YES;
-        }
-    }
-    
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(forceUpdate); i++) {
-        if (memcmp(buf + i, forceUpdate, sizeof(forceUpdate)) == 0) {
-            DLOG(@"[PATCH] Found '强制更新' at offset %zd", i);
-            memset(buf + i, ' ', sizeof(forceUpdate));
-            patched = YES;
-        }
-    }
-    
     if (len >= 8) {
+        uint32_t pktLenBE = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+                            ((uint32_t)buf[2] << 8)  | (uint32_t)buf[3];
         uint32_t cmd = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
                        ((uint32_t)buf[6] << 8)  | (uint32_t)buf[7];
         
         if (g_logProtoEnabled) {
-            DLOG(@"[PROTO] cmd=0x%08X len=%zd", cmd, len);
+            DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, len);
         }
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121 || 
-            cmd == 0x802EE113 || cmd == 0x802EE100) {
-            DLOG(@"[PROTO] VERSION CHECK RESPONSE cmd=0x%08X", cmd);
+        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u", cmd, pktLenBE);
             DLOG_HEX(buf, len);
             
             if (len >= 12) {
                 uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
                                    ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
                 if (status4 != 0) {
-                    DLOG(@"[PATCH] Status %u -> 0", status4);
+                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
                     memset(buf + 8, 0, 4);
                     patched = YES;
                 }
             }
             
             if (len >= 13 && buf[12] != 0) {
-                DLOG(@"[PATCH] Byte status %u -> 0", buf[12]);
+                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", buf[12]);
                 buf[12] = 0;
                 patched = YES;
             }
+            
+            if (len > 13) {
+                DLOG(@"[PROTO-R-PATCH] Clearing error messages from offset 13 onwards (%zd bytes)", len - 13);
+                memset(buf + 13, 0, len - 13);
+                patched = YES;
+            }
+        } else if (cmd == 0x76666669) {
+            DLOG(@"[PROTO-R] ERROR RESPONSE cmd=0x%08X (vfvfi pattern)", cmd);
+            DLOG_HEX(buf, len);
+            
+            if (len >= 12) {
+                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
+                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Error status %u -> 0", status4);
+                    memset(buf + 8, 0, 4);
+                    patched = YES;
+                }
+            }
+        } else if (cmd == 0x80000015) {
+            DLOG(@"[PROTO-R] PING RESPONSE cmd=0x%08X", cmd);
+        } else if (cmd == 0x800FF012) {
+            DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X len=%zd", cmd, len);
+            DLOG_HEX(buf, len);
+        } else if (cmd == 0x81EFBC8C) {
+            DLOG(@"[PROTO-R] LARGE DATA RESPONSE cmd=0x%08X len=%zd", cmd, len);
+        }
+    }
+    
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(buf + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-R] Detected '版本过低' at offset %zd", i);
+            memset(buf + i, ' ', sizeof(verLow));
+            patched = YES;
+        }
+    }
+    
+    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(curVer); i++) {
+        if (memcmp(buf + i, curVer, sizeof(curVer)) == 0) {
+            DLOG(@"[PATCH-R] Detected '当前版本' at offset %zd", i);
+            memset(buf + i, ' ', sizeof(curVer));
+            patched = YES;
+        }
+    }
+    
+    static const unsigned char needUpdate[] = {0xE8,0xAF,0xB7,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
+    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(needUpdate); i++) {
+        if (memcmp(buf + i, needUpdate, sizeof(needUpdate)) == 0) {
+            DLOG(@"[PATCH-R] Detected '请更新' at offset %zd", i);
+            memset(buf + i, ' ', sizeof(needUpdate));
+            patched = YES;
+        }
+    }
+    
+    static const unsigned char forceUpdate[] = {0xE5,0xBC,0xBA,0x5F,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
+    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(forceUpdate); i++) {
+        if (memcmp(buf + i, forceUpdate, sizeof(forceUpdate)) == 0) {
+            DLOG(@"[PATCH-R] Detected '强制更新' at offset %zd", i);
+            memset(buf + i, ' ', sizeof(forceUpdate));
+            patched = YES;
         }
     }
     
@@ -460,14 +487,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv || !buf) return -1;
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
-    if (ret > 0) {
-        const char *host = getHostForFd(fd);
-        int port = getPortForFd(fd);
-        
-        DLOG(@"[RECV] fd=%d %s:%d len=%zd", fd, host ?: "unknown", port, ret);
-        
-        patchVersionCheckResponse((unsigned char *)buf, ret);
-    }
+    if (ret <= 0) return ret;
+    
+    const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
+    
+    DLOG(@"[RECV] fd=%d %s:%d len=%zd", fd, host ?: "unknown", port, ret);
+    
+    patchVersionCheckResponse((unsigned char *)buf, ret);
+    
     return ret;
 }
 
@@ -476,26 +504,27 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
     if (!orig_recvfrom || !buf) return -1;
     
     ssize_t ret = orig_recvfrom(fd, buf, len, flags, src_addr, addrlen);
-    if (ret > 0) {
-        char host[64] = "unknown";
-        int port = 0;
-        
-        if (src_addr && addrlen && *addrlen > 0) {
-            if (src_addr->sa_family == AF_INET) {
-                struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
-                inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
-                port = ntohs(sin->sin_port);
-            } else if (src_addr->sa_family == AF_INET6) {
-                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)src_addr;
-                inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
-                port = ntohs(sin6->sin6_port);
-            }
+    if (ret <= 0) return ret;
+    
+    char host[64] = "unknown";
+    int port = 0;
+    
+    if (src_addr && addrlen && *addrlen > 0) {
+        if (src_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
+            port = ntohs(sin->sin_port);
+        } else if (src_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)src_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
+            port = ntohs(sin6->sin6_port);
         }
-        
-        DLOG(@"[RECVFROM] fd=%d %s:%d len=%zd", fd, host, port, ret);
-        
-        patchVersionCheckResponse((unsigned char *)buf, ret);
     }
+    
+    DLOG(@"[RECVFROM] fd=%d %s:%d len=%zd", fd, host, port, ret);
+    
+    patchVersionCheckResponse((unsigned char *)buf, ret);
+    
     return ret;
 }
 
@@ -504,30 +533,31 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
     if (!orig_recvmsg || !msg || !msg->msg_iov || msg->msg_iovlen == 0) return -1;
     
     ssize_t ret = orig_recvmsg(fd, msg, flags);
-    if (ret > 0) {
-        char host[64] = "unknown";
-        int port = 0;
-        
-        if (msg->msg_name && msg->msg_namelen > 0) {
-            struct sockaddr *src_addr = (struct sockaddr *)msg->msg_name;
-            if (src_addr->sa_family == AF_INET) {
-                struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
-                inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
-                port = ntohs(sin->sin_port);
-            } else if (src_addr->sa_family == AF_INET6) {
-                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)src_addr;
-                inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
-                port = ntohs(sin6->sin6_port);
-            }
-        }
-        
-        DLOG(@"[RECVMSG] fd=%d %s:%d len=%zd", fd, host, port, ret);
-        
-        struct iovec *iov = msg->msg_iov;
-        if (iov->iov_base && iov->iov_len > 0) {
-            patchVersionCheckResponse((unsigned char *)iov->iov_base, ret);
+    if (ret <= 0) return ret;
+    
+    char host[64] = "unknown";
+    int port = 0;
+    
+    if (msg->msg_name && msg->msg_namelen > 0) {
+        struct sockaddr *src_addr = (struct sockaddr *)msg->msg_name;
+        if (src_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
+            port = ntohs(sin->sin_port);
+        } else if (src_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)src_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
+            port = ntohs(sin6->sin6_port);
         }
     }
+    
+    DLOG(@"[RECVMSG] fd=%d %s:%d len=%zd", fd, host, port, ret);
+    
+    struct iovec *iov = msg->msg_iov;
+    if (iov->iov_base && iov->iov_len > 0) {
+        patchVersionCheckResponse((unsigned char *)iov->iov_base, ret);
+    }
+    
     return ret;
 }
 
