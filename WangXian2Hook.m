@@ -398,10 +398,13 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         }
         
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
-            DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u", cmd, pktLenBE);
+            DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
             DLOG_HEX(buf, len);
             
-            if (len >= 12) {
+            ssize_t maxPatch = (ssize_t)pktLenBE;
+            if (maxPatch > len) maxPatch = len;
+            
+            if (maxPatch >= 12) {
                 uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
                                    ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
                 DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
@@ -412,15 +415,15 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
                 }
             }
             
-            if (len >= 13 && buf[12] != 0) {
+            if (maxPatch >= 13 && buf[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", buf[12]);
                 buf[12] = 0;
                 patched = YES;
             }
             
-            if (len > 13) {
-                DLOG(@"[PROTO-R-PATCH] Clearing error messages from offset 13 onwards (%zd bytes)", len - 13);
-                memset(buf + 13, 0, len - 13);
+            if (maxPatch > 13) {
+                DLOG(@"[PROTO-R-PATCH] Clearing error messages from offset 13 onwards (%zd bytes, within pktLen)", maxPatch - 13);
+                memset(buf + 13, 0, maxPatch - 13);
                 patched = YES;
             }
         } else if (cmd == 0x76666669) {
@@ -439,13 +442,16 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         } else if (cmd == 0x80000015) {
             DLOG(@"[PROTO-R] PING RESPONSE cmd=0x%08X", cmd);
         } else if (cmd == 0x800FF012) {
-            DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X len=%zd", cmd, len);
+            DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
             DLOG_HEX(buf, len);
+            
+            ssize_t maxPatch = (ssize_t)pktLenBE;
+            if (maxPatch > len) maxPatch = len;
             
             const char *fakeServerList = "[{\"serverid\":1,\"serverName\":\"一区\",\"status\":1,\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":12003,\"category\":\"一区\",\"recommend\":1}]";
             size_t fakeLen = strlen(fakeServerList);
             
-            if (len >= 12) {
+            if (maxPatch >= 12) {
                 uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
                                    ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
                 if (status4 != 0) {
@@ -455,9 +461,9 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
                 }
             }
             
-            if (len > 12 && fakeLen < len - 12) {
-                DLOG(@"[PROTO-R-PATCH] Replacing server list content with fake data");
-                memset(buf + 12, 0, len - 12);
+            if (maxPatch > 12 && fakeLen < maxPatch - 12) {
+                DLOG(@"[PROTO-R-PATCH] Replacing server list content with fake data (within pktLen)");
+                memset(buf + 12, 0, maxPatch - 12);
                 memcpy(buf + 12, fakeServerList, fakeLen);
                 patched = YES;
             }
