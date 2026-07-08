@@ -3,7 +3,6 @@
 # Usage: make -f Makefile.wx2
 
 TARGET = WangXian2Hook.dylib
-SOURCES = WangXian2Hook.m fishhook.c
 
 SDK_PATH  = $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC        = $(shell xcrun --sdk iphoneos --find clang)
@@ -23,11 +22,15 @@ CFLAGS += -lz
 CFLAGS += -dynamiclib
 CFLAGS += -O2
 CFLAGS += -fobjc-arc
+# 减少C++运行时依赖，降低ABI冲突风险
+CFLAGS += -fno-exceptions
+CFLAGS += -fno-rtti
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES)
+$(TARGET): WangXian2Hook.m fishhook.c
+	# WangXian2Hook.m 编译为 ObjC++（支持 std::string），fishhook.c 保持 C
+	$(CC) $(CFLAGS) -x objective-c++ WangXian2Hook.m -x c fishhook.c -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@ls -la $(TARGET)
 
