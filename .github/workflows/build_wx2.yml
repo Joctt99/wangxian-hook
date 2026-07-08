@@ -42,6 +42,7 @@ jobs:
           -framework CoreGraphics \
           -lobjc \
           -lz \
+          -lc++ \
           -dynamiclib \
           -O2 \
           -fobjc-arc \
