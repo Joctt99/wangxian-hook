@@ -1,11 +1,14 @@
-#import "fishhook.h"
-#import <dlfcn.h>
-#import <stdlib.h>
-#import <string.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <sys/mman.h>
+#include "fishhook.h"
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <sys/mman.h>
+
+typedef uint32_t uint;
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
