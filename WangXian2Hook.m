@@ -12,6 +12,8 @@
 #import <sys/mman.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import "fishhook.h"
+#include <string>
+#include <cstring>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:@"[%@] " fmt, _timestamp(), ##__VA_ARGS__])
 #define DLOG_HEX(buf, len) _log_hex(buf, len)
@@ -104,7 +106,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.0 C++ Hook ===");
+        _log(@"=== WangXian2Hook v4.1 Hardened C++ Hook ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
@@ -159,174 +161,268 @@ static NSString *generateSignV2(NSString *username, NSString *password, NSString
 
 #pragma mark - C++ Function Hooks (GameMessageFactory)
 
-typedef void* (*ConstructLoginReqV1Func)(void *outPacket,
-                                         const char *username,
-                                         const char *password,
-                                         const char *deviceId,
-                                         const char *channel,
-                                         const char *os,
-                                         const char *subChannel,
-                                         const char *phoneModel);
+// 使用 std::string& 的正确函数签名（AAPCS64下引用=指针，ABI兼容）
+typedef void (*ConstructLoginReqV1Func)(std::string& out,
+    const std::string& p0, const std::string& p1, const std::string& p2,
+    const std::string& p3, const std::string& p4, const std::string& p5,
+    const std::string& p6);
 
-typedef void* (*ConstructLoginReqV2Func)(void *outPacket,
-                                         const char *param0,
-                                         const char *param1,
-                                         const char *param2,
-                                         const char *param3,
-                                         const char *param4,
-                                         const char *param5,
-                                         const char *param6,
-                                         const char *param7,
-                                         const char *param8,
-                                         const char *param9,
-                                         const char *param10,
-                                         const char *param11,
-                                         const char *param12,
-                                         const char *param13,
-                                         const char *param14,
-                                         const char *param15);
+typedef void (*ConstructLoginReqV2Func)(std::string& out,
+    const std::string& p0, const std::string& p1, const std::string& p2,
+    const std::string& p3, const std::string& p4, const std::string& p5,
+    const std::string& p6, const std::string& p7, const std::string& p8,
+    const std::string& p9, const std::string& p10, const std::string& p11,
+    const std::string& p12, const std::string& p13, const std::string& p14,
+    const std::string& p15);
 
 static ConstructLoginReqV1Func orig_construct_login_v1 = NULL;
 static ConstructLoginReqV2Func orig_construct_login_v2 = NULL;
+static BOOL g_manualMode = NO;
 
-static void *my_construct_login_v1(void *outPacket,
-                                   const char *username,
-                                   const char *password,
-                                   const char *deviceId,
-                                   const char *channel,
-                                   const char *os,
-                                   const char *subChannel,
-                                   const char *phoneModel) {
-    DLOG(@"[C++-HOOK] construct_NEW_USER_LOGIN_REQ_v1 called!");
-    DLOG(@"[C++-HOOK]   username=%s", username ? username : "(null)");
-    DLOG(@"[C++-HOOK]   password=%s", password ? password : "(null)");
-    DLOG(@"[C++-HOOK]   deviceId=%s", deviceId ? deviceId : "(null)");
-    DLOG(@"[C++-HOOK]   channel=%s", channel ? channel : "(null)");
-    DLOG(@"[C++-HOOK]   os=%s", os ? os : "(null)");
-    DLOG(@"[C++-HOOK]   subChannel=%s", subChannel ? subChannel : "(null)");
-    DLOG(@"[C++-HOOK]   phoneModel=%s", phoneModel ? phoneModel : "(null)");
-
-    if (!orig_construct_login_v2) {
-        DLOG(@"[C++-HOOK] v2 function not found, falling back to v1");
-        if (orig_construct_login_v1) {
-            return orig_construct_login_v1(outPacket, username, password, deviceId, channel, os, subChannel, phoneModel);
-        }
-        return outPacket;
-    }
-
-    NSString *userStr = username ? [NSString stringWithUTF8String:username] : @"";
-    NSString *passStr = password ? [NSString stringWithUTF8String:password] : @"";
-    NSString *devStr = deviceId ? [NSString stringWithUTF8String:deviceId] : @"";
-    NSString *signStr = generateSignV2(userStr, passStr, devStr);
-    const char *signCStr = [signStr UTF8String];
-
-    const char *p0 = username ? username : "";
-    const char *p1 = password ? password : "";
-    const char *p2 = deviceId ? deviceId : "";
-    const char *p3 = channel ? channel : "SQAGE";
-    const char *p4 = os ? os : "IOS";
-    const char *p5 = phoneModel ? phoneModel : "";
-    const char *p6 = "";
-    const char *p7 = "";
-    const char *p8 = subChannel ? subChannel : "SQAGE_MIESHI";
-    const char *p9 = signCStr;
-    const char *p10 = "";
-    const char *p11 = "";
-    const char *p12 = "";
-    const char *p13 = "";
-    const char *p14 = "";
-    const char *p15 = "";
-
-    DLOG(@"[C++-HOOK] Converting v1 -> v2 (16 fields)");
-    DLOG(@"[C++-HOOK]   p0(username)=%s", p0);
-    DLOG(@"[C++-HOOK]   p1(password)=%s", p1);
-    DLOG(@"[C++-HOOK]   p2(deviceId)=%s", p2);
-    DLOG(@"[C++-HOOK]   p3(channel)=%s", p3);
-    DLOG(@"[C++-HOOK]   p4(os)=%s", p4);
-    DLOG(@"[C++-HOOK]   p5(phoneModel)=%s", p5);
-    DLOG(@"[C++-HOOK]   p6(empty)=%s", p6);
-    DLOG(@"[C++-HOOK]   p7(empty)=%s", p7);
-    DLOG(@"[C++-HOOK]   p8(subChannel)=%s", p8);
-    DLOG(@"[C++-HOOK]   p9(sign)=%s", p9);
-    DLOG(@"[C++-HOOK]   p10-p15 (empty)");
-
-    void *result = orig_construct_login_v2(outPacket,
-                                            p0, p1, p2, p3, p4, p5, p6, p7,
-                                            p8, p9, p10, p11, p12, p13, p14, p15);
-
-    DLOG(@"[C++-HOOK] v2 packet constructed, result=%p", result);
-    return result;
+static void _writeBE32(unsigned char *buf, uint32_t val) {
+    buf[0] = (val >> 24) & 0xFF; buf[1] = (val >> 16) & 0xFF;
+    buf[2] = (val >> 8) & 0xFF;  buf[3] = val & 0xFF;
 }
 
-static void *find_cpp_symbol(const char *symbolName) {
-    void *handle = dlopen(NULL, RTLD_LAZY);
-    if (!handle) {
-        DLOG(@"[C++-HOOK] dlopen(NULL) failed: %s", dlerror());
-        return NULL;
+static void _writeBE16(unsigned char *buf, uint16_t val) {
+    buf[0] = (val >> 8) & 0xFF; buf[1] = val & 0xFF;
+}
+
+static void _appendField(std::string& packet, const std::string& field) {
+    unsigned char lenBuf[2];
+    _writeBE16(lenBuf, (uint16_t)field.size());
+    packet.append((const char *)lenBuf, 2);
+    packet.append(field);
+}
+
+// 手动构造v2二进制包（fallback模式，完全不依赖游戏ABI）
+static void manualConstructV2Packet(std::string& out,
+    const std::string& username, const std::string& password,
+    const std::string& deviceId, const std::string& channel,
+    const std::string& os, const std::string& phoneModel,
+    const std::string& subChannel, const std::string& sign) {
+
+    DLOG(@"[MANUAL] Start manual v2 binary construction");
+
+    std::string packet;
+    packet.reserve(512);
+
+    // 4字节pktLen占位（稍后回填）
+    packet.append(4, '\0');
+    // 4字节cmd = 0x002EE121 (大端)
+    unsigned char cmdBuf[4] = {0x00, 0x2E, 0xE1, 0x21};
+    packet.append((const char *)cmdBuf, 4);
+    // 4字节status = 0
+    packet.append(4, '\0');
+
+    // 16个字符串字段（每个=2字节长度前缀+内容）
+    _appendField(packet, username);     // 字段0
+    _appendField(packet, password);     // 字段1
+    _appendField(packet, deviceId);     // 字段2
+    _appendField(packet, channel);      // 字段3
+    _appendField(packet, os);           // 字段4
+    _appendField(packet, phoneModel);   // 字段5
+    _appendField(packet, "");           // 字段6
+    _appendField(packet, "");           // 字段7
+    _appendField(packet, subChannel);   // 字段8
+    _appendField(packet, sign);         // 字段9
+    _appendField(packet, "");           // 字段10
+    _appendField(packet, "");           // 字段11
+    _appendField(packet, "");           // 字段12
+    _appendField(packet, "");           // 字段13
+    _appendField(packet, "");           // 字段14
+    _appendField(packet, "");           // 字段15
+
+    // 回填pktLen（不包含自身的4字节）
+    uint32_t pktLen = (uint32_t)(packet.size() - 4);
+    _writeBE32((unsigned char *)&packet[0], pktLen);
+
+    out = packet;
+
+    DLOG(@"[MANUAL] v2 packet constructed, totalLen=%zu, pktLen=%u", out.size(), pktLen);
+    if (out.size() <= 256) {
+        DLOG_HEX(out.data(), out.size());
     }
-    
-    void *sym = dlsym(handle, symbolName);
-    if (sym) {
-        DLOG(@"[C++-HOOK] Found symbol %s at %p", symbolName, sym);
-        return sym;
+}
+
+// Hook函数 - 使用正确的std::string&签名
+static void my_construct_login_v1(std::string& out,
+    const std::string& username, const std::string& password,
+    const std::string& deviceId, const std::string& channel,
+    const std::string& os, const std::string& subChannel,
+    const std::string& phoneModel) {
+
+    NSLog(@"[HOOK] v1 intercepted: username=%s password=%s deviceId=%s",
+          username.c_str(), password.c_str(), deviceId.c_str());
+    DLOG(@"[HOOK] v1 intercepted: username=%s", username.c_str());
+    DLOG(@"[HOOK] v1 intercepted: password=%s", password.c_str());
+    DLOG(@"[HOOK] v1 intercepted: deviceId=%s", deviceId.c_str());
+    DLOG(@"[HOOK] v1 intercepted: channel=%s", channel.c_str());
+    DLOG(@"[HOOK] v1 intercepted: os=%s", os.c_str());
+    DLOG(@"[HOOK] v1 intercepted: subChannel=%s", subChannel.c_str());
+    DLOG(@"[HOOK] v1 intercepted: phoneModel=%s", phoneModel.c_str());
+
+    // 生成sign
+    NSString *userNS = [NSString stringWithUTF8String:username.c_str()];
+    NSString *passNS = [NSString stringWithUTF8String:password.c_str()];
+    NSString *devNS = [NSString stringWithUTF8String:deviceId.c_str()];
+    NSString *signNS = generateSignV2(userNS, passNS, devNS);
+    std::string signStr = [signNS UTF8String];
+
+    // 默认值处理
+    std::string ch = channel.empty() ? "SQAGE" : channel;
+    std::string oss = os.empty() ? "IOS" : os;
+    std::string sub = subChannel.empty() ? "SQAGE_MIESHI" : subChannel;
+
+    // 模式1：调用v2构造器（有@try/@catch保护）
+    if (orig_construct_login_v2 && !g_manualMode) {
+        DLOG(@"[HOOK] v2 constructor found: %p, attempting call...", orig_construct_login_v2);
+
+        @try {
+            std::string empty = "";
+            orig_construct_login_v2(out,
+                username, password, deviceId, ch, oss, phoneModel, empty, empty,
+                sub, signStr, empty, empty, empty, empty, empty, empty);
+
+            DLOG(@"[HOOK] v2 constructor CALLED successfully, packet size=%zu", out.size());
+            if (out.size() > 0 && out.size() <= 256) {
+                DLOG_HEX(out.data(), out.size());
+            }
+            NSLog(@"[HOOK] v2 constructor CALLED successfully, size=%zu", out.size());
+            return;
+        } @catch (NSException *e) {
+            DLOG(@"[HOOK] *** EXCEPTION in v2 constructor: %@ ***", e);
+            DLOG(@"[HOOK] Falling back to manual binary construction");
+            NSLog(@"[HOOK] v2 constructor EXCEPTION: %@", e);
+            g_manualMode = YES;
+        }
     }
-    
-    DLOG(@"[C++-HOOK] Symbol %s not found in main executable, searching images...", symbolName);
-    
+
+    // 模式2：手动构造二进制包（fallback）
+    DLOG(@"[HOOK] Fallback to manual binary construction (g_manualMode=%d)", g_manualMode);
+    NSLog(@"[HOOK] Fallback to manual binary construction");
+
+    @try {
+        manualConstructV2Packet(out, username, password, deviceId, ch, oss,
+                                phoneModel, sub, signStr);
+        DLOG(@"[HOOK] Manual v2 packet OK, size=%zu", out.size());
+    } @catch (NSException *e) {
+        DLOG(@"[HOOK] *** MANUAL CONSTRUCTION ALSO FAILED: %@ ***", e);
+        DLOG(@"[HOOK] Last resort: calling original v1");
+        if (orig_construct_login_v1) {
+            orig_construct_login_v1(out, username, password, deviceId,
+                                    channel, os, subChannel, phoneModel);
+            DLOG(@"[HOOK] Original v1 called, packet size=%zu", out.size());
+        }
+    }
+}
+
+// 符号查找：多重fallback策略
+static void *find_cpp_symbol_multi(const char *mangledName, const char *shortName) {
+    // 策略1：dlsym在主进程中查找完整mangled name
+    void *handle = dlopen(NULL, RTLD_NOW);
+    if (handle) {
+        void *sym = dlsym(handle, mangledName);
+        if (sym) {
+            DLOG(@"[SYMLOOKUP] Found '%s' via dlsym(main) at %p", shortName, sym);
+            return sym;
+        }
+    }
+
+    // 策略2：遍历所有已加载的镜像
+    DLOG(@"[SYMLOOKUP] '%s' not in main image, searching %u images...", shortName, _dyld_image_count());
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *imageName = _dyld_get_image_name(i);
         if (!imageName) continue;
-        
-        void *imgHandle = dlopen(imageName, RTLD_LAZY);
+
+        void *imgHandle = dlopen(imageName, RTLD_NOW);
         if (imgHandle) {
-            void *imgSym = dlsym(imgHandle, symbolName);
+            void *imgSym = dlsym(imgHandle, mangledName);
             if (imgSym) {
-                DLOG(@"[C++-HOOK] Found symbol %s in %s at %p", symbolName, imageName, imgSym);
+                DLOG(@"[SYMLOOKUP] Found '%s' in %s at %p", shortName, imageName, imgSym);
                 return imgSym;
             }
         }
     }
-    
-    DLOG(@"[C++-HOOK] Symbol %s not found anywhere", symbolName);
+
+    // 策略3：尝试去掉前缀的变体（某些链接器会去掉前导下划线）
+    if (mangledName[0] == '_') {
+        const char *altName = mangledName + 1;
+        void *altSym = dlsym(RTLD_DEFAULT, altName);
+        if (altSym) {
+            DLOG(@"[SYMLOOKUP] Found '%s' (no underscore) at %p", shortName, altSym);
+            return altSym;
+        }
+    }
+
+    DLOG(@"[SYMLOOKUP] *** '%s' NOT FOUND anywhere ***", shortName);
     return NULL;
 }
 
 static void init_cpp_hooks(void) {
-    DLOG(@"[C++-HOOK] Initializing C++ function hooks...");
-    
+    DLOG(@"[C++-HOOK] Initializing C++ function hooks (v4.1 hardened)...");
+    NSLog(@"[HOOK] init_cpp_hooks starting");
+
+    // C++ mangled names (来自符号表分析)
     const char *v1_sym = "_ZN18GameMessageFactory28construct_NEW_USER_LOGIN_REQERNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES7_S7_S7_S7_S7_S7_S7_";
-    
     const char *v2_sym = "_ZN18GameMessageFactory31construct_NEW_USER_LOGIN_REQ_v2ERNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES7_S7_S7_S7_S7_S7_S7_S7_S7_S7_S7_S7_S7_S7_S7_";
-    
-    void *v2_func = find_cpp_symbol(v2_sym);
+
+    // 查找v2构造器
+    void *v2_func = find_cpp_symbol_multi(v2_sym, "construct_LOGIN_REQ_v2");
     if (v2_func) {
         orig_construct_login_v2 = (ConstructLoginReqV2Func)v2_func;
-        DLOG(@"[C++-HOOK] v2 function found at %p", v2_func);
+        DLOG(@"[C++-HOOK] v2 constructor found at %p", v2_func);
     } else {
-        DLOG(@"[C++-HOOK] v2 function NOT FOUND");
+        DLOG(@"[C++-HOOK] v2 constructor NOT FOUND - will use manual binary mode");
+        g_manualMode = YES;
     }
-    
+
+    // 用fishhook Hook v1函数
     struct rebinding rebindings[1];
     rebindings[0].name = v1_sym;
     rebindings[0].replacement = (void *)my_construct_login_v1;
     rebindings[0].replaced = (void **)&orig_construct_login_v1;
-    
+
     int result = rebind_symbols(rebindings, 1);
     DLOG(@"[C++-HOOK] fishhook rebind_symbols result: %d", result);
-    
+
     if (orig_construct_login_v1) {
         DLOG(@"[C++-HOOK] v1 original function saved at %p", orig_construct_login_v1);
     } else {
-        DLOG(@"[C++-HOOK] v1 original function NOT found via fishhook");
+        DLOG(@"[C++-HOOK] v1 NOT hooked via fishhook - trying dlsym fallback");
+        // fishhook失败时尝试dlsym直接查找
+        void *v1_func = find_cpp_symbol_multi(v1_sym, "construct_LOGIN_REQ_v1");
+        if (v1_func) {
+            orig_construct_login_v1 = (ConstructLoginReqV1Func)v1_func;
+            DLOG(@"[C++-HOOK] v1 found via dlsym at %p (but NOT hooked - fishhook needed for interception)", v1_func);
+            DLOG(@"[C++-HOOK] WARNING: v1 function found but fishhook did not intercept it");
+            DLOG(@"[C++-HOOK] The function may be called directly, not through symbol table");
+        }
     }
-    
-    if (orig_construct_login_v1 && orig_construct_login_v2) {
-        DLOG(@"[C++-HOOK] Both v1 and v2 hooked! v1->v2 conversion ready");
+
+    // 汇报状态
+    BOOL v1_hooked = (orig_construct_login_v1 != NULL);
+    BOOL v2_available = (orig_construct_login_v2 != NULL);
+
+    DLOG(@"[C++-HOOK] === Hook Status Summary ===");
+    DLOG(@"[C++-HOOK]   v1 hooked (fishhook): %s", v1_hooked ? "YES" : "NO");
+    DLOG(@"[C++-HOOK]   v2 constructor: %s", v2_available ? "AVAILABLE" : "NOT AVAILABLE");
+    DLOG(@"[C++-HOOK]   manual mode: %s", g_manualMode ? "FORCED" : "AUTO (fallback only)");
+
+    if (v1_hooked) {
+        if (v2_available) {
+            DLOG(@"[C++-HOOK] MODE: v1 hook + v2 constructor call (with @try/@catch protection)");
+        } else {
+            DLOG(@"[C++-HOOK] MODE: v1 hook + manual binary construction");
+        }
     } else {
-        DLOG(@"[C++-HOOK] WARNING: Some functions not found, C++ hook may not work");
-        DLOG(@"[C++-HOOK] Falling back to socket-level patching");
+        DLOG(@"[C++-HOOK] MODE: C++ hook FAILED - relying on socket-level patching only");
+        DLOG(@"[C++-HOOK] Socket hook will handle v1->v2 conversion at TCP layer");
     }
+
+    NSLog(@"[HOOK] init_cpp_hooks done: v1_hooked=%d v2=%d manual=%d",
+          v1_hooked, v2_available, g_manualMode);
 }
 
 #pragma mark - Log Panel UI
@@ -373,7 +469,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.0 C++层Hook面板";
+    titleLbl.text = @"WangXian2Hook v4.1 加固版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
