@@ -370,13 +370,17 @@ typedef ssize_t (*RecvFunc)(int, void *, size_t, int);
 typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
 typedef ssize_t (*SendFunc)(int, const void *, size_t, int);
+typedef ssize_t (*WriteFunc)(int, const void *, size_t);
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
+typedef int (*CloseFunc)(int);
 
 static RecvFunc orig_recv = NULL;
 static RecvfromFunc orig_recvfrom = NULL;
 static RecvmsgFunc orig_recvmsg = NULL;
 static SendFunc orig_send = NULL;
+static WriteFunc orig_write = NULL;
 static ConnectFunc orig_connect = NULL;
+static CloseFunc orig_close = NULL;
 
 static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     if (!buf || len <= 0) return;
@@ -437,6 +441,26 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         } else if (cmd == 0x800FF012) {
             DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X len=%zd", cmd, len);
             DLOG_HEX(buf, len);
+            
+            const char *fakeServerList = "[{\"serverid\":1,\"serverName\":\"一区\",\"status\":1,\"serverType\":1,\"ip\":\"47.100.222.229\",\"port\":12003,\"category\":\"一区\",\"recommend\":1}]";
+            size_t fakeLen = strlen(fakeServerList);
+            
+            if (len >= 12) {
+                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
+                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Server list status %u -> 1", status4);
+                    buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x01;
+                    patched = YES;
+                }
+            }
+            
+            if (len > 12 && fakeLen < len - 12) {
+                DLOG(@"[PROTO-R-PATCH] Replacing server list content with fake data");
+                memset(buf + 12, 0, len - 12);
+                memcpy(buf + 12, fakeServerList, fakeLen);
+                patched = YES;
+            }
         } else if (cmd == 0x81EFBC8C) {
             DLOG(@"[PROTO-R] LARGE DATA RESPONSE cmd=0x%08X len=%zd", cmd, len);
         }
@@ -594,6 +618,14 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
     return ret;
 }
 
+static int hook_close(int fd) {
+    if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    
+    releaseFd(fd);
+    
+    return orig_close ? orig_close(fd) : -1;
+}
+
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     if (!orig_send || !buf) return -1;
@@ -615,8 +647,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
             DLOG(@"[SEND-CMD] VERSION CHECK REQUEST");
             DLOG_HEX(buf, len);
-        } else if (cmd == 0x0000E011) {
+        } else if (cmd == 0x0234AB89) {
             DLOG(@"[SEND-CMD] LOGIN REQUEST");
+            DLOG_HEX(buf, len);
+        } else if (cmd == 0x000FF012) {
+            DLOG(@"[SEND-CMD] SERVER LIST REQUEST");
+            DLOG_HEX(buf, len);
+        } else if (cmd == 0x000EE006) {
+            DLOG(@"[SEND-CMD] UUID/HANDSHAKE REQUEST");
             DLOG_HEX(buf, len);
         } else {
             DLOG_HEX(buf, len);
@@ -781,15 +819,17 @@ static void entry(void) {
     int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
     int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
+    int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
     
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
     if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+    if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
     
-    DLOG(@"[SOCK] Patched: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d", c, s, r, rf, rm);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
+    DLOG(@"[SOCK] Patched: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d close=%d", c, s, r, rf, rm, cl);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p close=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_close);
     
     if (!orig_connect) DLOG(@"[SOCK-WARN] connect hook failed");
     if (!orig_recv) DLOG(@"[SOCK-WARN] recv hook failed");
