@@ -369,11 +369,13 @@ static void releaseFd(int fd) {
 typedef ssize_t (*RecvFunc)(int, void *, size_t, int);
 typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
+typedef ssize_t (*SendFunc)(int, const void *, size_t, int);
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
 
 static RecvFunc orig_recv = NULL;
 static RecvfromFunc orig_recvfrom = NULL;
 static RecvmsgFunc orig_recvmsg = NULL;
+static SendFunc orig_send = NULL;
 static ConnectFunc orig_connect = NULL;
 
 static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
@@ -592,6 +594,40 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
     return ret;
 }
 
+static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
+    if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    if (!orig_send || !buf) return -1;
+    
+    const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
+    
+    DLOG(@"[SEND] fd=%d %s:%d len=%zu", fd, host ?: "unknown", port, len);
+    
+    if (len >= 8) {
+        const unsigned char *p = (const unsigned char *)buf;
+        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        
+        DLOG(@"[SEND-CMD] cmd=0x%08X pktLen=%u", cmd, pktLenBE);
+        
+        if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
+            DLOG(@"[SEND-CMD] VERSION CHECK REQUEST");
+            DLOG_HEX(buf, len);
+        } else if (cmd == 0x0000E011) {
+            DLOG(@"[SEND-CMD] LOGIN REQUEST");
+            DLOG_HEX(buf, len);
+        } else {
+            DLOG_HEX(buf, len);
+        }
+    } else {
+        DLOG_HEX(buf, len);
+    }
+    
+    return orig_send(fd, buf, len, flags);
+}
+
 #pragma mark - URLSession Hooks
 
 static NSURLSessionDataTask *(*orig_dtwrc)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)) = NULL;
@@ -741,17 +777,19 @@ static void entry(void) {
     DLOG(@"[INIT] WangXian2Hook initialized");
     
     int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
+    int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
     int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
     int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
     
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
+    if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
     if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
     
-    DLOG(@"[SOCK] Patched: connect=%d recv=%d recvfrom=%d recvmsg=%d", c, r, rf, rm);
-    DLOG(@"[SOCK] Original: connect=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_recv, orig_recvfrom, orig_recvmsg);
+    DLOG(@"[SOCK] Patched: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d", c, s, r, rf, rm);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
     
     if (!orig_connect) DLOG(@"[SOCK-WARN] connect hook failed");
     if (!orig_recv) DLOG(@"[SOCK-WARN] recv hook failed");
