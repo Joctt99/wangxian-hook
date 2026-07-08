@@ -951,7 +951,8 @@ static int hook_close(int fd) {
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     if (!orig_send || !buf) return -1;
-    
+
+    const unsigned char *cbuf = (const unsigned char *)buf;
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
@@ -979,7 +980,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             
             if (len >= oldVerLen) {
                 for (size_t i = 0; i <= len - oldVerLen; i++) {
-                    if (memcmp(buf + i, oldVer, oldVerLen) == 0) {
+                    if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
                         sendBuf = malloc(len);
                         memcpy(sendBuf, buf, len);
                         unsigned char *mp = (unsigned char *)sendBuf;
