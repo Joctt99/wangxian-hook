@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.19 - UUID FIX v2: Separate handling for 0x00FFB005/0x00EAF016 (UUID=MACADDRESS format) and 0x00EE007 (zero-length field format)
+ * WangXianHook v35.20 - PORT FIX: Restrict UUID patching to game server (12003 port only), prevent breaking login server (5678)
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.19 ===");
+        _log(@"=== WXHook v35.20 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -387,7 +387,7 @@ static void installAdvertisingIdentifierHook(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.19 诊断面板";
+            lbl.text = @"WXHook v35.20 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1524,8 +1524,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         
         // Fix empty UUID in handshake packets (0x00FFB005, 0x00EAF016)
-        // These packets use "UUID=MACADDRESS=" prefix format
-        if (cmd == 0x00FFB005 || cmd == 0x00EAF016) {
+        // These packets use "UUID=MACADDRESS=" prefix format - ONLY for game server (12003)
+        if (port == 12003 && (cmd == 0x00FFB005 || cmd == 0x00EAF016)) {
             const char *haystack = (const char *)buf;
             const char *needle = "UUID=MACADDRESS=";
             size_t needleLen = strlen(needle);
@@ -1580,8 +1580,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         
         // Fix empty UUID in login packet 0x000EE007
-        // This packet uses field-length+field-content format with zero-length UUID fields
-        if (cmd == 0x000EE007) {
+        // ONLY for game server (12003), NOT login server (5678)!
+        if (port == 12003 && cmd == 0x000EE007) {
             // Check for zero-length fields in the payload (after header 12 bytes)
             unsigned char *haystack = (unsigned char *)buf;
             size_t pos = 12; // Start after header
