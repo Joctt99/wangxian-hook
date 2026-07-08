@@ -3,7 +3,7 @@
 # Usage: make -f Makefile.wx2
 
 TARGET = WangXian2Hook.dylib
-SOURCE = WangXian2Hook.m
+SOURCES = WangXian2Hook.m fishhook.c
 
 SDK_PATH  = $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC        = $(shell xcrun --sdk iphoneos --find clang)
@@ -26,8 +26,8 @@ CFLAGS += -fobjc-arc
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
+$(TARGET): $(SOURCES)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES)
 	@echo "Built: $(TARGET)"
 	@ls -la $(TARGET)
 
