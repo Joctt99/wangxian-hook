@@ -19,6 +19,7 @@ CFLAGS += -framework Security
 CFLAGS += -framework CoreGraphics
 CFLAGS += -lobjc
 CFLAGS += -lz
+CFLAGS += -lc++
 CFLAGS += -dynamiclib
 CFLAGS += -O2
 CFLAGS += -fobjc-arc
