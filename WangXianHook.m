@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.18 - IDFA HOOK: Hook ASIdentifierManager advertisingIdentifier + isTrackingEnabled to fix empty UUID when user denies app tracking
+ * WangXianHook v35.19 - UUID FIX v2: Separate handling for 0x00FFB005/0x00EAF016 (UUID=MACADDRESS format) and 0x00EE007 (zero-length field format)
  * FIX: Re-enabled log button user interaction (was disabled in v35.08, caused button to be unclickable)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.18 ===");
+        _log(@"=== WXHook v35.19 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -387,7 +387,7 @@ static void installAdvertisingIdentifierHook(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.18 诊断面板";
+            lbl.text = @"WXHook v35.19 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1523,9 +1523,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
         }
         
-        // Fix empty UUID in handshake packets (0x00FFB005, 0x00EAF016, 0x000EE007)
-        // Some devices return empty UUID which causes game server to reject connection
-        if (cmd == 0x00FFB005 || cmd == 0x00EAF016 || cmd == 0x000EE007) {
+        // Fix empty UUID in handshake packets (0x00FFB005, 0x00EAF016)
+        // These packets use "UUID=MACADDRESS=" prefix format
+        if (cmd == 0x00FFB005 || cmd == 0x00EAF016) {
             const char *haystack = (const char *)buf;
             const char *needle = "UUID=MACADDRESS=";
             size_t needleLen = strlen(needle);
@@ -1575,6 +1575,62 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
                         break;
                     }
+                }
+            }
+        }
+        
+        // Fix empty UUID in login packet 0x000EE007
+        // This packet uses field-length+field-content format with zero-length UUID fields
+        if (cmd == 0x000EE007) {
+            // Check for zero-length fields in the payload (after header 12 bytes)
+            unsigned char *haystack = (unsigned char *)buf;
+            size_t pos = 12; // Start after header
+            BOOL foundEmpty = NO;
+            
+            while (pos + 2 <= len) {
+                uint16_t fieldLen = ((uint16_t)haystack[pos] << 8) | (uint8_t)haystack[pos + 1];
+                if (fieldLen == 0 && pos + 2 < len) {
+                    // Found a zero-length field - this is an empty UUID
+                    foundEmpty = YES;
+                    break;
+                }
+                pos += 2 + fieldLen;
+            }
+            
+            if (foundEmpty) {
+                DLOG(@"[SEND-FIX] Empty UUID field detected in cmd=0x%08X, generating fake UUID", cmd);
+                NSString *fakeUUID = @"B4F45911-6E9F-4733-B6EA-0E64B1763FEC";
+                const char *uuidStr = [fakeUUID UTF8String];
+                size_t uuidStrLen = strlen(uuidStr);
+                size_t newPktLen = len + uuidStrLen; // Add UUID length to packet
+                
+                unsigned char *newBuf = (unsigned char *)malloc(newPktLen);
+                if (newBuf) {
+                    memcpy(newBuf, buf, len);
+                    // Insert UUID at the first zero-length field position
+                    pos = 12;
+                    while (pos + 2 <= len) {
+                        uint16_t fieldLen = ((uint16_t)newBuf[pos] << 8) | (uint8_t)newBuf[pos + 1];
+                        if (fieldLen == 0) {
+                            // Update field length to UUID length
+                            newBuf[pos] = (uuidStrLen >> 8) & 0xFF;
+                            newBuf[pos + 1] = uuidStrLen & 0xFF;
+                            // Insert UUID value
+                            memmove(newBuf + pos + 2 + uuidStrLen, newBuf + pos + 2, len - pos - 2);
+                            memcpy(newBuf + pos + 2, uuidStr, uuidStrLen);
+                            break;
+                        }
+                        pos += 2 + fieldLen;
+                    }
+                    // Update packet length
+                    newBuf[0] = (newPktLen >> 24) & 0xFF;
+                    newBuf[1] = (newPktLen >> 16) & 0xFF;
+                    newBuf[2] = (newPktLen >> 8) & 0xFF;
+                    newBuf[3] = newPktLen & 0xFF;
+                    
+                    sendBuf = newBuf;
+                    sendLen = newPktLen;
+                    DLOG(@"[SEND-FIX] UUID patched in 0xEE007: pktLen=%zu -> %zu", len, newPktLen);
                 }
             }
         }
