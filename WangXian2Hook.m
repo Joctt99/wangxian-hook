@@ -102,7 +102,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.10 ===");
+        _log(@"=== WangXian2Hook v3.0 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
@@ -152,7 +152,7 @@ static void log_init(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v2.10 诊断面板";
+    titleLbl.text = @"WangXian2Hook v3.0 协议转换面板";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -430,7 +430,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             DLOG(@"[PROTO-R] DEBUG ECHO RESPONSE cmd=0x%08X", cmd);
         } else if (cmd == 0x80000015) {
             DLOG(@"[PROTO-R] PING RESPONSE cmd=0x%08X", cmd);
-        } else if (cmd == 0x800FF012) {
+        } else if (cmd == 0x800FF012 || cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
             
             if (len >= 12) {
@@ -448,6 +448,18 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             }
         } else if (cmd == 0x81EFBC8C) {
             DLOG(@"[PROTO-R] LARGE DATA RESPONSE cmd=0x%08X len=%zd", cmd, len);
+        } else if (cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] NEW USER LOGIN RES v2 cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
+            DLOG_HEX(buf, len < 200 ? len : 200);
+        } else if (cmd == 0x8234AB89) {
+            DLOG(@"[PROTO-R] NEW USER LOGIN RES v1 cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
+            DLOG_HEX(buf, len < 200 ? len : 200);
+        } else if (cmd == 0x800EAE03) {
+            DLOG(@"[PROTO-R] GET RSA DATA RES cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
+            DLOG_HEX(buf, len < 200 ? len : 200);
+        } else if (cmd == 0x802EE113) {
+            DLOG(@"[PROTO-R] NEW QUERY SERVER LIST RES cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
+            DLOG_HEX(buf, len < 200 ? len : 200);
         }
     }
     
@@ -662,11 +674,62 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 }
             }
         } else if (cmd == 0x0234AB89) {
-            DLOG(@"[SEND-CMD] LOGIN REQUEST");
-        } else if (cmd == 0x000FF012) {
-            DLOG(@"[SEND-CMD] SERVER LIST REQUEST");
+            DLOG(@"[SEND-CMD] LOGIN REQUEST (old v1, 7 fields)");
+
+            // 将旧版登录请求(cmd=0x0234AB89)转换为新版v2格式(cmd=0x002EE121)
+            // v2格式需要16个字符串字段，旧版只有7个
+            // 方案：修改cmd + 在现有字段后添加9个空字段
+            size_t extraFields = 9 * 2; // 9个空字段，每个=2字节长度前缀(0x0000)
+            size_t newLen = len + extraFields;
+            unsigned char *newBuf = (unsigned char *)malloc(newLen);
+            memcpy(newBuf, buf, len);
+
+            // 修改cmd: 0x0234AB89 -> 0x002EE121
+            newBuf[4] = 0x00; newBuf[5] = 0x2E; newBuf[6] = 0xE1; newBuf[7] = 0x21;
+
+            // 在末尾(替换最后的0x00结束符)添加9个空字段
+            // 先移除最后的0x00结束符(如果有)
+            size_t insertPos = len;
+            if (newBuf[len - 1] == 0x00) {
+                insertPos = len - 1; // 覆盖结束符
+            }
+
+            // 添加9个空字段 (每个 = 00 00)
+            for (int i = 0; i < 9; i++) {
+                newBuf[insertPos + i * 2] = 0x00;
+                newBuf[insertPos + i * 2 + 1] = 0x00;
+            }
+
+            // 更新pktLen (前4字节，大端)
+            uint32_t newPktLen = newPktLen = (uint32_t)(insertPos + extraFields);
+            newBuf[0] = (newPktLen >> 24) & 0xFF;
+            newBuf[1] = (newPktLen >> 16) & 0xFF;
+            newBuf[2] = (newPktLen >> 8) & 0xFF;
+            newBuf[3] = newPktLen & 0xFF;
+
+            sendBuf = newBuf;
+            len = insertPos + extraFields;
+            modified = YES;
+
+            DLOG(@"[SEND-PATCH] Login v1->v2: cmd 0x0234AB89 -> 0x002EE121, added 9 empty fields, newLen=%zu", len);
+            DLOG_HEX(sendBuf, len < 200 ? len : 200);
+
+        } else if (cmd == 0x000FF012 || cmd == 0x002EE113) {
+            DLOG(@"[SEND-CMD] SERVER LIST REQUEST (cmd=0x%08X)", cmd);
+
+            // 新版服务器列表请求cmd=0x002EE113，旧版=0x000FF012
+            if (cmd == 0x000FF012) {
+                sendBuf = malloc(len);
+                memcpy(sendBuf, buf, len);
+                unsigned char *mp = (unsigned char *)sendBuf;
+                mp[4] = 0x00; mp[5] = 0x2E; mp[6] = 0xE1; mp[7] = 0x13;
+                modified = YES;
+                DLOG(@"[SEND-PATCH] Server list cmd 0x000FF012 -> 0x002EE113");
+            }
         } else if (cmd == 0x000EE006) {
             DLOG(@"[SEND-CMD] UUID/HANDSHAKE REQUEST");
+        } else if (cmd == 0x000EAE03) {
+            DLOG(@"[SEND-CMD] GET RSA DATA REQUEST (new v7.6)");
         }
         
         if (len >= 30 && len < 150) {
