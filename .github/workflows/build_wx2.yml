@@ -5,6 +5,8 @@ on:
     branches: [ main ]
     paths:
       - 'WangXian2Hook.m'
+      - 'fishhook.c'
+      - 'fishhook.h'
       - 'Makefile.wx2'
   workflow_dispatch:
 
@@ -41,7 +43,7 @@ jobs:
           -O2 \
           -fobjc-arc \
           -o WangXian2Hook.dylib \
-          WangXian2Hook.m
+          WangXian2Hook.m fishhook.c
         
         echo "Build completed successfully!"
         ls -la WangXian2Hook.dylib
