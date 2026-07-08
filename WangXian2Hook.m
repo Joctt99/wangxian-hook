@@ -102,7 +102,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.7 ===");
+        _log(@"=== WangXian2Hook v2.8 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
@@ -152,7 +152,7 @@ static void log_init(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v2.7 诊断面板";
+    titleLbl.text = @"WangXian2Hook v2.8 诊断面板";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -628,6 +628,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     
     DLOG(@"[SEND] fd=%d %s:%d len=%zu", fd, host ?: "unknown", port, len);
     
+    void *sendBuf = (void *)buf;
+    BOOL modified = NO;
+    
     if (len >= 8) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -640,9 +643,45 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
             DLOG(@"[SEND-CMD] VERSION CHECK REQUEST");
             DLOG_HEX(buf, len);
+            
+            const char *oldVer = "7.5.0";
+            const char *newVer = "7.6.0";
+            size_t oldVerLen = strlen(oldVer);
+            size_t newVerLen = strlen(newVer);
+            
+            for (size_t i = 0; i <= len - oldVerLen; i++) {
+                if (memcmp(p + i, oldVer, oldVerLen) == 0) {
+                    sendBuf = malloc(len);
+                    memcpy(sendBuf, buf, len);
+                    unsigned char *mp = (unsigned char *)sendBuf;
+                    memcpy(mp + i, newVer, newVerLen);
+                    if (newVerLen < oldVerLen) {
+                        memset(mp + i + newVerLen, 0, oldVerLen - newVerLen);
+                    }
+                    DLOG(@"[SEND-PATCH] Version string '%s' -> '%s' at offset %zu", oldVer, newVer, i);
+                    modified = YES;
+                    break;
+                }
+            }
         } else if (cmd == 0x0234AB89) {
             DLOG(@"[SEND-CMD] LOGIN REQUEST");
             DLOG_HEX(buf, len);
+            
+            const char *oldVer = "7.5.0";
+            const char *newVer = "7.6.0";
+            size_t oldVerLen = strlen(oldVer);
+            
+            for (size_t i = 0; i <= len - oldVerLen; i++) {
+                if (memcmp(p + i, oldVer, oldVerLen) == 0) {
+                    sendBuf = malloc(len);
+                    memcpy(sendBuf, buf, len);
+                    unsigned char *mp = (unsigned char *)sendBuf;
+                    memcpy(mp + i, newVer, strlen(newVer));
+                    DLOG(@"[SEND-PATCH] Version string '%s' -> '%s' at offset %zu", oldVer, newVer, i);
+                    modified = YES;
+                    break;
+                }
+            }
         } else if (cmd == 0x000FF012) {
             DLOG(@"[SEND-CMD] SERVER LIST REQUEST");
             DLOG_HEX(buf, len);
@@ -656,7 +695,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG_HEX(buf, len);
     }
     
-    return orig_send(fd, buf, len, flags);
+    ssize_t ret = orig_send(fd, sendBuf, len, flags);
+    
+    if (modified && sendBuf != buf) {
+        free(sendBuf);
+    }
+    
+    return ret;
 }
 
 #pragma mark - URLSession Hooks
