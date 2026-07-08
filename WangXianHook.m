@@ -1,6 +1,6 @@
 /**
- * WangXianHook v35.21 - CLEAN: Removed all network patches (IDFV/IDFA hook, UUID fix, md5xor auth bypass, status code patching)
- * Only keeps: Input method crash fix (NSArray count removal, keyboard protection, gesture fixes)
+ * WangXianHook v35.22 - RESTORE: Re-enabled version check patching (0x802EE118/120/121), '版本过低' text patch, HTTP version error fix
+ * Only keeps: Input method crash fix + version bypass (no UUID/IDFV/IDFA/md5xor hooks)
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
  * FIX: Stop corrupting version string in 0x8002A016 (was misidentified as server list response)
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.21 ===");
+        _log(@"=== WXHook v35.22 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -243,7 +243,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.21 诊断面板";
+            lbl.text = @"WXHook v35.22 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1664,6 +1664,38 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-R] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
+            }
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                ((unsigned char *)buf)[12] = 0;
+            }
+        }
+    }
+    
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+        }
+    }
+    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+            DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+        }
     }
     
     return ret;
@@ -1712,6 +1744,25 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RF] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
+            DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-RF-PATCH] Version status %u -> 0, clearing error messages", p[12]);
+                ((unsigned char *)buf)[12] = 0;
+                if (ret > 13) {
+                    memset((unsigned char *)buf + 13, 0, ret - 13);
+                }
+            }
+        }
+    }
+    
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-RF] Detected '版本过低' at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+        }
     }
     
     return ret;
@@ -1765,6 +1816,25 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
+            DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
+            if (iov->iov_len >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-RM-PATCH] Version status %u -> 0, clearing error messages", p[12]);
+                ((unsigned char *)iov->iov_base)[12] = 0;
+                if (ret > 13) {
+                    memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
+                }
+            }
+        }
+    }
+    
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow) && i <= (ssize_t)iov->iov_len - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-RM] Detected '版本过低' at offset %zd", i);
+            memset((unsigned char *)iov->iov_base + i, ' ', sizeof(verLow));
+        }
     }
     
     return ret;
