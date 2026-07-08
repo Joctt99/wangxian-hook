@@ -6,6 +6,10 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <unistd.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <sys/mman.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -38,7 +42,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.3 ===");
+        _log(@"=== WangXian2Hook v2.4 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -232,15 +236,90 @@ static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
 }
 
+#pragma mark - Symbol Rebinding
+
+static int rebindSymbol(const char *symbolName, void *replacement, void **original) {
+    int totalPatched = 0;
+    uint32_t imageCount = _dyld_image_count();
+    size_t pageSize = 16384;
+    
+    for (uint32_t img = 0; img < imageCount; img++) {
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(img);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+        if (!header || header->magic != 0xFEEDFACF) continue;
+        
+        const struct load_command *cmd = (const struct load_command *)((char *)header + sizeof(struct mach_header_64));
+        const struct segment_command_64 *linkeditSeg = NULL;
+        struct symtab_command *symtab = NULL;
+        struct dysymtab_command *dysymtab = NULL;
+        
+        const struct segment_command_64 *dataSegs[8];
+        int dataSegCount = 0;
+        
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkeditSeg = seg;
+                else if (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
+                    if (dataSegCount < 8) dataSegs[dataSegCount++] = seg;
+                }
+            } else if (cmd->cmd == LC_SYMTAB) {
+                symtab = (struct symtab_command *)cmd;
+            } else if (cmd->cmd == LC_DYSYMTAB) {
+                dysymtab = (struct dysymtab_command *)cmd;
+            }
+            cmd = (const struct load_command *)((char *)cmd + cmd->cmdsize);
+        }
+        
+        if (!linkeditSeg || !symtab || !dysymtab) continue;
+        
+        char *linkeditBase = (char *)slide + linkeditSeg->vmaddr - linkeditSeg->fileoff;
+        const struct nlist_64 *syms = (const struct nlist_64 *)(linkeditBase + symtab->symoff);
+        char *strtab = (char *)(linkeditBase + symtab->stroff);
+        uint32_t *indirectSyms = (uint32_t *)(linkeditBase + dysymtab->indirectsymoff);
+        
+        for (int d = 0; d < dataSegCount; d++) {
+            const struct section_64 *sec = (const struct section_64 *)((char *)dataSegs[d] + sizeof(struct segment_command_64));
+            for (uint32_t s = 0; s < dataSegs[d]->nsects; s++) {
+                if (strcmp(sec[s].sectname, "__la_symbol_ptr") != 0 &&
+                    strcmp(sec[s].sectname, "__got") != 0) continue;
+                
+                void **pointers = (void **)((char *)slide + sec[s].addr);
+                uint32_t count = (uint32_t)(sec[s].size / sizeof(void *));
+                for (uint32_t j = 0; j < count; j++) {
+                    uint32_t symIdx = indirectSyms[sec[s].reserved1 + j];
+                    if (symIdx >= symtab->nsyms) continue;
+                    const char *name = strtab + syms[symIdx].n_un.n_strx;
+                    if (strcmp(name, symbolName) == 0) {
+                        void *page = (void *)((uintptr_t)&pointers[j] & ~(pageSize - 1));
+                        if (mprotect(page, pageSize, PROT_READ | PROT_WRITE) == 0) {
+                            if (original && !*original) *original = pointers[j];
+                            pointers[j] = replacement;
+                            totalPatched++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return totalPatched;
+}
+
 __attribute__((constructor))
 static void entry(void) {
     log_init();
     DLOG(@"[INIT] WangXian2Hook initialized");
     
-    orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-    orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
-    orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
-    DLOG(@"[SOCK] dlsym: recv=%p recvfrom=%p recvmsg=%p", orig_recv, orig_recvfrom, orig_recvmsg);
+    int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
+    int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
+    int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
+    
+    if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+    
+    DLOG(@"[SOCK] Patched: recv=%d recvfrom=%d recvmsg=%d", r, rf, rm);
+    DLOG(@"[SOCK] Original: recv=%p recvfrom=%p recvmsg=%p", orig_recv, orig_recvfrom, orig_recvmsg);
     
     Class sessCls = [NSURLSession class];
     if (sessCls) {
