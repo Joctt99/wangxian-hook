@@ -636,16 +636,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     size_t oldVerLen = strlen(oldVer);
     size_t newVerLen = strlen(newVer);
     
-    for (size_t i = 0; i <= len - oldVerLen; i++) {
-        if (memcmp(buf + i, oldVer, oldVerLen) == 0) {
-            if (!modified) {
-                sendBuf = malloc(len);
-                memcpy(sendBuf, buf, len);
-                modified = YES;
+    if (len >= oldVerLen) {
+        for (size_t i = 0; i <= len - oldVerLen; i++) {
+            if (memcmp(buf + i, oldVer, oldVerLen) == 0) {
+                if (!modified) {
+                    sendBuf = malloc(len);
+                    memcpy(sendBuf, buf, len);
+                    modified = YES;
+                }
+                unsigned char *mp = (unsigned char *)sendBuf;
+                memcpy(mp + i, newVer, newVerLen);
+                DLOG(@"[SEND-PATCH] Version '%s' -> '%s' at offset %zu", oldVer, newVer, i);
             }
-            unsigned char *mp = (unsigned char *)sendBuf;
-            memcpy(mp + i, newVer, newVerLen);
-            DLOG(@"[SEND-PATCH] Version '%s' -> '%s' at offset %zu", oldVer, newVer, i);
         }
     }
     
