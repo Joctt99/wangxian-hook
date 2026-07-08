@@ -29,6 +29,9 @@ jobs:
         ARCH=arm64
         MIN_IOS=12.0
         
+        # WangXian2Hook.m -> ObjC++ (for std::string support)
+        # fishhook.c -> plain C
+        # -fno-exceptions -fno-rtti: reduce C++ runtime dependency
         $CC -arch $ARCH \
           -isysroot $SDK_PATH \
           -miphoneos-version-min=$MIN_IOS \
@@ -42,8 +45,11 @@ jobs:
           -dynamiclib \
           -O2 \
           -fobjc-arc \
-          -o WangXian2Hook.dylib \
-          WangXian2Hook.m fishhook.c
+          -fno-exceptions \
+          -fno-rtti \
+          -x objective-c++ WangXian2Hook.m \
+          -x c fishhook.c \
+          -o WangXian2Hook.dylib
         
         echo "Build completed successfully!"
         ls -la WangXian2Hook.dylib
