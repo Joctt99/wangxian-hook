@@ -472,8 +472,16 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         }
     }
     
+    ssize_t searchLimit = len;
+    if (len >= 4) {
+        uint32_t firstPktLenBE = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+                                 ((uint32_t)buf[2] << 8)  | (uint32_t)buf[3];
+        searchLimit = (ssize_t)firstPktLenBE;
+        if (searchLimit > len) searchLimit = len;
+    }
+    
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(verLow); i++) {
+    for (ssize_t i = 0; i <= searchLimit - (ssize_t)sizeof(verLow); i++) {
         if (memcmp(buf + i, verLow, sizeof(verLow)) == 0) {
             DLOG(@"[PATCH-R] Detected '版本过低' at offset %zd", i);
             memset(buf + i, ' ', sizeof(verLow));
@@ -482,7 +490,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     }
     
     static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(curVer); i++) {
+    for (ssize_t i = 0; i <= searchLimit - (ssize_t)sizeof(curVer); i++) {
         if (memcmp(buf + i, curVer, sizeof(curVer)) == 0) {
             DLOG(@"[PATCH-R] Detected '当前版本' at offset %zd", i);
             memset(buf + i, ' ', sizeof(curVer));
@@ -491,7 +499,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     }
     
     static const unsigned char needUpdate[] = {0xE8,0xAF,0xB7,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(needUpdate); i++) {
+    for (ssize_t i = 0; i <= searchLimit - (ssize_t)sizeof(needUpdate); i++) {
         if (memcmp(buf + i, needUpdate, sizeof(needUpdate)) == 0) {
             DLOG(@"[PATCH-R] Detected '请更新' at offset %zd", i);
             memset(buf + i, ' ', sizeof(needUpdate));
@@ -500,7 +508,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     }
     
     static const unsigned char forceUpdate[] = {0xE5,0xBC,0xBA,0x5F,0xE6,0x9B,0xB4,0xE6,0x96,0xB0};
-    for (ssize_t i = 0; i <= len - (ssize_t)sizeof(forceUpdate); i++) {
+    for (ssize_t i = 0; i <= searchLimit - (ssize_t)sizeof(forceUpdate); i++) {
         if (memcmp(buf + i, forceUpdate, sizeof(forceUpdate)) == 0) {
             DLOG(@"[PATCH-R] Detected '强制更新' at offset %zd", i);
             memset(buf + i, ' ', sizeof(forceUpdate));
