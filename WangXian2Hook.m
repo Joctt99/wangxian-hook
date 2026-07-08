@@ -102,7 +102,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v2.8 ===");
+        _log(@"=== WangXian2Hook v2.9 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
     }
@@ -152,7 +152,7 @@ static void log_init(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v2.8 诊断面板";
+    titleLbl.text = @"WangXian2Hook v2.9 诊断面板";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -631,8 +631,26 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     void *sendBuf = (void *)buf;
     BOOL modified = NO;
     
+    const char *oldVer = "7.5.0";
+    const char *newVer = "9.9.9";
+    size_t oldVerLen = strlen(oldVer);
+    size_t newVerLen = strlen(newVer);
+    
+    for (size_t i = 0; i <= len - oldVerLen; i++) {
+        if (memcmp(buf + i, oldVer, oldVerLen) == 0) {
+            if (!modified) {
+                sendBuf = malloc(len);
+                memcpy(sendBuf, buf, len);
+                modified = YES;
+            }
+            unsigned char *mp = (unsigned char *)sendBuf;
+            memcpy(mp + i, newVer, newVerLen);
+            DLOG(@"[SEND-PATCH] Version '%s' -> '%s' at offset %zu", oldVer, newVer, i);
+        }
+    }
+    
     if (len >= 8) {
-        const unsigned char *p = (const unsigned char *)buf;
+        const unsigned char *p = (const unsigned char *)sendBuf;
         uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
@@ -642,57 +660,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         
         if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
             DLOG(@"[SEND-CMD] VERSION CHECK REQUEST");
-            DLOG_HEX(buf, len);
-            
-            const char *oldVer = "7.5.0";
-            const char *newVer = "7.6.0";
-            size_t oldVerLen = strlen(oldVer);
-            size_t newVerLen = strlen(newVer);
-            
-            for (size_t i = 0; i <= len - oldVerLen; i++) {
-                if (memcmp(p + i, oldVer, oldVerLen) == 0) {
-                    sendBuf = malloc(len);
-                    memcpy(sendBuf, buf, len);
-                    unsigned char *mp = (unsigned char *)sendBuf;
-                    memcpy(mp + i, newVer, newVerLen);
-                    if (newVerLen < oldVerLen) {
-                        memset(mp + i + newVerLen, 0, oldVerLen - newVerLen);
-                    }
-                    DLOG(@"[SEND-PATCH] Version string '%s' -> '%s' at offset %zu", oldVer, newVer, i);
-                    modified = YES;
-                    break;
-                }
-            }
         } else if (cmd == 0x0234AB89) {
             DLOG(@"[SEND-CMD] LOGIN REQUEST");
-            DLOG_HEX(buf, len);
-            
-            const char *oldVer = "7.5.0";
-            const char *newVer = "7.6.0";
-            size_t oldVerLen = strlen(oldVer);
-            
-            for (size_t i = 0; i <= len - oldVerLen; i++) {
-                if (memcmp(p + i, oldVer, oldVerLen) == 0) {
-                    sendBuf = malloc(len);
-                    memcpy(sendBuf, buf, len);
-                    unsigned char *mp = (unsigned char *)sendBuf;
-                    memcpy(mp + i, newVer, strlen(newVer));
-                    DLOG(@"[SEND-PATCH] Version string '%s' -> '%s' at offset %zu", oldVer, newVer, i);
-                    modified = YES;
-                    break;
-                }
-            }
         } else if (cmd == 0x000FF012) {
             DLOG(@"[SEND-CMD] SERVER LIST REQUEST");
-            DLOG_HEX(buf, len);
         } else if (cmd == 0x000EE006) {
             DLOG(@"[SEND-CMD] UUID/HANDSHAKE REQUEST");
-            DLOG_HEX(buf, len);
-        } else {
-            DLOG_HEX(buf, len);
+        }
+        
+        if (len >= 30 && len < 150) {
+            DLOG_HEX(sendBuf, len);
+        } else if (len >= 150) {
+            DLOG_HEX(sendBuf, 100);
         }
     } else {
-        DLOG_HEX(buf, len);
+        DLOG_HEX(sendBuf, len);
     }
     
     ssize_t ret = orig_send(fd, sendBuf, len, flags);
