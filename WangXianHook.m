@@ -1,6 +1,6 @@
 /**
- * WangXianHook v35.22 - RESTORE: Re-enabled version check patching (0x802EE118/120/121), '版本过低' text patch, HTTP version error fix
- * Only keeps: Input method crash fix + version bypass (no UUID/IDFV/IDFA/md5xor hooks)
+ * WangXianHook v35.23 - FIX: SK.judgeAppInfoWithBaseUrl now calls original, allowing normal device authorization flow
+ * Previously bypassed with fake result which broke auth - now game makes real requests to md5xor.com
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
  * FIX: Stop corrupting version string in 0x8002A016 (was misidentified as server list response)
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.22 ===");
+        _log(@"=== WXHook v35.23 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -96,19 +96,14 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - BYPASS
+// 4. judgeAppInfoWithBaseUrl: - Call original to allow normal auth flow
+// IMPORTANT: Do NOT bypass this - it breaks device authorization
+// Let the game make real requests to md5xor.com
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (BYPASSING)", baseUrl);
-    @try {
-        NSDictionary *fakeResult = @{@"status":@200,@"ispass":@"YES",@"pass":@"YES",@"result":@"pass",@"code":@0,@"verify":@"YES",@"data":@{@"status":@1,@"ispass":@"YES"},@"msg":@"success"};
-        ((void (*)(id, SEL, id))objc_msgSend)(self, @selector(handleAppInfoResult:), fakeResult);
-        DLOG(@"[SK] handleAppInfoResult: called OK");
-    } @catch (NSException *e) {
-        DLOG(@"[SK] Exception in bypass: %@", e);
-        if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
-    }
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (calling original)", baseUrl);
+    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
 }
 
 // 5. judgeNet - Call original to let it complete
@@ -243,7 +238,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.22 诊断面板";
+            lbl.text = @"WXHook v35.23 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2457,7 +2452,7 @@ static void installAllHooks(void) {
         if (m) { orig_exitApp = (ExitAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_exitApp); _log(@"[INIT] SK.exitApplication: BLOCK"); }
         
         m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
-        if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: BYPASS"); }
+        if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: ORIG"); }
         
         m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
         if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: LOG"); }
