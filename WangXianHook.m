@@ -2295,8 +2295,6 @@ static void installAllHooks(void) {
     
     installSecurityHooks();
     installKeyboardProtection();
-    installIdentifierForVendorHook();
-    installAdvertisingIdentifierHook();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
