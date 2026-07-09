@@ -885,9 +885,13 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, len);
         }
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x8000E002) {
             parseLoginServerFromResponse(buf, len);
-            DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
+            if (cmd == 0x8000E002) {
+                DLOG(@"[PROTO-R] HANDSHAKE/UUID RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
+            } else {
+                DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
+            }
             DLOG_HEX(buf, len);
             
             ssize_t maxPatch = (ssize_t)pktLenBE;
@@ -950,6 +954,18 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         } else if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] NEW QUERY SERVER LIST RES cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
             DLOG_HEX(buf, len < 200 ? len : 200);
+        } else if ((cmd & 0x80000000) != 0) {
+            DLOG(@"[PROTO-R] UNKNOWN RESPONSE cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
+            
+            if (len >= 12) {
+                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
+                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Unknown response status %u -> 0", status4);
+                    memset(buf + 8, 0, 4);
+                    patched = YES;
+                }
+            }
         }
     }
     
