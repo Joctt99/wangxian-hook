@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.5 调试版 (全量日志 + 超时警告 + RSA回退) ===");
+        _log(@"=== WangXian2Hook v4.6 极简版 (无阻塞connect + SEND-DEBUG/RECV-DEBUG) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -587,7 +587,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.5 调试版";
+    titleLbl.text = @"WangXian2Hook v4.6 极简版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -1049,15 +1049,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     int port = getPortForFd(fd);
     
     if (ret > 0) {
-        DLOG(@"[RECV] fd=%d %s:%d len=%zd flags=%d", fd, host ?: "unknown", port, ret, flags);
+        DLOG(@"[RECV-DEBUG] fd=%d %s:%d len=%zd flags=%d", fd, host ?: "unknown", port, ret, flags);
         DLOG_HEX(buf, ret < 256 ? ret : 256);
         
         patchVersionCheckResponse((unsigned char *)buf, ret);
         parseLoginResponse((unsigned char *)buf, ret);
     } else if (ret == 0) {
-        DLOG(@"[RECV] fd=%d %s:%d ret=0 (connection closed)", fd, host ?: "unknown", port);
+        DLOG(@"[RECV-DEBUG] fd=%d %s:%d ret=0 (connection closed)", fd, host ?: "unknown", port);
     } else {
-        DLOG(@"[RECV] fd=%d %s:%d ret=%zd err=%d (%s)", fd, host ?: "unknown", port, ret, errno, strerror(errno));
+        DLOG(@"[RECV-DEBUG] fd=%d %s:%d ret=%zd err=%d (%s)", fd, host ?: "unknown", port, ret, errno, strerror(errno));
     }
     
     return ret;
@@ -1143,7 +1143,7 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
         }
     }
     
-    DLOG(@"[CONNECT] fd=%d original=%s:%d target=%s:%d", fd, host, port, g_loginServerIP, g_loginServerPort);
+    DLOG(@"[CONNECT] fd=%d %s:%d -> target=%s:%d", fd, host, port, g_loginServerIP, g_loginServerPort);
     
     const struct sockaddr *finalAddr = addr;
     struct sockaddr_in newAddr;
@@ -1157,45 +1157,10 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
         DLOG(@"[CONNECT] REWRITTEN to %s:%d", g_loginServerIP, g_loginServerPort);
     }
     
-    int ret = -1;
-    int retryCount = 0;
-    const int maxRetries = 3;
-    
-    while (retryCount < maxRetries) {
-        ret = orig_connect ? orig_connect(fd, finalAddr, addrlen) : -1;
-        int err = errno;
-        
-        if (ret == 0) {
-            trackFd(fd, g_loginServerIP, g_loginServerPort);
-            DLOG(@"[CONNECT] SUCCESS fd=%d ret=%d after %d attempts", fd, ret, retryCount + 1);
-            
-            static int firstConnect = 1;
-            if (firstConnect) {
-                firstConnect = 0;
-                DLOG(@"[CONNECT] *** FIRST CONNECTION ESTABLISHED ***");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    DLOG(@"[WARN] No data sent within 5 seconds after connection");
-                });
-            }
-            return ret;
-        }
-        
-        DLOG(@"[CONNECT] FAILED fd=%d attempt=%d ret=%d err=%d (%s)", fd, retryCount + 1, ret, err, strerror(err));
-        
-        if (err != ECONNREFUSED && err != 61) {
-            break;
-        }
-        
-        retryCount++;
-        if (retryCount < maxRetries) {
-            DLOG(@"[CONNECT] Retrying in 1000ms...");
-            usleep(1000000);
-        }
-    }
-    
-    if (ret != 0) {
-        DLOG(@"[CONNECT] FINAL FAILURE fd=%d ret=%d after %d attempts, err=%d", fd, ret, maxRetries, errno);
-    }
+    DLOG(@"[CONNECT] Calling original connect...");
+    int ret = orig_connect ? orig_connect(fd, finalAddr, addrlen) : -1;
+    int err = errno;
+    DLOG(@"[CONNECT] original connect returned: %d, errno: %d (%s)", ret, err, strerror(err));
     
     return ret;
 }
@@ -1216,102 +1181,67 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
-    DLOG(@"[SEND] fd=%d %s:%d len=%zu flags=%d", fd, host ?: "unknown", port, len, flags);
+    DLOG(@"[SEND-DEBUG] fd=%d %s:%d len=%zu flags=%d", fd, host ?: "unknown", port, len, flags);
     DLOG_HEX(buf, len < 256 ? len : 256);
     
     void *sendBuf = (void *)buf;
     BOOL modified = NO;
     
     if (len >= 8) {
-        const unsigned char *p = (const unsigned char *)buf;
-        uint32_t pktLenBE = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        uint32_t cmd = ((uint32_t)cbuf[4] << 24) | ((uint32_t)cbuf[5] << 16) |
+                       ((uint32_t)cbuf[6] << 8)  | (uint32_t)cbuf[7];
         
-        DLOG(@"[SEND-CMD] cmd=0x%08X pktLen=%u", cmd, pktLenBE);
+        DLOG(@"[SEND-DEBUG] cmd=0x%08X", cmd);
         
         if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
-            DLOG(@"[SEND-CMD] VERSION CHECK REQUEST");
-            
             const char *oldVer = "7.5.0";
             const char *newVer = "7.6.0";
             size_t oldVerLen = strlen(oldVer);
-            size_t newVerLen = strlen(newVer);
-            
-            if (len >= oldVerLen) {
-                for (size_t i = 0; i <= len - oldVerLen; i++) {
-                    if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
-                        sendBuf = malloc(len);
-                        memcpy(sendBuf, buf, len);
-                        unsigned char *mp = (unsigned char *)sendBuf;
-                        memcpy(mp + i, newVer, newVerLen);
-                        DLOG(@"[SEND-PATCH] Version '%s' -> '%s' at offset %zu", oldVer, newVer, i);
-                        modified = YES;
-                        break;
-                    }
+            for (size_t i = 0; i <= len - oldVerLen; i++) {
+                if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
+                    sendBuf = malloc(len);
+                    memcpy(sendBuf, buf, len);
+                    unsigned char *mp = (unsigned char *)sendBuf;
+                    memcpy(mp + i, newVer, strlen(newVer));
+                    modified = YES;
+                    DLOG(@"[SEND-DEBUG] Version replaced 7.5.0->7.6.0");
+                    break;
                 }
             }
         } else if (cmd == 0x0234AB89) {
-            DLOG(@"[SEND-CMD] LOGIN REQUEST (old v1, 7 fields)");
-
+            DLOG(@"[SEND-DEBUG] v1 login -> converting to v2");
+            
             unsigned char *newBuf = (unsigned char *)malloc(len + 100);
             memcpy(newBuf, buf, len);
-
             newBuf[4] = 0x00; newBuf[5] = 0x2E; newBuf[6] = 0xE1; newBuf[7] = 0x21;
 
             size_t pos = 12;
-            NSString *username = nil;
-            NSString *password = nil;
-            NSString *deviceId = nil;
-            NSString *version = @"7.6.0";
-
-            for (int f = 0; f < 7 && pos < len; f++) {
-                if (pos + 2 > len) break;
+            NSString *username = nil, *password = nil, *deviceId = nil;
+            for (int f = 0; f < 7 && pos + 2 <= len; f++) {
                 uint16_t fieldLen = ((uint16_t)newBuf[pos] << 8) | newBuf[pos + 1];
                 if (pos + 2 + fieldLen > len) break;
-                
                 char field[256] = {0};
-                if (fieldLen > 0 && fieldLen < 256) {
-                    memcpy(field, newBuf + pos + 2, fieldLen);
-                }
-                
+                if (fieldLen > 0 && fieldLen < 256) memcpy(field, newBuf + pos + 2, fieldLen);
                 if (f == 0) username = [NSString stringWithUTF8String:field];
                 else if (f == 1) password = [NSString stringWithUTF8String:field];
                 else if (f == 2) deviceId = [NSString stringWithUTF8String:field];
-                
                 pos += 2 + fieldLen;
             }
 
-            DLOG(@"[LOGIN-FIELDS] username=%@ password=%@ deviceId=%@", username, password, deviceId);
-
-            NSString *sign = generateSign(username, password, deviceId, version);
+            NSString *sign = generateSign(username, password, deviceId, @"7.6.0");
             const char *signCStr = [sign UTF8String];
             size_t signLen = strlen(signCStr);
 
             size_t insertPos = len;
-            if (newBuf[len - 1] == 0x00) {
-                insertPos = len - 1;
-            }
-
-            size_t extraFields = 9;
-            size_t signFieldLen = 2 + signLen;
-            size_t otherFieldsLen = (extraFields - 1) * 2;
-            size_t totalExtra = signFieldLen + otherFieldsLen;
-            size_t finalLen = insertPos + totalExtra;
+            if (newBuf[len - 1] == 0x00) insertPos = len - 1;
+            size_t finalLen = insertPos + 2 + signLen + 16;
 
             unsigned char *finalBuf = (unsigned char *)malloc(finalLen);
             memcpy(finalBuf, newBuf, insertPos);
-
             finalBuf[insertPos] = (signLen >> 8) & 0xFF;
             finalBuf[insertPos + 1] = signLen & 0xFF;
             memcpy(finalBuf + insertPos + 2, signCStr, signLen);
-
-            size_t otherPos = insertPos + signFieldLen;
-            for (int i = 0; i < extraFields - 1; i++) {
-                finalBuf[otherPos + i * 2] = 0x00;
-                finalBuf[otherPos + i * 2 + 1] = 0x00;
-            }
+            memset(finalBuf + insertPos + 2 + signLen, 0, 16);
 
             uint32_t newPktLen = (uint32_t)finalLen;
             finalBuf[0] = (newPktLen >> 24) & 0xFF;
@@ -1323,94 +1253,48 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             sendBuf = finalBuf;
             len = finalLen;
             modified = YES;
-
-            DLOG(@"[SEND-PATCH] Login v1->v2: cmd 0x0234AB89 -> 0x002EE121, sign=%@, newLen=%zu", sign, len);
-            DLOG_HEX(sendBuf, len < 256 ? len : 256);
-
+            DLOG(@"[SEND-DEBUG] v1->v2 converted, newLen=%zu", len);
         } else if (cmd == 0x002EE121) {
-            // v2登录请求 - iOS游戏直接发送v2，检查sign是否为空
-            DLOG(@"[SEND-CMD] LOGIN REQUEST v2 (cmd=0x002EE121, 16 fields)");
-
-            // 解析16个字段
-            size_t pos = 12; // 跳过4字节pktLen + 4字节cmd + 4字节status
+            DLOG(@"[SEND-DEBUG] v2 login request");
+            
+            size_t pos = 12;
             char fields[16][256] = {0};
             uint16_t fieldLens[16] = {0};
             int fieldCount = 0;
-
+            
             for (int f = 0; f < 16 && pos + 2 <= len; f++) {
                 uint16_t flen = ((uint16_t)cbuf[pos] << 8) | cbuf[pos + 1];
                 if (pos + 2 + flen > len) break;
-
+                if (flen > 0 && flen < 256) memcpy(fields[f], cbuf + pos + 2, flen);
                 fieldLens[f] = flen;
-                if (flen > 0 && flen < 256) {
-                    memcpy(fields[f], cbuf + pos + 2, flen);
-                }
                 fieldCount++;
                 pos += 2 + flen;
             }
-
-            // === 字段完整性校验：打印全部16个字段 ===
-            DLOG(@"[V2-LOGIN] === ALL 16 FIELDS BEFORE PATCH ===");
-            DLOG(@"[V2-LOGIN]   f0(username)    = [%d] %s", fieldLens[0], fields[0]);
-            DLOG(@"[V2-LOGIN]   f1(password)    = [%d] %s", fieldLens[1], fields[1]);
-            DLOG(@"[V2-LOGIN]   f2(deviceId)    = [%d] %s", fieldLens[2], fields[2]);
-            DLOG(@"[V2-LOGIN]   f3(channel)     = [%d] %s", fieldLens[3], fields[3]);
-            DLOG(@"[V2-LOGIN]   f4(os)          = [%d] %s", fieldLens[4], fields[4]);
-            DLOG(@"[V2-LOGIN]   f5(phoneModel)  = [%d] %s", fieldLens[5], fields[5]);
-            DLOG(@"[V2-LOGIN]   f6(?)           = [%d] %s", fieldLens[6], fields[6]);
-            DLOG(@"[V2-LOGIN]   f7(?)           = [%d] %s", fieldLens[7], fields[7]);
-            DLOG(@"[V2-LOGIN]   f8(subChannel)  = [%d] %s", fieldLens[8], fields[8]);
-            DLOG(@"[V2-LOGIN]   f9(sign)        = [%d] %s", fieldLens[9], fields[9]);
-            DLOG(@"[V2-LOGIN]   f10(?)          = [%d] %s", fieldLens[10], fields[10]);
-            DLOG(@"[V2-LOGIN]   f11(?)          = [%d] %s", fieldLens[11], fields[11]);
-            DLOG(@"[V2-LOGIN]   f12(?)          = [%d] %s", fieldLens[12], fields[12]);
-            DLOG(@"[V2-LOGIN]   f13(?)          = [%d] %s", fieldLens[13], fields[13]);
-            DLOG(@"[V2-LOGIN]   f14(?)          = [%d] %s", fieldLens[14], fields[14]);
-            DLOG(@"[V2-LOGIN]   f15(?)          = [%d] %s", fieldLens[15], fields[15]);
-
-            // === 修复1：版本号替换 7.5.0 -> 7.6.0 ===
+            
             const char *oldVer = "7.5.0";
             const char *newVer = "7.6.0";
-            size_t oldVerLen = strlen(oldVer);
-            size_t newVerLen = strlen(newVer);
-            BOOL versionReplaced = NO;
-            for (size_t i = 0; i <= len - oldVerLen; i++) {
-                if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
-                    DLOG(@"[V2-LOGIN] *** VERSION FOUND: '7.5.0' at offset %zu, replacing with '7.6.0' ***", i);
+            for (size_t i = 0; i <= len - strlen(oldVer); i++) {
+                if (memcmp(cbuf + i, oldVer, strlen(oldVer)) == 0) {
                     sendBuf = malloc(len);
                     memcpy(sendBuf, buf, len);
                     unsigned char *mp = (unsigned char *)sendBuf;
-                    memcpy(mp + i, newVer, newVerLen);
+                    memcpy(mp + i, newVer, strlen(newVer));
+                    cbuf = (const unsigned char *)sendBuf;
                     modified = YES;
-                    versionReplaced = YES;
+                    DLOG(@"[SEND-DEBUG] v2 login version replaced");
                     break;
                 }
             }
-            if (!versionReplaced) {
-                DLOG(@"[V2-LOGIN] *** WARNING: Version '7.5.0' NOT found in login packet ***");
-                DLOG_HEX(buf, len);
-            }
-
-            // 更新cbuf指针指向可能修改后的buffer
-            if (sendBuf != buf) {
-                cbuf = (const unsigned char *)sendBuf;
-            }
-
-            // === 修复3：RSA加密密码（如果公钥存在且未强制明文）===
+            
             if (!g_forcePlainPassword && g_rsaPublicKey && fieldLens[1] > 0) {
                 NSString *plainPassword = [NSString stringWithUTF8String:fields[1]];
-                DLOG(@"[V2-LOGIN] *** RSA ENCRYPT ATTEMPT: plain password='%@' (len=%zu) ***",
-                     plainPassword, (unsigned long)fieldLens[1]);
-                
+                DLOG(@"[SEND-DEBUG] RSA encrypt: '%@' (len=%d)", plainPassword, fieldLens[1]);
                 NSString *encryptedPassword = rsaEncryptString(plainPassword, g_rsaPublicKey);
                 if (encryptedPassword) {
                     const char *encPassCStr = [encryptedPassword UTF8String];
                     size_t encPassLen = strlen(encPassCStr);
+                    DLOG(@"[SEND-DEBUG] RSA result len=%zu", encPassLen);
                     
-                    DLOG(@"[V2-LOGIN] *** RSA ENCRYPT SUCCESS: '%@' -> '%s' (len=%zu) ***",
-                         plainPassword, encPassLen > 20 ? [encryptedPassword substringToIndex:20] : encryptedPassword, encPassLen);
-                    
-                    // 找到password字段（field 1）的位置
                     size_t passFieldPos = 12;
                     uint16_t passFieldLen = 0;
                     for (int f = 0; f < 1 && passFieldPos + 2 <= len; f++) {
@@ -1418,26 +1302,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         passFieldPos += 2 + passFieldLen;
                     }
                     
-                    // 计算新包长度变化
                     size_t extraBytes = encPassLen - passFieldLen;
                     if (extraBytes != 0) {
                         unsigned char *newBuf = (unsigned char *)malloc(len + extraBytes);
                         if (newBuf) {
                             size_t passStartPos = passFieldPos - 2 - passFieldLen;
-                            
-                            // 复制password字段之前的数据
                             memcpy(newBuf, cbuf, passStartPos);
-                            // 写入新的password字段长度
                             newBuf[passStartPos] = (encPassLen >> 8) & 0xFF;
                             newBuf[passStartPos + 1] = encPassLen & 0xFF;
-                            // 写入加密后的密码
                             memcpy(newBuf + passStartPos + 2, encPassCStr, encPassLen);
-                            // 复制password字段之后的数据
                             memcpy(newBuf + passStartPos + 2 + encPassLen,
                                    cbuf + passStartPos + 2 + passFieldLen,
-                                   len - (passStartPos + 2 + passFieldLen));
+                                   len - passStartPos - 2 - passFieldLen);
                             
-                            // 更新pktLen
                             uint32_t newPktLen = (uint32_t)((len + extraBytes) - 4);
                             newBuf[0] = (newPktLen >> 24) & 0xFF;
                             newBuf[1] = (newPktLen >> 16) & 0xFF;
@@ -1446,111 +1323,58 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             
                             if (sendBuf != buf) free(sendBuf);
                             sendBuf = newBuf;
-                            cbuf = (const unsigned char *)sendBuf;
                             len += extraBytes;
                             modified = YES;
-                            
-                            DLOG(@"[V2-LOGIN] Password RSA encrypted, packet len changed: %zu -> %zu",
-                                 len - extraBytes, len);
+                            DLOG(@"[SEND-DEBUG] RSA encrypted, len=%zu", len);
                         }
                     }
                 } else {
-                    DLOG(@"[V2-LOGIN] *** WARNING: RSA encryption failed, password remains plaintext ***");
+                    DLOG(@"[SEND-DEBUG] RSA encrypt failed, keeping plaintext");
                 }
-            } else if (g_rsaPublicKey && fieldLens[1] == 0) {
-                DLOG(@"[V2-LOGIN] *** WARNING: Password field is empty, cannot RSA encrypt ***");
             }
-
-            // 检查sign字段（field 9）- 如果为空则注入sign
+            
             if (fieldCount >= 10 && fieldLens[9] == 0) {
-                DLOG(@"[V2-LOGIN] *** Sign is EMPTY! Injecting sign via socket patch ***");
-
                 NSString *username = [NSString stringWithUTF8String:fields[0]];
                 NSString *password = [NSString stringWithUTF8String:fields[1]];
                 NSString *deviceId = [NSString stringWithUTF8String:fields[2]];
                 NSString *signNS = generateSignV2(username, password, deviceId);
                 const char *signCStr = [signNS UTF8String];
                 size_t signLen = strlen(signCStr);
-
-                DLOG(@"[V2-LOGIN] Generated sign: %s (len=%zu)", signCStr, signLen);
-
-                // 计算新包长度
-                size_t extraBytes = 2 + signLen; // 2字节长度前缀 + sign内容
-                size_t newLen = len + extraBytes;
-
-                unsigned char *newBuf = (unsigned char *)malloc(newLen);
+                
+                size_t extraBytes = 2 + signLen;
+                unsigned char *newBuf = (unsigned char *)malloc(len + extraBytes);
                 if (newBuf) {
-                    // 找到sign字段的位置（field 9的起始位置）
                     size_t signFieldPos = 12;
                     for (int f = 0; f < 9 && signFieldPos + 2 <= len; f++) {
                         uint16_t flen = ((uint16_t)cbuf[signFieldPos] << 8) | cbuf[signFieldPos + 1];
                         signFieldPos += 2 + flen;
                     }
-
-                    DLOG(@"[V2-LOGIN] Sign field at offset %zu, inserting %zu bytes", signFieldPos, extraBytes);
-
-                    // 复制sign字段之前的数据
+                    
                     memcpy(newBuf, cbuf, signFieldPos);
-                    // 写入sign字段长度前缀（替换原来的00 00）
                     newBuf[signFieldPos] = (signLen >> 8) & 0xFF;
                     newBuf[signFieldPos + 1] = signLen & 0xFF;
-                    // 写入sign内容
                     memcpy(newBuf + signFieldPos + 2, signCStr, signLen);
-                    // 复制sign字段之后的数据（跳过原来的2字节长度前缀，因为长度没变）
                     memcpy(newBuf + signFieldPos + 2 + signLen,
                            cbuf + signFieldPos + 2, len - signFieldPos - 2);
-
-                    // 更新pktLen
-                    uint32_t newPktLen = (uint32_t)(newLen - 4);
+                    
+                    uint32_t newPktLen = (uint32_t)(len + extraBytes - 4);
                     newBuf[0] = (newPktLen >> 24) & 0xFF;
                     newBuf[1] = (newPktLen >> 16) & 0xFF;
                     newBuf[2] = (newPktLen >> 8) & 0xFF;
                     newBuf[3] = newPktLen & 0xFF;
-
+                    
+                    if (sendBuf != buf) free(sendBuf);
                     sendBuf = newBuf;
-                    len = newLen;
+                    len += extraBytes;
                     modified = YES;
-
-                    DLOG(@"[SEND-PATCH] v2 sign injected: oldLen=%zu newLen=%zu sign=%@",
-                          len - extraBytes, newLen, signNS);
-                    DLOG_HEX(sendBuf, len < 256 ? len : 256);
+                    DLOG(@"[SEND-DEBUG] Sign injected, len=%zu", len);
                 }
-            } else {
-                DLOG(@"[V2-LOGIN] Sign already present (len=%d), no patch needed", fieldLens[9]);
             }
-
-            if (!modified && len < 256) {
-                DLOG_HEX(sendBuf, len);
-            }
-
-        } else if (cmd == 0x000FF012 || cmd == 0x002EE113) {
-            DLOG(@"[SEND-CMD] SERVER LIST REQUEST (cmd=0x%08X)", cmd);
-
-            // 新版服务器列表请求cmd=0x002EE113，旧版=0x000FF012
-            if (cmd == 0x000FF012) {
-                sendBuf = malloc(len);
-                memcpy(sendBuf, buf, len);
-                unsigned char *mp = (unsigned char *)sendBuf;
-                mp[4] = 0x00; mp[5] = 0x2E; mp[6] = 0xE1; mp[7] = 0x13;
-                modified = YES;
-                DLOG(@"[SEND-PATCH] Server list cmd 0x000FF012 -> 0x002EE113");
-            }
-        } else if (cmd == 0x000EE006) {
-            DLOG(@"[SEND-CMD] UUID/HANDSHAKE REQUEST");
-        } else if (cmd == 0x000EAE03) {
-            DLOG(@"[SEND-CMD] GET RSA DATA REQUEST (new v7.6)");
         }
-        
-        if (len >= 30 && len < 150) {
-            DLOG_HEX(sendBuf, len);
-        } else if (len >= 150) {
-            DLOG_HEX(sendBuf, 100);
-        }
-    } else {
-        DLOG_HEX(sendBuf, len);
     }
     
     ssize_t ret = orig_send(fd, sendBuf, len, flags);
+    DLOG(@"[SEND-DEBUG] orig_send returned: %zd", ret);
     
     if (modified && sendBuf != buf) {
         free(sendBuf);
