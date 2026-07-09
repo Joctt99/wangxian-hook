@@ -29,6 +29,7 @@ static NSString *readRsaPublicKey(void);
 
 static char g_loginServerIP[64] = "116.213.192.216";
 static int g_loginServerPort = 5678;
+static BOOL g_forcePlainPassword = NO;
 
 static UIButton *g_logBtn = nil;
 static UIView *g_logPanel = nil;
@@ -112,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.4 网络修复版 (动态服务器 + 重连 + RSA硬编码) ===");
+        _log(@"=== WangXian2Hook v4.5 调试版 (全量日志 + 超时警告 + RSA回退) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -586,7 +587,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.4 网络修复版";
+    titleLbl.text = @"WangXian2Hook v4.5 调试版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -1044,16 +1045,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv || !buf) return -1;
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
-    if (ret <= 0) return ret;
-    
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
-    DLOG(@"[RECV] fd=%d %s:%d len=%zd", fd, host ?: "unknown", port, ret);
-    
-    patchVersionCheckResponse((unsigned char *)buf, ret);
-    
-    parseLoginResponse((unsigned char *)buf, ret);
+    if (ret > 0) {
+        DLOG(@"[RECV] fd=%d %s:%d len=%zd flags=%d", fd, host ?: "unknown", port, ret, flags);
+        DLOG_HEX(buf, ret < 256 ? ret : 256);
+        
+        patchVersionCheckResponse((unsigned char *)buf, ret);
+        parseLoginResponse((unsigned char *)buf, ret);
+    } else if (ret == 0) {
+        DLOG(@"[RECV] fd=%d %s:%d ret=0 (connection closed)", fd, host ?: "unknown", port);
+    } else {
+        DLOG(@"[RECV] fd=%d %s:%d ret=%zd err=%d (%s)", fd, host ?: "unknown", port, ret, errno, strerror(errno));
+    }
     
     return ret;
 }
@@ -1138,9 +1143,8 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
         }
     }
     
-    DLOG(@"[CONNECT] fd=%d %s:%d -> target=%s:%d", fd, host, port, g_loginServerIP, g_loginServerPort);
+    DLOG(@"[CONNECT] fd=%d original=%s:%d target=%s:%d", fd, host, port, g_loginServerIP, g_loginServerPort);
     
-    // 如果连接到登录服务器端口(5678)，替换为我们的目标服务器
     const struct sockaddr *finalAddr = addr;
     struct sockaddr_in newAddr;
     if (port == 5678 || port == 12003) {
@@ -1159,14 +1163,24 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
     
     while (retryCount < maxRetries) {
         ret = orig_connect ? orig_connect(fd, finalAddr, addrlen) : -1;
+        int err = errno;
+        
         if (ret == 0) {
             trackFd(fd, g_loginServerIP, g_loginServerPort);
-            DLOG(@"[CONNECT] SUCCESS fd=%d after %d retries", fd, retryCount);
+            DLOG(@"[CONNECT] SUCCESS fd=%d ret=%d after %d attempts", fd, ret, retryCount + 1);
+            
+            static int firstConnect = 1;
+            if (firstConnect) {
+                firstConnect = 0;
+                DLOG(@"[CONNECT] *** FIRST CONNECTION ESTABLISHED ***");
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    DLOG(@"[WARN] No data sent within 5 seconds after connection");
+                });
+            }
             return ret;
         }
         
-        int err = errno;
-        DLOG(@"[CONNECT] FAILED fd=%d attempt=%d err=%d (%s)", fd, retryCount + 1, err, strerror(err));
+        DLOG(@"[CONNECT] FAILED fd=%d attempt=%d ret=%d err=%d (%s)", fd, retryCount + 1, ret, err, strerror(err));
         
         if (err != ECONNREFUSED && err != 61) {
             break;
@@ -1180,7 +1194,7 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
     }
     
     if (ret != 0) {
-        DLOG(@"[CONNECT] FINAL FAILURE fd=%d after %d attempts, err=%d", fd, maxRetries, errno);
+        DLOG(@"[CONNECT] FINAL FAILURE fd=%d ret=%d after %d attempts, err=%d", fd, ret, maxRetries, errno);
     }
     
     return ret;
@@ -1202,7 +1216,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
-    DLOG(@"[SEND] fd=%d %s:%d len=%zu", fd, host ?: "unknown", port, len);
+    DLOG(@"[SEND] fd=%d %s:%d len=%zu flags=%d", fd, host ?: "unknown", port, len, flags);
+    DLOG_HEX(buf, len < 256 ? len : 256);
     
     void *sendBuf = (void *)buf;
     BOOL modified = NO;
@@ -1381,16 +1396,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 cbuf = (const unsigned char *)sendBuf;
             }
 
-            // === 修复3：RSA加密密码（如果公钥存在）===
-            if (g_rsaPublicKey && fieldLens[1] > 0) {
+            // === 修复3：RSA加密密码（如果公钥存在且未强制明文）===
+            if (!g_forcePlainPassword && g_rsaPublicKey && fieldLens[1] > 0) {
                 NSString *plainPassword = [NSString stringWithUTF8String:fields[1]];
+                DLOG(@"[V2-LOGIN] *** RSA ENCRYPT ATTEMPT: plain password='%@' (len=%zu) ***",
+                     plainPassword, (unsigned long)fieldLens[1]);
+                
                 NSString *encryptedPassword = rsaEncryptString(plainPassword, g_rsaPublicKey);
                 if (encryptedPassword) {
                     const char *encPassCStr = [encryptedPassword UTF8String];
                     size_t encPassLen = strlen(encPassCStr);
                     
-                    DLOG(@"[V2-LOGIN] *** RSA ENCRYPTING PASSWORD: '%@' -> '%s' (len=%zu) ***",
-                         plainPassword, encPassCStr, encPassLen);
+                    DLOG(@"[V2-LOGIN] *** RSA ENCRYPT SUCCESS: '%@' -> '%s' (len=%zu) ***",
+                         plainPassword, encPassLen > 20 ? [encryptedPassword substringToIndex:20] : encryptedPassword, encPassLen);
                     
                     // 找到password字段（field 1）的位置
                     size_t passFieldPos = 12;
