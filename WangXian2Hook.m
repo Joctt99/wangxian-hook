@@ -1321,7 +1321,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 pos += 2 + fieldLen;
             }
             
-            NSString *sign = generateSign(username, password, deviceId, @"7.6.0");
+            NSString *sign = generateSign([NSString stringWithUTF8String:username], 
+                                          [NSString stringWithUTF8String:password], 
+                                          [NSString stringWithUTF8String:deviceId], 
+                                          @"7.6.0");
             const char *signCStr = [sign UTF8String];
             
             const char *channel = "SQAGE";
