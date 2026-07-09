@@ -106,9 +106,17 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.2 iOS修正版 (Hook v2 + Socket v2 + 手动组包) ===");
+        _log(@"=== WangXian2Hook v4.3 完整版 (RSA加密 + 版本号替换 + 登录响应解析) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
+        
+        // 加载RSA公钥（如果存在）
+        g_rsaPublicKey = readRsaPublicKey();
+        if (g_rsaPublicKey) {
+            DLOG(@"[RSA] Public key loaded, RSA encryption will be used for password");
+        } else {
+            DLOG(@"[RSA] No public key found, password will be sent in plaintext");
+        }
     }
 }
 
@@ -153,10 +161,116 @@ static NSString *generateSignV2(NSString *username, NSString *password, NSString
     NSString *signKey = @"SQAGE_MIESHI";
     NSString *input = [NSString stringWithFormat:@"%@%@%@%@", username, password, deviceId, signKey];
     NSString *sign = md5String(input);
-    DLOG(@"[SIGN-V2] Generated: username=%@ password=%@ deviceId=%@", username, password, deviceId);
-    DLOG(@"[SIGN-V2] Input: %@", input);
-    DLOG(@"[SIGN-V2] Result: %@", sign);
+    DLOG(@"[SIGN-V2] === SIGN GENERATION DETAILS ===");
+    DLOG(@"[SIGN-V2] username: '%@' (len=%lu)", username, (unsigned long)username.length);
+    DLOG(@"[SIGN-V2] password: '%@' (len=%lu)", password, (unsigned long)password.length);
+    DLOG(@"[SIGN-V2] deviceId: '%@' (len=%lu)", deviceId, (unsigned long)deviceId.length);
+    DLOG(@"[SIGN-V2] key: '%@' (len=%lu)", signKey, (unsigned long)signKey.length);
+    DLOG(@"[SIGN-V2] INPUT: '%@' (len=%lu)", input, (unsigned long)input.length);
+    DLOG(@"[SIGN-V2] RESULT: '%@'", sign);
     return sign;
+}
+
+#pragma mark - RSA Encryption
+
+static NSString *readRsaPublicKey(void) {
+    NSString *pkPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/pk.txt"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:pkPath]) {
+        NSString *key = [NSString stringWithContentsOfFile:pkPath encoding:NSUTF8StringEncoding error:nil];
+        if (key) {
+            key = [key stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            DLOG(@"[RSA] Public key read from pk.txt (len=%lu)", (unsigned long)key.length);
+            return key;
+        }
+    }
+    DLOG(@"[RSA] pk.txt not found at %@", pkPath);
+    return nil;
+}
+
+static NSString *rsaEncryptString(NSString *input, NSString *publicKeyStr) {
+    if (!input || !publicKeyStr) {
+        DLOG(@"[RSA] Error: input or publicKey is nil");
+        return nil;
+    }
+    
+    @try {
+        NSData *inputData = [input dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *keyData = [publicKeyStr dataUsingEncoding:NSUTF8StringEncoding];
+        
+        SecCertificateRef certificate = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)keyData);
+        if (!certificate) {
+            DLOG(@"[RSA] Error: Cannot create certificate from public key");
+            return nil;
+        }
+        
+        SecPolicyRef policy = SecPolicyCreateBasicX509();
+        SecTrustRef trust;
+        OSStatus status = SecTrustCreateWithCertificates(certificate, policy, &trust);
+        CFRelease(certificate);
+        CFRelease(policy);
+        
+        if (status != errSecSuccess) {
+            DLOG(@"[RSA] Error: SecTrustCreateWithCertificates failed (%d)", (int)status);
+            return nil;
+        }
+        
+        SecTrustResultType trustResult;
+        status = SecTrustEvaluate(trust, &trustResult);
+        if (status != errSecSuccess) {
+            CFRelease(trust);
+            DLOG(@"[RSA] Error: SecTrustEvaluate failed (%d)", (int)status);
+            return nil;
+        }
+        
+        SecKeyRef publicKey = SecTrustCopyPublicKey(trust);
+        CFRelease(trust);
+        
+        if (!publicKey) {
+            DLOG(@"[RSA] Error: Cannot extract public key from trust");
+            return nil;
+        }
+        
+        size_t keySize = SecKeyGetBlockSize(publicKey);
+        size_t blockSize = keySize - 42;
+        NSMutableData *encryptedData = [[NSMutableData alloc] init];
+        
+        const unsigned char *bytes = (const unsigned char *)inputData.bytes;
+        size_t idx = 0;
+        while (idx < inputData.length) {
+            size_t dataLen = MIN(blockSize, inputData.length - idx);
+            NSData *block = [NSData dataWithBytes:bytes + idx length:dataLen];
+            
+            size_t encryptedSize = keySize;
+            unsigned char *encryptedBytes = malloc(encryptedSize);
+            
+            OSStatus encryptStatus = SecKeyEncrypt(publicKey, kSecPaddingPKCS1,
+                (const unsigned char *)block.bytes, dataLen,
+                encryptedBytes, &encryptedSize);
+            
+            if (encryptStatus == errSecSuccess) {
+                [encryptedData appendBytes:encryptedBytes length:encryptedSize];
+            } else {
+                DLOG(@"[RSA] Error: SecKeyEncrypt failed (%d)", (int)encryptStatus);
+                free(encryptedBytes);
+                CFRelease(publicKey);
+                return nil;
+            }
+            free(encryptedBytes);
+            idx += dataLen;
+        }
+        
+        CFRelease(publicKey);
+        
+        NSString *base64Str = [encryptedData base64EncodedStringWithOptions:0];
+        DLOG(@"[RSA] Encryption OK: input='%@' (len=%lu) -> output='%@' (len=%lu)",
+             input, (unsigned long)input.length,
+             base64Str.length > 50 ? [base64Str substringToIndex:50] : base64Str,
+             (unsigned long)base64Str.length);
+        return base64Str;
+    } @catch (NSException *e) {
+        DLOG(@"[RSA] Exception: %@", e);
+        return nil;
+    }
 }
 
 #pragma mark - C++ Function Hooks (GameMessageFactory)
@@ -173,6 +287,7 @@ typedef void (*ConstructLoginReqV2Func)(std::string& out,
 
 static ConstructLoginReqV2Func orig_construct_login_v2 = NULL;
 static BOOL g_manualMode = NO;
+static NSString *g_rsaPublicKey = nil;
 
 static void _writeBE32(unsigned char *buf, uint32_t val) {
     buf[0] = (val >> 24) & 0xFF; buf[1] = (val >> 16) & 0xFF;
@@ -464,7 +579,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.2 iOS修正版";
+    titleLbl.text = @"WangXian2Hook v4.3 完整版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -825,6 +940,43 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     }
 }
 
+static void parseLoginResponse(unsigned char *buf, ssize_t len) {
+    if (len < 12) return;
+    
+    uint32_t cmd = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+                   ((uint32_t)buf[6] << 8)  | (uint32_t)buf[7];
+    uint32_t status = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
+                      ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+    
+    if (cmd == 0x802EE121) {
+        DLOG(@"[RECV-CMD] LOGIN RESPONSE v2 (cmd=0x%08X)", cmd);
+        DLOG(@"[RECV-CMD] Status: %u (0=success, non-zero=error)", status);
+        
+        if (status == 0) {
+            DLOG(@"[RECV-CMD] *** LOGIN SUCCESS ***");
+        } else {
+            DLOG(@"[RECV-CMD] *** LOGIN FAILED with status=%u ***", status);
+        }
+        
+        // 解析响应字段（响应格式类似请求：2字节长度前缀+字符串）
+        size_t pos = 12;
+        int fieldNum = 0;
+        while (pos + 2 <= len) {
+            uint16_t flen = ((uint16_t)buf[pos] << 8) | buf[pos + 1];
+            if (pos + 2 + flen > len) break;
+            
+            char field[512] = {0};
+            if (flen > 0 && flen < 512) memcpy(field, buf + pos + 2, flen);
+            
+            DLOG(@"[RECV-CMD]   resp_field[%d] = [%d] %s", fieldNum, flen, field);
+            fieldNum++;
+            pos += 2 + flen;
+        }
+        
+        DLOG_HEX(buf, len < 256 ? len : 256);
+    }
+}
+
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
@@ -838,6 +990,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     DLOG(@"[RECV] fd=%d %s:%d len=%zd", fd, host ?: "unknown", port, ret);
     
     patchVersionCheckResponse((unsigned char *)buf, ret);
+    
+    parseLoginResponse((unsigned char *)buf, ret);
     
     return ret;
 }
@@ -1083,18 +1237,114 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 pos += 2 + flen;
             }
 
-            DLOG(@"[V2-LOGIN] Parsed %d fields:", fieldCount);
-            DLOG(@"[V2-LOGIN]   f0(username)   = %s", fields[0]);
-            DLOG(@"[V2-LOGIN]   f1(password)   = %s", fields[1]);
-            DLOG(@"[V2-LOGIN]   f2(deviceId)   = %s", fields[2]);
-            DLOG(@"[V2-LOGIN]   f3(channel)    = %s", fields[3]);
-            DLOG(@"[V2-LOGIN]   f4(os)         = %s", fields[4]);
-            DLOG(@"[V2-LOGIN]   f5(phoneModel) = %s", fields[5]);
-            DLOG(@"[V2-LOGIN]   f6             = %s", fields[6]);
-            DLOG(@"[V2-LOGIN]   f7             = %s", fields[7]);
-            DLOG(@"[V2-LOGIN]   f8(subChannel) = %s", fields[8]);
-            DLOG(@"[V2-LOGIN]   f9(sign)       = %s (len=%d)", fields[9], fieldLens[9]);
-            DLOG(@"[V2-LOGIN]   f10-f15        = (checked below)");
+            // === 字段完整性校验：打印全部16个字段 ===
+            DLOG(@"[V2-LOGIN] === ALL 16 FIELDS BEFORE PATCH ===");
+            DLOG(@"[V2-LOGIN]   f0(username)    = [%d] %s", fieldLens[0], fields[0]);
+            DLOG(@"[V2-LOGIN]   f1(password)    = [%d] %s", fieldLens[1], fields[1]);
+            DLOG(@"[V2-LOGIN]   f2(deviceId)    = [%d] %s", fieldLens[2], fields[2]);
+            DLOG(@"[V2-LOGIN]   f3(channel)     = [%d] %s", fieldLens[3], fields[3]);
+            DLOG(@"[V2-LOGIN]   f4(os)          = [%d] %s", fieldLens[4], fields[4]);
+            DLOG(@"[V2-LOGIN]   f5(phoneModel)  = [%d] %s", fieldLens[5], fields[5]);
+            DLOG(@"[V2-LOGIN]   f6(?)           = [%d] %s", fieldLens[6], fields[6]);
+            DLOG(@"[V2-LOGIN]   f7(?)           = [%d] %s", fieldLens[7], fields[7]);
+            DLOG(@"[V2-LOGIN]   f8(subChannel)  = [%d] %s", fieldLens[8], fields[8]);
+            DLOG(@"[V2-LOGIN]   f9(sign)        = [%d] %s", fieldLens[9], fields[9]);
+            DLOG(@"[V2-LOGIN]   f10(?)          = [%d] %s", fieldLens[10], fields[10]);
+            DLOG(@"[V2-LOGIN]   f11(?)          = [%d] %s", fieldLens[11], fields[11]);
+            DLOG(@"[V2-LOGIN]   f12(?)          = [%d] %s", fieldLens[12], fields[12]);
+            DLOG(@"[V2-LOGIN]   f13(?)          = [%d] %s", fieldLens[13], fields[13]);
+            DLOG(@"[V2-LOGIN]   f14(?)          = [%d] %s", fieldLens[14], fields[14]);
+            DLOG(@"[V2-LOGIN]   f15(?)          = [%d] %s", fieldLens[15], fields[15]);
+
+            // === 修复1：版本号替换 7.5.0 -> 7.6.0 ===
+            const char *oldVer = "7.5.0";
+            const char *newVer = "7.6.0";
+            size_t oldVerLen = strlen(oldVer);
+            size_t newVerLen = strlen(newVer);
+            BOOL versionReplaced = NO;
+            for (size_t i = 0; i <= len - oldVerLen; i++) {
+                if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
+                    DLOG(@"[V2-LOGIN] *** VERSION FOUND: '7.5.0' at offset %zu, replacing with '7.6.0' ***", i);
+                    sendBuf = malloc(len);
+                    memcpy(sendBuf, buf, len);
+                    unsigned char *mp = (unsigned char *)sendBuf;
+                    memcpy(mp + i, newVer, newVerLen);
+                    modified = YES;
+                    versionReplaced = YES;
+                    break;
+                }
+            }
+            if (!versionReplaced) {
+                DLOG(@"[V2-LOGIN] *** WARNING: Version '7.5.0' NOT found in login packet ***");
+                DLOG_HEX(buf, len);
+            }
+
+            // 更新cbuf指针指向可能修改后的buffer
+            if (sendBuf != buf) {
+                cbuf = (const unsigned char *)sendBuf;
+            }
+
+            // === 修复3：RSA加密密码（如果公钥存在）===
+            if (g_rsaPublicKey && fieldLens[1] > 0) {
+                NSString *plainPassword = [NSString stringWithUTF8String:fields[1]];
+                NSString *encryptedPassword = rsaEncryptString(plainPassword, g_rsaPublicKey);
+                if (encryptedPassword) {
+                    const char *encPassCStr = [encryptedPassword UTF8String];
+                    size_t encPassLen = strlen(encPassCStr);
+                    
+                    DLOG(@"[V2-LOGIN] *** RSA ENCRYPTING PASSWORD: '%@' -> '%s' (len=%zu) ***",
+                         plainPassword, encPassCStr, encPassLen);
+                    
+                    // 找到password字段（field 1）的位置
+                    size_t passFieldPos = 12;
+                    uint16_t passFieldLen = 0;
+                    for (int f = 0; f < 1 && passFieldPos + 2 <= len; f++) {
+                        passFieldLen = ((uint16_t)cbuf[passFieldPos] << 8) | cbuf[passFieldPos + 1];
+                        passFieldPos += 2 + passFieldLen;
+                    }
+                    
+                    // 计算新包长度变化
+                    size_t extraBytes = encPassLen - passFieldLen;
+                    if (extraBytes != 0) {
+                        unsigned char *newBuf = (unsigned char *)malloc(len + extraBytes);
+                        if (newBuf) {
+                            size_t passStartPos = passFieldPos - 2 - passFieldLen;
+                            
+                            // 复制password字段之前的数据
+                            memcpy(newBuf, cbuf, passStartPos);
+                            // 写入新的password字段长度
+                            newBuf[passStartPos] = (encPassLen >> 8) & 0xFF;
+                            newBuf[passStartPos + 1] = encPassLen & 0xFF;
+                            // 写入加密后的密码
+                            memcpy(newBuf + passStartPos + 2, encPassCStr, encPassLen);
+                            // 复制password字段之后的数据
+                            memcpy(newBuf + passStartPos + 2 + encPassLen,
+                                   cbuf + passStartPos + 2 + passFieldLen,
+                                   len - (passStartPos + 2 + passFieldLen));
+                            
+                            // 更新pktLen
+                            uint32_t newPktLen = (uint32_t)((len + extraBytes) - 4);
+                            newBuf[0] = (newPktLen >> 24) & 0xFF;
+                            newBuf[1] = (newPktLen >> 16) & 0xFF;
+                            newBuf[2] = (newPktLen >> 8) & 0xFF;
+                            newBuf[3] = newPktLen & 0xFF;
+                            
+                            if (sendBuf != buf) free(sendBuf);
+                            sendBuf = newBuf;
+                            cbuf = (const unsigned char *)sendBuf;
+                            len += extraBytes;
+                            modified = YES;
+                            
+                            DLOG(@"[V2-LOGIN] Password RSA encrypted, packet len changed: %zu -> %zu",
+                                 len - extraBytes, len);
+                        }
+                    }
+                } else {
+                    DLOG(@"[V2-LOGIN] *** WARNING: RSA encryption failed, password remains plaintext ***");
+                }
+            } else if (g_rsaPublicKey && fieldLens[1] == 0) {
+                DLOG(@"[V2-LOGIN] *** WARNING: Password field is empty, cannot RSA encrypt ***");
+            }
 
             // 检查sign字段（field 9）- 如果为空则注入sign
             if (fieldCount >= 10 && fieldLens[9] == 0) {
@@ -1126,13 +1376,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     // 复制sign字段之前的数据
                     memcpy(newBuf, cbuf, signFieldPos);
-                    // 写入sign字段
+                    // 写入sign字段长度前缀（替换原来的00 00）
                     newBuf[signFieldPos] = (signLen >> 8) & 0xFF;
                     newBuf[signFieldPos + 1] = signLen & 0xFF;
+                    // 写入sign内容
                     memcpy(newBuf + signFieldPos + 2, signCStr, signLen);
-                    // 复制sign字段之后的数据
+                    // 复制sign字段之后的数据（跳过原来的2字节长度前缀，因为长度没变）
                     memcpy(newBuf + signFieldPos + 2 + signLen,
-                           cbuf + signFieldPos, len - signFieldPos);
+                           cbuf + signFieldPos + 2, len - signFieldPos - 2);
 
                     // 更新pktLen
                     uint32_t newPktLen = (uint32_t)(newLen - 4);
