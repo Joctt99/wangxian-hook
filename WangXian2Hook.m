@@ -27,7 +27,7 @@ static NSUInteger g_logMaxSize = 10 * 1024 * 1024;
 static NSString *g_rsaPublicKey = nil;
 static NSString *readRsaPublicKey(void);
 
-static char g_loginServerIP[64] = "116.213.192.216";
+static char g_loginServerIP[64] = "47.100.222.229";
 static int g_loginServerPort = 5678;
 static BOOL g_forcePlainPassword = NO;
 
