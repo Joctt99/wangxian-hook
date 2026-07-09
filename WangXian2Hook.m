@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v5.2 修复版 (移除版本检查PATCH + 让游戏正常连接) ===");
+        _log(@"=== WangXian2Hook v5.3 修复版 (版本检查status=1改为0 + 允许版本检查通过) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -984,8 +984,15 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             }
             DLOG_HEX(buf, len);
             
-            if (cmd == 0x8000E002 && len >= 13) {
-                DLOG(@"[PROTO-R] Handshake status at offset 12: %u", buf[12]);
+            if (len >= 12) {
+                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
+                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
+                DLOG(@"[PROTO-R] Status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Status %u -> 0 to allow version check pass", status4);
+                    memset(buf + 8, 0, 4);
+                    patched = YES;
+                }
             }
         } else if (cmd == 0x76666669) {
             DLOG(@"[PROTO-R] DEBUG ECHO RESPONSE cmd=0x%08X", cmd);
