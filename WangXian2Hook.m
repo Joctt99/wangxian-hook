@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v5.0 重写版 (完整v1→v2转换 + 正确字段映射 + status=0x44) ===");
+        _log(@"=== WangXian2Hook v5.1 修复版 (保留服务器列表数据 + 修复PATCH过度) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -1004,9 +1004,9 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
                 patched = YES;
             }
             
-            if (maxPatch > 13) {
-                DLOG(@"[PROTO-R-PATCH] Clearing error messages from offset 13 onwards (%zd bytes, within pktLen)", maxPatch - 13);
-                memset(buf + 13, 0, maxPatch - 13);
+            if (maxPatch >= 14 && buf[13] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 13: %u -> 0", buf[13]);
+                buf[13] = 0;
                 patched = YES;
             }
         } else if (cmd == 0x76666669) {
