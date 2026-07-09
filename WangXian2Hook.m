@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.8 完整版 (完整组包 BUILDER + 16字段 + sign算法验证) ===");
+        _log(@"=== WangXian2Hook v4.9 修复版 (修复v1解析崩溃 + 全局版本替换 + IP解析优化) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -672,7 +672,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.8 完整版";
+    titleLbl.text = @"WangXian2Hook v4.9 修复版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -918,29 +918,37 @@ static void parseLoginServerFromResponse(unsigned char *buf, ssize_t len) {
                 memcpy(ipStr, buf + i, j - i);
                 ipStr[j - i] = '\0';
                 
-                if (inet_addr(ipStr) != INADDR_NONE) {
-                    DLOG(@"[SERVER-PARSE] Found IP address: %s at offset %zd", ipStr, i);
-                    
-                    for (int k = j; k < len - 1 && k < j + 10; k++) {
-                        if (isdigit(buf[k])) {
-                            int portStart = k;
-                            while (k < len && isdigit(buf[k])) k++;
-                            
-                            char portStr[8] = {0};
-                            memcpy(portStr, buf + portStart, k - portStart);
-                            portStr[k - portStart] = '\0';
-                            int port = atoi(portStr);
-                            
-                            if (port > 0 && port < 65536) {
-                                DLOG(@"[SERVER-PARSE] Found port: %d at offset %d", port, (int)portStart);
-                                foundIP = 1;
-                                foundPort = port;
-                                break;
-                            }
-                        }
+                struct in_addr addr;
+                if (inet_aton(ipStr, &addr) != 0) {
+                    int dotCount = 0;
+                    for (int k = 0; ipStr[k]; k++) {
+                        if (ipStr[k] == '.') dotCount++;
                     }
                     
-                    if (foundIP) break;
+                    if (dotCount == 3) {
+                        DLOG(@"[SERVER-PARSE] Found IP address: %s at offset %zd", ipStr, i);
+                        
+                        for (int k = j; k < len - 1 && k < j + 10; k++) {
+                            if (isdigit(buf[k])) {
+                                int portStart = k;
+                                while (k < len && isdigit(buf[k])) k++;
+                                
+                                char portStr[8] = {0};
+                                memcpy(portStr, buf + portStart, k - portStart);
+                                portStr[k - portStart] = '\0';
+                                int port = atoi(portStr);
+                                
+                                if (port > 0 && port < 65536) {
+                                    DLOG(@"[SERVER-PARSE] Found port: %d at offset %d", port, (int)portStart);
+                                    foundIP = 1;
+                                    foundPort = port;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (foundIP) break;
+                    }
                 }
             }
         }
@@ -1286,7 +1294,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         
         DLOG(@"[SEND-DEBUG] cmd=0x%08X", cmd);
         
-        if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120) {
+        if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120 ||
+            cmd == 0x0002A018 || cmd == 0x0002A017) {
             const char *oldVer = "7.5.0";
             const char *newVer = "7.6.0";
             size_t oldVerLen = strlen(oldVer);
@@ -1306,10 +1315,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             
             size_t pos = 12;
             char username[256] = {0}, password[256] = {0}, deviceId[256] = {0};
+            char channel[256] = {0}, os[256] = {0}, phoneModel[256] = {0}, v1Sign[256] = {0};
+            char *fields[] = {username, password, deviceId, channel, os, phoneModel, v1Sign};
+            
             for (int f = 0; f < 7 && pos + 2 <= len; f++) {
                 uint16_t fieldLen = ((uint16_t)cbuf[pos] << 8) | cbuf[pos + 1];
                 if (pos + 2 + fieldLen > len) break;
-                if (fieldLen > 0 && fieldLen < 256) memcpy(((char *[]){username, password, deviceId, NULL})[f], cbuf + pos + 2, fieldLen);
+                if (fieldLen > 0 && fieldLen < 256) memcpy(fields[f], cbuf + pos + 2, fieldLen);
                 pos += 2 + fieldLen;
             }
             
