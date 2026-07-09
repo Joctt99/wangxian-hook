@@ -24,6 +24,9 @@ static BOOL g_logHexEnabled = YES;
 static BOOL g_logProtoEnabled = YES;
 static NSUInteger g_logMaxSize = 10 * 1024 * 1024;
 
+static NSString *g_rsaPublicKey = nil;
+static NSString *readRsaPublicKey(void);
+
 static UIButton *g_logBtn = nil;
 static UIView *g_logPanel = nil;
 static UITextView *g_logTextView = nil;
@@ -241,7 +244,7 @@ static NSString *rsaEncryptString(NSString *input, NSString *publicKeyStr) {
             NSData *block = [NSData dataWithBytes:bytes + idx length:dataLen];
             
             size_t encryptedSize = keySize;
-            unsigned char *encryptedBytes = malloc(encryptedSize);
+            unsigned char *encryptedBytes = (unsigned char *)malloc(encryptedSize);
             
             OSStatus encryptStatus = SecKeyEncrypt(publicKey, kSecPaddingPKCS1,
                 (const unsigned char *)block.bytes, dataLen,
@@ -287,7 +290,6 @@ typedef void (*ConstructLoginReqV2Func)(std::string& out,
 
 static ConstructLoginReqV2Func orig_construct_login_v2 = NULL;
 static BOOL g_manualMode = NO;
-static NSString *g_rsaPublicKey = nil;
 
 static void _writeBE32(unsigned char *buf, uint32_t val) {
     buf[0] = (val >> 24) & 0xFF; buf[1] = (val >> 16) & 0xFF;
