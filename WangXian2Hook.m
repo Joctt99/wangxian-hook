@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.9 修复版 (修复v1解析崩溃 + 全局版本替换 + IP解析优化) ===");
+        _log(@"=== WangXian2Hook v5.0 重写版 (完整v1→v2转换 + 正确字段映射 + status=0x44) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -185,15 +185,8 @@ static unsigned char *buildV2LoginPacket(const char *username, const char *passw
                                          const char *os, const char *phoneModel,
                                          const char *subChannel, const char *sign,
                                          size_t *outLen) {
-    DLOG(@"[BUILDER] === MANUAL PACKET BUILDING ===");
-    DLOG(@"[BUILDER] Field[0] username: '%s' (len=%zu)", username, strlen(username));
-    DLOG(@"[BUILDER] Field[1] password: '%s' (len=%zu)", password, strlen(password));
-    DLOG(@"[BUILDER] Field[2] deviceId: '%s' (len=%zu)", deviceId, strlen(deviceId));
-    DLOG(@"[BUILDER] Field[3] channel: '%s' (len=%zu)", channel, strlen(channel));
-    DLOG(@"[BUILDER] Field[4] os: '%s' (len=%zu)", os, strlen(os));
-    DLOG(@"[BUILDER] Field[5] phoneModel: '%s' (len=%zu)", phoneModel, strlen(phoneModel));
-    DLOG(@"[BUILDER] Field[8] subChannel: '%s' (len=%zu)", subChannel, strlen(subChannel));
-    DLOG(@"[BUILDER] Field[9] sign: '%s' (len=%zu)", sign, strlen(sign));
+    DLOG(@"[V2-BUILD] === V2 LOGIN PACKET CONSTRUCTION ===");
+    DLOG(@"[V2-BUILD] cmd=0x002EE121 status=0x00000044");
     
     const char *fields[16] = {
         username,     // 0: username
@@ -220,7 +213,11 @@ static unsigned char *buildV2LoginPacket(const char *username, const char *passw
     for (int i = 0; i < 16; i++) {
         fieldLens[i] = strlen(fields[i]);
         totalBodyLen += 2 + fieldLens[i];
-        DLOG(@"[BUILDER] Field[%d]: len=%zu, data='%s'", i, fieldLens[i], fields[i]);
+        if (fieldLens[i] > 0) {
+            DLOG(@"[V2-BUILD] field%d: '%s' len=%zu", i, fields[i], fieldLens[i]);
+        } else {
+            DLOG(@"[V2-BUILD] field%d: \"\" len=0", i);
+        }
     }
     
     size_t headerLen = 12;
@@ -228,7 +225,7 @@ static unsigned char *buildV2LoginPacket(const char *username, const char *passw
     
     unsigned char *packet = (unsigned char *)malloc(pktLen);
     if (!packet) {
-        DLOG(@"[BUILDER] ERROR: malloc failed");
+        DLOG(@"[V2-BUILD] ERROR: malloc failed");
         *outLen = 0;
         return NULL;
     }
@@ -243,7 +240,7 @@ static unsigned char *buildV2LoginPacket(const char *username, const char *passw
     
     packet[4] = 0x00; packet[5] = 0x2E; packet[6] = 0xE1; packet[7] = 0x21;
     
-    packet[8] = 0x00; packet[9] = 0x00; packet[10] = 0x00; packet[11] = 0x01;
+    packet[8] = 0x00; packet[9] = 0x00; packet[10] = 0x00; packet[11] = 0x44;
     
     size_t pos = 12;
     for (int i = 0; i < 16; i++) {
@@ -257,7 +254,7 @@ static unsigned char *buildV2LoginPacket(const char *username, const char *passw
     }
     
     *outLen = pktLen;
-    DLOG(@"[BUILDER] Packet built: total len=%zu", pktLen);
+    DLOG(@"[V2-BUILD] Total fields: 16, packet length: %zu", pktLen);
     DLOG_HEX(packet, pktLen < 256 ? pktLen : 256);
     
     return packet;
@@ -672,7 +669,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.9 修复版";
+    titleLbl.text = @"WangXian2Hook v5.0 重写版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -1314,38 +1311,45 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             DLOG(@"[SEND-DEBUG] v1 login -> converting to v2 using BUILDER");
             
             size_t pos = 12;
-            char username[256] = {0}, password[256] = {0}, deviceId[256] = {0};
-            char channel[256] = {0}, os[256] = {0}, phoneModel[256] = {0}, v1Sign[256] = {0};
-            char *fields[] = {username, password, deviceId, channel, os, phoneModel, v1Sign};
+            char v1Fields[20][256] = {0};
+            int v1FieldCount = 0;
             
-            for (int f = 0; f < 7 && pos + 2 <= len; f++) {
+            while (pos + 2 <= len && v1FieldCount < 20) {
                 uint16_t fieldLen = ((uint16_t)cbuf[pos] << 8) | cbuf[pos + 1];
                 if (pos + 2 + fieldLen > len) break;
-                if (fieldLen > 0 && fieldLen < 256) memcpy(fields[f], cbuf + pos + 2, fieldLen);
+                if (fieldLen > 0 && fieldLen < 256) memcpy(v1Fields[v1FieldCount], cbuf + pos + 2, fieldLen);
+                DLOG(@"[V2-BUILD] v1 field[%d]: '%s' len=%u", v1FieldCount, v1Fields[v1FieldCount], fieldLen);
                 pos += 2 + fieldLen;
+                v1FieldCount++;
             }
+            DLOG(@"[V2-BUILD] Total v1 fields parsed: %d", v1FieldCount);
             
-            NSString *sign = generateSign([NSString stringWithUTF8String:username], 
-                                          [NSString stringWithUTF8String:password], 
-                                          [NSString stringWithUTF8String:deviceId], 
-                                          @"7.6.0");
-            const char *signCStr = [sign UTF8String];
+            NSString *usernameNS = [NSString stringWithUTF8String:v1Fields[0]];
+            NSString *passwordNS = [NSString stringWithUTF8String:v1Fields[1]];
+            NSString *deviceIdNS = [NSString stringWithUTF8String:v1Fields[2]];
+            NSString *phoneModelNS = [NSString stringWithUTF8String:v1Fields[6]];
+            NSString *subChannelNS = [NSString stringWithUTF8String:v1Fields[5]];
+            
+            NSString *signNS = generateSignV2(usernameNS, passwordNS, deviceIdNS);
+            const char *signCStr = [signNS UTF8String];
             
             const char *channel = "SQAGE";
             const char *os = "IOS";
-            const char *phoneModel = [[UIDevice currentDevice] model].UTF8String;
-            const char *subChannel = "SQAGE_MIESHI";
+            const char *phoneModel = phoneModelNS.length > 0 ? [phoneModelNS UTF8String] : [[UIDevice currentDevice] model].UTF8String;
+            const char *subChannel = subChannelNS.length > 0 ? [subChannelNS UTF8String] : "SQAGE_MIESHI";
             
             size_t newLen = 0;
-            unsigned char *finalBuf = buildV2LoginPacket(username, password, deviceId, 
-                                                        channel, os, phoneModel, 
-                                                        subChannel, signCStr, &newLen);
+            unsigned char *finalBuf = buildV2LoginPacket([usernameNS UTF8String], [passwordNS UTF8String],
+                                                        [deviceIdNS UTF8String], channel, os,
+                                                        phoneModel, subChannel, signCStr, &newLen);
             
             if (finalBuf) {
                 sendBuf = finalBuf;
                 len = newLen;
                 modified = YES;
-                DLOG(@"[SEND-DEBUG] v1->v2 converted using BUILDER, newLen=%zu", len);
+                uint32_t newCmd = ((uint32_t)finalBuf[4] << 24) | ((uint32_t)finalBuf[5] << 16) |
+                                  ((uint32_t)finalBuf[6] << 8)  | (uint32_t)finalBuf[7];
+                DLOG(@"[SEND-DEBUG] v1->v2 converted! NEW cmd=0x%08X, newLen=%zu", newCmd, len);
             }
         } else if (cmd == 0x002EE121) {
             DLOG(@"[SEND-DEBUG] v2 login request - COMPLETE REBUILD using BUILDER");
