@@ -27,6 +27,9 @@ static NSUInteger g_logMaxSize = 10 * 1024 * 1024;
 static NSString *g_rsaPublicKey = nil;
 static NSString *readRsaPublicKey(void);
 
+static char g_loginServerIP[64] = "116.213.192.216";
+static int g_loginServerPort = 5678;
+
 static UIButton *g_logBtn = nil;
 static UIView *g_logPanel = nil;
 static UITextView *g_logTextView = nil;
@@ -109,7 +112,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.3 完整版 (RSA加密 + 版本号替换 + 登录响应解析) ===");
+        _log(@"=== WangXian2Hook v4.4 网络修复版 (动态服务器 + 重连 + RSA硬编码) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -186,8 +189,10 @@ static NSString *readRsaPublicKey(void) {
             return key;
         }
     }
-    DLOG(@"[RSA] pk.txt not found at %@", pkPath);
-    return nil;
+    DLOG(@"[RSA] pk.txt not found, using hardcoded public key");
+    
+    static NSString *hardcodedKey = @"MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCSzpfizT72XGTfAoXnNtRUCAh+licr5QxhhVwXP1+cNZZ8GTrH/zRkuN37693qGKcM6Odq8ipK41EebhHpaVMPEhCUIh5blk9Q1EhZxTT90B+fidJQiWZ+p4IwkkojTjvmsuRkVQexy3JA+HCuteu/66jo/MoapVfGA+AGhH0giY2rg7nbUTGSpSrhVHwnF77VihHAUaucyqHGmEnRyTjSj6Tth9gsO/hT781yWtd8rvY2Q3C69oBUr8xMo/sZTchLsdYk0zXvKSDy8MXELnkqqDEqolsRdJHHYMIVcXOeXvQPnCoVXA+4uttLMsB2DDOdyvF23BsAKVIgTsRXaKlJAgMBAAECggEAFsnE3+rWNC3BZrCgknR7XxPkJaovKGwkkNq/ocgvkjLrShYsfrEJs/zSUHGbf+QVwjZA/ePbVsaUZ/HUC/RSdUtrkWL+bV8WrshU9sJa6G8vCXe+UswRQeXEmr+KjJJvT+9C7qQYTqvy70zhSO1qS99L1+athJdX2Z/uXXSha7RSL4g2nDx+ajCJ+CtlT1xG5K+GriPcn2lvIhaGjDxZwpv8aehRnw1hhyG6dcGN6lX7AOhZb1O4v6WA9YsSy8MGSNlAMlVjdm0dwqca0+fm8M6LEnxHiadSyAEvo8TuJ7EAj3YYmwKlPg+8TMub/pbO/JVresMxgzp96XInKK6LRQKBgQDKtrk1oWOASPADxTtEKmT/kwPMXIojdhE+fN7MIMXk4eKNbqwH8eVVmnSw2ecsOQ5Dk/yy8XnfibOzgc78AGA82H0Ajb4Sc++3Hv5zq0MDBxyywKTodjazJ1EpagcleUHBIT8ivOJcPnFBAEzHwt0eIU0id2Q+imvKb6vpBEwhtwKBgQC5ZbhRok8QN4o3xq4033Ev0oGOWbmfK4d4/e/uaPGpk5LE24WJIN8qGPL7MJjR/s4WFmCNOjh0hN6jkv2nbYk2S8j6PYgyTtgsJ7kb/joUaBs8wjvOG1VP6ILCPiLQe3M0lI80kFWosH4jLMdNEm/kwfX33Fi5v0voeYySH/WM/wKBgCj+PIP46As4NLk+eFa3kAcS7tCz4gd7x87wJ4n2Eq7PcyYQvF867pqaCoD8/7+0pgrKcW6qYG/xA9MILBhP5yZGzTiAcXB/23kXnnM7reh91rLbPD36MeOWztXmKB3O4Joyo/bdZZUr13FCo0Q+RsLiDxwqMq5nBZdBb+1GPjMPAoGAVaABLNLFqTu9fl0ogArif6+9Xj1aWYUFIIBHm9ikJCmgE4M/fUHNT+gN8K1VJ0eDbvgOx6sn/8iN+wYcWINiZ81AmTJqALIhbOM7vw3/TQV37uvWKy68jBdarNN9yMP7RUGHkkNHDI3W8+/ubE4jl4dtTnhaEg+jw06/+Y0BH4kCgYBN6HqRRL6LwYZkhv/5nhi7NpJRE7+ikuH2rrBh6qFvaBGqAVdG+ylc+Oe5+lz7ppZwfvlXsPy6v1rGgg0LvKVbVXt/nJDU2mAaRWPY/nItZT2ztPZ3uh73cI4398AXYCt2FlkoRe8EmVD54nyK+HB8X+VnxcfyjEDKCydHLuCg6g==";
+    return hardcodedKey;
 }
 
 static NSString *rsaEncryptString(NSString *input, NSString *publicKeyStr) {
@@ -581,7 +586,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.3 完整版";
+    titleLbl.text = @"WangXian2Hook v4.4 网络修复版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -811,6 +816,59 @@ static WriteFunc orig_write = NULL;
 static ConnectFunc orig_connect = NULL;
 static CloseFunc orig_close = NULL;
 
+static void parseLoginServerFromResponse(unsigned char *buf, ssize_t len) {
+    if (!buf || len < 12) return;
+    
+    char ipStr[64] = {0};
+    int foundIP = 0;
+    int foundPort = 0;
+    
+    for (ssize_t i = 12; i < len - 3; i++) {
+        if (isdigit(buf[i]) || buf[i] == '.') {
+            int j = i;
+            while (j < len && (isdigit(buf[j]) || buf[j] == '.')) j++;
+            
+            if (j - i >= 7 && j - i <= 15) {
+                memcpy(ipStr, buf + i, j - i);
+                ipStr[j - i] = '\0';
+                
+                if (inet_addr(ipStr) != INADDR_NONE) {
+                    DLOG(@"[SERVER-PARSE] Found IP address: %s at offset %zd", ipStr, i);
+                    
+                    for (int k = j; k < len - 1 && k < j + 10; k++) {
+                        if (isdigit(buf[k])) {
+                            int portStart = k;
+                            while (k < len && isdigit(buf[k])) k++;
+                            
+                            char portStr[8] = {0};
+                            memcpy(portStr, buf + portStart, k - portStart);
+                            portStr[k - portStart] = '\0';
+                            int port = atoi(portStr);
+                            
+                            if (port > 0 && port < 65536) {
+                                DLOG(@"[SERVER-PARSE] Found port: %d at offset %zd", port, portStart);
+                                foundIP = 1;
+                                foundPort = port;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (foundIP) break;
+                }
+            }
+        }
+    }
+    
+    if (foundIP) {
+        strncpy(g_loginServerIP, ipStr, sizeof(g_loginServerIP) - 1);
+        if (foundPort > 0) {
+            g_loginServerPort = foundPort;
+        }
+        DLOG(@"[SERVER-PARSE] Updated login server to %s:%d", g_loginServerIP, g_loginServerPort);
+    }
+}
+
 static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
     if (!buf || len <= 0) return;
     
@@ -827,6 +885,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         }
         
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+            parseLoginServerFromResponse(buf, len);
             DLOG(@"[PROTO-R] VERSION CHECK RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
             DLOG_HEX(buf, len);
             
@@ -860,6 +919,7 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
         } else if (cmd == 0x80000015) {
             DLOG(@"[PROTO-R] PING RESPONSE cmd=0x%08X", cmd);
         } else if (cmd == 0x800FF012 || cmd == 0x802EE113) {
+            parseLoginServerFromResponse(buf, len);
             DLOG(@"[PROTO-R] SERVER LIST RESPONSE cmd=0x%08X pktLen=%u actualLen=%zd", cmd, pktLenBE, len);
             
             if (len >= 12) {
@@ -1074,18 +1134,53 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
         } else if (addr->sa_family == AF_INET6) {
             struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
             inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
-            port = ntohs(sin6->sin6_port);
+            port = ntohs(sin6->sin_port);
         }
     }
     
-    DLOG(@"[CONNECT] fd=%d %s:%d", fd, host, port);
+    DLOG(@"[CONNECT] fd=%d %s:%d -> target=%s:%d", fd, host, port, g_loginServerIP, g_loginServerPort);
     
-    int ret = orig_connect ? orig_connect(fd, addr, addrlen) : -1;
-    if (ret == 0) {
-        trackFd(fd, host, port);
-        DLOG(@"[CONNECT] SUCCESS fd=%d", fd);
-    } else {
-        DLOG(@"[CONNECT] FAILED fd=%d err=%d", fd, errno);
+    // 如果连接到登录服务器端口(5678)，替换为我们的目标服务器
+    const struct sockaddr *finalAddr = addr;
+    struct sockaddr_in newAddr;
+    if (port == 5678 || port == 12003) {
+        memset(&newAddr, 0, sizeof(newAddr));
+        newAddr.sin_family = AF_INET;
+        inet_aton(g_loginServerIP, &newAddr.sin_addr);
+        newAddr.sin_port = htons((uint16_t)g_loginServerPort);
+        finalAddr = (const struct sockaddr *)&newAddr;
+        addrlen = sizeof(newAddr);
+        DLOG(@"[CONNECT] REWRITTEN to %s:%d", g_loginServerIP, g_loginServerPort);
+    }
+    
+    int ret = -1;
+    int retryCount = 0;
+    const int maxRetries = 3;
+    
+    while (retryCount < maxRetries) {
+        ret = orig_connect ? orig_connect(fd, finalAddr, addrlen) : -1;
+        if (ret == 0) {
+            trackFd(fd, g_loginServerIP, g_loginServerPort);
+            DLOG(@"[CONNECT] SUCCESS fd=%d after %d retries", fd, retryCount);
+            return ret;
+        }
+        
+        int err = errno;
+        DLOG(@"[CONNECT] FAILED fd=%d attempt=%d err=%d (%s)", fd, retryCount + 1, err, strerror(err));
+        
+        if (err != ECONNREFUSED && err != 61) {
+            break;
+        }
+        
+        retryCount++;
+        if (retryCount < maxRetries) {
+            DLOG(@"[CONNECT] Retrying in 1000ms...");
+            usleep(1000000);
+        }
+    }
+    
+    if (ret != 0) {
+        DLOG(@"[CONNECT] FINAL FAILURE fd=%d after %d attempts, err=%d", fd, maxRetries, errno);
     }
     
     return ret;
