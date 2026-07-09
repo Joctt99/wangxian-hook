@@ -1040,16 +1040,8 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             DLOG(@"[PROTO-R] NEW QUERY SERVER LIST RES cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
             DLOG_HEX(buf, len < 200 ? len : 200);
         } else if ((cmd & 0x80000000) != 0) {
-            DLOG(@"[PROTO-R] UNKNOWN RESPONSE cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
-            
-            if (len >= 12) {
-                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
-                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Unknown response status %u -> 0", status4);
-                    memset(buf + 8, 0, 4);
-                    patched = YES;
-                }
+            if (pktLenBE > 0 && pktLenBE <= 10000) {
+                DLOG(@"[PROTO-R] UNKNOWN RESPONSE cmd=0x%08X pktLen=%u len=%zd", cmd, pktLenBE, len);
             }
         }
     }
