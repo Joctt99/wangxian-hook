@@ -846,7 +846,7 @@ static void parseLoginServerFromResponse(unsigned char *buf, ssize_t len) {
                             int port = atoi(portStr);
                             
                             if (port > 0 && port < 65536) {
-                                DLOG(@"[SERVER-PARSE] Found port: %d at offset %zd", port, portStart);
+                                DLOG(@"[SERVER-PARSE] Found port: %d at offset %d", port, (int)portStart);
                                 foundIP = 1;
                                 foundPort = port;
                                 break;
@@ -1134,7 +1134,7 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
         } else if (addr->sa_family == AF_INET6) {
             struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
             inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
-            port = ntohs(sin6->sin_port);
+            port = ntohs(sin6->sin6_port);
         }
     }
     
