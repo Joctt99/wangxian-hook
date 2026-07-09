@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v4.6 极简版 (无阻塞connect + SEND-DEBUG/RECV-DEBUG) ===");
+        _log(@"=== WangXian2Hook v4.8 完整版 (完整组包 BUILDER + 16字段 + sign算法验证) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -176,6 +176,91 @@ static NSString *generateSignV2(NSString *username, NSString *password, NSString
     DLOG(@"[SIGN-V2] INPUT: '%@' (len=%lu)", input, (unsigned long)input.length);
     DLOG(@"[SIGN-V2] RESULT: '%@'", sign);
     return sign;
+}
+
+#pragma mark - Complete V2 Login Packet Builder
+
+static unsigned char *buildV2LoginPacket(const char *username, const char *password, 
+                                         const char *deviceId, const char *channel,
+                                         const char *os, const char *phoneModel,
+                                         const char *subChannel, const char *sign,
+                                         size_t *outLen) {
+    DLOG(@"[BUILDER] === MANUAL PACKET BUILDING ===");
+    DLOG(@"[BUILDER] Field[0] username: '%s' (len=%zu)", username, strlen(username));
+    DLOG(@"[BUILDER] Field[1] password: '%s' (len=%zu)", password, strlen(password));
+    DLOG(@"[BUILDER] Field[2] deviceId: '%s' (len=%zu)", deviceId, strlen(deviceId));
+    DLOG(@"[BUILDER] Field[3] channel: '%s' (len=%zu)", channel, strlen(channel));
+    DLOG(@"[BUILDER] Field[4] os: '%s' (len=%zu)", os, strlen(os));
+    DLOG(@"[BUILDER] Field[5] phoneModel: '%s' (len=%zu)", phoneModel, strlen(phoneModel));
+    DLOG(@"[BUILDER] Field[8] subChannel: '%s' (len=%zu)", subChannel, strlen(subChannel));
+    DLOG(@"[BUILDER] Field[9] sign: '%s' (len=%zu)", sign, strlen(sign));
+    
+    const char *fields[16] = {
+        username,     // 0: username
+        password,     // 1: password
+        deviceId,     // 2: deviceId
+        channel,      // 3: channel
+        os,           // 4: os
+        phoneModel,   // 5: phoneModel
+        "",           // 6: (empty)
+        "",           // 7: (empty)
+        subChannel,   // 8: subChannel
+        sign,         // 9: sign
+        "",           // 10: (empty)
+        "",           // 11: (empty)
+        "",           // 12: (empty)
+        "",           // 13: (empty)
+        "",           // 14: (empty)
+        ""            // 15: (empty)
+    };
+    
+    size_t fieldLens[16];
+    size_t totalBodyLen = 0;
+    
+    for (int i = 0; i < 16; i++) {
+        fieldLens[i] = strlen(fields[i]);
+        totalBodyLen += 2 + fieldLens[i];
+        DLOG(@"[BUILDER] Field[%d]: len=%zu, data='%s'", i, fieldLens[i], fields[i]);
+    }
+    
+    size_t headerLen = 12;
+    size_t pktLen = headerLen + totalBodyLen;
+    
+    unsigned char *packet = (unsigned char *)malloc(pktLen);
+    if (!packet) {
+        DLOG(@"[BUILDER] ERROR: malloc failed");
+        *outLen = 0;
+        return NULL;
+    }
+    
+    memset(packet, 0, pktLen);
+    
+    uint32_t bodyLen = (uint32_t)(pktLen - 4);
+    packet[0] = (bodyLen >> 24) & 0xFF;
+    packet[1] = (bodyLen >> 16) & 0xFF;
+    packet[2] = (bodyLen >> 8) & 0xFF;
+    packet[3] = bodyLen & 0xFF;
+    
+    packet[4] = 0x00; packet[5] = 0x2E; packet[6] = 0xE1; packet[7] = 0x21;
+    
+    packet[8] = 0x00; packet[9] = 0x00; packet[10] = 0x00; packet[11] = 0x01;
+    
+    size_t pos = 12;
+    for (int i = 0; i < 16; i++) {
+        uint16_t flen = (uint16_t)fieldLens[i];
+        packet[pos] = (flen >> 8) & 0xFF;
+        packet[pos + 1] = flen & 0xFF;
+        if (flen > 0) {
+            memcpy(packet + pos + 2, fields[i], flen);
+        }
+        pos += 2 + flen;
+    }
+    
+    *outLen = pktLen;
+    DLOG(@"[BUILDER] Packet built: total len=%zu", pktLen);
+    DLOG_HEX(packet, pktLen < 256 ? pktLen : 256);
+    
+    return packet;
 }
 
 #pragma mark - RSA Encryption
@@ -587,7 +672,7 @@ static void init_cpp_hooks(void) {
     g_logPanel.hidden = YES;
     
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-    titleLbl.text = @"WangXian2Hook v4.6 极简版";
+    titleLbl.text = @"WangXian2Hook v4.8 完整版";
     titleLbl.textColor = [UIColor greenColor];
     titleLbl.font = [UIFont boldSystemFontOfSize:14];
     [g_logPanel addSubview:titleLbl];
@@ -1225,166 +1310,86 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 }
             }
         } else if (cmd == 0x0234AB89) {
-            DLOG(@"[SEND-DEBUG] v1 login -> converting to v2");
+            DLOG(@"[SEND-DEBUG] v1 login -> converting to v2 using BUILDER");
             
-            unsigned char *newBuf = (unsigned char *)malloc(len + 100);
-            memcpy(newBuf, buf, len);
-            newBuf[4] = 0x00; newBuf[5] = 0x2E; newBuf[6] = 0xE1; newBuf[7] = 0x21;
-
             size_t pos = 12;
-            NSString *username = nil, *password = nil, *deviceId = nil;
+            char username[256] = {0}, password[256] = {0}, deviceId[256] = {0};
             for (int f = 0; f < 7 && pos + 2 <= len; f++) {
-                uint16_t fieldLen = ((uint16_t)newBuf[pos] << 8) | newBuf[pos + 1];
+                uint16_t fieldLen = ((uint16_t)cbuf[pos] << 8) | cbuf[pos + 1];
                 if (pos + 2 + fieldLen > len) break;
-                char field[256] = {0};
-                if (fieldLen > 0 && fieldLen < 256) memcpy(field, newBuf + pos + 2, fieldLen);
-                if (f == 0) username = [NSString stringWithUTF8String:field];
-                else if (f == 1) password = [NSString stringWithUTF8String:field];
-                else if (f == 2) deviceId = [NSString stringWithUTF8String:field];
+                if (fieldLen > 0 && fieldLen < 256) memcpy(((char *[]){username, password, deviceId, NULL})[f], cbuf + pos + 2, fieldLen);
                 pos += 2 + fieldLen;
             }
-
+            
             NSString *sign = generateSign(username, password, deviceId, @"7.6.0");
             const char *signCStr = [sign UTF8String];
-            size_t signLen = strlen(signCStr);
-
-            size_t insertPos = len;
-            if (newBuf[len - 1] == 0x00) insertPos = len - 1;
-            size_t finalLen = insertPos + 2 + signLen + 16;
-
-            unsigned char *finalBuf = (unsigned char *)malloc(finalLen);
-            memcpy(finalBuf, newBuf, insertPos);
-            finalBuf[insertPos] = (signLen >> 8) & 0xFF;
-            finalBuf[insertPos + 1] = signLen & 0xFF;
-            memcpy(finalBuf + insertPos + 2, signCStr, signLen);
-            memset(finalBuf + insertPos + 2 + signLen, 0, 16);
-
-            uint32_t newPktLen = (uint32_t)finalLen;
-            finalBuf[0] = (newPktLen >> 24) & 0xFF;
-            finalBuf[1] = (newPktLen >> 16) & 0xFF;
-            finalBuf[2] = (newPktLen >> 8) & 0xFF;
-            finalBuf[3] = newPktLen & 0xFF;
-
-            free(newBuf);
-            sendBuf = finalBuf;
-            len = finalLen;
-            modified = YES;
-            DLOG(@"[SEND-DEBUG] v1->v2 converted, newLen=%zu", len);
+            
+            const char *channel = "SQAGE";
+            const char *os = "IOS";
+            const char *phoneModel = [[UIDevice currentDevice] model].UTF8String;
+            const char *subChannel = "SQAGE_MIESHI";
+            
+            size_t newLen = 0;
+            unsigned char *finalBuf = buildV2LoginPacket(username, password, deviceId, 
+                                                        channel, os, phoneModel, 
+                                                        subChannel, signCStr, &newLen);
+            
+            if (finalBuf) {
+                sendBuf = finalBuf;
+                len = newLen;
+                modified = YES;
+                DLOG(@"[SEND-DEBUG] v1->v2 converted using BUILDER, newLen=%zu", len);
+            }
         } else if (cmd == 0x002EE121) {
-            DLOG(@"[SEND-DEBUG] v2 login request");
+            DLOG(@"[SEND-DEBUG] v2 login request - COMPLETE REBUILD using BUILDER");
             
             size_t pos = 12;
             char fields[16][256] = {0};
             uint16_t fieldLens[16] = {0};
-            int fieldCount = 0;
-            
             for (int f = 0; f < 16 && pos + 2 <= len; f++) {
                 uint16_t flen = ((uint16_t)cbuf[pos] << 8) | cbuf[pos + 1];
                 if (pos + 2 + flen > len) break;
                 if (flen > 0 && flen < 256) memcpy(fields[f], cbuf + pos + 2, flen);
                 fieldLens[f] = flen;
-                fieldCount++;
                 pos += 2 + flen;
             }
             
-            const char *oldVer = "7.5.0";
-            const char *newVer = "7.6.0";
-            for (size_t i = 0; i <= len - strlen(oldVer); i++) {
-                if (memcmp(cbuf + i, oldVer, strlen(oldVer)) == 0) {
-                    sendBuf = malloc(len);
-                    memcpy(sendBuf, buf, len);
-                    unsigned char *mp = (unsigned char *)sendBuf;
-                    memcpy(mp + i, newVer, strlen(newVer));
-                    cbuf = (const unsigned char *)sendBuf;
-                    modified = YES;
-                    DLOG(@"[SEND-DEBUG] v2 login version replaced");
-                    break;
-                }
+            NSString *username = [NSString stringWithUTF8String:fields[0]];
+            NSString *password = [NSString stringWithUTF8String:fields[1]];
+            NSString *deviceId = [NSString stringWithUTF8String:fields[2]];
+            
+            const char *channel = fields[3][0] ? fields[3] : "SQAGE";
+            const char *os = fields[4][0] ? fields[4] : "IOS";
+            const char *phoneModel = fields[5][0] ? fields[5] : [[UIDevice currentDevice] model].UTF8String;
+            const char *subChannel = fields[8][0] ? fields[8] : "SQAGE_MIESHI";
+            
+            NSString *sign = nil;
+            if (fieldLens[9] > 0) {
+                sign = [NSString stringWithUTF8String:fields[9]];
+                DLOG(@"[SEND-DEBUG] Using existing sign: %@", sign);
+            } else {
+                sign = generateSignV2(username, password, deviceId);
             }
             
-            if (!g_forcePlainPassword && g_rsaPublicKey && fieldLens[1] > 0) {
-                NSString *plainPassword = [NSString stringWithUTF8String:fields[1]];
-                DLOG(@"[SEND-DEBUG] RSA encrypt: '%@' (len=%d)", plainPassword, fieldLens[1]);
-                NSString *encryptedPassword = rsaEncryptString(plainPassword, g_rsaPublicKey);
+            NSString *finalPassword = password;
+            if (!g_forcePlainPassword && g_rsaPublicKey && password.length > 0) {
+                NSString *encryptedPassword = rsaEncryptString(password, g_rsaPublicKey);
                 if (encryptedPassword) {
-                    const char *encPassCStr = [encryptedPassword UTF8String];
-                    size_t encPassLen = strlen(encPassCStr);
-                    DLOG(@"[SEND-DEBUG] RSA result len=%zu", encPassLen);
-                    
-                    size_t passFieldPos = 12;
-                    uint16_t passFieldLen = 0;
-                    for (int f = 0; f < 1 && passFieldPos + 2 <= len; f++) {
-                        passFieldLen = ((uint16_t)cbuf[passFieldPos] << 8) | cbuf[passFieldPos + 1];
-                        passFieldPos += 2 + passFieldLen;
-                    }
-                    
-                    size_t extraBytes = encPassLen - passFieldLen;
-                    if (extraBytes != 0) {
-                        unsigned char *newBuf = (unsigned char *)malloc(len + extraBytes);
-                        if (newBuf) {
-                            size_t passStartPos = passFieldPos - 2 - passFieldLen;
-                            memcpy(newBuf, cbuf, passStartPos);
-                            newBuf[passStartPos] = (encPassLen >> 8) & 0xFF;
-                            newBuf[passStartPos + 1] = encPassLen & 0xFF;
-                            memcpy(newBuf + passStartPos + 2, encPassCStr, encPassLen);
-                            memcpy(newBuf + passStartPos + 2 + encPassLen,
-                                   cbuf + passStartPos + 2 + passFieldLen,
-                                   len - passStartPos - 2 - passFieldLen);
-                            
-                            uint32_t newPktLen = (uint32_t)((len + extraBytes) - 4);
-                            newBuf[0] = (newPktLen >> 24) & 0xFF;
-                            newBuf[1] = (newPktLen >> 16) & 0xFF;
-                            newBuf[2] = (newPktLen >> 8) & 0xFF;
-                            newBuf[3] = newPktLen & 0xFF;
-                            
-                            if (sendBuf != buf) free(sendBuf);
-                            sendBuf = newBuf;
-                            len += extraBytes;
-                            modified = YES;
-                            DLOG(@"[SEND-DEBUG] RSA encrypted, len=%zu", len);
-                        }
-                    }
-                } else {
-                    DLOG(@"[SEND-DEBUG] RSA encrypt failed, keeping plaintext");
+                    finalPassword = encryptedPassword;
+                    DLOG(@"[SEND-DEBUG] RSA encrypted password: len=%lu", (unsigned long)finalPassword.length);
                 }
             }
             
-            if (fieldCount >= 10 && fieldLens[9] == 0) {
-                NSString *username = [NSString stringWithUTF8String:fields[0]];
-                NSString *password = [NSString stringWithUTF8String:fields[1]];
-                NSString *deviceId = [NSString stringWithUTF8String:fields[2]];
-                NSString *signNS = generateSignV2(username, password, deviceId);
-                const char *signCStr = [signNS UTF8String];
-                size_t signLen = strlen(signCStr);
-                
-                size_t extraBytes = 2 + signLen;
-                unsigned char *newBuf = (unsigned char *)malloc(len + extraBytes);
-                if (newBuf) {
-                    size_t signFieldPos = 12;
-                    for (int f = 0; f < 9 && signFieldPos + 2 <= len; f++) {
-                        uint16_t flen = ((uint16_t)cbuf[signFieldPos] << 8) | cbuf[signFieldPos + 1];
-                        signFieldPos += 2 + flen;
-                    }
-                    
-                    memcpy(newBuf, cbuf, signFieldPos);
-                    newBuf[signFieldPos] = (signLen >> 8) & 0xFF;
-                    newBuf[signFieldPos + 1] = signLen & 0xFF;
-                    memcpy(newBuf + signFieldPos + 2, signCStr, signLen);
-                    memcpy(newBuf + signFieldPos + 2 + signLen,
-                           cbuf + signFieldPos + 2, len - signFieldPos - 2);
-                    
-                    uint32_t newPktLen = (uint32_t)(len + extraBytes - 4);
-                    newBuf[0] = (newPktLen >> 24) & 0xFF;
-                    newBuf[1] = (newPktLen >> 16) & 0xFF;
-                    newBuf[2] = (newPktLen >> 8) & 0xFF;
-                    newBuf[3] = newPktLen & 0xFF;
-                    
-                    if (sendBuf != buf) free(sendBuf);
-                    sendBuf = newBuf;
-                    len += extraBytes;
-                    modified = YES;
-                    DLOG(@"[SEND-DEBUG] Sign injected, len=%zu", len);
-                }
+            size_t newLen = 0;
+            unsigned char *finalBuf = buildV2LoginPacket([username UTF8String], [finalPassword UTF8String],
+                                                        [deviceId UTF8String], channel, os,
+                                                        phoneModel, subChannel, [sign UTF8String], &newLen);
+            
+            if (finalBuf) {
+                sendBuf = finalBuf;
+                len = newLen;
+                modified = YES;
+                DLOG(@"[SEND-DEBUG] v2 login rebuilt using BUILDER, newLen=%zu", len);
             }
         }
     }
