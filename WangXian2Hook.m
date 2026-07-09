@@ -113,7 +113,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXian2Hook v5.1 修复版 (保留服务器列表数据 + 修复PATCH过度) ===");
+        _log(@"=== WangXian2Hook v5.2 修复版 (移除版本检查PATCH + 让游戏正常连接) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log([NSString stringWithFormat:@"Log max size: %lu bytes", (unsigned long)g_logMaxSize]);
         
@@ -984,30 +984,8 @@ static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
             }
             DLOG_HEX(buf, len);
             
-            ssize_t maxPatch = (ssize_t)pktLenBE;
-            if (maxPatch > len) maxPatch = len;
-            
-            if (maxPatch >= 12) {
-                uint32_t status4 = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
-                                   ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
-                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                    memset(buf + 8, 0, 4);
-                    patched = YES;
-                }
-            }
-            
-            if (maxPatch >= 13 && buf[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", buf[12]);
-                buf[12] = 0;
-                patched = YES;
-            }
-            
-            if (maxPatch >= 14 && buf[13] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 13: %u -> 0", buf[13]);
-                buf[13] = 0;
-                patched = YES;
+            if (cmd == 0x8000E002 && len >= 13) {
+                DLOG(@"[PROTO-R] Handshake status at offset 12: %u", buf[12]);
             }
         } else if (cmd == 0x76666669) {
             DLOG(@"[PROTO-R] DEBUG ECHO RESPONSE cmd=0x%08X", cmd);
