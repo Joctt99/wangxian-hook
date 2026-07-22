@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.35 - DIAG: Hook SecKeyEncrypt/SecKeyDecrypt to capture RSA plaintext - analyze game server login packet format
+ * WangXianHook v35.36 - DIAG: Hook SecKeyEncrypt/SecKeyDecrypt + CCCrypt to capture RSA/AES plaintext - analyze game server login packet format
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <zlib.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonCryptor.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -66,7 +67,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.35 ===");
+        _log(@"=== WXHook v35.36 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -244,7 +245,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.35 诊断面板";
+            lbl.text = @"WXHook v35.36 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2473,6 +2474,61 @@ static OSStatus hook_SecKeyDecrypt(void *key, void *padding, const uint8_t *ciph
     return status;
 }
 
+// Hook CCCrypt to capture symmetric encryption (AES/DES) - game may use this after RSA key exchange
+typedef CCCryptorStatus (*CCCryptFunc)(CCOperation op, CCAlgorithm alg, CCOptions options,
+    const void *key, size_t keyLength, const void *iv,
+    const void *dataIn, size_t dataInLength,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+static CCCryptFunc orig_CCCrypt = NULL;
+static int g_cryptCount = 0;
+
+static CCCryptorStatus hook_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions options,
+    const void *key, size_t keyLength, const void *iv,
+    const void *dataIn, size_t dataInLength,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    if (!orig_CCCrypt) {
+        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_DEFAULT, "CCCrypt");
+        if (!orig_CCCrypt) return -1;
+    }
+    
+    g_cryptCount++;
+    const char *opStr = (op == kCCEncrypt) ? "ENC" : (op == kCCDecrypt) ? "DEC" : "?";
+    const char *algStr = (alg == kCCAlgorithmAES) ? "AES" : (alg == kCCAlgorithmDES) ? "DES" : "?";
+    
+    // Log input data (before encryption or after decryption)
+    if (dataIn && dataInLength > 0 && dataInLength < 2048) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:dataInLength * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:dataInLength];
+        size_t showLen = dataInLength > 512 ? 512 : dataInLength;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", ((const uint8_t *)dataIn)[i]];
+            [ascii appendFormat:@"%c", (((const uint8_t *)dataIn)[i] >= 0x20 && ((const uint8_t *)dataIn)[i] < 0x7F) ? ((const uint8_t *)dataIn)[i] : '.'];
+        }
+        DLOG(@"[CC-%s] #%d %s inLen=%zu keyLen=%zu\n  hex: %@\n  txt: %@", algStr, g_cryptCount, opStr, dataInLength, keyLength, hex, ascii);
+    }
+    
+    CCCryptorStatus status = orig_CCCrypt(op, alg, options, key, keyLength, iv, dataIn, dataInLength, dataOut, dataOutAvailable, dataOutMoved);
+    
+    // For decryption: log output (decrypted plaintext)
+    if (status == 0 && op == kCCDecrypt && dataOut && dataOutMoved && *dataOutMoved > 0 && *dataOutMoved < 2048) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:*dataOutMoved * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:*dataOutMoved];
+        size_t showLen = *dataOutMoved > 512 ? 512 : *dataOutMoved;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", ((const uint8_t *)dataOut)[i]];
+            [ascii appendFormat:@"%c", (((const uint8_t *)dataOut)[i] >= 0x20 && ((const uint8_t *)dataOut)[i] < 0x7F) ? ((const uint8_t *)dataOut)[i] : '.'];
+        }
+        DLOG(@"[CC-%s-OUT] #%d decrypted len=%zu\n  hex: %@\n  txt: %@", algStr, g_cryptCount, *dataOutMoved, hex, ascii);
+    }
+    
+    // For encryption: log output (ciphertext)
+    if (status == 0 && op == kCCEncrypt && dataOut && dataOutMoved && *dataOutMoved > 0 && *dataOutMoved < 2048) {
+        DLOG(@"[CC-%s-OUT] #%d encrypted len=%zu", algStr, g_cryptCount, *dataOutMoved);
+    }
+    
+    return status;
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -2520,6 +2576,18 @@ static void installSecurityHooks(void) {
         orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_DEFAULT, "SecKeyDecrypt");
         if (orig_SecKeyDecrypt) {
             DLOG(@"[SEC] SecKeyDecrypt found via dlsym at %p", orig_SecKeyDecrypt);
+        }
+    }
+    
+    // Hook CCCrypt to capture AES/DES symmetric encryption
+    int cc = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+    if (cc == 0) {
+        DLOG(@"[SEC] CCCrypt hooked successfully");
+    } else {
+        DLOG(@"[SEC] CCCrypt hook failed: %d", cc);
+        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_DEFAULT, "CCCrypt");
+        if (orig_CCCrypt) {
+            DLOG(@"[SEC] CCCrypt found via dlsym at %p", orig_CCCrypt);
         }
     }
     
