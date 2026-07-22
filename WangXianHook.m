@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.33 - DIAG: Add recv ret=0/ret=-1 logging and close() backtrace for game server (12003) to identify who closes connection
+ * WangXianHook v35.35 - DIAG: Hook SecKeyEncrypt/SecKeyDecrypt to capture RSA plaintext - analyze game server login packet format
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -66,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.33 ===");
+        _log(@"=== WXHook v35.35 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -244,7 +244,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.33 诊断面板";
+            lbl.text = @"WXHook v35.35 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1724,10 +1724,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        // v35.34: Only patch 0x802EE121 (version check). Do NOT patch 0x802EE118/0x802EE120.
+        // Patching their byte 12 may corrupt non-error status codes and break game server auth.
+        if (cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
-            if (cmd == 0x802EE121 && ret >= 90) {
+            if (ret >= 90) {
                 const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
                 BOOL hasError = NO;
                 for (ssize_t i = 0; i <= ret - 12; i++) {
@@ -1737,24 +1739,35 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, patching status + clearing error text (preserving all data)");
                     unsigned char *b = (unsigned char *)buf;
-                    // Preserve original sequence number at bytes 8-11 (matches send packet)
-                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
-                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    // Restore original sequence number (DO NOT zero it - breaks protocol sync)
-                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
-                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
-                    b[12] = 0x00; // status 0 = success
-                    ret = 13;
-                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
-                }
-            } else {
-                // Only patch byte 12 (status code), NOT bytes 8-11 (sequence number)
-                if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq# at 8-11)", p[12]);
-                    ((unsigned char *)buf)[12] = 0;
+                    // v35.34: Instead of replacing entire response (which may lose data),
+                    // just patch the status byte and clear error message strings.
+                    // This preserves any hidden fields (tokens, keys, etc.) in the response.
+                    if (b[12] != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Status byte 12: 0x%02X -> 0x00", b[12]);
+                        b[12] = 0; // status = success
+                    }
+                    // Clear both error message strings in-place (replace with spaces to keep length)
+                    const unsigned char *msg1 = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E\xEF\xBC\x8C\xE8\xAF\xB7\xE4\xB8\x8B\xE8\xBD\xBD\xE6\x9C\x80\xE6\x96\xB0\xE7\x89\x88\xE6\x9C\xAC\xE6\x88\x96\xE8\x81\x94\xE7\xB3\xBB\xE5\xAE\xA2\xE6\x9C\x8D";
+                    size_t msg1Len = 57; // "当前版本过低，请下载最新版本或联系客服"
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg1Len; i++) {
+                        if (memcmp(b + i, msg1, msg1Len) == 0) {
+                            memset(b + i, 0x20, msg1Len);
+                            DLOG(@"[PROTO-R-PATCH] Cleared error msg1 at offset %zd", i);
+                            break;
+                        }
+                    }
+                    const unsigned char *msg2 = (const unsigned char *)"\xE7\x99\xBB\xE5\xBD\x95\xE5\xA4\xB1\xE8\xB4\xA5";
+                    size_t msg2Len = 12; // "登录失败"
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg2Len; i++) {
+                        if (memcmp(b + i, msg2, msg2Len) == 0) {
+                            memset(b + i, 0x20, msg2Len);
+                            DLOG(@"[PROTO-R-PATCH] Cleared error msg2 at offset %zd", i);
+                            break;
+                        }
+                    }
+                    DLOG(@"[PROTO-R-PATCH] Response length preserved: %zd bytes", ret);
                 }
             }
         }
@@ -1861,10 +1874,11 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-R] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        // v35.34: Only patch 0x802EE121. Do NOT patch 0x802EE118/0x802EE120.
+        if (cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
-            if (cmd == 0x802EE121 && ret >= 90) {
+            if (ret >= 90) {
                 const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
                 BOOL hasError = NO;
                 for (ssize_t i = 0; i <= ret - 12; i++) {
@@ -1874,21 +1888,31 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     }
                 }
                 if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, patching status + clearing error text (preserving all data)");
                     unsigned char *b = (unsigned char *)buf;
-                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
-                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
-                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
-                    b[12] = 0x00;
-                    ret = 13;
-                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
-                }
-            } else {
-                if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq#)", p[12]);
-                    ((unsigned char *)buf)[12] = 0;
+                    if (b[12] != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Status byte 12: 0x%02X -> 0x00", b[12]);
+                        b[12] = 0;
+                    }
+                    const unsigned char *msg1 = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E\xEF\xBC\x8C\xE8\xAF\xB7\xE4\xB8\x8B\xE8\xBD\xBD\xE6\x9C\x80\xE6\x96\xB0\xE7\x89\x88\xE6\x9C\xAC\xE6\x88\x96\xE8\x81\x94\xE7\xB3\xBB\xE5\xAE\xA2\xE6\x9C\x8D";
+                    size_t msg1Len = 57;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg1Len; i++) {
+                        if (memcmp(b + i, msg1, msg1Len) == 0) {
+                            memset(b + i, 0x20, msg1Len);
+                            DLOG(@"[PROTO-R-PATCH] Cleared error msg1 at offset %zd", i);
+                            break;
+                        }
+                    }
+                    const unsigned char *msg2 = (const unsigned char *)"\xE7\x99\xBB\xE5\xBD\x95\xE5\xA4\xB1\xE8\xB4\xA5";
+                    size_t msg2Len = 12;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg2Len; i++) {
+                        if (memcmp(b + i, msg2, msg2Len) == 0) {
+                            memset(b + i, 0x20, msg2Len);
+                            DLOG(@"[PROTO-R-PATCH] Cleared error msg2 at offset %zd", i);
+                            break;
+                        }
+                    }
+                    DLOG(@"[PROTO-R-PATCH] Response length preserved: %zd bytes", ret);
                 }
             }
         }
@@ -1956,13 +1980,41 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RF] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
+        // v35.34: Only patch 0x802EE121. Do NOT patch 0x802EE118/0x802EE120.
+        // Preserve all response data - only change status byte and clear error messages.
+        if (cmd == 0x802EE121) {
             DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RF-PATCH] Version status %u -> 0, clearing error messages", p[12]);
-                ((unsigned char *)buf)[12] = 0;
-                if (ret > 13) {
-                    memset((unsigned char *)buf + 13, 0, ret - 13);
+            if (ret >= 90) {
+                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+                BOOL hasError = NO;
+                for (ssize_t i = 0; i <= ret - 12; i++) {
+                    if (memcmp(p + i, errMsg, 12) == 0) { hasError = YES; break; }
+                }
+                if (hasError) {
+                    DLOG(@"[PROTO-RF-PATCH] 0x802EE121 has error, patching status + clearing error text (preserving data)");
+                    unsigned char *b = (unsigned char *)buf;
+                    if (b[12] != 0) {
+                        DLOG(@"[PROTO-RF-PATCH] Status byte 12: 0x%02X -> 0x00", b[12]);
+                        b[12] = 0;
+                    }
+                    // Clear error messages in-place with spaces (keep length)
+                    const unsigned char *msg1 = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E\xEF\xBC\x8C\xE8\xAF\xB7\xE4\xB8\x8B\xE8\xBD\xBD\xE6\x9C\x80\xE6\x96\xB0\xE7\x89\x88\xE6\x9C\xAC\xE6\x88\x96\xE8\x81\x94\xE7\xB3\xBB\xE5\xAE\xA2\xE6\x9C\x8D";
+                    size_t msg1Len = 57;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg1Len; i++) {
+                        if (memcmp(b + i, msg1, msg1Len) == 0) {
+                            memset(b + i, 0x20, msg1Len);
+                            break;
+                        }
+                    }
+                    const unsigned char *msg2 = (const unsigned char *)"\xE7\x99\xBB\xE5\xBD\x95\xE5\xA4\xB1\xE8\xB4\xA5";
+                    size_t msg2Len = 12;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg2Len; i++) {
+                        if (memcmp(b + i, msg2, msg2Len) == 0) {
+                            memset(b + i, 0x20, msg2Len);
+                            break;
+                        }
+                    }
+                    DLOG(@"[PROTO-RF-PATCH] Response length preserved: %zd bytes", ret);
                 }
             }
         }
@@ -2028,13 +2080,40 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
+        // v35.34: Only patch 0x802EE121. Do NOT patch 0x802EE118/0x802EE120.
+        // Preserve all response data - only change status byte and clear error messages.
+        if (cmd == 0x802EE121) {
             DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
-            if (iov->iov_len >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RM-PATCH] Version status %u -> 0, clearing error messages", p[12]);
-                ((unsigned char *)iov->iov_base)[12] = 0;
-                if (ret > 13) {
-                    memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
+            if (ret >= 90 && iov->iov_len >= 90) {
+                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+                BOOL hasError = NO;
+                for (ssize_t i = 0; i <= ret - 12; i++) {
+                    if (memcmp(p + i, errMsg, 12) == 0) { hasError = YES; break; }
+                }
+                if (hasError) {
+                    DLOG(@"[PROTO-RM-PATCH] 0x802EE121 has error, patching status + clearing error text (preserving data)");
+                    unsigned char *b = (unsigned char *)iov->iov_base;
+                    if (b[12] != 0) {
+                        DLOG(@"[PROTO-RM-PATCH] Status byte 12: 0x%02X -> 0x00", b[12]);
+                        b[12] = 0;
+                    }
+                    const unsigned char *msg1 = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E\xEF\xBC\x8C\xE8\xAF\xB7\xE4\xB8\x8B\xE8\xBD\xBD\xE6\x9C\x80\xE6\x96\xB0\xE7\x89\x88\xE6\x9C\xAC\xE6\x88\x96\xE8\x81\x94\xE7\xB3\xBB\xE5\xAE\xA2\xE6\x9C\x8D";
+                    size_t msg1Len = 57;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg1Len; i++) {
+                        if (memcmp(b + i, msg1, msg1Len) == 0) {
+                            memset(b + i, 0x20, msg1Len);
+                            break;
+                        }
+                    }
+                    const unsigned char *msg2 = (const unsigned char *)"\xE7\x99\xBB\xE5\xBD\x95\xE5\xA4\xB1\xE8\xB4\xA5";
+                    size_t msg2Len = 12;
+                    for (ssize_t i = 0; i <= ret - (ssize_t)msg2Len; i++) {
+                        if (memcmp(b + i, msg2, msg2Len) == 0) {
+                            memset(b + i, 0x20, msg2Len);
+                            break;
+                        }
+                    }
+                    DLOG(@"[PROTO-RM-PATCH] Response length preserved: %zd bytes", ret);
                 }
             }
         }
@@ -2337,6 +2416,63 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
     return result;
 }
 
+// Hook SecKeyEncrypt to capture plaintext before RSA encryption
+// This helps analyze what data is being sent to game server in encrypted packets
+typedef OSStatus (*SecKeyEncryptFunc)(void *key, void *padding, const uint8_t *plainText, size_t plainTextLen, uint8_t *cipherText, size_t *cipherTextLen);
+static SecKeyEncryptFunc orig_SecKeyEncrypt = NULL;
+static int g_encryptCount = 0;
+
+// Hook SecKeyDecrypt to capture decrypted server responses
+typedef OSStatus (*SecKeyDecryptFunc)(void *key, void *padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen);
+static SecKeyDecryptFunc orig_SecKeyDecrypt = NULL;
+static int g_decryptCount = 0;
+
+static OSStatus hook_SecKeyEncrypt(void *key, void *padding, const uint8_t *plainText, size_t plainTextLen, uint8_t *cipherText, size_t *cipherTextLen) {
+    if (!orig_SecKeyEncrypt) {
+        // Try to find original function
+        orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_DEFAULT, "SecKeyEncrypt");
+        if (!orig_SecKeyEncrypt) return -1;
+    }
+    
+    g_encryptCount++;
+    
+    // Log all RSA encryptions - this is how we discover login packet format
+    if (plainText && plainTextLen > 0 && plainTextLen < 1024) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:plainTextLen * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:plainTextLen];
+        for (size_t i = 0; i < plainTextLen; i++) {
+            [hex appendFormat:@"%02X ", plainText[i]];
+            [ascii appendFormat:@"%c", (plainText[i] >= 0x20 && plainText[i] < 0x7F) ? plainText[i] : '.'];
+        }
+        DLOG(@"[RSA-ENC] #%d len=%zu padding=%p\n  hex: %@\n  txt: %@", g_encryptCount, plainTextLen, padding, hex, ascii);
+    }
+    
+    // Call original function
+    return orig_SecKeyEncrypt(key, padding, plainText, plainTextLen, cipherText, cipherTextLen);
+}
+
+static OSStatus hook_SecKeyDecrypt(void *key, void *padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen) {
+    if (!orig_SecKeyDecrypt) {
+        orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_DEFAULT, "SecKeyDecrypt");
+        if (!orig_SecKeyDecrypt) return -1;
+    }
+    
+    OSStatus status = orig_SecKeyDecrypt(key, padding, cipherText, cipherTextLen, plainText, plainTextLen);
+    
+    if (status == 0 && plainText && plainTextLen && *plainTextLen > 0 && *plainTextLen < 1024) {
+        g_decryptCount++;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:*plainTextLen * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:*plainTextLen];
+        for (size_t i = 0; i < *plainTextLen; i++) {
+            [hex appendFormat:@"%02X ", plainText[i]];
+            [ascii appendFormat:@"%c", (plainText[i] >= 0x20 && plainText[i] < 0x7F) ? plainText[i] : '.'];
+        }
+        DLOG(@"[RSA-DEC] #%d len=%zu status=%d\n  hex: %@\n  txt: %@", g_decryptCount, *plainTextLen, (int)status, hex, ascii);
+    }
+    
+    return status;
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -2361,6 +2497,30 @@ static void installSecurityHooks(void) {
         void *fp = dlsym(syslib, "fopen");
         void *fg = dlsym(syslib, "fgets");
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
+    }
+    
+    // Hook SecKeyEncrypt to capture RSA plaintext (game server login analysis)
+    int sk = rebindSymbol("_SecKeyEncrypt", (void *)hook_SecKeyEncrypt, (void **)&orig_SecKeyEncrypt);
+    if (sk == 0) {
+        DLOG(@"[SEC] SecKeyEncrypt hooked successfully");
+    } else {
+        DLOG(@"[SEC] SecKeyEncrypt hook failed: %d (trying dlsym fallback)", sk);
+        orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_DEFAULT, "SecKeyEncrypt");
+        if (orig_SecKeyEncrypt) {
+            DLOG(@"[SEC] SecKeyEncrypt found via dlsym at %p", orig_SecKeyEncrypt);
+        }
+    }
+    
+    // Hook SecKeyDecrypt to capture decrypted server responses
+    int sd = rebindSymbol("_SecKeyDecrypt", (void *)hook_SecKeyDecrypt, (void **)&orig_SecKeyDecrypt);
+    if (sd == 0) {
+        DLOG(@"[SEC] SecKeyDecrypt hooked successfully");
+    } else {
+        DLOG(@"[SEC] SecKeyDecrypt hook failed: %d", sd);
+        orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_DEFAULT, "SecKeyDecrypt");
+        if (orig_SecKeyDecrypt) {
+            DLOG(@"[SEC] SecKeyDecrypt found via dlsym at %p", orig_SecKeyDecrypt);
+        }
     }
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
