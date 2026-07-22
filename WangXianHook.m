@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.32 - FIX: Disable VER-REPLACE (breaks packet signature/MD5 on game server, causing connection close)
+ * WangXianHook v35.33 - DIAG: Add recv ret=0/ret=-1 logging and close() backtrace for game server (12003) to identify who closes connection
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -66,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.32 ===");
+        _log(@"=== WXHook v35.33 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -244,7 +244,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.32 诊断面板";
+            lbl.text = @"WXHook v35.33 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1261,6 +1261,7 @@ static unsigned char *gzipCompress(const unsigned char *data, size_t len, size_t
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 // === Socket hook functions ===
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
@@ -1362,6 +1363,23 @@ static void updateFdHostPort(int fd, const char *host, int port) {
 
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    // Log close with backtrace for game server connections
+    for (int i = 0; i < g_trackedCount; i++) {
+        if (g_trackedFds[i] == fd && g_trackedActive[i] && g_trackedPorts[i] == 12003) {
+            DLOG(@"[CLOSE-TRACE] close(%d) for game server %s:%d", fd, g_trackedHosts[i], g_trackedPorts[i]);
+            // Print backtrace
+            void *callstack[8];
+            int frames = backtrace(callstack, 8);
+            char **strs = backtrace_symbols(callstack, frames);
+            if (strs) {
+                for (int j = 1; j < frames && j < 6; j++) {
+                    DLOG(@"[BT] %d: %s", j, strs[j] ? strs[j] : "?");
+                }
+                free(strs);
+            }
+            break;
+        }
+    }
     clearTrackedFd(fd);
     return orig_close ? orig_close(fd) : -1;
 }
@@ -1670,7 +1688,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv || !buf) return -1;
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
-    if (ret <= 0) return ret;
+    if (ret <= 0) {
+        // Log connection close/error with context
+        const char *host = ""; int port = 0;
+        for (int i = 0; i < g_trackedCount; i++) {
+            if (g_trackedFds[i] == fd && g_trackedActive[i]) { host = g_trackedHosts[i]; port = g_trackedPorts[i]; break; }
+        }
+        if (ret == 0) {
+            DLOG(@"[RECV-CLOSE] fd=%d %s:%d ret=0 (server closed connection gracefully)", fd, host, port);
+        } else {
+            DLOG(@"[RECV-ERR] fd=%d %s:%d ret=%zd errno=%d (%s)", fd, host, port, ret, errno, strerror(errno));
+        }
+        return ret;
+    }
     
     const char *host = getHostForFd(fd);
     if (!host) return ret;
