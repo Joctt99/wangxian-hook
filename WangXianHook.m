@@ -1,5 +1,9 @@
 /**
- * WangXianHook v35.28 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
+ * WangXianHook v35.29 - FIX: Preserve sequence number (bytes 8-11) in protocol responses, add version replacement 7.6.2 -> 7.7.0 in send packets
+ * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
+ * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
+ * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
+ * FIX: Removed bytes 8-11 patching for 0x802EE118/0x802EE120 (keep byte 12 status patching only)
  * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.28 ===");
+        _log(@"=== WXHook v35.29 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -238,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.28 诊断面板";
+            lbl.text = @"WXHook v35.29 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1367,6 +1371,39 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
+    // Version replacement: Change "7.6.2" -> "7.7.0" in send packets to game server (12003)
+    // Pattern: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
+    // Only for game server (port 12003) to avoid breaking login server's signature-protected packets
+    if (port == 12003 && sendLen >= 7 && sendBuf == buf) {
+        const unsigned char *p = (const unsigned char *)sendBuf;
+        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+        BOOL found = NO;
+        for (size_t i = 0; i + 7 <= sendLen; i++) {
+            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
+        }
+        if (found) {
+            void *newBuf = malloc(sendLen);
+            if (newBuf) {
+                memcpy(newBuf, buf, sendLen);
+                unsigned char *q = (unsigned char *)newBuf;
+                int cnt = 0;
+                for (size_t i = 0; i + 7 <= sendLen; i++) {
+                    if (memcmp(q + i, verPattern, 7) == 0) {
+                        q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
+                        cnt++;
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (game server)", i+2);
+                    }
+                }
+                if (cnt > 0) {
+                    sendBuf = newBuf;
+                    DLOG(@"[VER-REPLACE] Total %d version replacements for game server packet", cnt);
+                } else {
+                    free(newBuf);
+                }
+            }
+        }
+    }
+    
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
     return ret;
@@ -1616,39 +1653,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response");
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
                     unsigned char *b = (unsigned char *)buf;
+                    // Preserve original sequence number at bytes 8-11 (matches send packet)
+                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
                     b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    b[8] = 0x00; b[9] = 0x00; b[10] = 0x00; b[11] = 0x00;
-                    b[12] = 0x00;
+                    // Restore original sequence number (DO NOT zero it - breaks protocol sync)
+                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
+                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
+                    b[12] = 0x00; // status 0 = success
                     ret = 13;
+                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
                 }
             } else {
-                if (ret >= 12) {
-                    uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                    if (status4 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                        memset((unsigned char *)buf + 8, 0, 4);
-                    }
-                }
+                // Only patch byte 12 (status code), NOT bytes 8-11 (sequence number)
                 if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq# at 8-11)", p[12]);
                     ((unsigned char *)buf)[12] = 0;
-                }
-            }
-        }
-        if (cmd == 0x80000015) {
-            DLOG(@"[PROTO-R] Game server auth response 0x80000015 pktLen=%u ret=%zd", pktLenBE, ret);
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                DLOG(@"[PROTO-R] Game server auth status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Game server auth status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
                 }
             }
         }
@@ -1691,6 +1713,36 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
             uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
             DLOG(@"[WRITE-CMD] cmd=0x%08X", cmd);
+        }
+    }
+    // Version replacement: Change "7.6.2" -> "7.7.0" for game server (12003) write() calls
+    if (port == 12003 && len >= 7) {
+        const unsigned char *p = (const unsigned char *)buf;
+        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+        BOOL found = NO;
+        for (size_t i = 0; i + 7 <= len; i++) {
+            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
+        }
+        if (found) {
+            void *newBuf = malloc(len);
+            if (newBuf) {
+                memcpy(newBuf, buf, len);
+                unsigned char *q = (unsigned char *)newBuf;
+                int cnt = 0;
+                for (size_t i = 0; i + 7 <= len; i++) {
+                    if (memcmp(q + i, verPattern, 7) == 0) {
+                        q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30;
+                        cnt++;
+                        DLOG(@"[VER-REPLACE] Write: replaced 7.6.2 -> 7.7.0 at offset %zu (game server)", i+2);
+                    }
+                }
+                if (cnt > 0) {
+                    ssize_t wr = orig_write ? orig_write(fd, newBuf, len) : -1;
+                    free(newBuf);
+                    return wr;
+                }
+                free(newBuf);
+            }
         }
     }
     return orig_write ? orig_write(fd, buf, len) : -1;
@@ -1738,26 +1790,20 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     }
                 }
                 if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response");
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
                     unsigned char *b = (unsigned char *)buf;
+                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
                     b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    b[8] = 0x00; b[9] = 0x00; b[10] = 0x00; b[11] = 0x00;
+                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
+                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
                     b[12] = 0x00;
                     ret = 13;
+                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
                 }
             } else {
-                if (ret >= 12) {
-                    uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                    if (status4 != 0) {
-                        DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                        memset((unsigned char *)buf + 8, 0, 4);
-                    }
-                }
                 if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq#)", p[12]);
                     ((unsigned char *)buf)[12] = 0;
                 }
             }
