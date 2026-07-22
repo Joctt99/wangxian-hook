@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.37 - FIX: Insert missing UUID field in 0x002EE121 and 0x000EE007 requests (root cause of version error and game server connection rejection)
+ * WangXianHook v35.38 - FIX: Hook UIDevice.identifierForVendor to ensure UUID is always valid (game builds login packets with correct UUID + valid signature)
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -67,7 +67,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.37 ===");
+        _log(@"=== WXHook v35.38 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -245,7 +245,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.37 UUID补丁";
+            lbl.text = @"WXHook v35.38 UUID修复";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1477,11 +1477,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
 
-    // UUID PATCH (v35.37): Insert missing UUID field in 0x002EE121 and 0x000EE007 requests
-    // Original IPA includes device UUID (identifierForVendor) in these packets, but Hook version sends empty UUID
-    // This causes login server (5678) to return version error (0x802EE121) and game server (12003) to reject connection
-    // Fix: Find empty UUID field after "Apple Inc." GPU field and fill it with device's identifierForVendor UUID
-    if (sendLen >= 12 && sendBuf == buf) {
+    // UUID PATCH (v35.37) DISABLED in v35.38: Modifying send packets breaks MD5/signature check
+    // Server detects tampered packets and closes connection immediately.
+    // Correct approach: Hook [UIDevice identifierForVendor] so game builds packets with correct UUID + valid signature.
+    if (0 && sendLen >= 12 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         uint32_t patchCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
@@ -2723,6 +2722,26 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 }
 
 // ============================================================
+#pragma mark - UIDevice identifierForVendor hook (fix empty UUID in login packets)
+// ============================================================
+
+static NSUUID * (*orig_identifierForVendor)(id, SEL) = NULL;
+static NSUUID *hook_identifierForVendor(id self, SEL _cmd) {
+    NSUUID *uuid = orig_identifierForVendor ? orig_identifierForVendor(self, _cmd) : nil;
+    // Always return a valid UUID - game needs it for login packet construction
+    if (!uuid) {
+        uuid = [NSUUID UUID];
+        DLOG(@"[UUID-FIX] identifierForVendor returned nil, generated fallback: %@", uuid);
+    }
+    static int g_uuidLogCount = 0;
+    if (g_uuidLogCount < 3) {
+        DLOG(@"[UUID-FIX] identifierForVendor called, returning: %@", uuid.UUIDString);
+        g_uuidLogCount++;
+    }
+    return uuid;
+}
+
+// ============================================================
 #pragma mark - Observation-only hooks (log, don't modify)
 // ============================================================
 
@@ -2949,6 +2968,19 @@ static void installAllHooks(void) {
         Method m2 = class_getInstanceMethod(udCls, @selector(boolForKey:));
         if (m2) { orig_boolForKey = (BoolForKeyIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_boolForKey); }
         _log(@"[INIT] NSUserDefaults hooked (objectForKey + boolForKey)");
+    }
+
+    // === FIX: UIDevice identifierForVendor hook (v35.38) ===
+    // Game uses identifierForVendor to build UUID field in login packets (0x002EE121, 0x000EE007)
+    // If UUID is empty/nil, server returns version error or closes connection
+    Class uidCls = [UIDevice class];
+    if (uidCls) {
+        Method m = class_getInstanceMethod(uidCls, @selector(identifierForVendor));
+        if (m) {
+            orig_identifierForVendor = (NSUUID * (*)(id, SEL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_identifierForVendor);
+            _log(@"[INIT] UIDevice.identifierForVendor: HOOKED (UUID fix)");
+        }
     }
     
     // === IMMEDIATE: Observation-only hooks ===
