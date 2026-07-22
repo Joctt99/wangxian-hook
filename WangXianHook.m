@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.30 - FIX: Patch judgeAppInfoApi ENDTIME (expired 2026-07-22), hook delegate-mode judgeAppInfoSignApi responses
+ * WangXianHook v35.31 - FIX: verifySignatureFromParameters now calls original instead of returning fake data (root cause of game server connection close)
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -66,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.30 ===");
+        _log(@"=== WXHook v35.31 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -118,12 +118,14 @@ static void hook_judgeNet(id self, SEL _cmd) {
     if (orig_judgeNet) orig_judgeNet(self, _cmd);
 }
 
-// 6. verifySignatureFromParameters: - LOG only
+// 6. verifySignatureFromParameters: - Call original (returns real signature result)
+// IMPORTANT: Must call original to get valid signature result, returning fake data breaks game server auth
 typedef id (*VerifySigIMP)(id, SEL, id);
 static VerifySigIMP orig_verifySig = NULL;
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    DLOG(@"[SK] verifySignatureFromParameters: BLOCKED: %@", params);
-    return @{@"status":@200,@"ispass":@"YES",@"pass":@"YES"};
+    DLOG(@"[SK] verifySignatureFromParameters: calling original: %@", params);
+    if (orig_verifySig) return orig_verifySig(self, _cmd, params);
+    return nil;
 }
 
 // 7. generateRequestParams - LOG only
@@ -242,7 +244,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.30 诊断面板";
+            lbl.text = @"WXHook v35.31 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
