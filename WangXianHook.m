@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.24 - FIX: Added version check patching in hook_recv (missing in v35.22), game uses recv() not read()
+ * WangXianHook v35.25 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
  * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.24 ===");
+        _log(@"=== WXHook v35.25 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -238,7 +238,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.24 诊断面板";
+            lbl.text = @"WXHook v35.25 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1618,6 +1618,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
+        }
+        if (cmd == 0x80000015) {
+            DLOG(@"[PROTO-R] Game server auth response 0x80000015 pktLen=%u ret=%zd", pktLenBE, ret);
+            if (ret >= 12) {
+                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                DLOG(@"[PROTO-R] Game server auth status at offset 8-11: %u (0x%08X)", status4, status4);
+                if (status4 != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Game server auth status %u -> 0", status4);
+                    memset((unsigned char *)buf + 8, 0, 4);
+                }
+            }
+        }
         }
     }
     
