@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.25 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
+ * WangXianHook v35.26 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
  * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
