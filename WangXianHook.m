@@ -642,7 +642,7 @@ static void installNSURLSessionHooks(void) {
         }
         free(classes);
         if (hookedCount > 0) {
-            _log(@"[INIT] URLSession:dataTask:didReceiveData: hooked on %d classes", hookedCount);
+            DLOG(@"[INIT] URLSession:dataTask:didReceiveData: hooked on %d classes", hookedCount);
         }
     }
 }
