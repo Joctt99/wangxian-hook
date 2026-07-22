@@ -1,5 +1,11 @@
 /**
- * WangXianHook v35.38 - FIX: Hook UIDevice.identifierForVendor to ensure UUID is always valid (game builds login packets with correct UUID + valid signature)
+ * WangXianHook v35.39 - FIX: Hook NSBundle.objectForInfoDictionaryKey to fake higher app version (7.6.2 -> 7.7.0)
+ * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
+ *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
+ *   with no valid auth data, so game server rejected connection.
+ * Fix: Fake app version 7.7.0 so server returns REAL success response with full login credentials.
+ * RESTORE: Keep UUID fix (UIDevice.identifierForVendor always returns valid UUID)
+ * RESTORE: Keep response patching as safety fallback
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -2722,6 +2728,38 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 }
 
 // ============================================================
+#pragma mark - NSBundle hook (fake higher version to pass server version check)
+// ============================================================
+
+static id (*orig_objectForInfoDictionaryKey)(id, SEL, id);
+static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
+    id val = orig_objectForInfoDictionaryKey ? orig_objectForInfoDictionaryKey(self, _cmd, key) : nil;
+    
+    if (key && [key isKindOfClass:[NSString class]]) {
+        NSString *keyStr = (NSString *)key;
+        if ([keyStr isEqualToString:@"CFBundleShortVersionString"]) {
+            // Fake version 7.7.0 to pass server version check
+            // This allows real login with valid session/ticket from login server
+            static dispatch_once_t once;
+            static int g_verLogCount = 0;
+            if (g_verLogCount < 3) {
+                DLOG(@"[VER-FAKE] CFBundleShortVersionString: %@ -> 7.7.0", val);
+                g_verLogCount++;
+            }
+            return @"7.7.0";
+        }
+        if ([keyStr isEqualToString:@"CFBundleVersion"]) {
+            static int g_buildLogCount = 0;
+            if (g_buildLogCount < 3) {
+                DLOG(@"[VER-FAKE] CFBundleVersion: %@ (kept)", val);
+                g_buildLogCount++;
+            }
+        }
+    }
+    return val;
+}
+
+// ============================================================
 #pragma mark - UIDevice identifierForVendor hook (fix empty UUID in login packets)
 // ============================================================
 
@@ -2968,6 +3006,19 @@ static void installAllHooks(void) {
         Method m2 = class_getInstanceMethod(udCls, @selector(boolForKey:));
         if (m2) { orig_boolForKey = (BoolForKeyIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_boolForKey); }
         _log(@"[INIT] NSUserDefaults hooked (objectForKey + boolForKey)");
+    }
+
+    // === FIX: NSBundle hook (v35.39) - fake higher version to pass real version check ===
+    // Instead of patching version error response (which loses login credentials),
+    // we fake the app version so server returns real success response with valid ticket/session.
+    Class bundleCls = [NSBundle class];
+    if (bundleCls) {
+        Method m = class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:));
+        if (m) {
+            orig_objectForInfoDictionaryKey = (id (*)(id, SEL, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey);
+            _log(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.2->7.7.0)");
+        }
     }
 
     // === FIX: UIDevice identifierForVendor hook (v35.38) ===
