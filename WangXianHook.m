@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.29 - FIX: Preserve sequence number (bytes 8-11) in protocol responses, add version replacement 7.6.2 -> 7.7.0 in send packets
+ * WangXianHook v35.30 - FIX: Patch judgeAppInfoApi ENDTIME (expired 2026-07-22), hook delegate-mode judgeAppInfoSignApi responses
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -66,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.29 ===");
+        _log(@"=== WXHook v35.30 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -242,7 +242,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.29 诊断面板";
+            lbl.text = @"WXHook v35.30 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -560,14 +560,35 @@ static void installJSONSerializationHook(void) {
 static void (*orig_urlSessionDataTaskDidReceiveData)(id, SEL, NSURLSession*, NSURLSessionDataTask*, NSData*) = NULL;
 
 static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
-    DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu", (unsigned long)[data length]);
+    NSString *url = dataTask.currentRequest.URL.absoluteString;
+    DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu url=%@", (unsigned long)[data length], url);
     
     NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (dataStr) {
         if ([dataStr containsString:@"版本"] || [dataStr containsString:@"server"] || 
             [dataStr containsString:@"status"] || [dataStr containsString:@"maintenance"] ||
-            [dataStr containsString:@"ispass"] || [dataStr containsString:@"md5xor"]) {
+            [dataStr containsString:@"ispass"] || [dataStr containsString:@"md5xor"] ||
+            [dataStr containsString:@"code"] || [dataStr containsString:@"sign"] ||
+            [dataStr containsString:@"ENDTIME"]) {
             DLOG(@"[HTTP-DATA] Response contains key info: %@", dataStr);
+        }
+    }
+    
+    // Patch delegate-mode responses for sign/cert APIs
+    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || [dataStr containsString:@"ENDTIME"])) {
+        DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response");
+        NSString *newBody = dataStr;
+        // Extend ENDTIME to future
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
+        newBody = [regex stringByReplacingMatchesInString:newBody options:0 range:NSMakeRange(0, newBody.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+        NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
+        DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
+        if (orig_urlSessionDataTaskDidReceiveData) {
+            orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
+            return;
         }
     }
     
@@ -596,6 +617,33 @@ static void installNSURLSessionHooks(void) {
     
     if (dataTaskCls) {
         DLOG(@"[HTTP-HOOK] NSURLSessionDataTask class found: %@", NSStringFromClass(dataTaskCls));
+    }
+    
+    // Hook URLSession:dataTask:didReceiveData: on classes that implement it
+    // This intercepts delegate-mode responses (used by judgeAppInfoSignApi)
+    unsigned int classCount = 0;
+    Class *classes = (Class *)malloc(sizeof(Class) * 0x10000);
+    if (classes) {
+        int numClasses = objc_getClassList(classes, 0x10000);
+        int hookedCount = 0;
+        for (int i = 0; i < numClasses; i++) {
+            Class cls = classes[i];
+            Method m = class_getInstanceMethod(cls, @selector(URLSession:dataTask:didReceiveData:));
+            if (m) {
+                IMP currentImp = method_getImplementation(m);
+                if (currentImp != (IMP)hook_urlSessionDataTaskDidReceiveData) {
+                    orig_urlSessionDataTaskDidReceiveData = (void(*)(id, SEL, NSURLSession*, NSURLSessionDataTask*, NSData*))currentImp;
+                    method_setImplementation(m, (IMP)hook_urlSessionDataTaskDidReceiveData);
+                    DLOG(@"[HTTP-HOOK] Hooked URLSession:dataTask:didReceiveData: on class: %@", NSStringFromClass(cls));
+                    hookedCount++;
+                    if (hookedCount >= 5) break;
+                }
+            }
+        }
+        free(classes);
+        if (hookedCount > 0) {
+            _log(@"[INIT] URLSession:dataTask:didReceiveData: hooked on %d classes", hookedCount);
+        }
     }
 }
 
@@ -2413,6 +2461,31 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         body = [body stringByReplacingOccurrencesOfString:@"版本过低" withString:@""];
                         body = [body stringByReplacingOccurrencesOfString:@"请更新" withString:@""];
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                    }
+                    
+                    // Patch judgeAppInfoApi response: extend ENDTIME to future date
+                    if ([url containsString:@"judgeAppInfoApi"] || [body containsString:@"ENDTIME"]) {
+                        DLOG(@"[NET-PATCH] Detected judgeAppInfoApi response, extending ENDTIME");
+                        // Replace any ENDTIME value with a future date (2027-12-31)
+                        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
+                        body = [regex stringByReplacingMatchesInString:body options:0 range:NSMakeRange(0, body.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+                        // Ensure END=0 (not ended) and OPEN=1 (open)
+                        body = [body stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+                        body = [body stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+                        // Ensure code=1 (success) instead of code=0
+                        body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+                        data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                        DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1, code=1");
+                    }
+                    
+                    // Patch any sign/cert API response to success
+                    if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
+                        DLOG(@"[NET-PATCH] Detected cert/sign API response, ensuring success");
+                        if ([body containsString:@"\"code\":0"]) {
+                            body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+                            data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                            DLOG(@"[NET-PATCH] Patched cert API code:0 -> 1");
+                        }
                     }
                 }
             }
