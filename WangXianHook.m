@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.31 - FIX: verifySignatureFromParameters now calls original instead of returning fake data (root cause of game server connection close)
+ * WangXianHook v35.32 - FIX: Disable VER-REPLACE (breaks packet signature/MD5 on game server, causing connection close)
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -66,7 +66,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.31 ===");
+        _log(@"=== WXHook v35.32 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -244,7 +244,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.31 诊断面板";
+            lbl.text = @"WXHook v35.32 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1424,7 +1424,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // Version replacement: Change "7.6.2" -> "7.7.0" in send packets to game server (12003)
     // Pattern: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
     // Only for game server (port 12003) to avoid breaking login server's signature-protected packets
-    if (port == 12003 && sendLen >= 7 && sendBuf == buf) {
+    // Version replacement DISABLED in v35.32: Changing 7.6.2 -> 7.7.0 breaks packet signature/MD5
+    // Game server verifies packet integrity, so any byte modification causes connection close.
+    // The version check is already bypassed at login server (5678) via 0x802EE121 response replacement.
+    // So game server (12003) should receive original 7.6.2 version as-is.
+    if (0 && port == 12003 && sendLen >= 7 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
         BOOL found = NO;
@@ -1765,8 +1769,8 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
             DLOG(@"[WRITE-CMD] cmd=0x%08X", cmd);
         }
     }
-    // Version replacement: Change "7.6.2" -> "7.7.0" for game server (12003) write() calls
-    if (port == 12003 && len >= 7) {
+    // Version replacement DISABLED in v35.32 (breaks packet signature)
+    if (0 && port == 12003 && len >= 7) {
         const unsigned char *p = (const unsigned char *)buf;
         const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
         BOOL found = NO;
@@ -2668,7 +2672,7 @@ static void installAllHooks(void) {
         if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet: BLOCK"); }
         
         m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
-        if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: BLOCK"); }
+        if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: ORIG"); }
         
         m = class_getClassMethod(skCls, @selector(generateRequestParams));
         if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams: LOG"); }
