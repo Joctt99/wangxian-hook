@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.36 - DIAG: Hook SecKeyEncrypt/SecKeyDecrypt + CCCrypt to capture RSA/AES plaintext - analyze game server login packet format
+ * WangXianHook v35.37 - FIX: Insert missing UUID field in 0x002EE121 and 0x000EE007 requests (root cause of version error and game server connection rejection)
  * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
  * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
  * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
@@ -67,7 +67,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.36 ===");
+        _log(@"=== WXHook v35.37 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -245,7 +245,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.36 诊断面板";
+            lbl.text = @"WXHook v35.37 UUID补丁";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1476,7 +1476,107 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             }
         }
     }
-    
+
+    // UUID PATCH (v35.37): Insert missing UUID field in 0x002EE121 and 0x000EE007 requests
+    // Original IPA includes device UUID (identifierForVendor) in these packets, but Hook version sends empty UUID
+    // This causes login server (5678) to return version error (0x802EE121) and game server (12003) to reject connection
+    // Fix: Find empty UUID field after "Apple Inc." GPU field and fill it with device's identifierForVendor UUID
+    if (sendLen >= 12 && sendBuf == buf) {
+        const unsigned char *p = (const unsigned char *)sendBuf;
+        uint32_t patchCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        if (patchCmd == 0x002EE121 || patchCmd == 0x000EE007) {
+            NSString *uuidStr = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+            if (uuidStr.length != 36) {
+                // Fallback: generate a stable UUID from device name if identifierForVendor fails
+                NSString *devName = [[UIDevice currentDevice] name];
+                if (devName.length == 0) devName = @"wangxian";
+                uint8_t hash[CC_MD5_DIGEST_LENGTH];
+                const char *cStr = [devName UTF8String];
+                CC_MD5(cStr, (CC_LONG)strlen(cStr), hash);
+                uuidStr = [NSString stringWithFormat:@"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                    hash[0],hash[1],hash[2],hash[3],hash[4],hash[5],hash[6],hash[7],
+                    hash[8],hash[9],hash[10],hash[11],hash[12],hash[13],hash[14],hash[15]];
+            }
+            if (uuidStr.length == 36) {
+                const char *uuid = [uuidStr UTF8String];
+                // Find "Apple Inc." field (GPU field) by searching for the pattern
+                const char *applePattern = "Apple Inc.";
+                size_t appleLen = strlen(applePattern);
+                ssize_t appleOffset = -1;
+                for (size_t i = 12; i + appleLen <= sendLen; i++) {
+                    if (memcmp(p + i, applePattern, appleLen) == 0) {
+                        appleOffset = i;
+                        break;
+                    }
+                }
+                if (appleOffset >= 2) {
+                    // Get GPU field length (2-byte prefix before "Apple Inc.")
+                    uint16_t gpuFieldLen = (p[appleOffset - 2] << 8) | p[appleOffset - 1];
+                    size_t gpuFieldEnd = appleOffset - 2 + 2 + gpuFieldLen; // offset after GPU field data
+                    if (gpuFieldEnd + 2 <= sendLen) {
+                        if (patchCmd == 0x002EE121) {
+                            // 0x002EE121: UUID field uses 2-byte length prefix
+                            // Original: 00 24 [36-byte UUID]
+                            // Hook version: 00 00 [empty UUID]
+                            if (p[gpuFieldEnd] == 0x00 && p[gpuFieldEnd + 1] == 0x00) {
+                                size_t insertLen = 36;
+                                size_t newLen = sendLen + insertLen;
+                                unsigned char *newBuf = malloc(newLen);
+                                if (newBuf) {
+                                    memcpy(newBuf, sendBuf, gpuFieldEnd);
+                                    newBuf[gpuFieldEnd] = 0x00;
+                                    newBuf[gpuFieldEnd + 1] = 0x24; // length = 36
+                                    memcpy(newBuf + gpuFieldEnd + 2, uuid, 36);
+                                    memcpy(newBuf + gpuFieldEnd + 2 + 36, sendBuf + gpuFieldEnd + 2, sendLen - gpuFieldEnd - 2);
+                                    uint32_t newTotalLen = (uint32_t)newLen;
+                                    newBuf[0] = (newTotalLen >> 24) & 0xFF;
+                                    newBuf[1] = (newTotalLen >> 16) & 0xFF;
+                                    newBuf[2] = (newTotalLen >> 8) & 0xFF;
+                                    newBuf[3] = newTotalLen & 0xFF;
+                                    sendBuf = newBuf;
+                                    sendLen = newLen;
+                                    DLOG(@"[UUID-PATCH] 0x002EE121: Inserted UUID '%@' at offset %zu, new len=%zu (was %zu)", uuidStr, gpuFieldEnd, newLen, newLen - 36);
+                                }
+                            }
+                        } else if (patchCmd == 0x000EE007) {
+                            // 0x000EE007: UUID field uses 4-byte separator + 4-byte length prefix
+                            // Original: 00 00 00 00 [sep] + 00 00 00 24 [len=36] + [36-byte UUID] + 00 01 00 [end]
+                            // Hook version: 00 00 00 00 [sep] + 00 00 00 00 [len=0] + 00 01 00 [end]
+                            if (gpuFieldEnd + 8 <= sendLen &&
+                                p[gpuFieldEnd] == 0x00 && p[gpuFieldEnd + 1] == 0x00 &&
+                                p[gpuFieldEnd + 2] == 0x00 && p[gpuFieldEnd + 3] == 0x00 &&
+                                p[gpuFieldEnd + 4] == 0x00 && p[gpuFieldEnd + 5] == 0x00 &&
+                                p[gpuFieldEnd + 6] == 0x00 && p[gpuFieldEnd + 7] == 0x00) {
+                                size_t insertPos = gpuFieldEnd + 8;
+                                size_t insertLen = 36;
+                                size_t newLen = sendLen + insertLen;
+                                unsigned char *newBuf = malloc(newLen);
+                                if (newBuf) {
+                                    memcpy(newBuf, sendBuf, insertPos);
+                                    newBuf[gpuFieldEnd + 4] = 0x00;
+                                    newBuf[gpuFieldEnd + 5] = 0x00;
+                                    newBuf[gpuFieldEnd + 6] = 0x00;
+                                    newBuf[gpuFieldEnd + 7] = 0x24; // length = 36
+                                    memcpy(newBuf + insertPos, uuid, 36);
+                                    memcpy(newBuf + insertPos + 36, sendBuf + insertPos, sendLen - insertPos);
+                                    uint32_t newTotalLen = (uint32_t)newLen;
+                                    newBuf[0] = (newTotalLen >> 24) & 0xFF;
+                                    newBuf[1] = (newTotalLen >> 16) & 0xFF;
+                                    newBuf[2] = (newTotalLen >> 8) & 0xFF;
+                                    newBuf[3] = newTotalLen & 0xFF;
+                                    sendBuf = newBuf;
+                                    sendLen = newLen;
+                                    DLOG(@"[UUID-PATCH] 0x000EE007: Inserted UUID '%@' at offset %zu, new len=%zu (was %zu)", uuidStr, insertPos, newLen, newLen - 36);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
     return ret;
