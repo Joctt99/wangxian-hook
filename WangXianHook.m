@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.27 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
+ * WangXianHook v35.28 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
  * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -62,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.27 ===");
+        _log(@"=== WXHook v35.28 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -238,7 +238,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.27 诊断面板";
+            lbl.text = @"WXHook v35.28 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
