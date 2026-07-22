@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.26 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
+ * WangXianHook v35.27 - FIX: Added game server auth response handling (0x80000015), fixes network disconnect on version 7.6.2
  * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
  * FIX: Added pan gesture for movable log button (drag to reposition)
  * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
@@ -1605,18 +1605,39 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
+
+            if (cmd == 0x802EE121 && ret >= 90) {
+                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+                BOOL hasError = NO;
+                for (ssize_t i = 0; i <= ret - 12; i++) {
+                    if (memcmp(p + i, errMsg, 12) == 0) {
+                        hasError = YES;
+                        break;
+                    }
                 }
-            }
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
-                ((unsigned char *)buf)[12] = 0;
+                if (hasError) {
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response");
+                    unsigned char *b = (unsigned char *)buf;
+                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
+                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
+                    b[8] = 0x00; b[9] = 0x00; b[10] = 0x00; b[11] = 0x00;
+                    b[12] = 0x00;
+                    ret = 13;
+                }
+            } else {
+                if (ret >= 12) {
+                    uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                    if (status4 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                        memset((unsigned char *)buf + 8, 0, 4);
+                    }
+                }
+                if (ret >= 13 && p[12] != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                    ((unsigned char *)buf)[12] = 0;
+                }
             }
         }
         if (cmd == 0x80000015) {
@@ -1706,18 +1727,39 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            if (ret >= 12) {
-                uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
-                if (status4 != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
-                    memset((unsigned char *)buf + 8, 0, 4);
+
+            if (cmd == 0x802EE121 && ret >= 90) {
+                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+                BOOL hasError = NO;
+                for (ssize_t i = 0; i <= ret - 12; i++) {
+                    if (memcmp(p + i, errMsg, 12) == 0) {
+                        hasError = YES;
+                        break;
+                    }
                 }
-            }
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
-                ((unsigned char *)buf)[12] = 0;
+                if (hasError) {
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response");
+                    unsigned char *b = (unsigned char *)buf;
+                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
+                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
+                    b[8] = 0x00; b[9] = 0x00; b[10] = 0x00; b[11] = 0x00;
+                    b[12] = 0x00;
+                    ret = 13;
+                }
+            } else {
+                if (ret >= 12) {
+                    uint32_t status4 = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    DLOG(@"[PROTO-R] Version check 4-byte status at offset 8-11: %u (0x%08X)", status4, status4);
+                    if (status4 != 0) {
+                        DLOG(@"[PROTO-R-PATCH] Version check 4-byte status %u -> 0", status4);
+                        memset((unsigned char *)buf + 8, 0, 4);
+                    }
+                }
+                if (ret >= 13 && p[12] != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0", p[12]);
+                    ((unsigned char *)buf)[12] = 0;
+                }
             }
         }
     }
