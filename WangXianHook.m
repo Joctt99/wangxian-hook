@@ -2652,51 +2652,12 @@ static void installSecurityHooks(void) {
     installDyldHooks();
     installDladdrHook();
     
-    // Hook fopen/fgets for /proc/self/maps (Linux fallback)
-    void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
-    if (syslib) {
-        void *fp = dlsym(syslib, "fopen");
-        void *fg = dlsym(syslib, "fgets");
-        DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
-    }
+    // v35.40: DISABLED all crypto hooks (SecKeyEncrypt, SecKeyDecrypt, CCCrypt)
+    // 7.62 uses new crypto APIs (SecKeyCreateEncryptedData, SecKeyCreateDecryptedData, CCHmac)
+    // Old hooks interfere with new WOOD_BOX_KEY -> RSA_DATA -> SESSION_ID_CONFIRM handshake
+    DLOG(@"[SEC] v35.40: Crypto hooks DISABLED (7.62 new APIs, old hooks break encryption)");
     
-    // Hook SecKeyEncrypt to capture RSA plaintext (game server login analysis)
-    int sk = rebindSymbol("_SecKeyEncrypt", (void *)hook_SecKeyEncrypt, (void **)&orig_SecKeyEncrypt);
-    if (sk == 0) {
-        DLOG(@"[SEC] SecKeyEncrypt hooked successfully");
-    } else {
-        DLOG(@"[SEC] SecKeyEncrypt hook failed: %d (trying dlsym fallback)", sk);
-        orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_DEFAULT, "SecKeyEncrypt");
-        if (orig_SecKeyEncrypt) {
-            DLOG(@"[SEC] SecKeyEncrypt found via dlsym at %p", orig_SecKeyEncrypt);
-        }
-    }
-    
-    // Hook SecKeyDecrypt to capture decrypted server responses
-    int sd = rebindSymbol("_SecKeyDecrypt", (void *)hook_SecKeyDecrypt, (void **)&orig_SecKeyDecrypt);
-    if (sd == 0) {
-        DLOG(@"[SEC] SecKeyDecrypt hooked successfully");
-    } else {
-        DLOG(@"[SEC] SecKeyDecrypt hook failed: %d", sd);
-        orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_DEFAULT, "SecKeyDecrypt");
-        if (orig_SecKeyDecrypt) {
-            DLOG(@"[SEC] SecKeyDecrypt found via dlsym at %p", orig_SecKeyDecrypt);
-        }
-    }
-    
-    // Hook CCCrypt to capture AES/DES symmetric encryption
-    int cc = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-    if (cc == 0) {
-        DLOG(@"[SEC] CCCrypt hooked successfully");
-    } else {
-        DLOG(@"[SEC] CCCrypt hook failed: %d", cc);
-        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_DEFAULT, "CCCrypt");
-        if (orig_CCCrypt) {
-            DLOG(@"[SEC] CCCrypt found via dlsym at %p", orig_CCCrypt);
-        }
-    }
-    
-    DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
+    DLOG(@"[SEC] Security hooks ready (DYLD hiding only, no crypto hooks)");
 }
 
 // ============================================================
