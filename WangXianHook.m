@@ -1,7 +1,9 @@
 /**
- * WangXianHook v35.61 - SK hooks now call original but force success results
- * FIX: judgeAppInfoWithBaseUrl, judgeNet now call original to trigger callbacks
- * FIX: verifySignatureFromParameters forces YES if original returns NO
+ * WangXianHook v35.62 - UI-level server list injection
+ * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server" and value is empty
+ * FIX: NSUserDefaults objectForKey: injects mock server data when key contains "Server"
+ * FIX: UITableView numberOfRowsInSection: forces 1 row when server list is empty
+ * FIX: SK hooks now call original but force success results
  * FIX: Removed all socket-level mock injection (causes packet corruption)
  * NOTE: Real 0x802EE118 response needed from 7.6 version for correct mock data
  * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
@@ -61,7 +63,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.61 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.62 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2792,7 +2794,19 @@ static ObjForKeyIMP orig_objectForKey = NULL;
 static int g_nsudCount = 0;
 static id hook_objectForKey(id self, SEL _cmd, NSString *key) {
     id val = orig_objectForKey ? orig_objectForKey(self, _cmd, key) : nil;
-    // Log first 50 NSUserDefaults reads to avoid spam
+    
+    if ([key containsString:@"Server"] || [key containsString:@"server"]) {
+        if (!val || ([val isKindOfClass:[NSArray class]] && [(NSArray *)val count] == 0)) {
+            DLOG(@"[WXHOOK] ✅ NSUserDefaults objectForKey:'%@' is empty, injecting mock server data", key);
+            NSArray *mockServers = @[
+                @{@"serverid": @"1", @"name": @"测试服务器", @"ip": @"139.224.129.92", 
+                  @"port": @"12003", @"status": @"1", @"serverType": @"1", @"clientid": @"1",
+                  @"category": @"一区", @"realname": @"测试服务器", @"onlinePlayerNum": @"1000", @"description": @"运行"}
+            ];
+            return mockServers;
+        }
+    }
+    
     if (g_nsudCount < 50) {
         DLOG(@"[NSUD] objectForKey: %@ = %@", key, val);
     }
@@ -2945,30 +2959,54 @@ static NSUUID *hook_identifierForVendor(id self, SEL _cmd) {
 #pragma mark - Observation-only hooks (log, don't modify)
 // ============================================================
 
-// UITableView data source hooks - trace server list display
+// UITableView data source hooks - inject server list display
 static NSInteger (*orig_numberOfRows)(id, SEL, NSInteger) = NULL;
 static NSInteger (*orig_numberOfSections)(id, SEL) = NULL;
 static NSInteger hook_numberOfRows(id self, SEL _cmd, NSInteger section) {
     NSInteger ret = orig_numberOfRows ? orig_numberOfRows(self, _cmd, section) : 0;
     NSString *cls = NSStringFromClass([self class]);
+    
     if ([cls containsString:@"Server"] || [cls containsString:@"server"] || 
         [cls containsString:@"List"] || [cls containsString:@"list"] ||
         [cls containsString:@"Table"] || [cls containsString:@"table"]) {
         DLOG(@"[TABLE] numberOfRowsInSection:%ld -> %ld class=%@", (long)section, (long)ret, cls);
+        
+        if (ret == 0) {
+            DLOG(@"[WXHOOK] ✅ UITableView numberOfRows=0, forcing 1 row for server list");
+            return 1;
+        }
     }
     return ret;
 }
 
-// NSDictionary objectForKey: - trace server list parsing (minimal logging)
+// NSDictionary objectForKey: - inject mock server data when empty
 static id (*orig_dictObjectForKey)(id, SEL, id) = NULL;
 static int g_dictLogCount = 0;
 static id hook_dictObjectForKey(id self, SEL _cmd, id key) {
     id ret = orig_dictObjectForKey ? orig_dictObjectForKey(self, _cmd, key) : nil;
-    // Limit logging to first 30 calls to avoid performance issues during keyboard input
+    NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
+    
+    if ([keyStr containsString:@"Server"] || [keyStr containsString:@"server"]) {
+        NSString *retCls = ret ? NSStringFromClass([ret class]) : @"nil";
+        
+        if (!ret || ([ret isKindOfClass:[NSArray class]] && [(NSArray *)ret count] == 0)) {
+            DLOG(@"[WXHOOK] ✅ NSDictionary objectForKey:'%@' is empty, injecting mock server data", keyStr);
+            NSArray *mockServers = @[
+                @{@"serverid": @"1", @"name": @"测试服务器", @"ip": @"139.224.129.92", 
+                  @"port": @"12003", @"status": @"1", @"serverType": @"1", @"clientid": @"1",
+                  @"category": @"一区", @"realname": @"测试服务器", @"onlinePlayerNum": @"1000", @"description": @"运行"}
+            ];
+            return mockServers;
+        }
+        
+        if (g_dictLogCount < 30) {
+            DLOG(@"[DICT] objectForKey:'%@' -> %@ (%@)", keyStr, ret ?: @"nil", retCls);
+            g_dictLogCount++;
+        }
+    }
+    
     if (g_dictLogCount < 30) {
-        NSString *keyStr = [key isKindOfClass:[NSString class]] ? key : @"<non-string>";
-        if ([keyStr containsString:@"server"] || [keyStr containsString:@"Server"] ||
-            [keyStr containsString:@"status"] || [keyStr containsString:@"Status"] ||
+        if ([keyStr containsString:@"status"] || [keyStr containsString:@"Status"] ||
             [keyStr containsString:@"list"] || [keyStr containsString:@"List"]) {
             NSString *retCls = ret ? NSStringFromClass([ret class]) : @"nil";
             DLOG(@"[DICT] objectForKey:'%@' -> %@ (%@)", keyStr, ret ?: @"nil", retCls);
