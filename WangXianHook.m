@@ -1,12 +1,10 @@
 /**
- * WangXianHook v35.76 - TEST: Disable send version replacement to diagnose "no network"
- * TEST: Temporarily DISABLE send version replacement (7.6.2 -> 7.7.0)
- *       to verify if version tampering causes empty server list / "no network" error
+ * WangXianHook v35.77 - TEST: Disable ALL server list injection to diagnose
+ * TEST: Disable ALL server list injection (nested + standalone + 0x80000015)
+ *       to verify if "packet too big" is caused by our injection
+ * TEST: Keep send version replacement DISABLED
  * FIX: Keep response-side patches (PROTO-R-PATCH for 0x802EE121, etc.)
- * FIX: Dump ALL methods of target Swift classes to see what methods they have
- * FIX: Check pktLenBE < 30 instead of ret < 30 for standalone 0x802EE118
  * FIX: Multi-pass scanning + direct class hooks + class method hooks
- * FIX: Properly inject full mock server list into nested 0x802EE118
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
  * FIX: Any method containing reachable/connected/available -> returns YES
@@ -80,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.76 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.77 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1943,7 +1941,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // v35.72: Intercept 0x8000E002 response and PROPERLY inject mock server list into nested 0x802EE118
         // FIX: Previous code only injected 5 bytes of garbage string data.
         // Now we properly construct a full server list response and update both inner and outer pktLen.
-        if (cmd == 0x8000E002 && port == 5678) {
+        // v35.77 TEST: DISABLED to verify if "packet too big" is caused by our injection
+        if (0 && cmd == 0x8000E002 && port == 5678) {
             DLOG(@"[WXHOOK] 🔥 Intercepted 0x8000E002 response, searching for nested 0x802EE118");
             
             unsigned char *payload = (unsigned char *)buf + 8;
@@ -2097,7 +2096,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // From logs: [RECV] fd=105 ... cmd=0x802EE118 pktLen=13 (empty server list)
         // The 0x802EE118 is returned separately, NOT nested in 0x8000E002
         // v35.74 FIX: Check pktLen < 30 instead of ret < 30 (ret can be larger due to buffering)
-        if (cmd == 0x802EE118 && port == 5678 && pktLenBE < 30) {
+        // v35.77 TEST: DISABLED to verify if "packet too big" is caused by our injection
+        if (0 && cmd == 0x802EE118 && port == 5678 && pktLenBE < 30) {
             DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (pktLen=%u, ret=%zd bytes)", pktLenBE, ret);
             
             const unsigned char mockServerList[] = {
@@ -2131,7 +2131,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // KEY FIX: Keep cmd=0x80000015 (response to request 0x00000015), don't change to 0x802EE118
         // The client matches responses to requests by cmd (response_cmd = request_cmd | 0x80000000)
         // If we return 0x802EE118, client never processes it!
-        if (cmd == 0x80000015 && port == 5678) {
+        // v35.77 TEST: DISABLED to verify if "packet too big" is caused by our injection
+        if (0 && cmd == 0x80000015 && port == 5678) {
             DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes), injecting mock server list", ret);
             
             // Construct mock response: keep cmd=0x80000015 but fill with server list data
