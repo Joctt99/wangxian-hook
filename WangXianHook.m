@@ -1,9 +1,10 @@
 /**
- * WangXianHook v35.58 - Inject mock server list in nested 0x802EE118 inside 0x8000E002
- * DISCOVERY: 0x802EE118 is nested INSIDE 0x8000E002 response (not standalone)
- * FIX: Search for nested 0x802EE118 in 0x8000E002 payload and inject mock data
- * FIX: Update outer pktLen to account for expanded nested packet
- * ROOT CAUSE: v35.57 looked for standalone 0x802EE118 but it's always nested
+ * WangXianHook v35.59 - Intercept 0x00000015 request and directly return mock server list
+ * FIX: Added g_needMockServerList flag to track server list requests
+ * FIX: In hook_send, detect 0x00000015 and set flag for mock response
+ * FIX: In hook_recv, if flag set, bypass real recv and return mock data directly
+ * FIX: Added version log at load time: "WangXianHook v35.59 loaded @ DATE TIME"
+ * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
@@ -29,6 +30,8 @@ static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
+
+static BOOL g_needMockServerList = NO; // flag: need to return mock server list in next recv
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -59,7 +62,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.52 ===");
+        _log(@"=== WangXianHook v35.59 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1417,6 +1420,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (port == 5678) {
             DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
+            
+            if (cmd == 0x00000015) {
+                DLOG(@"[WXHOOK] ✅ Detected server list request (0x00000015), preparing mock response");
+                g_needMockServerList = YES;
+            }
         }
     }
     
@@ -1791,9 +1799,43 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
+    // v35.59: Check if we need to return mock server list
+    // If g_needMockServerList is set, intercept the next recv and return mock data
+    const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
+    
+    if (g_needMockServerList && port == 5678) {
+        const unsigned char mockServerList[] = {
+            0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
+            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
+            0x00, 0x01, // server count = 1
+            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
+            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
+            0x00, 0x01, 0x31, // serverType = "1"
+            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
+            0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
+            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
+            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
+            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
+            0x00, 0x01, 0x31, // status = "1"
+            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
+            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
+        };
+        
+        size_t mockLen = sizeof(mockServerList);
+        if (len >= mockLen) {
+            memcpy((unsigned char *)buf, mockServerList, mockLen);
+            g_needMockServerList = NO;
+            DLOG(@"[WXHOOK] ✅ Returning mock server list (109 bytes) for 0x00000015 request");
+            return (ssize_t)mockLen;
+        } else {
+            DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
+            g_needMockServerList = NO;
+        }
+    }
+    
     ssize_t ret = orig_recv(fd, buf, len, flags);
     if (ret <= 0) {
-        // Log connection close/error with context
         const char *host = ""; int port = 0;
         for (int i = 0; i < g_trackedCount; i++) {
             if (g_trackedFds[i] == fd && g_trackedActive[i]) { host = g_trackedHosts[i]; port = g_trackedPorts[i]; break; }
@@ -1806,10 +1848,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         return ret;
     }
     
-    const char *host = getHostForFd(fd);
     if (!host) return ret;
     
-    int port = getPortForFd(fd);
     const unsigned char *p = (const unsigned char *)buf;
     
     NSMutableString *hex = [NSMutableString stringWithCapacity:ret * 3];
