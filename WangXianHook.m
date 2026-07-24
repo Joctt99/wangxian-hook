@@ -1,5 +1,8 @@
 /**
- * WangXianHook v35.69 - FIX protocol mismatch + NetworkReachabilityProvider/NetworkMonitor hooks
+ * WangXianHook v35.70 - FIX Swift module class name format for network detection
+ * FIX: NetworkReachabilityProvider now searched as BusinessServices.NetworkReachabilityProvider
+ * FIX: NetworkMonitor now searched as CTLazuliSupport.NetworkMonitor
+ * FIX: Added NetworkProvider and NetworkConnectivityTrampoline hooks
  * FIX: 0x80000015 response now keeps cmd=0x80000015 (not changed to 0x802EE118)
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
@@ -74,7 +77,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.69 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.70 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3776,84 +3779,136 @@ static void installAllHooks(void) {
         }
     }
     
-    // 3. NetworkReachabilityProvider (app custom class from GAME-CLASS scan)
-    Class nrProviderCls = NSClassFromString(@"NetworkReachabilityProvider");
-    if (nrProviderCls) {
-        DLOG(@"[REACH] Found NetworkReachabilityProvider class");
-        
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(nrProviderCls, &methodCount);
-        if (methods) {
-            for (unsigned int i = 0; i < methodCount; i++) {
-                SEL sel = method_getName(methods[i]);
-                NSString *methodName = NSStringFromSelector(sel);
-                if ([methodName containsString:@"reachable"] || 
-                    [methodName containsString:@"connect"] || 
-                    [methodName containsString:@"available"] ||
-                    [methodName containsString:@"network"]) {
-                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
-                        DLOG(@"[REACH] NetworkReachabilityProvider.%@ -> forced YES", methodName);
-                        return YES;
-                    });
-                    method_setImplementation(methods[i], new_imp);
-                    DLOG(@"[REACH] Hooked NetworkReachabilityProvider.%@", methodName);
+    // 3. NetworkReachabilityProvider - search multiple possible class names
+    // Swift module format: BusinessServices.NetworkReachabilityProvider
+    // Also search for _TtC* format (Swift runtime class name)
+    NSArray *nrProviderNames = @[@"NetworkReachabilityProvider", 
+                                  @"BusinessServices.NetworkReachabilityProvider",
+                                  @"_TtC20BusinessServices25NetworkReachabilityProvider"];
+    for (NSString *clsName in nrProviderNames) {
+        Class nrProviderCls = NSClassFromString(clsName);
+        if (nrProviderCls) {
+            DLOG(@"[REACH] Found NetworkReachabilityProvider class: %@", clsName);
+            
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(nrProviderCls, &methodCount);
+            if (methods) {
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    if ([methodName containsString:@"reachable"] || 
+                        [methodName containsString:@"connect"] || 
+                        [methodName containsString:@"available"] ||
+                        [methodName containsString:@"network"]) {
+                        IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                            DLOG(@"[REACH] %@.%@ -> forced YES", clsName, methodName);
+                            return YES;
+                        });
+                        method_setImplementation(methods[i], new_imp);
+                        DLOG(@"[REACH] Hooked %@.%@", clsName, methodName);
+                    }
                 }
+                free(methods);
             }
-            free(methods);
+            break;
         }
     }
     
-    // 4. NetworkMonitor (app custom class from GAME-CLASS scan)
-    Class netMonitorCls = NSClassFromString(@"NetworkMonitor");
-    if (netMonitorCls) {
-        DLOG(@"[REACH] Found NetworkMonitor class");
-        
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(netMonitorCls, &methodCount);
-        if (methods) {
-            for (unsigned int i = 0; i < methodCount; i++) {
-                SEL sel = method_getName(methods[i]);
-                NSString *methodName = NSStringFromSelector(sel);
-                if ([methodName containsString:@"reachable"] || 
-                    [methodName containsString:@"connect"] || 
-                    [methodName containsString:@"available"] ||
-                    [methodName containsString:@"network"]) {
-                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
-                        DLOG(@"[REACH] NetworkMonitor.%@ -> forced YES", methodName);
-                        return YES;
-                    });
-                    method_setImplementation(methods[i], new_imp);
-                    DLOG(@"[REACH] Hooked NetworkMonitor.%@", methodName);
+    // 4. NetworkMonitor - search multiple possible class names
+    // Swift module format: CTLazuliSupport.NetworkMonitor
+    NSArray *netMonitorNames = @[@"NetworkMonitor", 
+                                  @"CTLazuliSupport.NetworkMonitor",
+                                  @"_TtC16CTLazuliSupport14NetworkMonitor"];
+    for (NSString *clsName in netMonitorNames) {
+        Class netMonitorCls = NSClassFromString(clsName);
+        if (netMonitorCls) {
+            DLOG(@"[REACH] Found NetworkMonitor class: %@", clsName);
+            
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(netMonitorCls, &methodCount);
+            if (methods) {
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    if ([methodName containsString:@"reachable"] || 
+                        [methodName containsString:@"connect"] || 
+                        [methodName containsString:@"available"] ||
+                        [methodName containsString:@"network"]) {
+                        IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                            DLOG(@"[REACH] %@.%@ -> forced YES", clsName, methodName);
+                            return YES;
+                        });
+                        method_setImplementation(methods[i], new_imp);
+                        DLOG(@"[REACH] Hooked %@.%@", clsName, methodName);
+                    }
                 }
+                free(methods);
             }
-            free(methods);
+            break;
         }
     }
     
-    // 5. ConnectionManager (app custom class)
-    Class connManagerCls = NSClassFromString(@"ConnectionManager");
-    if (connManagerCls) {
-        DLOG(@"[REACH] Found ConnectionManager class");
-        
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(connManagerCls, &methodCount);
-        if (methods) {
-            for (unsigned int i = 0; i < methodCount; i++) {
-                SEL sel = method_getName(methods[i]);
-                NSString *methodName = NSStringFromSelector(sel);
-                if ([methodName containsString:@"reachable"] || 
-                    [methodName containsString:@"connect"] || 
-                    [methodName containsString:@"available"] ||
-                    [methodName containsString:@"network"]) {
-                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
-                        DLOG(@"[REACH] ConnectionManager.%@ -> forced YES", methodName);
-                        return YES;
-                    });
-                    method_setImplementation(methods[i], new_imp);
-                    DLOG(@"[REACH] Hooked ConnectionManager.%@", methodName);
+    // 5. BusinessServices.NetworkProvider (from GAME-CLASS scan)
+    NSArray *networkProviderNames = @[@"BusinessServices.NetworkProvider",
+                                       @"_TtC20BusinessServices15NetworkProvider"];
+    for (NSString *clsName in networkProviderNames) {
+        Class netProviderCls = NSClassFromString(clsName);
+        if (netProviderCls) {
+            DLOG(@"[REACH] Found NetworkProvider class: %@", clsName);
+            
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(netProviderCls, &methodCount);
+            if (methods) {
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    if ([methodName containsString:@"reachable"] || 
+                        [methodName containsString:@"connect"] || 
+                        [methodName containsString:@"available"] ||
+                        [methodName containsString:@"network"]) {
+                        IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                            DLOG(@"[REACH] %@.%@ -> forced YES", clsName, methodName);
+                            return YES;
+                        });
+                        method_setImplementation(methods[i], new_imp);
+                        DLOG(@"[REACH] Hooked %@.%@", clsName, methodName);
+                    }
                 }
+                free(methods);
             }
-            free(methods);
+            break;
+        }
+    }
+    
+    // 6. BusinessServices.NetworkConnectivityTrampoline (from GAME-CLASS scan)
+    NSArray *connectivityTrampolineNames = @[@"BusinessServices.NetworkConnectivityTrampoline",
+                                              @"_TtC20BusinessServices29NetworkConnectivityTrampoline"];
+    for (NSString *clsName in connectivityTrampolineNames) {
+        Class trampolineCls = NSClassFromString(clsName);
+        if (trampolineCls) {
+            DLOG(@"[REACH] Found NetworkConnectivityTrampoline class: %@", clsName);
+            
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(trampolineCls, &methodCount);
+            if (methods) {
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    if ([methodName containsString:@"reachable"] || 
+                        [methodName containsString:@"connect"] || 
+                        [methodName containsString:@"available"] ||
+                        [methodName containsString:@"network"]) {
+                        IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                            DLOG(@"[REACH] %@.%@ -> forced YES", clsName, methodName);
+                            return YES;
+                        });
+                        method_setImplementation(methods[i], new_imp);
+                        DLOG(@"[REACH] Hooked %@.%@", clsName, methodName);
+                    }
+                }
+                free(methods);
+            }
+            break;
         }
     }
     
