@@ -1,5 +1,8 @@
 /**
- * WangXianHook v35.70 - FIX Swift module class name format for network detection
+ * WangXianHook v35.71 - Deferred network class scan (2s delay) for Swift module classes
+ * FIX: Deferred scan at 2s to catch Swift classes loaded after init
+ * FIX: Smart filtering for Swift module classes (Module.ClassName format)
+ * FIX: Only hook methods with BOOL/int return type (avoids crashing object-return methods)
  * FIX: NetworkReachabilityProvider now searched as BusinessServices.NetworkReachabilityProvider
  * FIX: NetworkMonitor now searched as CTLazuliSupport.NetworkMonitor
  * FIX: Added NetworkProvider and NetworkConnectivityTrampoline hooks
@@ -77,7 +80,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.70 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.71 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4397,6 +4400,172 @@ static void installAllHooks(void) {
         Method reloadData = class_getInstanceMethod(tableViewCls, @selector(reloadData));
         if (reloadData) {
             DLOG(@"[TV-HOOK] Found reloadData in UITableView");
+        }
+    });
+    
+    // === DEFERRED: Network reachability class scan + hook (v35.70) ===
+    // Swift classes like BusinessServices.NetworkReachabilityProvider are NOT loaded yet
+    // when installAllHooks runs. We scan 2 seconds after launch to find and hook them.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            DLOG(@"[REACH-SCAN] Starting deferred network class scan...");
+            
+            int netClassCount = 0;
+            Class *netAllClasses = NULL;
+            unsigned int classCount = 0;
+            
+            netAllClasses = objc_copyClassList(&classCount);
+            if (!netAllClasses) {
+                DLOG(@"[REACH-SCAN] Failed to get class list");
+                return;
+            }
+            
+            int hookedClasses = 0;
+            int hookedMethods = 0;
+            
+            for (unsigned int i = 0; i < classCount; i++) {
+                Class cls = netAllClasses[i];
+                NSString *clsName = NSStringFromClass(cls);
+                if (!clsName) continue;
+                
+                NSString *lowerName = [clsName lowercaseString];
+                
+                // Only hook classes that are clearly network reachability related
+                BOOL isNetReachClass = NO;
+                if (([lowerName containsString:@"network"] && 
+                     ([lowerName containsString:@"reach"] || 
+                      [lowerName containsString:@"monitor"] ||
+                      [lowerName containsString:@"connectivity"] ||
+                      [lowerName containsString:@"provider"] ||
+                      [lowerName containsString:@"availability"])) ||
+                    ([lowerName containsString:@"reachability"] && 
+                     ![lowerName containsString:@"coreml"] &&
+                     ![lowerName containsString:@"ml"] &&
+                     ![lowerName containsString:@"neural"])) {
+                    isNetReachClass = YES;
+                }
+                
+                if (!isNetReachClass) continue;
+                
+                // Skip system framework classes that could cause crashes
+                // For Swift module classes (Module.ClassName), check the module part only
+                BOOL isSystemClass = NO;
+                NSArray *systemPrefixes = @[
+                    @"NS", @"UI", @"_", @"WK", @"GE", @"CM", @"FC", @"SP",
+                    @"StocksCore", @"TipsCore", @"VisualLookUp", @"Reality",
+                    @"MP", @"_MF", @"IS", @"SAS", @"CP", @"IDSServer", @"MX_",
+                    @"CMNetwork", @"GEONetwork", @"AKNetwork", @"WebNetwork",
+                    @"CT", @"Core", @"Fig", @"ExtensionFoundation",
+                    @"LPMediaAssetFetcher", @"NRMock", @"SUCore",
+                    @"WebKit", @"XCTest", @"NWLink", @"PBServer",
+                    @"IXServer", @"WISServer", @"SUCoreConnect",
+                    @"AWDSiri", @"FigPWD", @"CMCapture", @"STSNDEF",
+                    @"INCar", @"INConnected", @"INSend", @"DAD",
+                    @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate",
+                    @"TeaFoundation", @"FinanceKit", @"PegasusConfiguration",
+                    @"BusinessServices"  // Wait - this might be the game's module!
+                ];
+                
+                // For Swift module classes, only skip if module is a known system module
+                if ([clsName containsString:@"."]) {
+                    NSArray *parts = [clsName componentsSeparatedByString:@"."];
+                    NSString *moduleName = parts.firstObject;
+                    // Known Apple/Swift modules to skip
+                    NSArray *appleModules = @[
+                        @"StocksCore", @"TipsCore", @"VisualLookUp", @"RealityKit",
+                        @"RealityFoundation", @"FinanceKit", @"PegasusConfiguration",
+                        @"TeaFoundation", @"BusinessServices",  // Wait - might be game's!
+                        @"CTLazuliSupport"  // Wait - might be game's!
+                    ];
+                    // Actually, let's NOT skip module-based classes - they're likely the game's
+                    // Only skip if the class name itself (after the dot) starts with system prefix
+                    if (parts.count >= 2) {
+                        NSString *classNamePart = parts[1];
+                        for (NSString *prefix in systemPrefixes) {
+                            if ([classNamePart hasPrefix:prefix]) {
+                                isSystemClass = YES;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Regular ObjC class - check prefix
+                    for (NSString *prefix in systemPrefixes) {
+                        if ([clsName hasPrefix:prefix]) {
+                            isSystemClass = YES;
+                            break;
+                        }
+                    }
+                }
+                
+                if (isSystemClass) {
+                    continue;
+                }
+                
+                unsigned int methodCount = 0;
+                Method *methods = class_copyMethodList(cls, &methodCount);
+                if (!methods) continue;
+                
+                BOOL classHooked = NO;
+                
+                for (unsigned int m = 0; m < methodCount; m++) {
+                    SEL sel = method_getName(methods[m]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    NSString *lowerMethod = [methodName lowercaseString];
+                    
+                    // Only hook methods that clearly return network status
+                    BOOL shouldHook = NO;
+                    if ([lowerMethod containsString:@"reachable"] ||
+                        [lowerMethod containsString:@"isnetwork"] ||
+                        [lowerMethod containsString:@"networkavailable"] ||
+                        [lowerMethod containsString:@"hasconnection"] ||
+                        [lowerMethod containsString:@"isconnected"] ||
+                        [lowerMethod containsString:@"isavailable"] ||
+                        [lowerMethod containsString:@"networkstatus"] ||
+                        [lowerMethod containsString:@"connectivity"]) {
+                        shouldHook = YES;
+                    }
+                    
+                    if (!shouldHook) continue;
+                    
+                    // Check that this is likely a BOOL or integer return type method
+                    // by checking the return type encoding
+                    const char *retType = method_copyReturnType(methods[m]);
+                    if (retType) {
+                        // Only hook if return type is BOOL (B), char (c), int (i), etc.
+                        // Skip methods that return objects (id, class, etc.)
+                        if (retType[0] != 'B' && retType[0] != 'c' && retType[0] != 'i' && 
+                            retType[0] != 's' && retType[0] != 'l' && retType[0] != 'q' &&
+                            retType[0] != 'C' && retType[0] != 'I' && retType[0] != 'S' &&
+                            retType[0] != 'L' && retType[0] != 'Q') {
+                            free((void *)retType);
+                            continue;
+                        }
+                        free((void *)retType);
+                    }
+                    
+                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                        return YES;
+                    });
+                    method_setImplementation(methods[m], new_imp);
+                    hookedMethods++;
+                    classHooked = YES;
+                }
+                
+                free(methods);
+                
+                if (classHooked) {
+                    hookedClasses++;
+                    DLOG(@"[REACH-SCAN] Hooked network class: %@", clsName);
+                }
+            }
+            
+            if (netAllClasses) free(netAllClasses);
+            
+            DLOG(@"[REACH-SCAN] Done: hooked %d classes, %d methods", hookedClasses, hookedMethods);
+            
+        } @catch (NSException *e) {
+            DLOG(@"[REACH-SCAN] Exception: %@", e);
         }
     });
     
