@@ -113,7 +113,12 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
         @"ENDTIME": @"2027-12-31 23:59:59"
     };
     DLOG(@"[SK] judgeAppInfoWithBaseUrl: calling handleAppInfoResult: with fake success");
-    [SK handleAppInfoResult:successResult];
+    Class skCls = NSClassFromString(@"SignatureKit");
+    if (skCls) {
+        [skCls handleAppInfoResult:successResult];
+    } else {
+        DLOG(@"[SK] judgeAppInfoWithBaseUrl: SK class not found, cannot call handleAppInfoResult");
+    }
 }
 
 // 5. judgeNet - Call original, always return network available
