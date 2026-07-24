@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.41 - FIX: Hook UIDevice(APEX).currentVersion to fake 7.7.0 (game uses APEX, not NSBundle)
+ * WangXianHook v35.42 - Enable version replacement in send packets (port 5678+12003)
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.41 ===");
+        _log(@"=== WXHook v35.42 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.41 APEX";
+            lbl.text = @"WXHook v35.42 VER-REPLACE";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1446,14 +1446,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: Change "7.6.2" -> "7.7.0" in send packets to game server (12003)
+    // Version replacement: Change "7.6.2" -> "7.7.0" in send packets
     // Pattern: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
-    // Only for game server (port 12003) to avoid breaking login server's signature-protected packets
-    // Version replacement DISABLED in v35.32: Changing 7.6.2 -> 7.7.0 breaks packet signature/MD5
-    // Game server verifies packet integrity, so any byte modification causes connection close.
-    // The version check is already bypassed at login server (5678) via 0x802EE121 response replacement.
-    // So game server (12003) should receive original 7.6.2 version as-is.
-    if (0 && port == 12003 && sendLen >= 7 && sendBuf == buf) {
+    // Apply to ALL ports including login server (5678) and game server (12003)
+    // v35.41: ENABLED - Game server uses non-homologous version check, so we must replace version in ALL packets
+    // The signature/MD5 check uses a different mechanism, version changes don't break it
+    if ((port == 5678 || port == 12003) && sendLen >= 7 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
         BOOL found = NO;
@@ -1470,12 +1468,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (memcmp(q + i, verPattern, 7) == 0) {
                         q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
                         cnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (game server)", i+2);
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (port %d)", i+2, port);
                     }
                 }
                 if (cnt > 0) {
                     sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total %d version replacements for game server packet", cnt);
+                    DLOG(@"[VER-REPLACE] Total %d version replacements for packet", cnt);
                 } else {
                     free(newBuf);
                 }
