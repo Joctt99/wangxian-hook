@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.49 - Replace version in game server send packets (7.6.2->7.7.0), keep 978
+ * WangXianHook v35.50 - Hook SecKeyCreateEncryptedData to replace version before encryption
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.49 ===");
+        _log(@"=== WXHook v35.50 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.49 GS-VER";
+            lbl.text = @"WXHook v35.50 CRYPTO";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2635,6 +2635,85 @@ static CCCryptorStatus hook_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions o
     return status;
 }
 
+// Hook SecKeyCreateEncryptedData (new RSA API in iOS 10+)
+// 7.62 uses this instead of SecKeyEncrypt
+typedef CFDataRef (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plainText, CFErrorRef *error);
+static SecKeyCreateEncryptedDataFunc orig_SecKeyCreateEncryptedData = NULL;
+
+static CFDataRef hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plainText, CFErrorRef *error) {
+    if (!orig_SecKeyCreateEncryptedData) {
+        orig_SecKeyCreateEncryptedData = (SecKeyCreateEncryptedDataFunc)dlsym(RTLD_DEFAULT, "SecKeyCreateEncryptedData");
+        if (!orig_SecKeyCreateEncryptedData) return NULL;
+    }
+    
+    const uint8_t *data = CFDataGetBytePtr(plainText);
+    CFIndex len = CFDataGetLength(plainText);
+    
+    const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+    CFDataRef modifiedData = plainText;
+    
+    if (len >= 7) {
+        BOOL found = NO;
+        for (CFIndex i = 0; i + 7 <= len; i++) {
+            if (memcmp(data + i, verPattern, 7) == 0) { found = YES; break; }
+        }
+        
+        if (found) {
+            uint8_t *newData = malloc(len);
+            if (newData) {
+                memcpy(newData, data, len);
+                int replaced = 0;
+                for (CFIndex i = 0; i + 7 <= len; i++) {
+                    if (memcmp(newData + i, verPattern, 7) == 0) {
+                        newData[i+2] = 0x37; newData[i+3] = 0x2E; newData[i+4] = 0x37; newData[i+5] = 0x2E; newData[i+6] = 0x30;
+                        replaced++;
+                        DLOG(@"[SEC] SecKeyCreateEncryptedData: replaced 7.6.2 -> 7.7.0 at offset %ld", i+2);
+                    }
+                }
+                modifiedData = CFDataCreate(kCFAllocatorDefault, newData, len);
+                free(newData);
+                DLOG(@"[SEC] SecKeyCreateEncryptedData: total %d replacements", replaced);
+            }
+        }
+    }
+    
+    static int g_rsaEncCount = 0;
+    if (g_rsaEncCount < 10) {
+        DLOG(@"[SEC] SecKeyCreateEncryptedData #%d: plaintext len=%ld", g_rsaEncCount, len);
+        g_rsaEncCount++;
+    }
+    
+    CFDataRef result = orig_SecKeyCreateEncryptedData(key, algorithm, modifiedData, error);
+    
+    if (modifiedData != plainText) {
+        CFRelease(modifiedData);
+    }
+    
+    return result;
+}
+
+// Hook SecKeyCreateDecryptedData (new RSA API in iOS 10+)
+typedef CFDataRef (*SecKeyCreateDecryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef cipherText, CFErrorRef *error);
+static SecKeyCreateDecryptedDataFunc orig_SecKeyCreateDecryptedData = NULL;
+
+static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef cipherText, CFErrorRef *error) {
+    if (!orig_SecKeyCreateDecryptedData) {
+        orig_SecKeyCreateDecryptedData = (SecKeyCreateDecryptedDataFunc)dlsym(RTLD_DEFAULT, "SecKeyCreateDecryptedData");
+        if (!orig_SecKeyCreateDecryptedData) return NULL;
+    }
+    
+    CFDataRef result = orig_SecKeyCreateDecryptedData(key, algorithm, cipherText, error);
+    
+    static int g_rsaDecCount = 0;
+    if (g_rsaDecCount < 10) {
+        CFIndex len = result ? CFDataGetLength(result) : 0;
+        DLOG(@"[SEC] SecKeyCreateDecryptedData #%d: plaintext len=%ld", g_rsaDecCount, len);
+        g_rsaDecCount++;
+    }
+    
+    return result;
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -2653,12 +2732,54 @@ static void installSecurityHooks(void) {
     installDyldHooks();
     installDladdrHook();
     
-    // v35.40: DISABLED all crypto hooks (SecKeyEncrypt, SecKeyDecrypt, CCCrypt)
-    // 7.62 uses new crypto APIs (SecKeyCreateEncryptedData, SecKeyCreateDecryptedData, CCHmac)
-    // Old hooks interfere with new WOOD_BOX_KEY -> RSA_DATA -> SESSION_ID_CONFIRM handshake
-    DLOG(@"[SEC] v35.40: Crypto hooks DISABLED (7.62 new APIs, old hooks break encryption)");
+    // v35.49: RE-ENABLED crypto hooks for 7.62
+    // Game encrypts version info in packets, need to replace BEFORE encryption
+    // Old hooks (SecKeyEncrypt/SecKeyDecrypt/CCCrypt) for 7.6 compatibility
+    // New hooks (SecKeyCreateEncryptedData/SecKeyCreateDecryptedData) for 7.62
     
-    DLOG(@"[SEC] Security hooks ready (DYLD hiding only, no crypto hooks)");
+    // Hook SecKeyEncrypt (RSA encryption)
+    void *sym = dlsym(RTLD_DEFAULT, "SecKeyEncrypt");
+    if (sym) {
+        orig_SecKeyEncrypt = (SecKeyEncryptFunc)sym;
+        rebindSymbol("SecKeyEncrypt", (void *)hook_SecKeyEncrypt, (void **)&orig_SecKeyEncrypt);
+        DLOG(@"[SEC] SecKeyEncrypt: HOOKED (replace version before RSA encryption)");
+    } else {
+        DLOG(@"[SEC] SecKeyEncrypt: NOT found in current dyld image");
+    }
+    
+    // Hook SecKeyDecrypt (RSA decryption)
+    sym = dlsym(RTLD_DEFAULT, "SecKeyDecrypt");
+    if (sym) {
+        orig_SecKeyDecrypt = (SecKeyDecryptFunc)sym;
+        rebindSymbol("SecKeyDecrypt", (void *)hook_SecKeyDecrypt, (void **)&orig_SecKeyDecrypt);
+        DLOG(@"[SEC] SecKeyDecrypt: HOOKED");
+    }
+    
+    // Hook CCCrypt (symmetric encryption - AES/DES)
+    sym = dlsym(RTLD_DEFAULT, "CCCrypt");
+    if (sym) {
+        orig_CCCrypt = (CCCryptFunc)sym;
+        rebindSymbol("CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+        DLOG(@"[SEC] CCCrypt: HOOKED (replace version before AES encryption)");
+    }
+    
+    // Hook SecKeyCreateEncryptedData (new RSA API - 7.62 uses this)
+    sym = dlsym(RTLD_DEFAULT, "SecKeyCreateEncryptedData");
+    if (sym) {
+        rebindSymbol("SecKeyCreateEncryptedData", (void *)hook_SecKeyCreateEncryptedData, (void **)&orig_SecKeyCreateEncryptedData);
+        DLOG(@"[SEC] SecKeyCreateEncryptedData: HOOKED (7.62 new API)");
+    } else {
+        DLOG(@"[SEC] SecKeyCreateEncryptedData: NOT found");
+    }
+    
+    // Hook SecKeyCreateDecryptedData (new RSA API - 7.62 uses this)
+    sym = dlsym(RTLD_DEFAULT, "SecKeyCreateDecryptedData");
+    if (sym) {
+        rebindSymbol("SecKeyCreateDecryptedData", (void *)hook_SecKeyCreateDecryptedData, (void **)&orig_SecKeyCreateDecryptedData);
+        DLOG(@"[SEC] SecKeyCreateDecryptedData: HOOKED (7.62 new API)");
+    }
+    
+    DLOG(@"[SEC] Security hooks ready (all crypto APIs hooked)");
 }
 
 // ============================================================
