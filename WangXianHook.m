@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.51 - Replace version in ALL send packets (login+game servers)
+ * WangXianHook v35.52 - Fix judgeAppInfoApi code=0 (success), keep code unchanged
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.51 ===");
+        _log(@"=== WXHook v35.52 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.51 ALL-PORT";
+            lbl.text = @"WXHook v35.52 FIX-CODE";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -3054,10 +3054,9 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         // Ensure END=0 (not ended) and OPEN=1 (open)
                         body = [body stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
                         body = [body stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-                        // Ensure code=1 (success) instead of code=0
-                        body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+                        // KEEP code=0 as-is - it means success ("未到上限，继续注册")
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
-                        DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1, code=1");
+                        DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1");
                     }
                     
                     // Patch any sign/cert API response to success
