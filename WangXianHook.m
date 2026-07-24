@@ -1,9 +1,10 @@
 /**
- * WangXianHook v35.73 - Fix nested server list injection + delayed scan at 6s
- * FIX: Properly inject full mock server list into nested 0x802EE118 (was only 5 bytes garbage)
- * FIX: Update both inner (nested) and outer pktLen when expanding server list
- * FIX: Move REACH-SCAN to 6s to catch BusinessServices/CTLazuliSupport classes
- * FIX: No longer skip BusinessServices, CTLazuliSupport, TeaFoundation Swift modules
+ * WangXianHook v35.74 - Multi-scan + direct Swift class hooks
+ * FIX: Multi-pass scanning at 3s, 6s, 10s to catch late-loaded Swift classes
+ * FIX: Direct hook known Swift classes: BusinessServices.NetworkReachabilityProvider, etc.
+ * FIX: Expanded method name matching (status, connected, reachable, available)
+ * FIX: Also hook class methods (+ method) not just instance methods
+ * FIX: Properly inject full mock server list into nested 0x802EE118
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
  * FIX: Any method containing reachable/connected/available -> returns YES
@@ -77,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.73 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.74 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4511,35 +4512,219 @@ static void installAllHooks(void) {
         }
     });
     
-    // === DEFERRED: Network reachability class scan + hook (v35.70) ===
-    // Swift classes like BusinessServices.NetworkReachabilityProvider are NOT loaded yet
-    // when installAllHooks runs. We scan 6 seconds after launch to find and hook them.
-    // NOTE: Moved from 2s to 6s because some classes load later (GAME-CLASS scan runs at 5s)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // === DEFERRED: Network reachability class scan + hook (v35.74) ===
+    // Multi-pass scanning at 3s, 6s, 10s to catch late-loaded Swift classes
+    // Also directly hooks known classes: BusinessServices.NetworkReachabilityProvider, etc.
+    
+    // Helper function to hook all network status methods in a class
+    void (^hookNetworkClass)(Class) = ^(Class cls) {
+        if (!cls) return;
+        
+        NSString *clsName = NSStringFromClass(cls);
+        unsigned int methodCount = 0;
+        
+        // Hook instance methods
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        BOOL instanceHooked = NO;
+        int instanceCount = 0;
+        
+        if (methods) {
+            for (unsigned int m = 0; m < methodCount; m++) {
+                SEL sel = method_getName(methods[m]);
+                NSString *methodName = NSStringFromSelector(sel);
+                NSString *lowerMethod = [methodName lowercaseString];
+                
+                BOOL shouldHook = NO;
+                if ([lowerMethod containsString:@"reachable"] ||
+                    [lowerMethod containsString:@"isnetwork"] ||
+                    [lowerMethod containsString:@"networkavailable"] ||
+                    [lowerMethod containsString:@"hasconnection"] ||
+                    [lowerMethod containsString:@"isconnected"] ||
+                    [lowerMethod containsString:@"isavailable"] ||
+                    [lowerMethod containsString:@"networkstatus"] ||
+                    [lowerMethod containsString:@"connectivity"] ||
+                    [lowerMethod containsString:@"connectionstatus"] ||
+                    [lowerMethod containsString:@"currentreachability"] ||
+                    [lowerMethod containsString:@"status"] && 
+                    ([lowerMethod containsString:@"network"] || 
+                     [lowerMethod containsString:@"connect"] ||
+                     [lowerMethod containsString:@"reach"])) {
+                    shouldHook = YES;
+                }
+                
+                if (!shouldHook) continue;
+                
+                const char *retType = method_copyReturnType(methods[m]);
+                if (retType) {
+                    if (retType[0] != 'B' && retType[0] != 'c' && retType[0] != 'i' && 
+                        retType[0] != 's' && retType[0] != 'l' && retType[0] != 'q' &&
+                        retType[0] != 'C' && retType[0] != 'I' && retType[0] != 'S' &&
+                        retType[0] != 'L' && retType[0] != 'Q') {
+                        free((void *)retType);
+                        continue;
+                    }
+                    free((void *)retType);
+                }
+                
+                IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                    return YES;
+                });
+                method_setImplementation(methods[m], new_imp);
+                instanceCount++;
+                instanceHooked = YES;
+            }
+            free(methods);
+        }
+        
+        // Hook class methods (meta class)
+        Class metaCls = objc_getMetaClass(class_getName(cls));
+        BOOL classHooked = NO;
+        int classCount = 0;
+        
+        if (metaCls) {
+            unsigned int metaMethodCount = 0;
+            Method *metaMethods = class_copyMethodList(metaCls, &metaMethodCount);
+            if (metaMethods) {
+                for (unsigned int m = 0; m < metaMethodCount; m++) {
+                    SEL sel = method_getName(metaMethods[m]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    NSString *lowerMethod = [methodName lowercaseString];
+                    
+                    BOOL shouldHook = NO;
+                    if ([lowerMethod containsString:@"reachable"] ||
+                        [lowerMethod containsString:@"isnetwork"] ||
+                        [lowerMethod containsString:@"networkavailable"] ||
+                        [lowerMethod containsString:@"hasconnection"] ||
+                        [lowerMethod containsString:@"isconnected"] ||
+                        [lowerMethod containsString:@"isavailable"] ||
+                        [lowerMethod containsString:@"networkstatus"] ||
+                        [lowerMethod containsString:@"connectivity"] ||
+                        [lowerMethod containsString:@"connectionstatus"] ||
+                        [lowerMethod containsString:@"currentreachability"] ||
+                        ([lowerMethod containsString:@"status"] && 
+                         ([lowerMethod containsString:@"network"] || 
+                          [lowerMethod containsString:@"connect"] ||
+                          [lowerMethod containsString:@"reach"]))) {
+                        shouldHook = YES;
+                    }
+                    
+                    if (!shouldHook) continue;
+                    
+                    const char *retType = method_copyReturnType(metaMethods[m]);
+                    if (retType) {
+                        if (retType[0] != 'B' && retType[0] != 'c' && retType[0] != 'i' && 
+                            retType[0] != 's' && retType[0] != 'l' && retType[0] != 'q' &&
+                            retType[0] != 'C' && retType[0] != 'I' && retType[0] != 'S' &&
+                            retType[0] != 'L' && retType[0] != 'Q') {
+                            free((void *)retType);
+                            continue;
+                        }
+                        free((void *)retType);
+                    }
+                    
+                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                        return YES;
+                    });
+                    method_setImplementation(metaMethods[m], new_imp);
+                    classCount++;
+                    classHooked = YES;
+                }
+                free(metaMethods);
+            }
+        }
+        
+        if (instanceHooked || classHooked) {
+            DLOG(@"[REACH-HOOK] Hooked %@: %d instance + %d class methods", 
+                 clsName, instanceCount, classCount);
+        }
+    };
+    
+    // Direct hook known target classes
+    NSArray *targetClasses = @[
+        @"BusinessServices.NetworkReachabilityProvider",
+        @"BusinessServices.NetworkProvider",
+        @"BusinessServices.NetworkConnectivityTrampoline",
+        @"CTLazuliSupport.NetworkMonitor",
+        @"NetworkReachabilityProvider",
+        @"NetworkMonitor",
+        @"NetworkProvider",
+        @"NetworkConnectivityTrampoline",
+        @"TeaFoundation.NetworkReachability",
+        @"TeaFoundation.NetworkMonitor"
+    ];
+    
+    // Multi-pass scan function
+    void (^runReachScan)(int) = ^(int pass) {
         @try {
-            DLOG(@"[REACH-SCAN] Starting deferred network class scan...");
+            DLOG(@"[REACH-SCAN] Pass #%d starting...", pass);
             
-            int netClassCount = 0;
-            Class *netAllClasses = NULL;
+            int totalHooked = 0;
+            
+            // First: try direct hooks for known classes
+            for (NSString *clsName in targetClasses) {
+                Class cls = NSClassFromString(clsName);
+                if (cls) {
+                    DLOG(@"[REACH-SCAN] Found target class: %@, hooking directly...", clsName);
+                    hookNetworkClass(cls);
+                    totalHooked++;
+                }
+            }
+            
+            // Second: full scan for other network-related classes
             unsigned int classCount = 0;
-            
-            netAllClasses = objc_copyClassList(&classCount);
-            if (!netAllClasses) {
-                DLOG(@"[REACH-SCAN] Failed to get class list");
+            Class *allClasses = objc_copyClassList(&classCount);
+            if (!allClasses) {
+                DLOG(@"[REACH-SCAN] Pass #%d: Failed to get class list", pass);
                 return;
             }
             
-            int hookedClasses = 0;
-            int hookedMethods = 0;
+            int scannedCount = 0;
+            
+            NSArray *appleSwiftModules = @[
+                @"StocksCore", @"TipsCore", @"VisualLookUp", @"RealityKit",
+                @"RealityFoundation", @"FinanceKit", @"PegasusConfiguration",
+                @"SwiftUI", @"Combine", @"CoreData",
+                @"CoreML", @"Vision", @"NaturalLanguage", @"SoundAnalysis",
+                @"Speech", @"MediaPlayer", @"AVKit", @"AVFoundation",
+                @"CoreAudio", @"AudioToolbox", @"AudioUnit",
+                @"HealthKit", @"HomeKit", @"CloudKit", @"GameKit",
+                @"GameController", @"MapKit", @"Contacts", @"ContactsUI",
+                @"EventKit", @"EventKitUI", @"Photos", @"PhotosUI",
+                @"QuickLook", @"QuickLookThumbnailing", @"PDFKit",
+                @"PencilKit", @"ARKit", @"MetalKit", @"ModelIO",
+                @"SceneKit", @"SpriteKit", @"GameplayKit",
+                @"ReplayKit", @"MultipeerConnectivity",
+                @"NetworkExtension"
+            ];
+            
+            NSArray *systemPrefixes = @[
+                @"NS", @"UI", @"_", @"WK", @"GE", @"CM", @"FC", @"SP",
+                @"StocksCore", @"TipsCore", @"VisualLookUp", @"Reality",
+                @"MP", @"_MF", @"IS", @"SAS", @"CP", @"IDSServer", @"MX_",
+                @"CMNetwork", @"GEONetwork", @"AKNetwork", @"WebNetwork",
+                @"Core", @"Fig", @"ExtensionFoundation",
+                @"LPMediaAssetFetcher", @"NRMock", @"SUCore",
+                @"WebKit", @"XCTest", @"NWLink", @"PBServer",
+                @"IXServer", @"WISServer", @"SUCoreConnect",
+                @"AWDSiri", @"FigPWD", @"CMCapture", @"STSNDEF",
+                @"INCar", @"INConnected", @"INSend", @"DAD",
+                @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate",
+                @"CT"
+            ];
+            
+            NSMutableSet *alreadyHooked = [NSMutableSet set];
             
             for (unsigned int i = 0; i < classCount; i++) {
-                Class cls = netAllClasses[i];
+                Class cls = allClasses[i];
                 NSString *clsName = NSStringFromClass(cls);
                 if (!clsName) continue;
                 
+                // Skip already hooked target classes
+                if ([targetClasses containsObject:clsName]) continue;
+                if ([alreadyHooked containsObject:clsName]) continue;
+                
                 NSString *lowerName = [clsName lowercaseString];
                 
-                // Only hook classes that are clearly network reachability related
                 BOOL isNetReachClass = NO;
                 if (([lowerName containsString:@"network"] && 
                      ([lowerName containsString:@"reach"] || 
@@ -4556,43 +4741,9 @@ static void installAllHooks(void) {
                 
                 if (!isNetReachClass) continue;
                 
-                // Skip system framework classes that could cause crashes
-                // For Swift module classes (Module.ClassName), check the class name part only
+                // Filter system classes
                 BOOL isSystemClass = NO;
-                NSArray *systemPrefixes = @[
-                    @"NS", @"UI", @"_", @"WK", @"GE", @"CM", @"FC", @"SP",
-                    @"StocksCore", @"TipsCore", @"VisualLookUp", @"Reality",
-                    @"MP", @"_MF", @"IS", @"SAS", @"CP", @"IDSServer", @"MX_",
-                    @"CMNetwork", @"GEONetwork", @"AKNetwork", @"WebNetwork",
-                    @"CT", @"Core", @"Fig", @"ExtensionFoundation",
-                    @"LPMediaAssetFetcher", @"NRMock", @"SUCore",
-                    @"WebKit", @"XCTest", @"NWLink", @"PBServer",
-                    @"IXServer", @"WISServer", @"SUCoreConnect",
-                    @"AWDSiri", @"FigPWD", @"CMCapture", @"STSNDEF",
-                    @"INCar", @"INConnected", @"INSend", @"DAD",
-                    @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate"
-                ];
                 
-                // Known Apple system Swift modules - skip these entirely
-                NSArray *appleSwiftModules = @[
-                    @"StocksCore", @"TipsCore", @"VisualLookUp", @"RealityKit",
-                    @"RealityFoundation", @"FinanceKit", @"PegasusConfiguration",
-                    @"SwiftUI", @"Combine", @"CoreData",
-                    @"CoreML", @"Vision", @"NaturalLanguage", @"SoundAnalysis",
-                    @"Speech", @"MediaPlayer", @"AVKit", @"AVFoundation",
-                    @"CoreAudio", @"AudioToolbox", @"AudioUnit",
-                    @"HealthKit", @"HomeKit", @"CloudKit", @"GameKit",
-                    @"GameController", @"MapKit", @"Contacts", @"ContactsUI",
-                    @"EventKit", @"EventKitUI", @"Photos", @"PhotosUI",
-                    @"QuickLook", @"QuickLookThumbnailing", @"PDFKit",
-                    @"PencilKit", @"ARKit", @"MetalKit", @"ModelIO",
-                    @"SceneKit", @"SpriteKit", @"GameplayKit",
-                    @"ReplayKit", @"MultipeerConnectivity",
-                    @"NetworkExtension"
-                    // NOTE: Do NOT skip BusinessServices, CTLazuliSupport, TeaFoundation - might be game's!
-                ];
-                
-                // For Swift module classes, check if module is known Apple module
                 if ([clsName containsString:@"."]) {
                     NSArray *parts = [clsName componentsSeparatedByString:@"."];
                     NSString *moduleName = parts.firstObject;
@@ -4603,7 +4754,6 @@ static void installAllHooks(void) {
                             break;
                         }
                     }
-                    // Also check if class name part starts with system prefix
                     if (!isSystemClass && parts.count >= 2) {
                         NSString *classNamePart = parts[1];
                         for (NSString *prefix in systemPrefixes) {
@@ -4614,7 +4764,6 @@ static void installAllHooks(void) {
                         }
                     }
                 } else {
-                    // Regular ObjC class - check prefix
                     for (NSString *prefix in systemPrefixes) {
                         if ([clsName hasPrefix:prefix]) {
                             isSystemClass = YES;
@@ -4623,75 +4772,35 @@ static void installAllHooks(void) {
                     }
                 }
                 
-                if (isSystemClass) {
-                    continue;
-                }
+                if (isSystemClass) continue;
                 
-                unsigned int methodCount = 0;
-                Method *methods = class_copyMethodList(cls, &methodCount);
-                if (!methods) continue;
-                
-                BOOL classHooked = NO;
-                
-                for (unsigned int m = 0; m < methodCount; m++) {
-                    SEL sel = method_getName(methods[m]);
-                    NSString *methodName = NSStringFromSelector(sel);
-                    NSString *lowerMethod = [methodName lowercaseString];
-                    
-                    // Only hook methods that clearly return network status
-                    BOOL shouldHook = NO;
-                    if ([lowerMethod containsString:@"reachable"] ||
-                        [lowerMethod containsString:@"isnetwork"] ||
-                        [lowerMethod containsString:@"networkavailable"] ||
-                        [lowerMethod containsString:@"hasconnection"] ||
-                        [lowerMethod containsString:@"isconnected"] ||
-                        [lowerMethod containsString:@"isavailable"] ||
-                        [lowerMethod containsString:@"networkstatus"] ||
-                        [lowerMethod containsString:@"connectivity"]) {
-                        shouldHook = YES;
-                    }
-                    
-                    if (!shouldHook) continue;
-                    
-                    // Check that this is likely a BOOL or integer return type method
-                    // by checking the return type encoding
-                    const char *retType = method_copyReturnType(methods[m]);
-                    if (retType) {
-                        // Only hook if return type is BOOL (B), char (c), int (i), etc.
-                        // Skip methods that return objects (id, class, etc.)
-                        if (retType[0] != 'B' && retType[0] != 'c' && retType[0] != 'i' && 
-                            retType[0] != 's' && retType[0] != 'l' && retType[0] != 'q' &&
-                            retType[0] != 'C' && retType[0] != 'I' && retType[0] != 'S' &&
-                            retType[0] != 'L' && retType[0] != 'Q') {
-                            free((void *)retType);
-                            continue;
-                        }
-                        free((void *)retType);
-                    }
-                    
-                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
-                        return YES;
-                    });
-                    method_setImplementation(methods[m], new_imp);
-                    hookedMethods++;
-                    classHooked = YES;
-                }
-                
-                free(methods);
-                
-                if (classHooked) {
-                    hookedClasses++;
-                    DLOG(@"[REACH-SCAN] Hooked network class: %@", clsName);
-                }
+                hookNetworkClass(cls);
+                [alreadyHooked addObject:clsName];
+                scannedCount++;
             }
             
-            if (netAllClasses) free(netAllClasses);
+            if (allClasses) free(allClasses);
             
-            DLOG(@"[REACH-SCAN] Done: hooked %d classes, %d methods", hookedClasses, hookedMethods);
+            DLOG(@"[REACH-SCAN] Pass #%d complete: scanned %d additional classes", pass, scannedCount);
             
         } @catch (NSException *e) {
-            DLOG(@"[REACH-SCAN] Exception: %@", e);
+            DLOG(@"[REACH-SCAN] Pass #%d exception: %@", pass, e);
         }
+    };
+    
+    // Pass 1: at 3 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        runReachScan(1);
+    });
+    
+    // Pass 2: at 6 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        runReachScan(2);
+    });
+    
+    // Pass 3: at 10 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        runReachScan(3);
     });
     
     // === DEFERRED: Hook LoginModuleMessageHandlerImpl for server list response ===
