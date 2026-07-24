@@ -1,23 +1,13 @@
 /**
- * WangXianHook v35.52 - Fix judgeAppInfoApi code=0 (success), keep code unchanged
- * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
- *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
- *   with no valid auth data, so game server rejected connection.
- * Fix: Fake app version 7.7.0 so server returns REAL success response with full login credentials.
- * RESTORE: Keep UUID fix (UIDevice.identifierForVendor always returns valid UUID)
- * RESTORE: Keep response patching as safety fallback
- * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
- * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
- * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
- * FIX: Removed bytes 8-11 patching for 0x802EE118/0x802EE120 (keep byte 12 status patching only)
- * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
- * FIX: Added pan gesture for movable log button (drag to reposition)
- * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
- * FIX: Stop corrupting version string in 0x8002A016 (was misidentified as server list response)
- * FIX: Set requiresExclusiveTouchType=NO on gesture recognizers to avoid blocking system gestures
- * FIX: Set userInteractionEnabled=NO on hidden log button to prevent accidental interaction
- * FIX: Enhanced socket hook initialization with dlsym fallback for ALL hooks (connect, send, recv, recvfrom, recvmsg, write, read, close)
- * FIX: Added close() hook for proper fd cleanup and tracking
+ * WangXianHook v35.53 - Enhanced version replacement + server info class scanning for 7.62
+ * FIX: Version replacement now supports multiple patterns (with/without length prefix)
+ * FIX: Added class name alternatives for ServerInfoForClient (MEShiServerInfo, GameServerInfo, etc.)
+ * FIX: Added automatic class scanning for server-related classes when known names not found
+ * FIX: Enhanced ServerInfoForClient hook to try multiple class name variants
+ * FIX: Added fallback scan for all classes containing "Server" or "MESHI" keywords
+ * ROOT CAUSE: ServerInfoForClient class renamed in 7.62, causing server list parsing failure
+ * RESULT: Game stuck on startup page because it couldn't parse server list response
+ * FIX: Version replacement now also matches "7.6.2" without 0x00 0x05 length prefix
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
@@ -1446,17 +1436,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: v35.51 - Replace in ALL send packets (both login and game servers)
-    // Pattern: 0x00 0x05 (length prefix) + "7.6.2" -> "7.7.0"
+    // Version replacement: v35.53 - Replace in ALL send packets (both login and game servers)
+    // Support multiple patterns:
+    // Pattern 1: 0x00 0x05 (length prefix) + "7.6.2" -> "7.7.0"
+    // Pattern 2: "7.6.2" without length prefix
     // Login server (5678) also checks version in send packets, not just response
     // Game server (12003) encrypts version, so need to replace before encryption too
-    if ((port == 5678 || port == 12003) && sendLen >= 7 && sendBuf == buf) {
+    if ((port == 5678 || port == 12003) && sendLen >= 5 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
-        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+        const unsigned char verPatternWithPrefix[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+        const unsigned char verPatternSimple[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
         
         BOOL foundVer = NO;
-        for (size_t i = 0; i + 7 <= sendLen; i++) {
-            if (memcmp(p + i, verPattern, 7) == 0) { foundVer = YES; break; }
+        for (size_t i = 0; i + 5 <= sendLen; i++) {
+            if ((i + 7 <= sendLen && memcmp(p + i, verPatternWithPrefix, 7) == 0) ||
+                memcmp(p + i, verPatternSimple, 5) == 0) {
+                foundVer = YES;
+                break;
+            }
         }
         
         if (foundVer) {
@@ -1466,11 +1463,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 unsigned char *q = (unsigned char *)newBuf;
                 int verCnt = 0;
                 
-                for (size_t i = 0; i + 7 <= sendLen; i++) {
-                    if (memcmp(q + i, verPattern, 7) == 0) {
+                for (size_t i = 0; i + 5 <= sendLen; i++) {
+                    if (i + 7 <= sendLen && memcmp(q + i, verPatternWithPrefix, 7) == 0) {
                         q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
                         verCnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (port %d)", i+2, port);
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 (with prefix) at offset %zu (port %d)", i+2, port);
+                    } else if (memcmp(q + i, verPatternSimple, 5) == 0) {
+                        q[i] = 0x37; q[i+1] = 0x2E; q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x30; // "7.7.0"
+                        verCnt++;
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 (simple) at offset %zu (port %d)", i, port);
                     }
                 }
                 
@@ -3429,9 +3430,26 @@ static void installAllHooks(void) {
     }
     
     // === IMMEDIATE: Hook ServerInfoForClient class to trace server list parsing ===
-    Class msiCls = NSClassFromString(@"ServerInfoForClient");
+    // Try multiple possible class names for 7.62 version compatibility
+    NSArray *serverInfoClassNames = @[
+        @"ServerInfoForClient", @"ServerInfoClient", @"ServerInfo",
+        @"MEShiServerInfo", @"MEShiClientInfo", @"GameServerInfo",
+        @"ServerListItem", @"ServerData", @"ServerItem",
+        @"MSIClient", @"MSIInfo", @"ServerInfoItem"
+    ];
+    
+    Class msiCls = nil;
+    for (NSString *clsName in serverInfoClassNames) {
+        Class cls = NSClassFromString(clsName);
+        if (cls) {
+            msiCls = cls;
+            DLOG(@"[MSI] Found server info class: %@", clsName);
+            break;
+        }
+    }
+    
     if (msiCls) {
-        DLOG(@"[MSI] ServerInfoForClient class FOUND!");
+        DLOG(@"[MSI] Server info class FOUND: %@", NSStringFromClass(msiCls));
         
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(msiCls, &mcount);
@@ -3499,7 +3517,21 @@ static void installAllHooks(void) {
             DLOG(@"[MSI-HOOK] Hooked: clientid");
         }
     } else {
-        DLOG(@"[MSI] ServerInfoForClient class NOT found!");
+        DLOG(@"[MSI] ServerInfoForClient class NOT found! Scanning for alternatives...");
+        // Scan all classes for server-related classes
+        unsigned int classCount = 0;
+        Class *allClasses = objc_copyClassList(&classCount);
+        if (allClasses) {
+            for (unsigned int i = 0; i < classCount; i++) {
+                NSString *clsName = NSStringFromClass(allClasses[i]);
+                if ([clsName containsString:@"Server"] || [clsName containsString:@"server"] ||
+                    [clsName containsString:@"MESHI"] || [clsName containsString:@"Meshi"] ||
+                    [clsName containsString:@"MEShi"]) {
+                    DLOG(@"[MSI-SCAN] Found candidate class: %@", clsName);
+                }
+            }
+            free(allClasses);
+        }
     }
     
     // Dump NSUserDefaults
