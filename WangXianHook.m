@@ -1,9 +1,9 @@
 /**
- * WangXianHook v35.57 - Inject mock server list in correct protocol step (0x802EE118)
- * FIX: Changed injection point from 0x80000015 to 0x802EE118 response
- * FIX: Protocol flow: Client sends 0x00000015 -> Server returns 0x802EE118 (server list)
- * FIX: Detect empty server list (pktLen<20) and inject mock data with correct pktLen=109
- * ROOT CAUSE: v35.56 injected at wrong step, game expected 0x80000015 but got 0x802EE118
+ * WangXianHook v35.58 - Inject mock server list in nested 0x802EE118 inside 0x8000E002
+ * DISCOVERY: 0x802EE118 is nested INSIDE 0x8000E002 response (not standalone)
+ * FIX: Search for nested 0x802EE118 in 0x8000E002 payload and inject mock data
+ * FIX: Update outer pktLen to account for expanded nested packet
+ * ROOT CAUSE: v35.57 looked for standalone 0x802EE118 but it's always nested
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
@@ -1876,49 +1876,63 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.57: Handle 0x802EE118 response - inject mock server list
-        // PROTOCOL FLOW: Client sends 0x00000015 -> Server returns 0x802EE118 (server list)
-        // PROBLEM: Server returns empty 0x802EE118 (pktLenBE=13), causing game to get no server info
-        // SOLUTION: Replace the empty body with mock server list data, update pktLenBE accordingly
-        if (cmd == 0x802EE118 && port == 5678) {
-            DLOG(@"[PROTO-R] 0x802EE118 response received (server list), pktLenBE=%u ret=%zd", pktLenBE, ret);
+        // v35.58: Handle nested 0x802EE118 inside 0x8000E002 response
+        // DISCOVERY: 0x802EE118 is nested INSIDE 0x8000E002 response, not a standalone response
+        // Response format: [pktLen=120][cmd=0x8000E002][data...][pktLen=13][cmd=0x802EE118][empty server list]
+        // SOLUTION: Find the nested 0x802EE118 inside 0x8000E002 and inject mock data there
+        if (cmd == 0x8000E002 && port == 5678) {
+            DLOG(@"[PROTO-R] 0x8000E002 response received, searching for nested 0x802EE118");
             
-            if (pktLenBE < 20) {
-                DLOG(@"[PROTO-R-PATCH] Server list empty (pktLenBE=%u), injecting mock data", pktLenBE);
+            unsigned char *payload = (unsigned char *)buf + 8;
+            size_t payloadLen = (size_t)ret - 8;
+            
+            for (size_t i = 0; i + 8 <= payloadLen; i++) {
+                uint32_t nestedPktLen = ((uint32_t)payload[i] << 24) | ((uint32_t)payload[i+1] << 16) |
+                                        ((uint32_t)payload[i+2] << 8)  | (uint32_t)payload[i+3];
+                uint32_t nestedCmd = ((uint32_t)payload[i+4] << 24) | ((uint32_t)payload[i+5] << 16) |
+                                      ((uint32_t)payload[i+6] << 8)  | (uint32_t)payload[i+7];
                 
-                const unsigned char mockServerList[] = {
-                    0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
-                    0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
-                    0x00, 0x01, // server count = 1
-                    0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
-                    0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
-                    0x00, 0x01, 0x31, // serverType = "1"
-                    0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
-                    0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
-                    0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-                    0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
-                    0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
-                    0x00, 0x01, 0x31, // status = "1"
-                    0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
-                    0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
-                };
-                
-                size_t mockLen = sizeof(mockServerList);
-                if (len >= mockLen) {
-                    memcpy((unsigned char *)buf, mockServerList, mockLen);
-                    DLOG(@"[PROTO-R-PATCH] Injected mock server list: pktLen=109 (overwrote %zd bytes)", ret);
-                    return (ssize_t)mockLen;
-                } else {
-                    DLOG(@"[PROTO-R-PATCH] ERROR: Buffer too small (need=%zu, have=%zu)", mockLen, len);
-                    unsigned char *p = (unsigned char *)buf;
-                    p[0] = (mockLen >> 24) & 0xFF;
-                    p[1] = (mockLen >> 16) & 0xFF;
-                    p[2] = (mockLen >> 8) & 0xFF;
-                    p[3] = mockLen & 0xFF;
-                    size_t copyLen = len < mockLen ? len : mockLen;
-                    memcpy(p, mockServerList, copyLen);
-                    DLOG(@"[PROTO-R-PATCH] Partial injection: updated pktLen, copied %zu bytes", copyLen);
-                    return (ssize_t)copyLen;
+                if (nestedCmd == 0x802EE118) {
+                    DLOG(@"[PROTO-R] Found nested 0x802EE118 at offset %zu, pktLen=%u", i, nestedPktLen);
+                    
+                    if (nestedPktLen < 20) {
+                        DLOG(@"[PROTO-R-PATCH] Nested server list empty (pktLen=%u), injecting mock data", nestedPktLen);
+                        
+                        const unsigned char mockServerList[] = {
+                            0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
+                            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
+                            0x00, 0x01, // server count = 1
+                            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
+                            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
+                            0x00, 0x01, 0x31, // serverType = "1"
+                            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
+                            0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
+                            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
+                            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
+                            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
+                            0x00, 0x01, 0x31, // status = "1"
+                            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
+                            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
+                        };
+                        
+                        size_t mockLen = sizeof(mockServerList);
+                        size_t insertOffset = 8 + i;
+                        
+                        if (insertOffset + mockLen <= (size_t)len) {
+                            memcpy((unsigned char *)buf + insertOffset, mockServerList, mockLen);
+                            
+                            uint32_t newOuterLen = pktLenBE - nestedPktLen + mockLen;
+                            ((unsigned char *)buf)[0] = (newOuterLen >> 24) & 0xFF;
+                            ((unsigned char *)buf)[1] = (newOuterLen >> 16) & 0xFF;
+                            ((unsigned char *)buf)[2] = (newOuterLen >> 8) & 0xFF;
+                            ((unsigned char *)buf)[3] = newOuterLen & 0xFF;
+                            
+                            DLOG(@"[PROTO-R-PATCH] Injected nested mock server list: pktLen=109, outer pktLen updated to %u", newOuterLen);
+                        } else {
+                            DLOG(@"[PROTO-R-PATCH] ERROR: Buffer too small for nested injection");
+                        }
+                        break;
+                    }
                 }
             }
         }
