@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.48 - Remove infoDictionary hook (infinite recursion), keep safe hooks only
+ * WangXianHook v35.49 - Replace version in game server send packets (7.6.2->7.7.0), keep 978
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.48 ===");
+        _log(@"=== WXHook v35.49 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.48 SAFE";
+            lbl.text = @"WXHook v35.49 GS-VER";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1446,28 +1446,25 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: DISABLED - modifying send packets breaks MD5/signature check
-    // Server validates packet integrity, any byte modification causes connection close
-    // Correct approach: Hook at data construction level (where version is assembled), not at send level
-    if (0 && (port == 5678 || port == 12003) && sendLen >= 7 && sendBuf == buf) {
+    // Version replacement: v35.49 - ONLY for game server (port 12003)
+    // Replace "7.6.2" -> "7.7.0" (same length, won't break structure)
+    // DO NOT replace resource version (978) - server validates resource package
+    // Login server (5678) is handled by response patching, so no need to replace there
+    if (port == 12003 && sendLen >= 7 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
-        const unsigned char resPattern[] = {0x00, 0x03, 0x39, 0x37, 0x38};
         
-        BOOL foundVer = NO, foundRes = NO;
+        BOOL foundVer = NO;
         for (size_t i = 0; i + 7 <= sendLen; i++) {
             if (memcmp(p + i, verPattern, 7) == 0) { foundVer = YES; break; }
         }
-        for (size_t i = 0; i + 5 <= sendLen; i++) {
-            if (memcmp(p + i, resPattern, 5) == 0) { foundRes = YES; break; }
-        }
         
-        if (foundVer || foundRes) {
+        if (foundVer) {
             void *newBuf = malloc(sendLen);
             if (newBuf) {
                 memcpy(newBuf, buf, sendLen);
                 unsigned char *q = (unsigned char *)newBuf;
-                int verCnt = 0, resCnt = 0;
+                int verCnt = 0;
                 
                 for (size_t i = 0; i + 7 <= sendLen; i++) {
                     if (memcmp(q + i, verPattern, 7) == 0) {
@@ -1477,17 +1474,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     }
                 }
                 
-                for (size_t i = 0; i + 5 <= sendLen; i++) {
-                    if (memcmp(q + i, resPattern, 5) == 0) {
-                        q[i+2] = 0x39; q[i+3] = 0x37; q[i+4] = 0x39; // "979"
-                        resCnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 978 -> 979 at offset %zu (port %d)", i+2, port);
-                    }
-                }
-                
-                if (verCnt > 0 || resCnt > 0) {
+                if (verCnt > 0) {
                     sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total: %d version replacements, %d resourceVersion replacements", verCnt, resCnt);
+                    DLOG(@"[VER-REPLACE] Total: %d version replacements", verCnt);
                 } else {
                     free(newBuf);
                 }
