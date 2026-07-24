@@ -2721,6 +2721,86 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
 }
 
 // ============================================================
+#pragma mark - UIDevice(APEX) category hooks (v35.41)
+// ============================================================
+static NSString *(*orig_APEX_currentVersion)(id, SEL);
+static NSString *hook_APEX_currentVersion(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_currentVersion ? orig_APEX_currentVersion(self, _cmd) : @"7.6.2";
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] currentVersion: %@ -> 7.7.0", orig);
+        g_logCount++;
+    }
+    return @"7.7.0";
+}
+
+static BOOL (*orig_APEX_isJailbroken)(id, SEL);
+static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
+    BOOL orig = orig_APEX_isJailbroken ? orig_APEX_isJailbroken(self, _cmd) : YES;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] isJailbroken: %d -> NO", orig);
+        g_logCount++;
+    }
+    return NO;
+}
+
+static NSString *(*orig_APEX_clientKey)(id, SEL);
+static NSString *hook_APEX_clientKey(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_clientKey ? orig_APEX_clientKey(self, _cmd) : nil;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] clientKey: %@", orig);
+        g_logCount++;
+    }
+    return orig;
+}
+
+static NSString *(*orig_APEX_tid)(id, SEL);
+static NSString *hook_APEX_tid(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_tid ? orig_APEX_tid(self, _cmd) : nil;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] tid: %@", orig);
+        g_logCount++;
+    }
+    return orig;
+}
+
+static NSString *(*orig_APEX_udid)(id, SEL);
+static NSString *hook_APEX_udid(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_udid ? orig_APEX_udid(self, _cmd) : nil;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] udid: %@", orig);
+        g_logCount++;
+    }
+    return orig;
+}
+
+static NSString *(*orig_APEX_virtualImei)(id, SEL);
+static NSString *hook_APEX_virtualImei(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_virtualImei ? orig_APEX_virtualImei(self, _cmd) : nil;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] virtualImei: %@", orig);
+        g_logCount++;
+    }
+    return orig;
+}
+
+static NSString *(*orig_APEX_virtualImsi)(id, SEL);
+static NSString *hook_APEX_virtualImsi(id self, SEL _cmd) {
+    NSString *orig = orig_APEX_virtualImsi ? orig_APEX_virtualImsi(self, _cmd) : nil;
+    static int g_logCount = 0;
+    if (g_logCount < 3) {
+        DLOG(@"[APEX] virtualImsi: %@", orig);
+        g_logCount++;
+    }
+    return orig;
+}
+
+// ============================================================
 #pragma mark - UIDevice identifierForVendor hook (fix empty UUID in login packets)
 // ============================================================
 
@@ -2996,6 +3076,40 @@ static void installAllHooks(void) {
     }
     
     // === IMMEDIATE: Observation-only hooks ===
+    
+    // === FIX: UIDevice(APEX) category hooks (v35.41) ===
+    // Game uses UIDevice(APEX) category to get version and device info
+    // currentVersion is used for server version check (not NSBundle!)
+    // isJailbroken is used for jailbreak detection
+    Class uidCls = [UIDevice class];
+    Class apexCls = NSClassFromString(@"UIDevice(APEX)");
+    if (apexCls) {
+        Class metaCls = object_getClass(apexCls);
+        
+        Method m = class_getClassMethod(uidCls, @selector(currentVersion));
+        if (m) { orig_APEX_currentVersion = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_currentVersion); _log(@"[INIT] UIDevice(APEX).currentVersion: HOOKED (fake 7.7.0)"); }
+        
+        m = class_getClassMethod(uidCls, @selector(isJailbroken));
+        if (m) { orig_APEX_isJailbroken = (BOOL(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_isJailbroken); _log(@"[INIT] UIDevice(APEX).isJailbroken: HOOKED (return NO)"); }
+        
+        m = class_getClassMethod(uidCls, @selector(clientKey));
+        if (m) { orig_APEX_clientKey = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_clientKey); _log(@"[INIT] UIDevice(APEX).clientKey: HOOKED"); }
+        
+        m = class_getClassMethod(uidCls, @selector(tid));
+        if (m) { orig_APEX_tid = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_tid); _log(@"[INIT] UIDevice(APEX).tid: HOOKED"); }
+        
+        m = class_getClassMethod(uidCls, @selector(udid));
+        if (m) { orig_APEX_udid = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_udid); _log(@"[INIT] UIDevice(APEX).udid: HOOKED"); }
+        
+        m = class_getClassMethod(uidCls, @selector(virtualImei));
+        if (m) { orig_APEX_virtualImei = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_virtualImei); _log(@"[INIT] UIDevice(APEX).virtualImei: HOOKED"); }
+        
+        m = class_getClassMethod(uidCls, @selector(virtualImsi));
+        if (m) { orig_APEX_virtualImsi = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_virtualImsi); _log(@"[INIT] UIDevice(APEX).virtualImsi: HOOKED"); }
+    } else {
+        _log(@"[INIT] WARNING: UIDevice(APEX) category NOT found!");
+    }
+
     // NSURLSession completion handler mode
     Class sessCls = [NSURLSession class];
     if (sessCls) {
