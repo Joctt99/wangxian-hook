@@ -1,10 +1,13 @@
 /**
- * WangXianHook v35.68 - Replace 0x80000015 response with mock server list
+ * WangXianHook v35.69 - FIX protocol mismatch + NetworkReachabilityProvider/NetworkMonitor hooks
+ * FIX: 0x80000015 response now keeps cmd=0x80000015 (not changed to 0x802EE118)
+ * FIX: NetworkReachabilityProvider.isReachable -> YES
+ * FIX: NetworkMonitor.isNetworkAvailable -> YES
+ * FIX: Any method containing reachable/connected/available -> returns YES
  * FIX: judgeNet now skips original, forces network available
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
  * FIX: Intercept standalone 0x802EE118 response (not nested) and inject mock server list
- * FIX: Intercept 0x80000015 response and REPLACE with mock 0x802EE118 server list data
  * FIX: Added GAME-CLASS scan filtering Apple framework classes
  * FIX: Hook SCNetworkReachabilityGetFlags -> force kSCNetworkReachabilityFlagsReachable
  * FIX: Hook Reachability class (currentReachabilityStatus, isReachable, isReachableViaWiFi/WWAN)
@@ -71,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.68 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.69 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2005,34 +2008,115 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.65: Intercept 0x80000015 response (empty server list response)
-        // From logs: [RECV] fd=105 ... cmd=0x80000015 pktLen=22 (empty)
-        // The server returns empty 0x80000015 instead of 0x802EE118 with server list
-        // Replace this with mock server list data
+        // v35.68: Intercept 0x80000015 response (empty server list response)
+        // KEY FIX: Keep cmd=0x80000015 (response to request 0x00000015), don't change to 0x802EE118
+        // The client matches responses to requests by cmd (response_cmd = request_cmd | 0x80000000)
+        // If we return 0x802EE118, client never processes it!
         if (cmd == 0x80000015 && port == 5678) {
-            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes), replacing with mock server list", ret);
+            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes), injecting mock server list", ret);
             
-            const unsigned char mockServerList[] = {
-                0x00, 0x00, 0x00, 0x7D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=125, cmd=0x802EE118
-                0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
-                0x00, 0x01, // server count = 1
-                0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
-                0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
-                0x00, 0x01, 0x31, // serverType = "1"
-                0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
-                0x00, 0x10, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "测试a123" (16 bytes)
-                0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-                0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
-                0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
-                0x00, 0x01, 0x31, // status = "1"
-                0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
-                0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
-            };
+            // Construct mock response: keep cmd=0x80000015 but fill with server list data
+            // Format: pktLen(4) + cmd(4) + seq(4) + server_count(2) + server_data...
+            unsigned char mockServerList[200] = {0};
+            size_t idx = 0;
             
-            size_t mockLen = sizeof(mockServerList);
+            // pktLen = 180 (will be filled later)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x00; 
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0xB4; // 180
+            
+            // cmd = 0x80000015 (RESPONSE to request 0x00000015)
+            mockServerList[idx++] = 0x80; mockServerList[idx++] = 0x00; 
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x15;
+            
+            // seq: keep original seq from response
+            if (ret >= 12) {
+                memcpy(mockServerList + idx, p + 8, 4);
+                idx += 4;
+            } else {
+                mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x00; 
+                mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x01;
+            }
+            
+            // Server count = 1
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x01;
+            
+            // Server ID (with length prefix)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x04; // len=4
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '2'; 
+            mockServerList[idx++] = '3'; mockServerList[idx++] = '4';
+            
+            // Client ID
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x04; // len=4
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '2'; 
+            mockServerList[idx++] = '3'; mockServerList[idx++] = '4';
+            
+            // Server Type
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x01; // len=1
+            mockServerList[idx++] = '1';
+            
+            // Category (一区)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x06; // len=6
+            mockServerList[idx++] = 0xE4; mockServerList[idx++] = 0xB8; 
+            mockServerList[idx++] = 0x80; mockServerList[idx++] = 0xE5; 
+            mockServerList[idx++] = 0x8C; mockServerList[idx++] = 0xBA;
+            
+            // Name (测试服务器)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x10; // len=16
+            mockServerList[idx++] = 0xE6; mockServerList[idx++] = 0xB5; 
+            mockServerList[idx++] = 0x8B; mockServerList[idx++] = 0xE8; 
+            mockServerList[idx++] = 0xAF; mockServerList[idx++] = 0x95; 
+            mockServerList[idx++] = 0x61; mockServerList[idx++] = '1'; 
+            mockServerList[idx++] = '2'; mockServerList[idx++] = '3';
+            for (int i = 0; i < 6; i++) mockServerList[idx++] = ' ';
+            
+            // Real Name (运行)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x06; // len=6
+            mockServerList[idx++] = 0xE8; mockServerList[idx++] = 0xBF; 
+            mockServerList[idx++] = 0x90; mockServerList[idx++] = 0xE8; 
+            mockServerList[idx++] = 0xA1; mockServerList[idx++] = 0x8C;
+            
+            // IP (139.224.129.92)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x0E; // len=14
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '3'; 
+            mockServerList[idx++] = '9'; mockServerList[idx++] = '.'; 
+            mockServerList[idx++] = '2'; mockServerList[idx++] = '2'; 
+            mockServerList[idx++] = '4'; mockServerList[idx++] = '.'; 
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '2'; 
+            mockServerList[idx++] = '9'; mockServerList[idx++] = '.'; 
+            mockServerList[idx++] = '9'; mockServerList[idx++] = '2';
+            
+            // Port (12003)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x05; // len=5
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '2'; 
+            mockServerList[idx++] = '0'; mockServerList[idx++] = '0'; 
+            mockServerList[idx++] = '3';
+            
+            // Status (1 = running)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x01; // len=1
+            mockServerList[idx++] = '1';
+            
+            // Online Player Num (1000)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x04; // len=4
+            mockServerList[idx++] = '1'; mockServerList[idx++] = '0'; 
+            mockServerList[idx++] = '0'; mockServerList[idx++] = '0';
+            
+            // Description (运行)
+            mockServerList[idx++] = 0x00; mockServerList[idx++] = 0x06; // len=6
+            mockServerList[idx++] = 0xE8; mockServerList[idx++] = 0xBF; 
+            mockServerList[idx++] = 0x90; mockServerList[idx++] = 0xE8; 
+            mockServerList[idx++] = 0xA1; mockServerList[idx++] = 0x8C;
+            
+            size_t mockLen = idx;
+            
+            // Update pktLen in header
+            mockServerList[0] = (mockLen >> 24) & 0xFF;
+            mockServerList[1] = (mockLen >> 16) & 0xFF;
+            mockServerList[2] = (mockLen >> 8) & 0xFF;
+            mockServerList[3] = mockLen & 0xFF;
+            
             if (len >= mockLen) {
                 memcpy((unsigned char *)buf, mockServerList, mockLen);
-                DLOG(@"[WXHOOK] ✅ Replaced 0x80000015 with mock 0x802EE118 server list (%zu bytes)", mockLen);
+                DLOG(@"[WXHOOK] ✅ Replaced 0x80000015 with mock server list (%zu bytes), cmd=0x80000015 preserved!", mockLen);
                 return (ssize_t)mockLen;
             } else {
                 DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
@@ -3689,6 +3773,87 @@ static void installAllHooks(void) {
             });
             method_setImplementation(m_status, new_imp);
             DLOG(@"[REACH] Hooked AFNetworkReachabilityManager.networkReachabilityStatus");
+        }
+    }
+    
+    // 3. NetworkReachabilityProvider (app custom class from GAME-CLASS scan)
+    Class nrProviderCls = NSClassFromString(@"NetworkReachabilityProvider");
+    if (nrProviderCls) {
+        DLOG(@"[REACH] Found NetworkReachabilityProvider class");
+        
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(nrProviderCls, &methodCount);
+        if (methods) {
+            for (unsigned int i = 0; i < methodCount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *methodName = NSStringFromSelector(sel);
+                if ([methodName containsString:@"reachable"] || 
+                    [methodName containsString:@"connect"] || 
+                    [methodName containsString:@"available"] ||
+                    [methodName containsString:@"network"]) {
+                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                        DLOG(@"[REACH] NetworkReachabilityProvider.%@ -> forced YES", methodName);
+                        return YES;
+                    });
+                    method_setImplementation(methods[i], new_imp);
+                    DLOG(@"[REACH] Hooked NetworkReachabilityProvider.%@", methodName);
+                }
+            }
+            free(methods);
+        }
+    }
+    
+    // 4. NetworkMonitor (app custom class from GAME-CLASS scan)
+    Class netMonitorCls = NSClassFromString(@"NetworkMonitor");
+    if (netMonitorCls) {
+        DLOG(@"[REACH] Found NetworkMonitor class");
+        
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(netMonitorCls, &methodCount);
+        if (methods) {
+            for (unsigned int i = 0; i < methodCount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *methodName = NSStringFromSelector(sel);
+                if ([methodName containsString:@"reachable"] || 
+                    [methodName containsString:@"connect"] || 
+                    [methodName containsString:@"available"] ||
+                    [methodName containsString:@"network"]) {
+                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                        DLOG(@"[REACH] NetworkMonitor.%@ -> forced YES", methodName);
+                        return YES;
+                    });
+                    method_setImplementation(methods[i], new_imp);
+                    DLOG(@"[REACH] Hooked NetworkMonitor.%@", methodName);
+                }
+            }
+            free(methods);
+        }
+    }
+    
+    // 5. ConnectionManager (app custom class)
+    Class connManagerCls = NSClassFromString(@"ConnectionManager");
+    if (connManagerCls) {
+        DLOG(@"[REACH] Found ConnectionManager class");
+        
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(connManagerCls, &methodCount);
+        if (methods) {
+            for (unsigned int i = 0; i < methodCount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *methodName = NSStringFromSelector(sel);
+                if ([methodName containsString:@"reachable"] || 
+                    [methodName containsString:@"connect"] || 
+                    [methodName containsString:@"available"] ||
+                    [methodName containsString:@"network"]) {
+                    IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                        DLOG(@"[REACH] ConnectionManager.%@ -> forced YES", methodName);
+                        return YES;
+                    });
+                    method_setImplementation(methods[i], new_imp);
+                    DLOG(@"[REACH] Hooked ConnectionManager.%@", methodName);
+                }
+            }
+            free(methods);
         }
     }
     
