@@ -1470,7 +1470,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (memcmp(q + i, verPattern, 7) == 0) {
                         q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
                         verCnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (port %d, cmd=0x%08X)", i+2, port, cmd);
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (port %d)", i+2, port);
                     }
                 }
                 
