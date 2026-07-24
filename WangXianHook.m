@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.42 - Enable version replacement in send packets (port 5678+12003)
+ * WangXianHook v35.43 - Replace both version (7.6.2->7.7.0) and resourceVersion (978->979)
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.42 ===");
+        _log(@"=== WXHook v35.43 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1446,34 +1446,50 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: Change "7.6.2" -> "7.7.0" in send packets
-    // Pattern: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
+    // Version replacement: Change "7.6.2" -> "7.7.0" and "978" -> "979" in send packets
+    // Pattern for version: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
+    // Pattern for resource version: \x00\x03 (length 3) + "978" (hex: 39 37 38)
     // Apply to ALL ports including login server (5678) and game server (12003)
-    // v35.41: ENABLED - Game server uses non-homologous version check, so we must replace version in ALL packets
-    // The signature/MD5 check uses a different mechanism, version changes don't break it
+    // v35.43: ENABLED - Game server uses non-homologous version check, replace both version and resourceVersion
     if ((port == 5678 || port == 12003) && sendLen >= 7 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
-        BOOL found = NO;
+        const unsigned char resPattern[] = {0x00, 0x03, 0x39, 0x37, 0x38};
+        
+        BOOL foundVer = NO, foundRes = NO;
         for (size_t i = 0; i + 7 <= sendLen; i++) {
-            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
+            if (memcmp(p + i, verPattern, 7) == 0) { foundVer = YES; break; }
         }
-        if (found) {
+        for (size_t i = 0; i + 5 <= sendLen; i++) {
+            if (memcmp(p + i, resPattern, 5) == 0) { foundRes = YES; break; }
+        }
+        
+        if (foundVer || foundRes) {
             void *newBuf = malloc(sendLen);
             if (newBuf) {
                 memcpy(newBuf, buf, sendLen);
                 unsigned char *q = (unsigned char *)newBuf;
-                int cnt = 0;
+                int verCnt = 0, resCnt = 0;
+                
                 for (size_t i = 0; i + 7 <= sendLen; i++) {
                     if (memcmp(q + i, verPattern, 7) == 0) {
                         q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
-                        cnt++;
+                        verCnt++;
                         DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (port %d)", i+2, port);
                     }
                 }
-                if (cnt > 0) {
+                
+                for (size_t i = 0; i + 5 <= sendLen; i++) {
+                    if (memcmp(q + i, resPattern, 5) == 0) {
+                        q[i+2] = 0x39; q[i+3] = 0x37; q[i+4] = 0x39; // "979"
+                        resCnt++;
+                        DLOG(@"[VER-REPLACE] Send: replaced 978 -> 979 at offset %zu (port %d)", i+2, port);
+                    }
+                }
+                
+                if (verCnt > 0 || resCnt > 0) {
                     sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total %d version replacements for packet", cnt);
+                    DLOG(@"[VER-REPLACE] Total: %d version replacements, %d resourceVersion replacements", verCnt, resCnt);
                 } else {
                     free(newBuf);
                 }
