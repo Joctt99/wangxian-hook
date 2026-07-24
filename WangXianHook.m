@@ -1,11 +1,9 @@
 /**
- * WangXianHook v35.71 - Deferred network class scan (2s delay) for Swift module classes
+ * WangXianHook v35.72 - Unblock BusinessServices/CTLazuliSupport/TeaFoundation in scan
+ * FIX: No longer skip BusinessServices, CTLazuliSupport, TeaFoundation Swift modules
  * FIX: Deferred scan at 2s to catch Swift classes loaded after init
  * FIX: Smart filtering for Swift module classes (Module.ClassName format)
  * FIX: Only hook methods with BOOL/int return type (avoids crashing object-return methods)
- * FIX: NetworkReachabilityProvider now searched as BusinessServices.NetworkReachabilityProvider
- * FIX: NetworkMonitor now searched as CTLazuliSupport.NetworkMonitor
- * FIX: Added NetworkProvider and NetworkConnectivityTrampoline hooks
  * FIX: 0x80000015 response now keeps cmd=0x80000015 (not changed to 0x802EE118)
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
@@ -80,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.71 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.72 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4448,7 +4446,7 @@ static void installAllHooks(void) {
                 if (!isNetReachClass) continue;
                 
                 // Skip system framework classes that could cause crashes
-                // For Swift module classes (Module.ClassName), check the module part only
+                // For Swift module classes (Module.ClassName), check the class name part only
                 BOOL isSystemClass = NO;
                 NSArray *systemPrefixes = @[
                     @"NS", @"UI", @"_", @"WK", @"GE", @"CM", @"FC", @"SP",
@@ -4461,25 +4459,41 @@ static void installAllHooks(void) {
                     @"IXServer", @"WISServer", @"SUCoreConnect",
                     @"AWDSiri", @"FigPWD", @"CMCapture", @"STSNDEF",
                     @"INCar", @"INConnected", @"INSend", @"DAD",
-                    @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate",
-                    @"TeaFoundation", @"FinanceKit", @"PegasusConfiguration",
-                    @"BusinessServices"  // Wait - this might be the game's module!
+                    @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate"
                 ];
                 
-                // For Swift module classes, only skip if module is a known system module
+                // Known Apple system Swift modules - skip these entirely
+                NSArray *appleSwiftModules = @[
+                    @"StocksCore", @"TipsCore", @"VisualLookUp", @"RealityKit",
+                    @"RealityFoundation", @"FinanceKit", @"PegasusConfiguration",
+                    @"SwiftUI", @"Combine", @"CoreData",
+                    @"CoreML", @"Vision", @"NaturalLanguage", @"SoundAnalysis",
+                    @"Speech", @"MediaPlayer", @"AVKit", @"AVFoundation",
+                    @"CoreAudio", @"AudioToolbox", @"AudioUnit",
+                    @"HealthKit", @"HomeKit", @"CloudKit", @"GameKit",
+                    @"GameController", @"MapKit", @"Contacts", @"ContactsUI",
+                    @"EventKit", @"EventKitUI", @"Photos", @"PhotosUI",
+                    @"QuickLook", @"QuickLookThumbnailing", @"PDFKit",
+                    @"PencilKit", @"ARKit", @"MetalKit", @"ModelIO",
+                    @"SceneKit", @"SpriteKit", @"GameplayKit",
+                    @"ReplayKit", @"MultipeerConnectivity",
+                    @"NetworkExtension"
+                    // NOTE: Do NOT skip BusinessServices, CTLazuliSupport, TeaFoundation - might be game's!
+                ];
+                
+                // For Swift module classes, check if module is known Apple module
                 if ([clsName containsString:@"."]) {
                     NSArray *parts = [clsName componentsSeparatedByString:@"."];
                     NSString *moduleName = parts.firstObject;
-                    // Known Apple/Swift modules to skip
-                    NSArray *appleModules = @[
-                        @"StocksCore", @"TipsCore", @"VisualLookUp", @"RealityKit",
-                        @"RealityFoundation", @"FinanceKit", @"PegasusConfiguration",
-                        @"TeaFoundation", @"BusinessServices",  // Wait - might be game's!
-                        @"CTLazuliSupport"  // Wait - might be game's!
-                    ];
-                    // Actually, let's NOT skip module-based classes - they're likely the game's
-                    // Only skip if the class name itself (after the dot) starts with system prefix
-                    if (parts.count >= 2) {
+                    for (NSString *appleMod in appleSwiftModules) {
+                        if ([moduleName isEqualToString:appleMod] || 
+                            [moduleName hasPrefix:appleMod]) {
+                            isSystemClass = YES;
+                            break;
+                        }
+                    }
+                    // Also check if class name part starts with system prefix
+                    if (!isSystemClass && parts.count >= 2) {
                         NSString *classNamePart = parts[1];
                         for (NSString *prefix in systemPrefixes) {
                             if ([classNamePart hasPrefix:prefix]) {
