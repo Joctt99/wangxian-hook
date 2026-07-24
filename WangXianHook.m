@@ -1942,45 +1942,45 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
         }
-    }
-    
-    // v35.65: Intercept standalone 0x802EE118 response (server list)
-    // From logs: [RECV] fd=105 ... cmd=0x802EE118 pktLen=13 (empty server list)
-    // The 0x802EE118 is returned separately, NOT nested in 0x8000E002
-    if (cmd == 0x802EE118 && port == 5678 && ret < 30) {
-        DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (empty, %zd bytes)", ret);
         
-        const unsigned char mockServerList[] = {
-            0x00, 0x00, 0x00, 0x7D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=125, cmd=0x802EE118
-            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
-            0x00, 0x01, // server count = 1
-            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
-            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
-            0x00, 0x01, 0x31, // serverType = "1"
-            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
-            0x00, 0x10, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "测试a123" (16 bytes)
-            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
-            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
-            0x00, 0x01, 0x31, // status = "1"
-            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
-            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
-        };
-        
-        size_t mockLen = sizeof(mockServerList);
-        if (len >= mockLen) {
-            memcpy((unsigned char *)buf, mockServerList, mockLen);
-            DLOG(@"[WXHOOK] ✅ Replaced empty 0x802EE118 with mock server list (%zu bytes)", mockLen);
-            return (ssize_t)mockLen;
-        } else {
-            DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
+        // v35.65: Intercept standalone 0x802EE118 response (server list)
+        // From logs: [RECV] fd=105 ... cmd=0x802EE118 pktLen=13 (empty server list)
+        // The 0x802EE118 is returned separately, NOT nested in 0x8000E002
+        if (cmd == 0x802EE118 && port == 5678 && ret < 30) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (empty, %zd bytes)", ret);
+            
+            const unsigned char mockServerList[] = {
+                0x00, 0x00, 0x00, 0x7D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=125, cmd=0x802EE118
+                0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
+                0x00, 0x01, // server count = 1
+                0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
+                0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
+                0x00, 0x01, 0x31, // serverType = "1"
+                0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
+                0x00, 0x10, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "测试a123" (16 bytes)
+                0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
+                0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
+                0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
+                0x00, 0x01, 0x31, // status = "1"
+                0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
+                0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
+            };
+            
+            size_t mockLen = sizeof(mockServerList);
+            if (len >= mockLen) {
+                memcpy((unsigned char *)buf, mockServerList, mockLen);
+                DLOG(@"[WXHOOK] ✅ Replaced empty 0x802EE118 with mock server list (%zu bytes)", mockLen);
+                return (ssize_t)mockLen;
+            } else {
+                DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
+            }
         }
-    }
-    
-    // v35.65: Intercept 0x80000015 response (empty server list response)
-    // From logs: [RECV] fd=105 ... cmd=0x80000015 pktLen=22 (empty)
-    if (cmd == 0x80000015 && port == 5678) {
-        DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes)", ret);
+        
+        // v35.65: Intercept 0x80000015 response (empty server list response)
+        // From logs: [RECV] fd=105 ... cmd=0x80000015 pktLen=22 (empty)
+        if (cmd == 0x80000015 && port == 5678) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes)", ret);
+        }
     }
     
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
@@ -3941,7 +3941,7 @@ static void installAllHooks(void) {
                 }
             }
             
-            DLOG(@"[SERVER-CLASS] Found %d server-related classes:", serverClasses.count);
+            DLOG(@"[SERVER-CLASS] Found %lu server-related classes:", (unsigned long)serverClasses.count);
             for (NSString *clsName in serverClasses) {
                 DLOG(@"[SERVER-CLASS]   %@", clsName);
             }
@@ -3996,7 +3996,7 @@ static void installAllHooks(void) {
                 }
             }
             
-            DLOG(@"[GAME-CLASS] Found %d game-specific classes:", gameClasses.count);
+            DLOG(@"[GAME-CLASS] Found %lu game-specific classes:", (unsigned long)gameClasses.count);
             for (NSString *clsName in gameClasses) {
                 DLOG(@"[GAME-CLASS]   %@", clsName);
             }
