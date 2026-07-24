@@ -1,6 +1,8 @@
 /**
- * WangXianHook v35.63 - Force SK callbacks + server list injection
- * FIX: judgeAppInfoWithBaseUrl now calls handleAppInfoResult: with fake success data
+ * WangXianHook v35.64 - Skip SK security checks entirely
+ * FIX: judgeNet now skips original, forces network available
+ * FIX: JudgeApp now skips original, forces success
+ * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
  * FIX: Intercept 0x8000E002 response and inject mock data into nested 0x802EE118
  * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server"
  * FIX: NSUserDefaults objectForKey: injects mock server data when key contains "Server"
@@ -63,7 +65,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.63 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.64 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -126,12 +128,11 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
     }
 }
 
-// 5. judgeNet - Call original, always return network available
+// 5. judgeNet - Skip original, force network available
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called -> calling original + force network available");
-    if (orig_judgeNet) orig_judgeNet(self, _cmd);
+    DLOG(@"[SK] judgeNet called -> SKIPPING original, forcing network available");
 }
 
 // 6. verifySignatureFromParameters: - Call original, but force return YES
@@ -174,8 +175,7 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 typedef void (*JudgeAppIMP)(id, SEL);
 static JudgeAppIMP orig_judgeApp = NULL;
 static void hook_judgeApp(id self, SEL _cmd) {
-    DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
-    if (orig_judgeApp) orig_judgeApp(self, _cmd);
+    DLOG(@"[SC] SignatureCheck.JudgeApp called -> SKIPPING original, forcing success");
 }
 
 typedef void (*ShowTipIMP)(id, SEL, id);
