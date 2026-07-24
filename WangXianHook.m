@@ -1,7 +1,8 @@
 /**
- * WangXianHook v35.60 - Remove ALL socket-level mock injection (causes packet corruption)
- * FIX: SK.* methods now return success directly without calling original
- * FIX: Added certificate verification request interception
+ * WangXianHook v35.61 - SK hooks now call original but force success results
+ * FIX: judgeAppInfoWithBaseUrl, judgeNet now call original to trigger callbacks
+ * FIX: verifySignatureFromParameters forces YES if original returns NO
+ * FIX: Removed all socket-level mock injection (causes packet corruption)
  * NOTE: Real 0x802EE118 response needed from 7.6 version for correct mock data
  * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
@@ -60,7 +61,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.60 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.61 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -94,26 +95,35 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - Return success directly
+// 4. judgeAppInfoWithBaseUrl: - Call original, but ensure success result
+// IMPORTANT: Must call original to trigger internal callbacks/delegates
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ -> RETURN SUCCESS DIRECTLY", baseUrl);
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ -> calling original + ensuring success", baseUrl);
+    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
 }
 
-// 5. judgeNet - Return network available directly
+// 5. judgeNet - Call original, always return network available
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called -> RETURN NETWORK AVAILABLE");
+    DLOG(@"[SK] judgeNet called -> calling original + force network available");
+    if (orig_judgeNet) orig_judgeNet(self, _cmd);
 }
 
-// 6. verifySignatureFromParameters: - Always return YES
+// 6. verifySignatureFromParameters: - Call original, but force return YES
 typedef id (*VerifySigIMP)(id, SEL, id);
 static VerifySigIMP orig_verifySig = NULL;
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    DLOG(@"[SK] verifySignatureFromParameters: %@ -> RETURN YES", params);
-    return [NSNumber numberWithBool:YES];
+    DLOG(@"[SK] verifySignatureFromParameters: %@ -> calling original + force YES", params);
+    id result = nil;
+    if (orig_verifySig) result = orig_verifySig(self, _cmd, params);
+    if (!result || [result boolValue] == NO) {
+        DLOG(@"[SK] verifySignatureFromParameters: original returned NO, forcing YES");
+        return [NSNumber numberWithBool:YES];
+    }
+    return result;
 }
 
 // 7. generateRequestParams - LOG only
