@@ -1,8 +1,10 @@
 /**
- * WangXianHook v35.75 - Debug Swift class method dump + fix 0x802EE118 pktLen check
- * FIX: Check pktLenBE < 30 instead of ret < 30 for standalone 0x802EE118
+ * WangXianHook v35.76 - TEST: Disable send version replacement to diagnose "no network"
+ * TEST: Temporarily DISABLE send version replacement (7.6.2 -> 7.7.0)
+ *       to verify if version tampering causes empty server list / "no network" error
+ * FIX: Keep response-side patches (PROTO-R-PATCH for 0x802EE121, etc.)
  * FIX: Dump ALL methods of target Swift classes to see what methods they have
- * FIX: targetClasses defined before hookNetworkClass block (no undefined variable)
+ * FIX: Check pktLenBE < 30 instead of ret < 30 for standalone 0x802EE118
  * FIX: Multi-pass scanning + direct class hooks + class method hooks
  * FIX: Properly inject full mock server list into nested 0x802EE118
  * FIX: NetworkReachabilityProvider.isReachable -> YES
@@ -78,7 +80,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.75 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.76 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1503,7 +1505,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // Pattern 2: "7.6.2" without length prefix
     // Login server (5678) also checks version in send packets, not just response
     // Game server (12003) encrypts version, so need to replace before encryption too
-    if ((port == 5678 || port == 12003) && sendLen >= 5 && sendBuf == buf) {
+    // v35.76 TEST: DISABLED to diagnose if version tampering causes "no network" error
+    if (0 && (port == 5678 || port == 12003) && sendLen >= 5 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         const unsigned char verPatternWithPrefix[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
         const unsigned char verPatternSimple[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
@@ -3019,7 +3022,9 @@ static CFDataRef hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm a
     const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
     CFDataRef modifiedData = plainText;
     
-    if (len >= 7) {
+    // v35.76 TEST: DISABLE version replacement in SecKeyCreateEncryptedData
+    // to verify if version tampering causes "no network" error
+    if (0 && len >= 7) {
         BOOL found = NO;
         for (CFIndex i = 0; i + 7 <= len; i++) {
             if (memcmp(data + i, verPattern, 7) == 0) { found = YES; break; }
