@@ -115,7 +115,12 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
     DLOG(@"[SK] judgeAppInfoWithBaseUrl: calling handleAppInfoResult: with fake success");
     Class skCls = NSClassFromString(@"SignatureKit");
     if (skCls) {
-        [skCls handleAppInfoResult:successResult];
+        SEL sel = NSSelectorFromString(@"handleAppInfoResult:");
+        if ([skCls respondsToSelector:sel]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(skCls, sel, successResult);
+        } else {
+            DLOG(@"[SK] judgeAppInfoWithBaseUrl: SK doesn't respond to handleAppInfoResult:");
+        }
     } else {
         DLOG(@"[SK] judgeAppInfoWithBaseUrl: SK class not found, cannot call handleAppInfoResult");
     }
