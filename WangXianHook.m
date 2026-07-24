@@ -1,9 +1,11 @@
 /**
- * WangXianHook v35.64 - Skip SK security checks entirely
+ * WangXianHook v35.65 - Intercept standalone responses + game class scan
  * FIX: judgeNet now skips original, forces network available
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
- * FIX: Intercept 0x8000E002 response and inject mock data into nested 0x802EE118
+ * FIX: Intercept standalone 0x802EE118 response (not nested) and inject mock server list
+ * FIX: Intercept 0x80000015 response for logging
+ * FIX: Added GAME-CLASS scan filtering Apple framework classes
  * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server"
  * FIX: NSUserDefaults objectForKey: injects mock server data when key contains "Server"
  * FIX: UITableView numberOfRowsInSection: forces 1 row when server list is empty
@@ -65,7 +67,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.64 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.65 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1940,6 +1942,45 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
         }
+    }
+    
+    // v35.65: Intercept standalone 0x802EE118 response (server list)
+    // From logs: [RECV] fd=105 ... cmd=0x802EE118 pktLen=13 (empty server list)
+    // The 0x802EE118 is returned separately, NOT nested in 0x8000E002
+    if (cmd == 0x802EE118 && port == 5678 && ret < 30) {
+        DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (empty, %zd bytes)", ret);
+        
+        const unsigned char mockServerList[] = {
+            0x00, 0x00, 0x00, 0x7D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=125, cmd=0x802EE118
+            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
+            0x00, 0x01, // server count = 1
+            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
+            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
+            0x00, 0x01, 0x31, // serverType = "1"
+            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
+            0x00, 0x10, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "测试a123" (16 bytes)
+            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
+            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
+            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
+            0x00, 0x01, 0x31, // status = "1"
+            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
+            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
+        };
+        
+        size_t mockLen = sizeof(mockServerList);
+        if (len >= mockLen) {
+            memcpy((unsigned char *)buf, mockServerList, mockLen);
+            DLOG(@"[WXHOOK] ✅ Replaced empty 0x802EE118 with mock server list (%zu bytes)", mockLen);
+            return (ssize_t)mockLen;
+        } else {
+            DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
+        }
+    }
+    
+    // v35.65: Intercept 0x80000015 response (empty server list response)
+    // From logs: [RECV] fd=105 ... cmd=0x80000015 pktLen=22 (empty)
+    if (cmd == 0x80000015 && port == 5678) {
+        DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes)", ret);
     }
     
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
@@ -3903,6 +3944,61 @@ static void installAllHooks(void) {
             DLOG(@"[SERVER-CLASS] Found %d server-related classes:", serverClasses.count);
             for (NSString *clsName in serverClasses) {
                 DLOG(@"[SERVER-CLASS]   %@", clsName);
+            }
+            
+            // v35.65: Scan for GAME-SPECIFIC classes only (filter out Apple framework classes)
+            // Apple framework prefixes: NS, UI, WK, SK, AV, CA, CF, CG, CL, CN, CK,
+            //                          MK, GL, AL, AV, BN, BT, CB, CM, CP, CR, CS,
+            //                          DA, DV, EA, FB, GC, GE, GL, GN, HB, HM, HW,
+            //                          ID, IM, IN, IX, NW, PB, PK, RP, SU, SC, ST,
+            //                          TS, TZ, UD, VC, VS, WK, WI, XC, XPC, _FB, _GC,
+            //                          _IX, _NSSQL, _Tt, AWDSiri, CMCapture, Core, Fig,
+            //                          ExtensionFoundation, LPMediaAssetFetcher, NRMock,
+            //                          SUCore, WebKit, XCTest, etc.
+            NSMutableArray *gameClasses = [NSMutableArray array];
+            NSArray *applePrefixes = @[
+                @"NS", @"UI", @"WK", @"SK", @"AV", @"CA", @"CF", @"CG", @"CL", @"CN", @"CK",
+                @"MK", @"GL", @"AL", @"BN", @"BT", @"CB", @"CM", @"CP", @"CR", @"CS",
+                @"DA", @"DV", @"EA", @"FB", @"GC", @"GE", @"GN", @"HB", @"HM", @"HW",
+                @"ID", @"IM", @"IN", @"IX", @"NW", @"PB", @"PK", @"RP", @"SU", @"SC", @"ST",
+                @"TS", @"TZ", @"UD", @"VC", @"VS", @"WI", @"XC", @"AWDSiri", @"CMCapture",
+                @"Core", @"Fig", @"ExtensionFoundation", @"LPMediaAssetFetcher", @"NRMock",
+                @"SUCore", @"WebKit", @"XCTest", @"_FB", @"_GC", @"_IX", @"_NSSQL", @"_Tt",
+                @"NSXPC", @"BSXPC", @"NWLink", @"PBServer", @"IXServer", @"WISServer",
+                @"SUCoreConnect", @"AWDSiri", @"FigPWD", @"CMCapture", @"STSNDEF", @"INCar",
+                @"INConnected", @"INSend", @"DAD", @"Frida", @"Substrate", @"Cydia", @"MobileSubstrate"
+            ];
+            
+            for (unsigned int i = 0; i < classCount; i++) {
+                Class cls = classes[i];
+                NSString *clsName = NSStringFromClass(cls);
+                if (!clsName) continue;
+                
+                BOOL isAppleClass = NO;
+                for (NSString *prefix in applePrefixes) {
+                    if ([clsName hasPrefix:prefix]) {
+                        isAppleClass = YES;
+                        break;
+                    }
+                }
+                
+                if (!isAppleClass) {
+                    NSString *lower = [clsName lowercaseString];
+                    if ([lower containsString:@"server"] || [lower containsString:@"login"] ||
+                        [lower containsString:@"net"] || [lower containsString:@"game"] ||
+                        [lower containsString:@"proto"] || [lower containsString:@"packet"] ||
+                        [lower containsString:@"message"] || [lower containsString:@"handler"] ||
+                        [lower containsString:@"account"] || [lower containsString:@"user"] ||
+                        [lower containsString:@"session"] || [lower containsString:@"connect"] ||
+                        [lower containsString:@"meshi"] || [lower containsString:@"wangxian"]) {
+                        [gameClasses addObject:clsName];
+                    }
+                }
+            }
+            
+            DLOG(@"[GAME-CLASS] Found %d game-specific classes:", gameClasses.count);
+            for (NSString *clsName in gameClasses) {
+                DLOG(@"[GAME-CLASS]   %@", clsName);
             }
             
             if (classes) free(classes);
