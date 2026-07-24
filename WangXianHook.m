@@ -1836,10 +1836,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
     if (ret <= 0) {
-        const char *host = ""; int port = 0;
-        for (int i = 0; i < g_trackedCount; i++) {
-            if (g_trackedFds[i] == fd && g_trackedActive[i]) { host = g_trackedHosts[i]; port = g_trackedPorts[i]; break; }
-        }
         if (ret == 0) {
             DLOG(@"[RECV-CLOSE] fd=%d %s:%d ret=0 (server closed connection gracefully)", fd, host, port);
         } else {
