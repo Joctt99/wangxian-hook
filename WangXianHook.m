@@ -3081,7 +3081,6 @@ static void installAllHooks(void) {
     // Game uses UIDevice(APEX) category to get version and device info
     // currentVersion is used for server version check (not NSBundle!)
     // isJailbroken is used for jailbreak detection
-    Class uidCls = [UIDevice class];
     Class apexCls = NSClassFromString(@"UIDevice(APEX)");
     if (apexCls) {
         Class metaCls = object_getClass(apexCls);
