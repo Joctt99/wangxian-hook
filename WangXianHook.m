@@ -18,6 +18,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <zlib.h>
