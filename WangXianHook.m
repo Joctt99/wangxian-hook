@@ -1878,13 +1878,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         // v35.57: Handle 0x802EE118 response - inject mock server list
         // PROTOCOL FLOW: Client sends 0x00000015 -> Server returns 0x802EE118 (server list)
-        // PROBLEM: Server returns empty 0x802EE118 (pktLen=13), causing game to get no server info
-        // SOLUTION: Replace the empty body with mock server list data, update pktLen accordingly
+        // PROBLEM: Server returns empty 0x802EE118 (pktLenBE=13), causing game to get no server info
+        // SOLUTION: Replace the empty body with mock server list data, update pktLenBE accordingly
         if (cmd == 0x802EE118 && port == 5678) {
-            DLOG(@"[PROTO-R] 0x802EE118 response received (server list), pktLen=%u ret=%zd", pktLen, ret);
+            DLOG(@"[PROTO-R] 0x802EE118 response received (server list), pktLenBE=%u ret=%zd", pktLenBE, ret);
             
-            if (pktLen < 20) {
-                DLOG(@"[PROTO-R-PATCH] Server list empty (pktLen=%u), injecting mock data", pktLen);
+            if (pktLenBE < 20) {
+                DLOG(@"[PROTO-R-PATCH] Server list empty (pktLenBE=%u), injecting mock data", pktLenBE);
                 
                 const unsigned char mockServerList[] = {
                     0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
