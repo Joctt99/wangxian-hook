@@ -1,10 +1,9 @@
 /**
- * WangXianHook v35.72 - Unblock BusinessServices/CTLazuliSupport/TeaFoundation in scan
+ * WangXianHook v35.73 - Fix nested server list injection + delayed scan at 6s
+ * FIX: Properly inject full mock server list into nested 0x802EE118 (was only 5 bytes garbage)
+ * FIX: Update both inner (nested) and outer pktLen when expanding server list
+ * FIX: Move REACH-SCAN to 6s to catch BusinessServices/CTLazuliSupport classes
  * FIX: No longer skip BusinessServices, CTLazuliSupport, TeaFoundation Swift modules
- * FIX: Deferred scan at 2s to catch Swift classes loaded after init
- * FIX: Smart filtering for Swift module classes (Module.ClassName format)
- * FIX: Only hook methods with BOOL/int return type (avoids crashing object-return methods)
- * FIX: 0x80000015 response now keeps cmd=0x80000015 (not changed to 0x802EE118)
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
  * FIX: Any method containing reachable/connected/available -> returns YES
@@ -78,7 +77,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.72 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.73 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1937,8 +1936,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.63: Intercept 0x8000E002 response and inject mock server list into nested 0x802EE118
-        // Approach: Find the nested 0x802EE118 and fill in server data without changing packet length
+        // v35.72: Intercept 0x8000E002 response and PROPERLY inject mock server list into nested 0x802EE118
+        // FIX: Previous code only injected 5 bytes of garbage string data.
+        // Now we properly construct a full server list response and update both inner and outer pktLen.
         if (cmd == 0x8000E002 && port == 5678) {
             DLOG(@"[WXHOOK] 🔥 Intercepted 0x8000E002 response, searching for nested 0x802EE118");
             
@@ -1955,23 +1955,133 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[WXHOOK] ✅ Found nested 0x802EE118 at offset %zu, pktLen=%u", i, nestedPktLen);
                     
                     if (nestedPktLen < 20) {
-                        DLOG(@"[WXHOOK] ✅ Nested server list is empty (pktLen=%u), injecting mock data", nestedPktLen);
+                        DLOG(@"[WXHOOK] ✅ Nested server list is empty (pktLen=%u), replacing with full mock data", nestedPktLen);
                         
-                        // Calculate the end of the nested packet
-                        size_t nestedEnd = i + nestedPktLen;
-                        if (nestedEnd > payloadLen) nestedEnd = payloadLen;
+                        // Build mock server list for nested 0x802EE118
+                        // Format: pktLen(4) + cmd(4) + status(?) + server_count(2) + server_data...
+                        unsigned char mockServers[256];
+                        size_t mockIdx = 0;
                         
-                        // Fill the empty server list area with mock server data (hex-encoded string format)
-                        // Format: <serverId><clientId><serverType><category><name><realname><ip><port><status><onlinePlayerNum><description>
-                        const char *mockServerStr = "1234567890123456789012345678901234567890123456789012345678901234567890";
-                        size_t mockLen = strlen(mockServerStr);
-                        size_t fillLen = nestedEnd - i - 8; // subtract header (8 bytes)
+                        // cmd = 0x802EE118 (keep original cmd)
+                        mockServers[mockIdx++] = 0x80;
+                        mockServers[mockIdx++] = 0x2E;
+                        mockServers[mockIdx++] = 0xE1;
+                        mockServers[mockIdx++] = 0x18;
                         
-                        if (fillLen > 0) {
-                            if (mockLen > fillLen) mockLen = fillLen;
-                            memset(payload + i + 8, ' ', fillLen); // Clear first
-                            memcpy(payload + i + 8, mockServerStr, mockLen);
-                            DLOG(@"[WXHOOK] ✅ Injected %zu bytes of mock server data into nested 0x802EE118", mockLen);
+                        // Status/success field (5 bytes: 00 00 00 01 01)
+                        mockServers[mockIdx++] = 0x00;
+                        mockServers[mockIdx++] = 0x00;
+                        mockServers[mockIdx++] = 0x00;
+                        mockServers[mockIdx++] = 0x01;
+                        mockServers[mockIdx++] = 0x01;
+                        
+                        // Server count = 1 (2 bytes)
+                        mockServers[mockIdx++] = 0x00;
+                        mockServers[mockIdx++] = 0x01;
+                        
+                        // Server ID: "1234" (len=4)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x04;
+                        mockServers[mockIdx++] = '1'; mockServers[mockIdx++] = '2';
+                        mockServers[mockIdx++] = '3'; mockServers[mockIdx++] = '4';
+                        
+                        // Client ID: "1234" (len=4)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x04;
+                        mockServers[mockIdx++] = '1'; mockServers[mockIdx++] = '2';
+                        mockServers[mockIdx++] = '3'; mockServers[mockIdx++] = '4';
+                        
+                        // Server Type: "1" (len=1)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x01;
+                        mockServers[mockIdx++] = '1';
+                        
+                        // Category: "一区" (len=6)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x06;
+                        mockServers[mockIdx++] = 0xE4; mockServers[mockIdx++] = 0xB8;
+                        mockServers[mockIdx++] = 0x80; mockServers[mockIdx++] = 0xE5;
+                        mockServers[mockIdx++] = 0x8C; mockServers[mockIdx++] = 0xBA;
+                        
+                        // Name: "测试123" (len=10)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x0A;
+                        mockServers[mockIdx++] = 0xE6; mockServers[mockIdx++] = 0xB5;
+                        mockServers[mockIdx++] = 0x8B; mockServers[mockIdx++] = 0xE8;
+                        mockServers[mockIdx++] = 0xAF; mockServers[mockIdx++] = 0x95;
+                        mockServers[mockIdx++] = '1'; mockServers[mockIdx++] = '2';
+                        mockServers[mockIdx++] = '3';
+                        
+                        // Real Name: "运行" (len=6)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x06;
+                        mockServers[mockIdx++] = 0xE8; mockServers[mockIdx++] = 0xBF;
+                        mockServers[mockIdx++] = 0x90; mockServers[mockIdx++] = 0xE8;
+                        mockServers[mockIdx++] = 0xA1; mockServers[mockIdx++] = 0x8C;
+                        
+                        // IP: "139.224.129.92" (len=14)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x0E;
+                        const char *ipStr = "139.224.129.92";
+                        memcpy(mockServers + mockIdx, ipStr, 14);
+                        mockIdx += 14;
+                        
+                        // Port: "12003" (len=5)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x05;
+                        const char *portStr = "12003";
+                        memcpy(mockServers + mockIdx, portStr, 5);
+                        mockIdx += 5;
+                        
+                        // Status: "1" (len=1)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x01;
+                        mockServers[mockIdx++] = '1';
+                        
+                        // Online Player Num: "1000" (len=4)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x04;
+                        const char *onlineStr = "1000";
+                        memcpy(mockServers + mockIdx, onlineStr, 4);
+                        mockIdx += 4;
+                        
+                        // Description: "运行" (len=6)
+                        mockServers[mockIdx++] = 0x00; mockServers[mockIdx++] = 0x06;
+                        mockServers[mockIdx++] = 0xE8; mockServers[mockIdx++] = 0xBF;
+                        mockServers[mockIdx++] = 0x90; mockServers[mockIdx++] = 0xE8;
+                        mockServers[mockIdx++] = 0xA1; mockServers[mockIdx++] = 0x8C;
+                        
+                        size_t mockDataLen = mockIdx; // includes cmd (4), excludes pktLen (4)
+                        size_t mockPktLen = mockDataLen + 4; // total pktLen including pktLen field
+                        
+                        // Check if buffer is big enough for the expanded data
+                        size_t oldNestedEnd = i + nestedPktLen;
+                        size_t newNestedEnd = i + mockPktLen;
+                        int sizeDiff = (int)(newNestedEnd - oldNestedEnd);
+                        
+                        if (ret + sizeDiff <= (ssize_t)len) {
+                            unsigned char *b = (unsigned char *)buf;
+                            
+                            // Move data after the nested packet to make room
+                            if (sizeDiff > 0 && oldNestedEnd < payloadLen) {
+                                size_t bytesToMove = payloadLen - oldNestedEnd;
+                                memmove(payload + newNestedEnd, payload + oldNestedEnd, bytesToMove);
+                                DLOG(@"[WXHOOK] Moved %zu bytes to expand nested packet by %d bytes", bytesToMove, sizeDiff);
+                            }
+                            
+                            // Write pktLen at start of nested packet
+                            payload[i] = (mockPktLen >> 24) & 0xFF;
+                            payload[i+1] = (mockPktLen >> 16) & 0xFF;
+                            payload[i+2] = (mockPktLen >> 8) & 0xFF;
+                            payload[i+3] = mockPktLen & 0xFF;
+                            
+                            // Write mock server data (cmd + payload) after pktLen
+                            memcpy(payload + i + 4, mockServers, mockDataLen);
+                            
+                            // Update outer packet's pktLen
+                            uint32_t newOuterLen = pktLenBE + sizeDiff;
+                            b[0] = (newOuterLen >> 24) & 0xFF;
+                            b[1] = (newOuterLen >> 16) & 0xFF;
+                            b[2] = (newOuterLen >> 8) & 0xFF;
+                            b[3] = newOuterLen & 0xFF;
+                            
+                            DLOG(@"[WXHOOK] ✅ Full mock server list injected! nested pktLen=%zu, outer pktLen=%u, sizeDiff=%d", 
+                                 mockPktLen, newOuterLen, sizeDiff);
+                            
+                            ret = ret + sizeDiff;
+                        } else {
+                            DLOG(@"[WXHOOK] ERROR: Buffer too small for expanded server list (need=%zd, have=%zd)", 
+                                 ret + sizeDiff, len);
                         }
                         break;
                     }
@@ -4403,8 +4513,9 @@ static void installAllHooks(void) {
     
     // === DEFERRED: Network reachability class scan + hook (v35.70) ===
     // Swift classes like BusinessServices.NetworkReachabilityProvider are NOT loaded yet
-    // when installAllHooks runs. We scan 2 seconds after launch to find and hook them.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // when installAllHooks runs. We scan 6 seconds after launch to find and hook them.
+    // NOTE: Moved from 2s to 6s because some classes load later (GAME-CLASS scan runs at 5s)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try {
             DLOG(@"[REACH-SCAN] Starting deferred network class scan...");
             
