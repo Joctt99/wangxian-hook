@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.39 - FIX: Hook NSBundle.objectForInfoDictionaryKey to fake higher app version (7.6.2 -> 7.7.0)
+ * WangXianHook v35.41 - FIX: Hook UIDevice(APEX).currentVersion to fake 7.7.0 (game uses APEX, not NSBundle)
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.38 ===");
+        _log(@"=== WXHook v35.41 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.38 UUID修复";
+            lbl.text = @"WXHook v35.41 APEX";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
