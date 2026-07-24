@@ -1,13 +1,17 @@
 /**
- * WangXianHook v35.65 - Intercept standalone responses + game class scan
+ * WangXianHook v35.66 - Comprehensive network reachability hooks
  * FIX: judgeNet now skips original, forces network available
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
  * FIX: Intercept standalone 0x802EE118 response (not nested) and inject mock server list
  * FIX: Intercept 0x80000015 response for logging
  * FIX: Added GAME-CLASS scan filtering Apple framework classes
+ * FIX: Hook SCNetworkReachabilityGetFlags -> force kSCNetworkReachabilityFlagsReachable
+ * FIX: Hook Reachability class (currentReachabilityStatus, isReachable, isReachableViaWiFi/WWAN)
+ * FIX: Hook AFNetworkReachabilityManager (isReachable, networkReachabilityStatus)
+ * FIX: NSUserDefaults network-related keys -> force YES/reachable
+ * FIX: Auto-scan and hook all classes containing Network/Reach/Connect/WiFi
  * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server"
- * FIX: NSUserDefaults objectForKey: injects mock server data when key contains "Server"
  * FIX: UITableView numberOfRowsInSection: forces 1 row when server list is empty
  * NOTE: Real 0x802EE118 response needed from 7.6 version for correct mock data
  * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
@@ -67,7 +71,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.65 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.66 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1304,6 +1308,27 @@ static WriteFunc orig_write = NULL;
 static ReadFunc orig_read = NULL;
 static CloseFunc orig_close = NULL;
 
+// ============================================================
+#pragma mark - Network Reachability Hooks
+// ============================================================
+
+// SCNetworkReachabilityGetFlags - system-level network detection
+typedef Boolean (*SCNetworkReachabilityGetFlagsFunc)(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags);
+static SCNetworkReachabilityGetFlagsFunc orig_SCNetworkReachabilityGetFlags = NULL;
+
+static Boolean hook_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
+    if (orig_SCNetworkReachabilityGetFlags) {
+        orig_SCNetworkReachabilityGetFlags(target, flags);
+    }
+    // Force return Reachable (kSCNetworkReachabilityFlagsReachable = 0x00000002)
+    if (flags) {
+        *flags = kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsConnectionRequired;
+    }
+    DLOG(@"[REACH] SCNetworkReachabilityGetFlags -> forced reachable (0x%08X)", 
+         flags ? *flags : kSCNetworkReachabilityFlagsReachable);
+    return TRUE;
+}
+
 #define MAX_TRACKED_FDS 64
 static int g_trackedFds[MAX_TRACKED_FDS];
 static char g_trackedHosts[MAX_TRACKED_FDS][64];
@@ -2445,6 +2470,13 @@ static void installSocketHooks(void) {
     if (!orig_connect) DLOG(@"[SOCK-ERROR] connect hook failed - network monitoring disabled!");
     if (!orig_send) DLOG(@"[SOCK-ERROR] send hook failed - outgoing data monitoring disabled!");
     if (!orig_recv) DLOG(@"[SOCK-ERROR] recv hook failed - incoming data monitoring disabled!");
+    
+    // v35.66: Install network reachability hooks
+    int sr = rebindSymbol("SCNetworkReachabilityGetFlags", (void *)hook_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
+    if (!orig_SCNetworkReachabilityGetFlags) {
+        orig_SCNetworkReachabilityGetFlags = (SCNetworkReachabilityGetFlagsFunc)dlsym(RTLD_NEXT, "SCNetworkReachabilityGetFlags");
+    }
+    DLOG(@"[REACH] SCNetworkReachabilityGetFlags hook: %d, orig=%p", sr, orig_SCNetworkReachabilityGetFlags);
 }
 
 // ============================================================
@@ -2894,6 +2926,19 @@ static ObjForKeyIMP orig_objectForKey = NULL;
 static int g_nsudCount = 0;
 static id hook_objectForKey(id self, SEL _cmd, NSString *key) {
     id val = orig_objectForKey ? orig_objectForKey(self, _cmd, key) : nil;
+    
+    NSString *lowerKey = [key lowercaseString];
+    
+    if ([lowerKey containsString:@"network"] || [lowerKey containsString:@"net"] ||
+        [lowerKey containsString:@"reachability"] || [lowerKey containsString:@"reachable"] ||
+        [lowerKey containsString:@"connect"] || [lowerKey containsString:@"connection"] ||
+        [lowerKey containsString:@"wifi"] || [lowerKey containsString:@"wwan"] ||
+        [lowerKey containsString:@"internet"]) {
+        if (!val || ([val isKindOfClass:[NSNumber class]] && [(NSNumber *)val boolValue] == NO)) {
+            DLOG(@"[WXHOOK] ✅ NSUserDefaults objectForKey:'%@' network key, forcing reachable", key);
+            return @(YES);
+        }
+    }
     
     if ([key containsString:@"Server"] || [key containsString:@"server"]) {
         if (!val || ([val isKindOfClass:[NSArray class]] && [(NSArray *)val count] == 0)) {
@@ -3533,6 +3578,176 @@ static void installAllHooks(void) {
         if (methods) free(methods);
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+    }
+    
+    // === IMMEDIATE: Network Reachability Hooks ===
+    // v35.66: Hook system and third-party network detection classes
+    // 1. Reachability class (Apple's Reachability or third-party)
+    Class reachabilityCls = NSClassFromString(@"Reachability");
+    if (reachabilityCls) {
+        DLOG(@"[REACH] Found Reachability class");
+        
+        // Hook currentReachabilityStatus - return Reachable (1)
+        Method m_status = class_getInstanceMethod(reachabilityCls, @selector(currentReachabilityStatus));
+        if (m_status) {
+            IMP new_status_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] Reachability.currentReachabilityStatus -> forced Reachable (1)");
+                return (NSInteger)1;
+            });
+            method_setImplementation(m_status, new_status_imp);
+            DLOG(@"[REACH] Hooked Reachability.currentReachabilityStatus");
+        }
+        
+        // Hook isReachable - return YES
+        Method m_reachable = class_getInstanceMethod(reachabilityCls, @selector(isReachable));
+        if (m_reachable) {
+            IMP new_reachable_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] Reachability.isReachable -> forced YES");
+                return YES;
+            });
+            method_setImplementation(m_reachable, new_reachable_imp);
+            DLOG(@"[REACH] Hooked Reachability.isReachable");
+        }
+        
+        // Hook isReachableViaWiFi
+        Method m_wifi = class_getInstanceMethod(reachabilityCls, @selector(isReachableViaWiFi));
+        if (m_wifi) {
+            IMP new_wifi_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] Reachability.isReachableViaWiFi -> forced YES");
+                return YES;
+            });
+            method_setImplementation(m_wifi, new_wifi_imp);
+            DLOG(@"[REACH] Hooked Reachability.isReachableViaWiFi");
+        }
+        
+        // Hook isReachableViaWWAN
+        Method m_wwan = class_getInstanceMethod(reachabilityCls, @selector(isReachableViaWWAN));
+        if (m_wwan) {
+            IMP new_wwan_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] Reachability.isReachableViaWWAN -> forced YES");
+                return YES;
+            });
+            method_setImplementation(m_wwan, new_wwan_imp);
+            DLOG(@"[REACH] Hooked Reachability.isReachableViaWWAN");
+        }
+    }
+    
+    // 2. AFNetworkReachabilityManager (AFNetworking)
+    Class afManagerCls = NSClassFromString(@"AFNetworkReachabilityManager");
+    if (afManagerCls) {
+        DLOG(@"[REACH] Found AFNetworkReachabilityManager class");
+        
+        // Hook isReachable - return YES
+        Method m_isReachable = class_getInstanceMethod(afManagerCls, @selector(isReachable));
+        if (m_isReachable) {
+            IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] AFNetworkReachabilityManager.isReachable -> forced YES");
+                return YES;
+            });
+            method_setImplementation(m_isReachable, new_imp);
+            DLOG(@"[REACH] Hooked AFNetworkReachabilityManager.isReachable");
+        }
+        
+        // Hook networkReachabilityStatus - return Reachable
+        Method m_status = class_getInstanceMethod(afManagerCls, @selector(networkReachabilityStatus));
+        if (m_status) {
+            IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                DLOG(@"[REACH] AFNetworkReachabilityManager.networkReachabilityStatus -> forced Reachable");
+                return (NSInteger)1;
+            });
+            method_setImplementation(m_status, new_imp);
+            DLOG(@"[REACH] Hooked AFNetworkReachabilityManager.networkReachabilityStatus");
+        }
+    }
+    
+    // === IMMEDIATE: Scan and Hook ALL classes containing Network/Reach/Connect ===
+    // v35.66: Search for custom network detection classes used by the app
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    if (allClasses) {
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class cls = allClasses[i];
+            NSString *clsName = NSStringFromClass(cls);
+            if (!clsName) continue;
+            
+            NSString *lowerName = [clsName lowercaseString];
+            if ([lowerName containsString:@"network"] || [lowerName containsString:@"reach"] ||
+                [lowerName containsString:@"connect"] || [lowerName containsString:@"netstatus"] ||
+                [lowerName containsString:@"internet"] || [lowerName containsString:@"wifi"]) {
+                
+                // Skip Apple framework classes
+                BOOL isAppleClass = NO;
+                NSArray *applePrefixes = @[@"NS", @"UI", @"WK", @"SK", @"AV", @"CA", @"CF", @"CG",
+                                          @"MK", @"GL", @"AL", @"BN", @"BT", @"CB", @"CM", @"CP",
+                                          @"ID", @"IM", @"IN", @"IX", @"NW", @"PB", @"PK", @"RP",
+                                          @"SU", @"SC", @"ST", @"TS", @"TZ", @"UD", @"VC", @"VS",
+                                          @"WI", @"XC", @"AWDSiri", @"CMCapture", @"Core", @"Fig",
+                                          @"_FB", @"_GC", @"_IX", @"_Tt", @"NSXPC", @"BSXPC", @"NWLink"];
+                for (NSString *prefix in applePrefixes) {
+                    if ([clsName hasPrefix:prefix]) {
+                        isAppleClass = YES;
+                        break;
+                    }
+                }
+                
+                if (!isAppleClass) {
+                    DLOG(@"[NET-CLASS] Found network-related class: %@", clsName);
+                    
+                    // Hook all methods returning BOOL or NSInteger
+                    unsigned int mcount = 0;
+                    Method *methods = class_copyMethodList(cls, &mcount);
+                    for (unsigned int j = 0; j < mcount; j++) {
+                        SEL sel = method_getName(methods[j]);
+                        NSString *selName = NSStringFromSelector(sel);
+                        
+                        if ([selName containsString:@"reachable"] || [selName containsString:@"Reachable"] ||
+                            [selName containsString:@"connected"] || [selName containsString:@"Connected"] ||
+                            [selName containsString:@"status"] || [selName containsString:@"Status"] ||
+                            [selName containsString:@"available"] || [selName containsString:@"Available"] ||
+                            [selName containsString:@"network"] || [selName containsString:@"Network"] ||
+                            [selName containsString:@"internet"] || [selName containsString:@"Internet"] ||
+                            [selName containsString:@"wifi"] || [selName containsString:@"WiFi"]) {
+                            
+                            DLOG(@"[NET-CLASS]   Instance method to hook: -[%@ %@]", clsName, selName);
+                            
+                            IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                                DLOG(@"[NET-HOOK] -[%@ %@] -> forced YES/Reachable", clsName, selName);
+                                return (BOOL)YES;
+                            });
+                            method_setImplementation(methods[j], new_imp);
+                        }
+                    }
+                    if (methods) free(methods);
+                    
+                    // Also check class methods
+                    Class metaCls = object_getClass(cls);
+                    Method *classMethods = class_copyMethodList(metaCls, &mcount);
+                    for (unsigned int j = 0; j < mcount; j++) {
+                        SEL sel = method_getName(classMethods[j]);
+                        NSString *selName = NSStringFromSelector(sel);
+                        
+                        if ([selName containsString:@"reachable"] || [selName containsString:@"Reachable"] ||
+                            [selName containsString:@"connected"] || [selName containsString:@"Connected"] ||
+                            [selName containsString:@"status"] || [selName containsString:@"Status"] ||
+                            [selName containsString:@"available"] || [selName containsString:@"Available"] ||
+                            [selName containsString:@"network"] || [selName containsString:@"Network"] ||
+                            [selName containsString:@"internet"] || [selName containsString:@"Internet"] ||
+                            [selName containsString:@"wifi"] || [selName containsString:@"WiFi"]) {
+                            
+                            DLOG(@"[NET-CLASS]   Class method to hook: +[%@ %@]", clsName, selName);
+                            
+                            IMP new_imp = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                                DLOG(@"[NET-HOOK] +[%@ %@] -> forced YES/Reachable", clsName, selName);
+                                return (BOOL)YES;
+                            });
+                            method_setImplementation(classMethods[j], new_imp);
+                        }
+                    }
+                    if (classMethods) free(classMethods);
+                }
+            }
+        }
+        free(allClasses);
     }
     
     // === IMMEDIATE: Version check bypass hooks ===
