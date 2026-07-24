@@ -1,10 +1,10 @@
 /**
- * WangXianHook v35.62 - UI-level server list injection
- * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server" and value is empty
+ * WangXianHook v35.63 - Force SK callbacks + server list injection
+ * FIX: judgeAppInfoWithBaseUrl now calls handleAppInfoResult: with fake success data
+ * FIX: Intercept 0x8000E002 response and inject mock data into nested 0x802EE118
+ * FIX: NSDictionary objectForKey: injects mock server data when key contains "Server"
  * FIX: NSUserDefaults objectForKey: injects mock server data when key contains "Server"
  * FIX: UITableView numberOfRowsInSection: forces 1 row when server list is empty
- * FIX: SK hooks now call original but force success results
- * FIX: Removed all socket-level mock injection (causes packet corruption)
  * NOTE: Real 0x802EE118 response needed from 7.6 version for correct mock data
  * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
@@ -63,7 +63,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.62 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.63 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -97,13 +97,23 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - Call original, but ensure success result
-// IMPORTANT: Must call original to trigger internal callbacks/delegates
+// 4. judgeAppInfoWithBaseUrl: - Call original, then immediately trigger success callback
+// IMPORTANT: The game may hang waiting for HTTP callback. We force success result.
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ -> calling original + ensuring success", baseUrl);
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ -> calling original + forcing success callback", baseUrl);
     if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
+    
+    // v35.63: Immediately call handleAppInfoResult: with success data to unblock the game
+    // This bypasses the HTTP request waiting phase
+    NSDictionary *successResult = @{
+        @"status": @0, @"code": @1, @"result": @"success",
+        @"NET": @"1", @"END": @0, @"OPEN": @1,
+        @"ENDTIME": @"2027-12-31 23:59:59"
+    };
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: calling handleAppInfoResult: with fake success");
+    [SK handleAppInfoResult:successResult];
 }
 
 // 5. judgeNet - Call original, always return network available
@@ -1879,8 +1889,47 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.60: Removed nested 0x802EE118 injection - causes packet corruption
-        // Real solution: capture real response from 7.6 version and use exact bytes
+        // v35.63: Intercept 0x8000E002 response and inject mock server list into nested 0x802EE118
+        // Approach: Find the nested 0x802EE118 and fill in server data without changing packet length
+        if (cmd == 0x8000E002 && port == 5678) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted 0x8000E002 response, searching for nested 0x802EE118");
+            
+            unsigned char *payload = (unsigned char *)buf + 8;
+            size_t payloadLen = (size_t)ret - 8;
+            
+            for (size_t i = 0; i + 8 <= payloadLen; i++) {
+                uint32_t nestedPktLen = ((uint32_t)payload[i] << 24) | ((uint32_t)payload[i+1] << 16) |
+                                        ((uint32_t)payload[i+2] << 8)  | (uint32_t)payload[i+3];
+                uint32_t nestedCmd = ((uint32_t)payload[i+4] << 24) | ((uint32_t)payload[i+5] << 16) |
+                                      ((uint32_t)payload[i+6] << 8)  | (uint32_t)payload[i+7];
+                
+                if (nestedCmd == 0x802EE118) {
+                    DLOG(@"[WXHOOK] ✅ Found nested 0x802EE118 at offset %zu, pktLen=%u", i, nestedPktLen);
+                    
+                    if (nestedPktLen < 20) {
+                        DLOG(@"[WXHOOK] ✅ Nested server list is empty (pktLen=%u), injecting mock data", nestedPktLen);
+                        
+                        // Calculate the end of the nested packet
+                        size_t nestedEnd = i + nestedPktLen;
+                        if (nestedEnd > payloadLen) nestedEnd = payloadLen;
+                        
+                        // Fill the empty server list area with mock server data (hex-encoded string format)
+                        // Format: <serverId><clientId><serverType><category><name><realname><ip><port><status><onlinePlayerNum><description>
+                        const char *mockServerStr = "1234567890123456789012345678901234567890123456789012345678901234567890";
+                        size_t mockLen = strlen(mockServerStr);
+                        size_t fillLen = nestedEnd - i - 8; // subtract header (8 bytes)
+                        
+                        if (fillLen > 0) {
+                            if (mockLen > fillLen) mockLen = fillLen;
+                            memset(payload + i + 8, ' ', fillLen); // Clear first
+                            memcpy(payload + i + 8, mockServerStr, mockLen);
+                            DLOG(@"[WXHOOK] ✅ Injected %zu bytes of mock server data into nested 0x802EE118", mockLen);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
     
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
