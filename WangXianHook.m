@@ -1,9 +1,9 @@
 /**
- * WangXianHook v35.74 - Multi-scan + direct Swift class hooks
- * FIX: Multi-pass scanning at 3s, 6s, 10s to catch late-loaded Swift classes
- * FIX: Direct hook known Swift classes: BusinessServices.NetworkReachabilityProvider, etc.
- * FIX: Expanded method name matching (status, connected, reachable, available)
- * FIX: Also hook class methods (+ method) not just instance methods
+ * WangXianHook v35.75 - Debug Swift class method dump + fix 0x802EE118 pktLen check
+ * FIX: Check pktLenBE < 30 instead of ret < 30 for standalone 0x802EE118
+ * FIX: Dump ALL methods of target Swift classes to see what methods they have
+ * FIX: targetClasses defined before hookNetworkClass block (no undefined variable)
+ * FIX: Multi-pass scanning + direct class hooks + class method hooks
  * FIX: Properly inject full mock server list into nested 0x802EE118
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
@@ -78,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.74 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.75 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2093,8 +2093,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // v35.65: Intercept standalone 0x802EE118 response (server list)
         // From logs: [RECV] fd=105 ... cmd=0x802EE118 pktLen=13 (empty server list)
         // The 0x802EE118 is returned separately, NOT nested in 0x8000E002
-        if (cmd == 0x802EE118 && port == 5678 && ret < 30) {
-            DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (empty, %zd bytes)", ret);
+        // v35.74 FIX: Check pktLen < 30 instead of ret < 30 (ret can be larger due to buffering)
+        if (cmd == 0x802EE118 && port == 5678 && pktLenBE < 30) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted standalone 0x802EE118 response (pktLen=%u, ret=%zd bytes)", pktLenBE, ret);
             
             const unsigned char mockServerList[] = {
                 0x00, 0x00, 0x00, 0x7D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=125, cmd=0x802EE118
@@ -4512,9 +4513,23 @@ static void installAllHooks(void) {
         }
     });
     
-    // === DEFERRED: Network reachability class scan + hook (v35.74) ===
+    // === DEFERRED: Network reachability class scan + hook (v35.75) ===
     // Multi-pass scanning at 3s, 6s, 10s to catch late-loaded Swift classes
     // Also directly hooks known classes: BusinessServices.NetworkReachabilityProvider, etc.
+    
+    // Direct hook known target classes (MUST be defined before hookNetworkClass block)
+    NSArray *targetClasses = @[
+        @"BusinessServices.NetworkReachabilityProvider",
+        @"BusinessServices.NetworkProvider",
+        @"BusinessServices.NetworkConnectivityTrampoline",
+        @"CTLazuliSupport.NetworkMonitor",
+        @"NetworkReachabilityProvider",
+        @"NetworkMonitor",
+        @"NetworkProvider",
+        @"NetworkConnectivityTrampoline",
+        @"TeaFoundation.NetworkReachability",
+        @"TeaFoundation.NetworkMonitor"
+    ];
     
     // Helper function to hook all network status methods in a class
     void (^hookNetworkClass)(Class) = ^(Class cls) {
@@ -4522,6 +4537,48 @@ static void installAllHooks(void) {
         
         NSString *clsName = NSStringFromClass(cls);
         unsigned int methodCount = 0;
+        
+        // DEBUG: Print all methods for target classes
+        BOOL isTargetClass = NO;
+        for (NSString *target in targetClasses) {
+            if ([clsName isEqualToString:target]) {
+                isTargetClass = YES;
+                break;
+            }
+        }
+        
+        if (isTargetClass) {
+            DLOG(@"[REACH-DEBUG] === Methods in %@ ===", clsName);
+            Method *allMethods = class_copyMethodList(cls, &methodCount);
+            if (allMethods) {
+                for (unsigned int m = 0; m < methodCount; m++) {
+                    SEL sel = method_getName(allMethods[m]);
+                    NSString *methodName = NSStringFromSelector(sel);
+                    const char *retType = method_copyReturnType(allMethods[m]);
+                    NSString *retStr = retType ? [NSString stringWithUTF8String:retType] : @"?";
+                    DLOG(@"[REACH-DEBUG]   -[%@ %@] retType=%@", clsName, methodName, retStr);
+                    if (retType) free((void *)retType);
+                }
+                free(allMethods);
+            }
+            // Also print class methods
+            Class metaCls = objc_getMetaClass(class_getName(cls));
+            if (metaCls) {
+                unsigned int metaCount = 0;
+                Method *metaMethods = class_copyMethodList(metaCls, &metaCount);
+                if (metaMethods) {
+                    for (unsigned int m = 0; m < metaCount; m++) {
+                        SEL sel = method_getName(metaMethods[m]);
+                        NSString *methodName = NSStringFromSelector(sel);
+                        const char *retType = method_copyReturnType(metaMethods[m]);
+                        NSString *retStr = retType ? [NSString stringWithUTF8String:retType] : @"?";
+                        DLOG(@"[REACH-DEBUG]   +[%@ %@] retType=%@", clsName, methodName, retStr);
+                        if (retType) free((void *)retType);
+                    }
+                    free(metaMethods);
+                }
+            }
+        }
         
         // Hook instance methods
         Method *methods = class_copyMethodList(cls, &methodCount);
@@ -4638,20 +4695,6 @@ static void installAllHooks(void) {
                  clsName, instanceCount, classCount);
         }
     };
-    
-    // Direct hook known target classes
-    NSArray *targetClasses = @[
-        @"BusinessServices.NetworkReachabilityProvider",
-        @"BusinessServices.NetworkProvider",
-        @"BusinessServices.NetworkConnectivityTrampoline",
-        @"CTLazuliSupport.NetworkMonitor",
-        @"NetworkReachabilityProvider",
-        @"NetworkMonitor",
-        @"NetworkProvider",
-        @"NetworkConnectivityTrampoline",
-        @"TeaFoundation.NetworkReachability",
-        @"TeaFoundation.NetworkMonitor"
-    ];
     
     // Multi-pass scan function
     void (^runReachScan)(int) = ^(int pass) {
