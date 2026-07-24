@@ -1313,10 +1313,14 @@ static CloseFunc orig_close = NULL;
 // ============================================================
 
 // SCNetworkReachabilityGetFlags - system-level network detection
-typedef Boolean (*SCNetworkReachabilityGetFlagsFunc)(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags);
+// Using void* and uint32_t to avoid needing SystemConfiguration framework import
+#define kSCNetworkReachabilityFlagsReachable 0x00000002
+#define kSCNetworkReachabilityFlagsConnectionRequired 0x00000004
+
+typedef Boolean (*SCNetworkReachabilityGetFlagsFunc)(void *target, uint32_t *flags);
 static SCNetworkReachabilityGetFlagsFunc orig_SCNetworkReachabilityGetFlags = NULL;
 
-static Boolean hook_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
+static Boolean hook_SCNetworkReachabilityGetFlags(void *target, uint32_t *flags) {
     if (orig_SCNetworkReachabilityGetFlags) {
         orig_SCNetworkReachabilityGetFlags(target, flags);
     }
@@ -3662,11 +3666,11 @@ static void installAllHooks(void) {
     
     // === IMMEDIATE: Scan and Hook ALL classes containing Network/Reach/Connect ===
     // v35.66: Search for custom network detection classes used by the app
-    unsigned int classCount = 0;
-    Class *allClasses = objc_copyClassList(&classCount);
-    if (allClasses) {
-        for (unsigned int i = 0; i < classCount; i++) {
-            Class cls = allClasses[i];
+    unsigned int netClassCount = 0;
+    Class *netAllClasses = objc_copyClassList(&netClassCount);
+    if (netAllClasses) {
+        for (unsigned int i = 0; i < netClassCount; i++) {
+            Class cls = netAllClasses[i];
             NSString *clsName = NSStringFromClass(cls);
             if (!clsName) continue;
             
@@ -3747,7 +3751,7 @@ static void installAllHooks(void) {
                 }
             }
         }
-        free(allClasses);
+        free(netAllClasses);
     }
     
     // === IMMEDIATE: Version check bypass hooks ===
