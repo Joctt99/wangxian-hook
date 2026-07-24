@@ -1,9 +1,8 @@
 /**
- * WangXianHook v35.59 - Intercept 0x00000015 request and directly return mock server list
- * FIX: Added g_needMockServerList flag to track server list requests
- * FIX: In hook_send, detect 0x00000015 and set flag for mock response
- * FIX: In hook_recv, if flag set, bypass real recv and return mock data directly
- * FIX: Added version log at load time: "WangXianHook v35.59 loaded @ DATE TIME"
+ * WangXianHook v35.60 - Remove ALL socket-level mock injection (causes packet corruption)
+ * FIX: SK.* methods now return success directly without calling original
+ * FIX: Added certificate verification request interception
+ * NOTE: Real 0x802EE118 response needed from 7.6 version for correct mock data
  * ROOT CAUSE: Previous approaches tried to patch responses, but server returns empty/nested data
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
@@ -31,8 +30,6 @@ static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
-
-static BOOL g_needMockServerList = NO; // flag: need to return mock server list in next recv
 
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
@@ -63,7 +60,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.59 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.60 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -97,32 +94,26 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - Call original to allow normal auth flow
-// IMPORTANT: Do NOT bypass this - it breaks device authorization
-// Let the game make real requests to md5xor.com
+// 4. judgeAppInfoWithBaseUrl: - Return success directly
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (calling original)", baseUrl);
-    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ -> RETURN SUCCESS DIRECTLY", baseUrl);
 }
 
-// 5. judgeNet - Call original to let it complete
+// 5. judgeNet - Return network available directly
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called, calling original");
-    if (orig_judgeNet) orig_judgeNet(self, _cmd);
+    DLOG(@"[SK] judgeNet called -> RETURN NETWORK AVAILABLE");
 }
 
-// 6. verifySignatureFromParameters: - Call original (returns real signature result)
-// IMPORTANT: Must call original to get valid signature result, returning fake data breaks game server auth
+// 6. verifySignatureFromParameters: - Always return YES
 typedef id (*VerifySigIMP)(id, SEL, id);
 static VerifySigIMP orig_verifySig = NULL;
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    DLOG(@"[SK] verifySignatureFromParameters: calling original: %@", params);
-    if (orig_verifySig) return orig_verifySig(self, _cmd, params);
-    return nil;
+    DLOG(@"[SK] verifySignatureFromParameters: %@ -> RETURN YES", params);
+    return [NSNumber numberWithBool:YES];
 }
 
 // 7. generateRequestParams - LOG only
@@ -1421,11 +1412,6 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if (port == 5678) {
             DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
-            
-            if (cmd == 0x00000015) {
-                DLOG(@"[WXHOOK] ✅ Detected server list request (0x00000015), preparing mock response");
-                g_needMockServerList = YES;
-            }
         }
     }
     
@@ -1800,40 +1786,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v35.59: Check if we need to return mock server list
-    // If g_needMockServerList is set, intercept the next recv and return mock data
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
-    
-    if (g_needMockServerList && port == 5678) {
-        const unsigned char mockServerList[] = {
-            0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
-            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
-            0x00, 0x01, // server count = 1
-            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
-            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
-            0x00, 0x01, 0x31, // serverType = "1"
-            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
-            0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
-            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
-            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
-            0x00, 0x01, 0x31, // status = "1"
-            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
-            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
-        };
-        
-        size_t mockLen = sizeof(mockServerList);
-        if (len >= mockLen) {
-            memcpy((unsigned char *)buf, mockServerList, mockLen);
-            g_needMockServerList = NO;
-            DLOG(@"[WXHOOK] ✅ Returning mock server list (109 bytes) for 0x00000015 request");
-            return (ssize_t)mockLen;
-        } else {
-            DLOG(@"[WXHOOK] ERROR: Buffer too small for mock server list (need=%zu, have=%zu)", mockLen, len);
-            g_needMockServerList = NO;
-        }
-    }
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
     if (ret <= 0) {
@@ -1913,66 +1867,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.58: Handle nested 0x802EE118 inside 0x8000E002 response
-        // DISCOVERY: 0x802EE118 is nested INSIDE 0x8000E002 response, not a standalone response
-        // Response format: [pktLen=120][cmd=0x8000E002][data...][pktLen=13][cmd=0x802EE118][empty server list]
-        // SOLUTION: Find the nested 0x802EE118 inside 0x8000E002 and inject mock data there
-        if (cmd == 0x8000E002 && port == 5678) {
-            DLOG(@"[PROTO-R] 0x8000E002 response received, searching for nested 0x802EE118");
-            
-            unsigned char *payload = (unsigned char *)buf + 8;
-            size_t payloadLen = (size_t)ret - 8;
-            
-            for (size_t i = 0; i + 8 <= payloadLen; i++) {
-                uint32_t nestedPktLen = ((uint32_t)payload[i] << 24) | ((uint32_t)payload[i+1] << 16) |
-                                        ((uint32_t)payload[i+2] << 8)  | (uint32_t)payload[i+3];
-                uint32_t nestedCmd = ((uint32_t)payload[i+4] << 24) | ((uint32_t)payload[i+5] << 16) |
-                                      ((uint32_t)payload[i+6] << 8)  | (uint32_t)payload[i+7];
-                
-                if (nestedCmd == 0x802EE118) {
-                    DLOG(@"[PROTO-R] Found nested 0x802EE118 at offset %zu, pktLen=%u", i, nestedPktLen);
-                    
-                    if (nestedPktLen < 20) {
-                        DLOG(@"[PROTO-R-PATCH] Nested server list empty (pktLen=%u), injecting mock data", nestedPktLen);
-                        
-                        const unsigned char mockServerList[] = {
-                            0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
-                            0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
-                            0x00, 0x01, // server count = 1
-                            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
-                            0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // clientid = "1234"
-                            0x00, 0x01, 0x31, // serverType = "1"
-                            0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
-                            0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
-                            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-                            0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
-                            0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
-                            0x00, 0x01, 0x31, // status = "1"
-                            0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
-                            0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
-                        };
-                        
-                        size_t mockLen = sizeof(mockServerList);
-                        size_t insertOffset = 8 + i;
-                        
-                        if (insertOffset + mockLen <= (size_t)len) {
-                            memcpy((unsigned char *)buf + insertOffset, mockServerList, mockLen);
-                            
-                            uint32_t newOuterLen = pktLenBE - nestedPktLen + mockLen;
-                            ((unsigned char *)buf)[0] = (newOuterLen >> 24) & 0xFF;
-                            ((unsigned char *)buf)[1] = (newOuterLen >> 16) & 0xFF;
-                            ((unsigned char *)buf)[2] = (newOuterLen >> 8) & 0xFF;
-                            ((unsigned char *)buf)[3] = newOuterLen & 0xFF;
-                            
-                            DLOG(@"[PROTO-R-PATCH] Injected nested mock server list: pktLen=109, outer pktLen updated to %u", newOuterLen);
-                        } else {
-                            DLOG(@"[PROTO-R-PATCH] ERROR: Buffer too small for nested injection");
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        // v35.60: Removed nested 0x802EE118 injection - causes packet corruption
+        // Real solution: capture real response from 7.6 version and use exact bytes
     }
     
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
@@ -3097,6 +2993,20 @@ static DTReqCompIMP orig_dtwrc = NULL;
 static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, void (^comp)(NSData *, NSURLResponse *, NSError *)) {
     NSString *url = req.URL.absoluteString;
     DLOG(@"[NET] URL: %@", url);
+    
+    // v35.60: Intercept certificate verification requests
+    // cert.qunhongtech.com and certbkp.qunhongtech.com
+    if ([url containsString:@"cert.qunhongtech.com"] || [url containsString:@"certbkp.qunhongtech.com"]) {
+        DLOG(@"[NET-INTERCEPT] Certificate verification request intercepted: %@", url);
+        if (comp) {
+            NSString *mockCertResponse = @"{\"status\":0,\"code\":1,\"result\":\"success\",\"data\":{\"valid\":true,\"message\":\"certificate valid\"}}";
+            NSData *mockData = [mockCertResponse dataUsingEncoding:NSUTF8StringEncoding];
+            NSHTTPURLResponse *mockResp = [[NSHTTPURLResponse alloc] initWithURL:req.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
+            DLOG(@"[NET-INTERCEPT] Returning mock certificate success response");
+            comp(mockData, mockResp, nil);
+        }
+        return nil;
+    }
     
     // Wrap completion handler to intercept and modify response
     void (^wrappedComp)(NSData *, NSURLResponse *, NSError *) = comp;
