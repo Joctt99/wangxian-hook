@@ -3095,7 +3095,6 @@ static void installAllHooks(void) {
     // isJailbroken is used for jailbreak detection
     // NOTE: APEX is a category, so NSClassFromString may return nil during early initialization
     // Use class_getClassMethod directly on UIDevice to find category methods
-    Class uidCls = [UIDevice class];
     
     Method m = class_getClassMethod(uidCls, @selector(currentVersion));
     if (m) { orig_APEX_currentVersion = (NSString *(*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_APEX_currentVersion); _log(@"[INIT] UIDevice.currentVersion: HOOKED (fake 7.7.0)"); }
