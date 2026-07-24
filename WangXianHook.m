@@ -1,10 +1,10 @@
 /**
- * WangXianHook v35.77 - TEST: Disable ALL server list injection to diagnose
- * TEST: Disable ALL server list injection (nested + standalone + 0x80000015)
- *       to verify if "packet too big" is caused by our injection
- * TEST: Keep send version replacement DISABLED
- * FIX: Keep response-side patches (PROTO-R-PATCH for 0x802EE121, etc.)
- * FIX: Multi-pass scanning + direct class hooks + class method hooks
+ * WangXianHook v35.78 - Targeted version replacement: only replace in cmd=0x002EE121
+ * FIX: Only replace version in LOGIN request (cmd=0x002EE121), NOT in server list request
+ *      This way: server list returns normally (real version), login succeeds (fake version)
+ * FIX: Keep server list injection DISABLED (server returns real list)
+ * FIX: Keep all network reachability hooks + SK hooks
+ * FIX: PROTO-R-PATCH still active as fallback
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
  * FIX: Any method containing reachable/connected/available -> returns YES
@@ -78,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.77 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.78 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1497,51 +1497,55 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: v35.53 - Replace in ALL send packets (both login and game servers)
-    // Support multiple patterns:
-    // Pattern 1: 0x00 0x05 (length prefix) + "7.6.2" -> "7.7.0"
-    // Pattern 2: "7.6.2" without length prefix
-    // Login server (5678) also checks version in send packets, not just response
-    // Game server (12003) encrypts version, so need to replace before encryption too
-    // v35.76 TEST: DISABLED to diagnose if version tampering causes "no network" error
-    if (0 && (port == 5678 || port == 12003) && sendLen >= 5 && sendBuf == buf) {
+    // Version replacement: v35.78 - ONLY replace in LOGIN request (cmd=0x002EE121)
+    // Why: Replacing in ALL packets causes server list request to fail (empty server list / "no network")
+    //      Login server checks version in login request - only tamper that one request
+    //      Server list request uses real version -> server returns normal list
+    //      Login request uses fake version -> server returns success + valid token
+    if ((port == 5678) && sendLen >= 8 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
-        const unsigned char verPatternWithPrefix[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
-        const unsigned char verPatternSimple[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
+        uint32_t sendCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         
-        BOOL foundVer = NO;
-        for (size_t i = 0; i + 5 <= sendLen; i++) {
-            if ((i + 7 <= sendLen && memcmp(p + i, verPatternWithPrefix, 7) == 0) ||
-                memcmp(p + i, verPatternSimple, 5) == 0) {
-                foundVer = YES;
-                break;
-            }
-        }
-        
-        if (foundVer) {
-            void *newBuf = malloc(sendLen);
-            if (newBuf) {
-                memcpy(newBuf, buf, sendLen);
-                unsigned char *q = (unsigned char *)newBuf;
-                int verCnt = 0;
-                
-                for (size_t i = 0; i + 5 <= sendLen; i++) {
-                    if (i + 7 <= sendLen && memcmp(q + i, verPatternWithPrefix, 7) == 0) {
-                        q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
-                        verCnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 (with prefix) at offset %zu (port %d)", i+2, port);
-                    } else if (memcmp(q + i, verPatternSimple, 5) == 0) {
-                        q[i] = 0x37; q[i+1] = 0x2E; q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x30; // "7.7.0"
-                        verCnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 (simple) at offset %zu (port %d)", i, port);
-                    }
+        // Only replace version in LOGIN request (0x002EE121)
+        if (sendCmd == 0x002EE121) {
+            const unsigned char verPatternWithPrefix[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+            const unsigned char verPatternSimple[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
+            
+            BOOL foundVer = NO;
+            for (size_t i = 0; i + 5 <= sendLen; i++) {
+                if ((i + 7 <= sendLen && memcmp(p + i, verPatternWithPrefix, 7) == 0) ||
+                    memcmp(p + i, verPatternSimple, 5) == 0) {
+                    foundVer = YES;
+                    break;
                 }
-                
-                if (verCnt > 0) {
-                    sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total: %d version replacements (port %d)", verCnt, port);
-                } else {
-                    free(newBuf);
+            }
+            
+            if (foundVer) {
+                void *newBuf = malloc(sendLen);
+                if (newBuf) {
+                    memcpy(newBuf, buf, sendLen);
+                    unsigned char *q = (unsigned char *)newBuf;
+                    int verCnt = 0;
+                    
+                    for (size_t i = 0; i + 5 <= sendLen; i++) {
+                        if (i + 7 <= sendLen && memcmp(q + i, verPatternWithPrefix, 7) == 0) {
+                            q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
+                            verCnt++;
+                            DLOG(@"[VER-REPLACE] Login req: replaced 7.6.2 -> 7.7.0 (with prefix) at offset %zu", i+2);
+                        } else if (memcmp(q + i, verPatternSimple, 5) == 0) {
+                            q[i] = 0x37; q[i+1] = 0x2E; q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x30; // "7.7.0"
+                            verCnt++;
+                            DLOG(@"[VER-REPLACE] Login req: replaced 7.6.2 -> 7.7.0 (simple) at offset %zu", i);
+                        }
+                    }
+                    
+                    if (verCnt > 0) {
+                        sendBuf = newBuf;
+                        DLOG(@"[VER-REPLACE] Login req: %d version replacements in cmd=0x%08X", verCnt, sendCmd);
+                    } else {
+                        free(newBuf);
+                    }
                 }
             }
         }
