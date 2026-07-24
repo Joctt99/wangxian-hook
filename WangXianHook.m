@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.45 - Fix APEX hook (direct method lookup + delayed retry)
+ * WangXianHook v35.46 - Add NSBundle.infoDictionary and valueForKey hooks
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.45 ===");
+        _log(@"=== WXHook v35.46 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.45 VER-ONLY";
+            lbl.text = @"WXHook v35.46 NSBUNDLE";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2711,8 +2711,6 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
     if (key && [key isKindOfClass:[NSString class]]) {
         NSString *keyStr = (NSString *)key;
         if ([keyStr isEqualToString:@"CFBundleShortVersionString"]) {
-            // Fake version 7.7.0 to pass server version check
-            // This allows real login with valid session/ticket from login server
             static dispatch_once_t once;
             static int g_verLogCount = 0;
             if (g_verLogCount < 3) {
@@ -2727,6 +2725,43 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
                 DLOG(@"[VER-FAKE] CFBundleVersion: %@ (kept)", val);
                 g_buildLogCount++;
             }
+        }
+    }
+    return val;
+}
+
+static id (*orig_infoDictionary)(id, SEL);
+static id hook_infoDictionary(id self, SEL _cmd) {
+    id dict = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
+    if (dict && [dict isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *mutDict = [dict mutableCopy];
+        NSString *origVer = mutDict[@"CFBundleShortVersionString"];
+        if (origVer) {
+            static int g_logCount = 0;
+            if (g_logCount < 3) {
+                DLOG(@"[VER-FAKE] infoDictionary: CFBundleShortVersionString %@ -> 7.7.0", origVer);
+                g_logCount++;
+            }
+            mutDict[@"CFBundleShortVersionString"] = @"7.7.0";
+        }
+        return [mutDict copy];
+    }
+    return dict;
+}
+
+static id (*orig_valueForKey)(id, SEL, id);
+static id hook_valueForKey(id self, SEL _cmd, id key) {
+    id val = orig_valueForKey ? orig_valueForKey(self, _cmd, key) : nil;
+    
+    if ([self isKindOfClass:[NSBundle class]] && key && [key isKindOfClass:[NSString class]]) {
+        NSString *keyStr = (NSString *)key;
+        if ([keyStr isEqualToString:@"CFBundleShortVersionString"] || [keyStr isEqualToString:@"bundleVersion"]) {
+            static int g_logCount = 0;
+            if (g_logCount < 3) {
+                DLOG(@"[VER-FAKE] NSBundle.valueForKey:%@ -> 7.7.0", keyStr);
+                g_logCount++;
+            }
+            return @"7.7.0";
         }
     }
     return val;
@@ -3071,6 +3106,20 @@ static void installAllHooks(void) {
             orig_objectForInfoDictionaryKey = (id (*)(id, SEL, id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey);
             _log(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.2->7.7.0)");
+        }
+        
+        m = class_getInstanceMethod(bundleCls, @selector(infoDictionary));
+        if (m) {
+            orig_infoDictionary = (id (*)(id, SEL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_infoDictionary);
+            _log(@"[INIT] NSBundle.infoDictionary: HOOKED (version fake 7.6.2->7.7.0)");
+        }
+        
+        m = class_getInstanceMethod(bundleCls, @selector(valueForKey:));
+        if (m) {
+            orig_valueForKey = (id (*)(id, SEL, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_valueForKey);
+            _log(@"[INIT] NSBundle.valueForKey: HOOKED (version fake)");
         }
     }
 
