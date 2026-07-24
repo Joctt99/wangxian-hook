@@ -1,5 +1,5 @@
 /**
- * WangXianHook v35.47 - Remove valueForKey hook (crashes), keep infoDictionary hook
+ * WangXianHook v35.48 - Remove infoDictionary hook (infinite recursion), keep safe hooks only
  * Root cause of game server disconnect: Patching 0x802EE121 error response only cleared error text
  *   but did NOT include real login credentials (ticket/session key). Game had "fake login success"
  *   with no valid auth data, so game server rejected connection.
@@ -73,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WXHook v35.47 ===");
+        _log(@"=== WXHook v35.48 ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -251,7 +251,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.47 INFO";
+            lbl.text = @"WXHook v35.48 SAFE";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2730,25 +2730,6 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
     return val;
 }
 
-static id (*orig_infoDictionary)(id, SEL);
-static id hook_infoDictionary(id self, SEL _cmd) {
-    id dict = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
-    if (dict && [dict isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *mutDict = [dict mutableCopy];
-        NSString *origVer = mutDict[@"CFBundleShortVersionString"];
-        if (origVer) {
-            static int g_logCount = 0;
-            if (g_logCount < 3) {
-                DLOG(@"[VER-FAKE] infoDictionary: CFBundleShortVersionString %@ -> 7.7.0", origVer);
-                g_logCount++;
-            }
-            mutDict[@"CFBundleShortVersionString"] = @"7.7.0";
-        }
-        return [mutDict copy];
-    }
-    return dict;
-}
-
 // ============================================================
 #pragma mark - UIDevice(APEX) category hooks (v35.41)
 // ============================================================
@@ -3088,13 +3069,6 @@ static void installAllHooks(void) {
             orig_objectForInfoDictionaryKey = (id (*)(id, SEL, id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey);
             _log(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.2->7.7.0)");
-        }
-        
-        m = class_getInstanceMethod(bundleCls, @selector(infoDictionary));
-        if (m) {
-            orig_infoDictionary = (id (*)(id, SEL))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_infoDictionary);
-            _log(@"[INIT] NSBundle.infoDictionary: HOOKED (version fake 7.6.2->7.7.0)");
         }
     }
 
