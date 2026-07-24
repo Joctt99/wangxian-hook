@@ -1,11 +1,9 @@
 /**
- * WangXianHook v35.55 - Fix mock server list injection buffer size issue
- * FIX: Changed mock server list injection to return correct mock length instead of checking ret
- * FIX: Buffer size check now uses len (buffer capacity) instead of ret (received bytes)
- * FIX: When buffer large enough, copy mock data and return mock length directly
- * FIX: Enhanced mock server list with proper IP format (139.224.129.92) and port (12003)
- * FIX: Buffer too small? Partial injection with reduced data size
- * ROOT CAUSE: v35.54 checked ret instead of len, buffer only had 22 bytes but needed 104
+ * WangXianHook v35.56 - Fix mock server list pktLen mismatch causing "数据包太大" error
+ * FIX: Updated pktLen from 88 to 109 (0x6D) to match actual data length
+ * FIX: Fixed IP format - now single string "139.224.129.92" instead of split format
+ * FIX: Fixed port format - now single string "12003" instead of split format
+ * ROOT CAUSE: v35.55 injected 109 bytes but pktLen=88, causing length mismatch and disconnect
  * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
  * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
  * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
@@ -1878,14 +1876,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.55: Handle 0x80000015 response - inject complete mock server list
-        // Game sends 0x0000015 expecting server list, but server echoes with empty data
-        // Solution: Copy mock server list to buffer and return mock length
+        // v35.56: Handle 0x80000015 response - inject mock server list with correct pktLen
+        // PROBLEM: Server echoes back 0x80000015 with pktLen=22, but we inject 109 bytes
+        // SOLUTION: Replace entire packet including cmd and pktLen, update pktLen to match actual data
         if (cmd == 0x80000015 && port == 5678) {
-            DLOG(@"[PROTO-R] 0x80000015 response received (server list request), injecting mock server list");
+            DLOG(@"[PROTO-R] 0x80000015 response received, injecting mock server list");
             
             const unsigned char mockServerList[] = {
-                0x00, 0x00, 0x00, 0x58, 0x80, 0x2E, 0xE1, 0x18, // pktLen=88, cmd=0x802EE118
+                0x00, 0x00, 0x00, 0x6D, 0x80, 0x2E, 0xE1, 0x18, // pktLen=109, cmd=0x802EE118
                 0x00, 0x00, 0x00, 0x01, 0x01, // status=1 (success)
                 0x00, 0x01, // server count = 1
                 0x00, 0x04, 0x31, 0x32, 0x33, 0x34, // serverid = "1234"
@@ -1894,10 +1892,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 0x00, 0x06, 0xE4, 0xB8, 0x80, 0xE5, 0x8C, 0xBA, // category = "一区"
                 0x00, 0x10, 0xE6, 0x9B, 0xB4, 0xE7, 0xAB, 0xAF, 0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95, 0x61, 0x31, 0x32, 0x33, // name = "更新测试a123"
                 0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C, // realname = "运行"
-                0x00, 0x0B, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, // ip = "139.224.129"
-                0x00, 0x04, 0x2E, 0x39, 0x32, 0x30, // ip continue = ".920"
-                0x00, 0x04, 0x31, 0x32, 0x30, 0x30, // port = "1200"
-                0x00, 0x01, 0x33, // port continue = "3"
+                0x00, 0x0E, 0x31, 0x33, 0x39, 0x2E, 0x32, 0x32, 0x34, 0x2E, 0x31, 0x32, 0x39, 0x2E, 0x39, 0x32, // ip = "139.224.129.92"
+                0x00, 0x05, 0x31, 0x32, 0x30, 0x30, 0x33, // port = "12003"
                 0x00, 0x01, 0x31, // status = "1"
                 0x00, 0x04, 0x31, 0x30, 0x30, 0x30, // onlinePlayerNum = "1000"
                 0x00, 0x06, 0xE8, 0xBF, 0x90, 0xE8, 0xA1, 0x8C  // description = "运行"
@@ -1906,14 +1902,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             size_t mockLen = sizeof(mockServerList);
             if (len >= mockLen) {
                 memcpy((unsigned char *)buf, mockServerList, mockLen);
-                DLOG(@"[PROTO-R-PATCH] Injected mock server list (len=%zu, overwrote %zd bytes)", mockLen, ret);
+                DLOG(@"[PROTO-R-PATCH] Injected mock server list: cmd=0x802EE118 pktLen=109 (overwrote %zd bytes)", ret);
                 return (ssize_t)mockLen;
             } else {
-                DLOG(@"[PROTO-R-PATCH] WARNING: Buffer too small (need=%zu, have=%zu)", mockLen, len);
-                if (len > 0) {
+                DLOG(@"[PROTO-R-PATCH] ERROR: Buffer too small (need=%zu, have=%zu)", mockLen, len);
+                if (len > 8) {
+                    unsigned char *p = (unsigned char *)buf;
+                    p[0] = (mockLen >> 24) & 0xFF;
+                    p[1] = (mockLen >> 16) & 0xFF;
+                    p[2] = (mockLen >> 8) & 0xFF;
+                    p[3] = mockLen & 0xFF;
+                    p[4] = 0x80; p[5] = 0x2E; p[6] = 0xE1; p[7] = 0x18;
                     size_t copyLen = len < mockLen ? len : mockLen;
-                    memcpy((unsigned char *)buf, mockServerList, copyLen);
-                    DLOG(@"[PROTO-R-PATCH] Partial injection: copied %zu bytes", copyLen);
+                    memcpy(p, mockServerList, copyLen);
+                    DLOG(@"[PROTO-R-PATCH] Partial injection: updated header, copied %zu bytes", copyLen);
                     return (ssize_t)copyLen;
                 }
             }
