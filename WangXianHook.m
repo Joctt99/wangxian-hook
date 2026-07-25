@@ -83,7 +83,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.94 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.97 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3355,6 +3355,43 @@ static void hook_CCHmac(uint32_t algorithm, const void *key, size_t keyLength, c
     orig_CCHmac(algorithm, key, keyLength, processedData, processedDataLength, macOut);
 }
 
+// === v35.97: Hook CCHmacInit/CCHmacUpdate/CCHmacFinal (segmented HMAC) ===
+// C++ CCFileUtils::hmacSha256Base64 may use these instead of one-shot CCHmac
+typedef void* (*CCHmacInitFunc)(void *ctx, uint32_t algorithm, const void *key, size_t keyLength);
+typedef void* (*CCHmacUpdateFunc)(void *ctx, const void *data, size_t dataLength);
+typedef void* (*CCHmacFinalFunc)(void *ctx, void *macOut);
+static CCHmacInitFunc orig_CCHmacInit = NULL;
+static CCHmacUpdateFunc orig_CCHmacUpdate = NULL;
+static CCHmacFinalFunc orig_CCHmacFinal = NULL;
+
+// Hook CCHmacUpdate - this is where data is fed into HMAC computation
+static void hook_CCHmacUpdate(void *ctx, const void *data, size_t dataLength) {
+    if (!orig_CCHmacUpdate) {
+        orig_CCHmacUpdate = (CCHmacUpdateFunc)dlsym(RTLD_DEFAULT, "CCHmacUpdate");
+        if (!orig_CCHmacUpdate) return;
+    }
+    
+    const void *processedData = data;
+    
+    // Check if data contains "7.6.2" version string
+    if (data && dataLength >= 5) {
+        const char *dataStr = (const char *)data;
+        for (size_t i = 0; i <= dataLength - 5; i++) {
+            if (memcmp(dataStr + i, "7.6.2", 5) == 0) {
+                // Found version string, create modified buffer
+                NSMutableData *modifiedData = [NSMutableData dataWithBytes:data length:dataLength];
+                unsigned char *buf = (unsigned char *)modifiedData.mutableBytes;
+                memcpy(buf + i, "7.7.0", 5);
+                processedData = modifiedData.bytes;
+                DLOG(@"[SEC] CCHmacUpdate: replaced 7.6.2->7.7.0 (len=%zu)", dataLength);
+                break;
+            }
+        }
+    }
+    
+    orig_CCHmacUpdate(ctx, processedData, dataLength);
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -3427,6 +3464,15 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] CCHmac: HOOKED (replace version before HMAC computation)");
     } else {
         DLOG(@"[SEC] CCHmac: NOT found");
+    }
+    
+    // v35.97: Hook CCHmacUpdate (segmented HMAC - used by C++ CCFileUtils)
+    sym = dlsym(RTLD_DEFAULT, "CCHmacUpdate");
+    if (sym) {
+        rebindSymbol("CCHmacUpdate", (void *)hook_CCHmacUpdate, (void **)&orig_CCHmacUpdate);
+        DLOG(@"[SEC] CCHmacUpdate: HOOKED (replace version in segmented HMAC)");
+    } else {
+        DLOG(@"[SEC] CCHmacUpdate: NOT found");
     }
     
     DLOG(@"[SEC] Security hooks ready (all crypto APIs hooked)");
