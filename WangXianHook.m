@@ -1,6 +1,7 @@
 /**
- * WangXianHook v35.92 - FIX: Don't intercept game server heartbeat (0x80000015)
- * KEY FIX: Game server uses 0x00000015/0x80000015 as HEARTBEAT, NOT server list!
+ * WangXianHook v35.93 - FIX: EncryptUtils nil param crash + don't modify non-version data
+ * KEY FIX: Add nil parameter check in EncryptUtils hooks to prevent crash
+ * KEY FIX: Only replace "7.6.2" (NOT "978") - modifying resource version may break integrity
  * KEY FIX: Only intercept 0x80000015 on login server (5678), NOT game server (12003)
  * KEY FIX: DISABLED cellForRowAtIndexPath hook - creates fake cells that crash game
  * KEY FIX: Increase log export limit from 200KB to 500KB
@@ -76,7 +77,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.92 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.93 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4017,14 +4018,17 @@ static void installAllHooks(void) {
         if (m) {
             IMP origImp = method_getImplementation(m);
             method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                if (!string) {
+                    NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))origImp;
+                    return orig(self, _cmd, key, string);
+                }
                 NSString *modifiedString = string;
-                if (string && ([string containsString:@"7.6.2"] || [string containsString:@"978"])) {
+                if ([string containsString:@"7.6.2"]) {
                     modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
                     DLOG(@"[ENCRYPT] hmacSha256Base64: replaced 7.6.2->7.7.0 in input");
                 }
                 NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))origImp;
                 NSString *result = orig(self, _cmd, key, modifiedString);
-                DLOG(@"[ENCRYPT] hmacSha256Base64:string=%@ -> %@", modifiedString, result);
                 return result;
             }));
             _log(@"[INIT] EncryptUtils.hmacSha256Base64WithKey:string: HOOKED (version fix)");
@@ -4035,14 +4039,17 @@ static void installAllHooks(void) {
         if (m) {
             IMP origImp = method_getImplementation(m);
             method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                if (!string) {
+                    NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))origImp;
+                    return orig(self, _cmd, key, string);
+                }
                 NSString *modifiedString = string;
-                if (string && ([string containsString:@"7.6.2"] || [string containsString:@"978"])) {
+                if ([string containsString:@"7.6.2"]) {
                     modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
                     DLOG(@"[ENCRYPT] hmacSha256: replaced 7.6.2->7.7.0 in input");
                 }
                 NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))origImp;
                 NSData *result = orig(self, _cmd, key, modifiedString);
-                DLOG(@"[ENCRYPT] hmacSha256:string=%@ -> %@", modifiedString, result);
                 return result;
             }));
             _log(@"[INIT] EncryptUtils.hmacSha256WithKey:string: HOOKED (version fix)");
@@ -4053,14 +4060,16 @@ static void installAllHooks(void) {
         if (m) {
             IMP origImp = method_getImplementation(m);
             method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSData *data) {
+                if (!data) {
+                    NSData *(*orig)(id, SEL, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*))origImp;
+                    return orig(self, _cmd, key, data);
+                }
                 NSData *modifiedData = data;
-                if (data) {
-                    NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                    if (dataStr && ([dataStr containsString:@"7.6.2"] || [dataStr containsString:@"978"])) {
-                        NSString *modifiedStr = [dataStr stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
-                        modifiedData = [modifiedStr dataUsingEncoding:NSUTF8StringEncoding];
-                        DLOG(@"[ENCRYPT] hmacSha256:data: replaced 7.6.2->7.7.0 in input");
-                    }
+                NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (dataStr && [dataStr containsString:@"7.6.2"]) {
+                    NSString *modifiedStr = [dataStr stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
+                    modifiedData = [modifiedStr dataUsingEncoding:NSUTF8StringEncoding];
+                    DLOG(@"[ENCRYPT] hmacSha256:data: replaced 7.6.2->7.7.0 in input");
                 }
                 NSData *(*orig)(id, SEL, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*))origImp;
                 return orig(self, _cmd, key, modifiedData);
