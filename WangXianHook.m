@@ -1,7 +1,8 @@
 /**
- * WangXianHook v35.86 - Fix: Game server 0x00000015 is heartbeat, not server list
- * KEY FIX: Only inject mock server list on login server (5678), NOT game server (12003)
- *          Game server uses 0x0000015 as heartbeat/ping, injecting server list breaks it
+ * WangXianHook v35.87 - Patch UUID validation response (ispass=NO -> YES)
+ * KEY FIX: Game sends UUID to https://x.md5xor.com for validation
+ *          Server returns ispass="NO" which causes game to hang
+ *          Patch both delegate-mode and completion-mode HTTP responses
  * FIX: Hook EncryptUtils HMAC to compute signatures with faked version (7.7.0)
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
  * BASE: v35.77 stable (no send tampering, no server list injection)
@@ -74,7 +75,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.86 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.87 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -617,6 +618,21 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
         newBody = [newBody stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
         NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
         DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
+        if (orig_urlSessionDataTaskDidReceiveData) {
+            orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
+            return;
+        }
+    }
+    
+    // v35.87: Patch UUID validation response from x.md5xor.com
+    // ispass="NO" means UUID not whitelisted, causes game to hang
+    if (dataStr && url && [url containsString:@"md5xor"]) {
+        DLOG(@"[HTTP-DATA-PATCH] Patching UUID validation response from md5xor");
+        NSString *newBody = dataStr;
+        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+        NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
+        DLOG(@"[HTTP-DATA-PATCH] UUID validation patched: ispass=YES");
         if (orig_urlSessionDataTaskDidReceiveData) {
             orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
             return;
@@ -3636,6 +3652,18 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                             body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
                             data = [body dataUsingEncoding:NSUTF8StringEncoding];
                             DLOG(@"[NET-PATCH] Patched cert API code:0 -> 1");
+                        }
+                    }
+                    
+                    // v35.87: Patch UUID validation response from x.md5xor.com
+                    // ispass="NO" means UUID not whitelisted, causes game to hang
+                    if ([url containsString:@"md5xor"]) {
+                        DLOG(@"[NET-PATCH] Detected UUID validation response from md5xor");
+                        if ([body containsString:@"\"ispass\":\"NO\""]) {
+                            body = [body stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+                            body = [body stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+                            data = [body dataUsingEncoding:NSUTF8StringEncoding];
+                            DLOG(@"[NET-PATCH] Patched UUID validation: ispass=YES, test=YES");
                         }
                     }
                 }
