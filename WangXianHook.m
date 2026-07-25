@@ -83,7 +83,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.98 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.99 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -5268,12 +5268,15 @@ static void installEncryptUtilsHooks(void) {
             _log(@"[INIT] EncryptUtils.hmacSha256WithKey:data: HOOKED (version fix)");
         }
         
-        m = class_getClassMethod(encryptCls, @selector(rsaVerifyData:signature:withPublicKey:));
-        if (m) {
-            orig_rsaVerifyData_signature_withPublicKey = method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_rsaVerifyData_signature_withPublicKey);
-            _log(@"[INIT] EncryptUtils.rsaVerifyData:signature:withPublicKey: FORCE YES");
-        }
+        // v35.99: DO NOT hook rsaVerifyData - let signature verification work normally
+        // Forcing YES may cause client to accept invalid server signature,
+        // leading to incorrect session key and server rejection
+        // m = class_getClassMethod(encryptCls, @selector(rsaVerifyData:signature:withPublicKey:));
+        // if (m) {
+        //     orig_rsaVerifyData_signature_withPublicKey = method_getImplementation(m);
+        //     method_setImplementation(m, (IMP)hook_rsaVerifyData_signature_withPublicKey);
+        //     _log(@"[INIT] EncryptUtils.rsaVerifyData:signature:withPublicKey: FORCE YES");
+        // }
         
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(metaCls, &mcount);
