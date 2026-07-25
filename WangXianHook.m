@@ -1,7 +1,7 @@
 /**
- * WangXianHook v35.80 - Hook NSBundle.infoDictionary + keep analysis dumps
- * FIX: Also hook infoDictionary method (not just objectForInfoDictionaryKey:)
- *      Game may read version from full dict, bypassing our single-key hook
+ * WangXianHook v35.81 - Fix infoDictionary crash (only hook mainBundle)
+ * FIX: infoDictionary hook only modifies mainBundle, other bundles return original
+ *      Previous version caused crash because all bundles returned mainBundle's dict
  * FIX: Keep login request/response dumps for verification
  * BASE: v35.77 stable (no send tampering, no server list injection)
  * FIX: NetworkReachabilityProvider.isReachable -> YES
@@ -77,7 +77,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.80 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.81 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3381,6 +3381,11 @@ static NSDictionary *(*orig_infoDictionary)(id, SEL);
 static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
     NSDictionary *orig = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
     if (!orig) return orig;
+    
+    // ONLY modify mainBundle's infoDictionary - other bundles (frameworks, plugins) need their own
+    if (self != [NSBundle mainBundle]) {
+        return orig;
+    }
     
     static NSDictionary *g_modifiedInfoDict = nil;
     static int g_infoDictLogCount = 0;
