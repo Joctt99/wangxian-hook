@@ -83,7 +83,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.97 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.98 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3334,25 +3334,9 @@ static void hook_CCHmac(uint32_t algorithm, const void *key, size_t keyLength, c
         if (!orig_CCHmac) return;
     }
     
-    const void *processedData = data;
-    size_t processedDataLength = dataLength;
-    
-    // Check if data contains "7.6.2" version string
-    const char *dataStr = (const char *)data;
-    for (size_t i = 0; i <= dataLength - 5; i++) {
-        if (memcmp(dataStr + i, "7.6.2", 5) == 0) {
-            // Found version string, create modified buffer
-            NSMutableData *modifiedData = [NSMutableData dataWithBytes:data length:dataLength];
-            unsigned char *buf = (unsigned char *)modifiedData.mutableBytes;
-            // Replace "7.6.2" with "7.7.0" (same length)
-            memcpy(buf + i, "7.7.0", 5);
-            processedData = modifiedData.bytes;
-            DLOG(@"[SEC] CCHmac: replaced 7.6.2->7.7.0 in data (len=%zu)", dataLength);
-            break;
-        }
-    }
-    
-    orig_CCHmac(algorithm, key, keyLength, processedData, processedDataLength, macOut);
+    // v35.98: DO NOT replace version - 7.6.2 is correct version
+    // Version tampering causes signature mismatch
+    orig_CCHmac(algorithm, key, keyLength, data, dataLength, macOut);
 }
 
 // === v35.97: Hook CCHmacInit/CCHmacUpdate/CCHmacFinal (segmented HMAC) ===
@@ -3371,25 +3355,8 @@ static void hook_CCHmacUpdate(void *ctx, const void *data, size_t dataLength) {
         if (!orig_CCHmacUpdate) return;
     }
     
-    const void *processedData = data;
-    
-    // Check if data contains "7.6.2" version string
-    if (data && dataLength >= 5) {
-        const char *dataStr = (const char *)data;
-        for (size_t i = 0; i <= dataLength - 5; i++) {
-            if (memcmp(dataStr + i, "7.6.2", 5) == 0) {
-                // Found version string, create modified buffer
-                NSMutableData *modifiedData = [NSMutableData dataWithBytes:data length:dataLength];
-                unsigned char *buf = (unsigned char *)modifiedData.mutableBytes;
-                memcpy(buf + i, "7.7.0", 5);
-                processedData = modifiedData.bytes;
-                DLOG(@"[SEC] CCHmacUpdate: replaced 7.6.2->7.7.0 (len=%zu)", dataLength);
-                break;
-            }
-        }
-    }
-    
-    orig_CCHmacUpdate(ctx, processedData, dataLength);
+    // v35.98: DO NOT replace version - 7.6.2 is correct version
+    orig_CCHmacUpdate(ctx, data, dataLength);
 }
 
 static void installSecurityHooks(void) {
@@ -3537,27 +3504,8 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 
 static id (*orig_objectForInfoDictionaryKey)(id, SEL, id);
 static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
+    // v35.98: DO NOT fake version - 7.6.2 is correct version
     id val = orig_objectForInfoDictionaryKey ? orig_objectForInfoDictionaryKey(self, _cmd, key) : nil;
-    
-    if (key && [key isKindOfClass:[NSString class]]) {
-        NSString *keyStr = (NSString *)key;
-        if ([keyStr isEqualToString:@"CFBundleShortVersionString"]) {
-            static dispatch_once_t once;
-            static int g_verLogCount = 0;
-            if (g_verLogCount < 3) {
-                DLOG(@"[VER-FAKE] CFBundleShortVersionString: %@ -> 7.7.0", val);
-                g_verLogCount++;
-            }
-            return @"7.7.0";
-        }
-        if ([keyStr isEqualToString:@"CFBundleVersion"]) {
-            static int g_buildLogCount = 0;
-            if (g_buildLogCount < 3) {
-                DLOG(@"[VER-FAKE] CFBundleVersion: %@ (kept)", val);
-                g_buildLogCount++;
-            }
-        }
-    }
     return val;
 }
 
@@ -3566,13 +3514,9 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
 // ============================================================
 static NSString *(*orig_APEX_currentVersion)(id, SEL);
 static NSString *hook_APEX_currentVersion(id self, SEL _cmd) {
+    // v35.98: DO NOT fake version - 7.6.2 is correct version
     NSString *orig = orig_APEX_currentVersion ? orig_APEX_currentVersion(self, _cmd) : @"7.6.2";
-    static int g_logCount = 0;
-    if (g_logCount < 3) {
-        DLOG(@"[APEX] currentVersion: %@ -> 7.7.0", orig);
-        g_logCount++;
-    }
-    return @"7.7.0";
+    return orig;
 }
 
 static BOOL (*orig_APEX_isJailbroken)(id, SEL);
@@ -5276,47 +5220,21 @@ static IMP orig_hmacSha256WithKey_data = NULL;
 static IMP orig_rsaVerifyData_signature_withPublicKey = NULL;
 
 static NSString *hook_hmacSha256Base64WithKey_string(id self, SEL _cmd, NSData *key, NSString *string) {
-    if (!string) {
-        NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))orig_hmacSha256Base64WithKey_string;
-        return orig(self, _cmd, key, string);
-    }
-    NSString *modifiedString = string;
-    if ([string containsString:@"7.6.2"]) {
-        modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
-        DLOG(@"[ENCRYPT] hmacSha256Base64: replaced 7.6.2->7.7.0 in input");
-    }
+    // v35.98: DO NOT replace version - 7.6.2 is correct version
     NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))orig_hmacSha256Base64WithKey_string;
-    return orig(self, _cmd, key, modifiedString);
+    return orig(self, _cmd, key, string);
 }
 
 static NSData *hook_hmacSha256WithKey_string(id self, SEL _cmd, NSData *key, NSString *string) {
-    if (!string) {
-        NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))orig_hmacSha256WithKey_string_imp;
-        return orig(self, _cmd, key, string);
-    }
-    NSString *modifiedString = string;
-    if ([string containsString:@"7.6.2"]) {
-        modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
-        DLOG(@"[ENCRYPT] hmacSha256: replaced 7.6.2->7.7.0 in input");
-    }
+    // v35.98: DO NOT replace version - 7.6.2 is correct version
     NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))orig_hmacSha256WithKey_string_imp;
-    return orig(self, _cmd, key, modifiedString);
+    return orig(self, _cmd, key, string);
 }
 
 static NSData *hook_hmacSha256WithKey_data(id self, SEL _cmd, NSData *key, NSData *data) {
-    if (!data) {
-        NSData *(*orig)(id, SEL, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*))orig_hmacSha256WithKey_data;
-        return orig(self, _cmd, key, data);
-    }
-    NSData *modifiedData = data;
-    NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (dataStr && [dataStr containsString:@"7.6.2"]) {
-        NSString *modifiedStr = [dataStr stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
-        modifiedData = [modifiedStr dataUsingEncoding:NSUTF8StringEncoding];
-        DLOG(@"[ENCRYPT] hmacSha256:data: replaced 7.6.2->7.7.0 in input");
-    }
+    // v35.98: DO NOT replace version - 7.6.2 is correct version
     NSData *(*orig)(id, SEL, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*))orig_hmacSha256WithKey_data;
-    return orig(self, _cmd, key, modifiedData);
+    return orig(self, _cmd, key, data);
 }
 
 static BOOL hook_rsaVerifyData_signature_withPublicKey(id self, SEL _cmd, NSData *data, NSData *signature, SecKeyRef publicKey) {
