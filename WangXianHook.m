@@ -1,9 +1,9 @@
 /**
- * WangXianHook v35.84 - Hook EncryptUtils HMAC to fix signature after version change
- * KEY FIX: Hook hmacSha256 methods, if input contains "7.6.2", replace with "7.7.0" BEFORE computing
- *          This ensures signatures are computed with the correct (faked) version number
+ * WangXianHook v35.85 - Fix 0x80000015 response on game server (12003)
+ * KEY FIX: Enable 0x80000015 response injection for both login server (5678) and game server (12003)
+ *          Game server returns empty 0x80000015 response, causing client to hang
+ * FIX: Hook EncryptUtils HMAC to compute signatures with faked version (7.7.0)
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
- * FIX: Also hook rsaVerifyData to always return YES
  * BASE: v35.77 stable (no send tampering, no server list injection)
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
@@ -74,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.84 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.85 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2263,13 +2263,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.68: Intercept 0x80000015 response (empty server list response)
-        // KEY FIX: Keep cmd=0x80000015 (response to request 0x00000015), don't change to 0x802EE118
+        // v35.85: Intercept 0x80000015 response (empty server list response)
+        // Handle both login server (5678) and game server (12003)
         // The client matches responses to requests by cmd (response_cmd = request_cmd | 0x80000000)
         // If we return 0x802EE118, client never processes it!
-        // v35.77 TEST: DISABLED to verify if "packet too big" is caused by our injection
-        if (0 && cmd == 0x80000015 && port == 5678) {
-            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes), injecting mock server list", ret);
+        if (cmd == 0x80000015 && (port == 5678 || port == 12003)) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes) from port %d, injecting mock server list", ret, port);
             
             // Construct mock response: keep cmd=0x80000015 but fill with server list data
             // Format: pktLen(4) + cmd(4) + seq(4) + server_count(2) + server_data...
