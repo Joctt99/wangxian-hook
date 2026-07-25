@@ -1,14 +1,10 @@
 /**
- * WangXianHook v35.82 - Binary patched version + stable hooks
- * KEY FIX: Binary patched "7.6.2" -> "7.7.0" directly in executable
- *          This bypasses all NSBundle/UIDevice hooks - game reads from binary
- * FIX: DISABLED infoDictionary hook (causes crash)
+ * WangXianHook v35.83 - Hook EncryptUtils signature verification
+ * KEY FIX: Hook EncryptUtils.rsaVerifyData:signature:withPublicKey: -> always return YES
+ *          7.62 version adds HMAC SHA256 signature verification that prevents version spoofing
+ * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
  * FIX: Keep objectForInfoDictionaryKey hook as fallback
  * BASE: v35.77 stable (no send tampering, no server list injection)
- * FIX: NetworkReachabilityProvider.isReachable -> YES
- * FIX: NetworkMonitor.isNetworkAvailable -> YES
- * FIX: Any method containing reachable/connected/available -> returns YES
- * FIX: judgeNet now skips original, forces network available
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
  * FIX: Intercept standalone 0x802EE118 response (not nested) and inject mock server list
@@ -78,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.82 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.83 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3957,6 +3953,56 @@ static void installAllHooks(void) {
         if (methods) free(methods);
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+    }
+    
+    // === IMMEDIATE: Hook EncryptUtils (v35.83) ===
+    // 7.62 version adds signature verification via EncryptUtils
+    // Hook rsaVerifyData:signature:withPublicKey: to always return YES
+    Class encryptCls = NSClassFromString(@"EncryptUtils");
+    if (encryptCls) {
+        Class metaCls = object_getClass(encryptCls);
+        
+        // Hook rsaVerifyData:signature:withPublicKey: - always return YES
+        Method m = class_getClassMethod(encryptCls, @selector(rsaVerifyData:signature:withPublicKey:));
+        if (m) {
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *data, NSData *signature, SecKeyRef publicKey) {
+                DLOG(@"[ENCRYPT] rsaVerifyData:signature:withPublicKey: -> FORCED YES");
+                return YES;
+            }));
+            _log(@"[INIT] EncryptUtils.rsaVerifyData:signature:withPublicKey: FORCE YES");
+        }
+        
+        // Hook hmacSha256Base64WithKey:string: - log and return original
+        m = class_getClassMethod(encryptCls, @selector(hmacSha256Base64WithKey:string:));
+        if (m) {
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                DLOG(@"[ENCRYPT] hmacSha256Base64WithKey:string: string=%@", string);
+                // Call original implementation
+                NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))method_getImplementation(m);
+                return orig(self, _cmd, key, string);
+            }));
+            _log(@"[INIT] EncryptUtils.hmacSha256Base64WithKey:string: HOOKED");
+        }
+        
+        // Hook hmacSha256WithKey:string: - log and return original
+        m = class_getClassMethod(encryptCls, @selector(hmacSha256WithKey:string:));
+        if (m) {
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                DLOG(@"[ENCRYPT] hmacSha256WithKey:string: string=%@", string);
+                NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))method_getImplementation(m);
+                return orig(self, _cmd, key, string);
+            }));
+            _log(@"[INIT] EncryptUtils.hmacSha256WithKey:string: HOOKED");
+        }
+        
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(metaCls, &mcount);
+        for (unsigned int i = 0; i < mcount; i++) {
+            DLOG(@"[ENCRYPT] +[%@]", NSStringFromSelector(method_getName(methods[i])));
+        }
+        if (methods) free(methods);
+    } else {
+        _log(@"[INIT] WARNING: EncryptUtils NOT found!");
     }
     
     // === IMMEDIATE: Network Reachability Hooks ===
