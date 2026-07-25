@@ -1,8 +1,9 @@
 /**
- * WangXianHook v35.81 - Fix infoDictionary crash (only hook mainBundle)
- * FIX: infoDictionary hook only modifies mainBundle, other bundles return original
- *      Previous version caused crash because all bundles returned mainBundle's dict
- * FIX: Keep login request/response dumps for verification
+ * WangXianHook v35.82 - Binary patched version + stable hooks
+ * KEY FIX: Binary patched "7.6.2" -> "7.7.0" directly in executable
+ *          This bypasses all NSBundle/UIDevice hooks - game reads from binary
+ * FIX: DISABLED infoDictionary hook (causes crash)
+ * FIX: Keep objectForInfoDictionaryKey hook as fallback
  * BASE: v35.77 stable (no send tampering, no server list injection)
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
@@ -77,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.81 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.82 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3377,32 +3378,6 @@ static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
     return val;
 }
 
-static NSDictionary *(*orig_infoDictionary)(id, SEL);
-static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
-    NSDictionary *orig = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
-    if (!orig) return orig;
-    
-    // ONLY modify mainBundle's infoDictionary - other bundles (frameworks, plugins) need their own
-    if (self != [NSBundle mainBundle]) {
-        return orig;
-    }
-    
-    static NSDictionary *g_modifiedInfoDict = nil;
-    static int g_infoDictLogCount = 0;
-    
-    if (!g_modifiedInfoDict) {
-        NSMutableDictionary *mutableDict = [orig mutableCopy];
-        [mutableDict setObject:@"7.7.0" forKey:@"CFBundleShortVersionString"];
-        g_modifiedInfoDict = [NSDictionary dictionaryWithDictionary:mutableDict];
-        if (g_infoDictLogCount < 3) {
-            DLOG(@"[VER-FAKE] infoDictionary: created modified dict, CFBundleShortVersionString = 7.7.0");
-            g_infoDictLogCount++;
-        }
-    }
-    
-    return g_modifiedInfoDict;
-}
-
 // ============================================================
 #pragma mark - UIDevice(APEX) category hooks (v35.41)
 // ============================================================
@@ -3772,6 +3747,7 @@ static void installAllHooks(void) {
     // === FIX: NSBundle hook (v35.39) - fake higher version to pass real version check ===
     // Instead of patching version error response (which loses login credentials),
     // we fake the app version so server returns real success response with valid ticket/session.
+    // v35.82: infoDictionary hook DISABLED (causes crash) - binary patched instead
     Class bundleCls = [NSBundle class];
     if (bundleCls) {
         Method m = class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:));
@@ -3779,13 +3755,6 @@ static void installAllHooks(void) {
             orig_objectForInfoDictionaryKey = (id (*)(id, SEL, id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey);
             _log(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.2->7.7.0)");
-        }
-        // v35.80: Also hook infoDictionary method - game may read version from full dict
-        Method mInfo = class_getInstanceMethod(bundleCls, @selector(infoDictionary));
-        if (mInfo) {
-            orig_infoDictionary = (NSDictionary *(*)(id, SEL))method_getImplementation(mInfo);
-            method_setImplementation(mInfo, (IMP)hook_infoDictionary);
-            _log(@"[INIT] NSBundle.infoDictionary: HOOKED (version fake 7.6.2->7.7.0)");
         }
     }
 
