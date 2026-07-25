@@ -1,6 +1,8 @@
 /**
- * WangXianHook v35.93 - FIX: EncryptUtils nil param crash + don't modify non-version data
- * KEY FIX: Add nil parameter check in EncryptUtils hooks to prevent crash
+ * WangXianHook v35.94 - ADD CRASH HANDLER + DISABLE UITableView hooks
+ * KEY FIX: Added NSSetUncaughtExceptionHandler and signal handlers (SIGABRT/SIGSEGV/SIGBUS/SIGILL/SIGFPE)
+ * KEY FIX: DISABLED ALL UITableView hooks - numberOfRowsInSection crashes game UI
+ * KEY FIX: EncryptUtils nil parameter check to prevent crash
  * KEY FIX: Only replace "7.6.2" (NOT "978") - modifying resource version may break integrity
  * KEY FIX: Only intercept 0x80000015 on login server (5678), NOT game server (12003)
  * KEY FIX: DISABLED cellForRowAtIndexPath hook - creates fake cells that crash game
@@ -77,10 +79,59 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.93 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.94 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
+    
+    // === CRASH HANDLER (v35.94) ===
+    // Capture uncaught exceptions and signals to diagnose crashes
+    NSSetUncaughtExceptionHandler(^(NSException *exception) {
+        _log(@"[CRASH] Uncaught exception: %@", exception.name);
+        _log(@"[CRASH] Reason: %@", exception.reason);
+        _log(@"[CRASH] Call stack:\n%@", exception.callStackSymbols);
+        _log(@"[CRASH] User info: %@", exception.userInfo);
+        NSLog(@"[WXHook-CRASH] EXCEPTION: %@ - %@", exception.name, exception.reason);
+    });
+    
+    // Signal handler wrapper
+    void (*signalHandler)(int) = ^(int sig) {
+        NSString *sigName = @"";
+        switch (sig) {
+            case SIGABRT: sigName = @"SIGABRT"; break;
+            case SIGSEGV: sigName = @"SIGSEGV"; break;
+            case SIGBUS: sigName = @"SIGBUS"; break;
+            case SIGILL: sigName = @"SIGILL"; break;
+            case SIGFPE: sigName = @"SIGFPE"; break;
+            default: sigName = [NSString stringWithFormat:@"SIG(%d)", sig];
+        }
+        _log(@"[CRASH] Signal received: %@", sigName);
+        
+        void *callstack[100];
+        int frames = backtrace(callstack, 100);
+        char **strs = backtrace_symbols(callstack, frames);
+        if (strs) {
+            NSMutableString *stackTrace = [NSMutableString string];
+            for (int i = 0; i < frames; i++) {
+                [stackTrace appendFormat:@"%s\n", strs[i]];
+            }
+            _log(@"[CRASH] Stack trace:\n%@", stackTrace);
+            free(strs);
+        }
+        NSLog(@"[WXHook-CRASH] SIGNAL: %@", sigName);
+        
+        // Re-raise signal to allow normal crash handling
+        signal(sig, SIG_DFL);
+        raise(sig);
+    };
+    
+    signal(SIGABRT, signalHandler);
+    signal(SIGSEGV, signalHandler);
+    signal(SIGBUS, signalHandler);
+    signal(SIGILL, signalHandler);
+    signal(SIGFPE, signalHandler);
+    
+    _log(@"[INIT] Crash handlers installed");
 }
 
 // ============================================================
@@ -3911,13 +3962,14 @@ static void installAllHooks(void) {
     }
     
     // === DIAGNOSTIC: UITableView data source hooks ===
-    Class tvCls = [UITableView class];
-    if (tvCls) {
-        Method m = class_getInstanceMethod(tvCls, @selector(numberOfRowsInSection:));
-        if (m) { orig_numberOfRows = (NSInteger (*)(id, SEL, NSInteger))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfRows); _log(@"[INIT] UITableView.numberOfRowsInSection: observe"); }
-        m = class_getInstanceMethod(tvCls, @selector(numberOfSections));
-        if (m) { orig_numberOfSections = (NSInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfSections); _log(@"[INIT] UITableView.numberOfSections: observe"); }
-    }
+    // v35.94: DISABLED - numberOfRowsInSection hook crashes game UI
+    // Class tvCls = [UITableView class];
+    // if (tvCls) {
+    //     Method m = class_getInstanceMethod(tvCls, @selector(numberOfRowsInSection:));
+    //     if (m) { orig_numberOfRows = (NSInteger (*)(id, SEL, NSInteger))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfRows); _log(@"[INIT] UITableView.numberOfRowsInSection: observe"); }
+    //     m = class_getInstanceMethod(tvCls, @selector(numberOfSections));
+    //     if (m) { orig_numberOfSections = (NSInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfSections); _log(@"[INIT] UITableView.numberOfSections: observe"); }
+    // }
     
     // === DIAGNOSTIC: UIAlertView show hook ===
     Class alertCls = [UIAlertView class];
