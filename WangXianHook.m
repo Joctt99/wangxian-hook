@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.03 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.04 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3261,6 +3261,47 @@ static void installDlopenHook(void) {
 }
 
 // ============================================================
+#pragma mark - dlsym Hook (hide suspicious symbols)
+// ============================================================
+
+typedef void *(*DlsymFunc)(void *, const char *);
+static DlsymFunc orig_dlsym = NULL;
+
+static void *hook_dlsym(void *handle, const char *symbol) {
+    void *result = orig_dlsym ? orig_dlsym(handle, symbol) : NULL;
+    
+    // Check for suspicious symbols used in jailbreak detection
+    if (symbol && result) {
+        static const char *suspiciousSymbols[] = {
+            "MSHookFunction", "MSHookMessageEx", "MSHookMemory",
+            "MSGetImageByName", "MSFindSymbol",
+            "fishhook", "rebind_symbols", "rebindSymbol",
+            "frida_agent_main", "gum_interceptor_attach",
+            "libcycript", "CYListenServer",
+            "substrate", "_substrate_start",
+            "Cydia",
+            NULL
+        };
+        for (int i = 0; suspiciousSymbols[i]; i++) {
+            if (strstr(symbol, suspiciousSymbols[i])) {
+                DLOG(@"[DLSYM-HOOK] Blocked lookup of suspicious symbol: %s", symbol);
+                return NULL;
+            }
+        }
+    }
+    
+    return result;
+}
+
+static void installDlsymHook(void) {
+    orig_dlsym = (DlsymFunc)dlsym(RTLD_DEFAULT, "dlsym");
+    if (orig_dlsym) {
+        rebindSymbol("_dlsym", (void *)hook_dlsym, (void **)&orig_dlsym);
+        DLOG(@"[DLSYM-HOOK] Installed, orig=%p", orig_dlsym);
+    }
+}
+
+// ============================================================
 #pragma mark - /proc/self/maps filtering (Linux fallback)
 // ============================================================
 
@@ -3675,6 +3716,7 @@ static void installSecurityHooks(void) {
     installDyldHooks();
     installDladdrHook();
     installDlopenHook();
+    installDlsymHook();
     
     // v36.03: DISABLE file system and sysctl hooks
     // These hooks may interfere with normal app behavior and trigger detection
