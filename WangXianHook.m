@@ -3130,14 +3130,22 @@ struct dyld_all_image_infos_patch {
     void *processDetachedFromSharedRegion;
     void *libSystemInitialized;
     void *dyldImageLoadAddress;
-    // ... more fields, but we only need first few
 };
 
-extern struct dyld_all_image_infos_patch _dyld_all_image_infos;
-
 static void patchDyldAllImageInfos(void) {
-    uint32_t realCount = _dyld_all_image_infos.infoArrayCount;
-    struct dyld_image_info_patch *infoArray = _dyld_all_image_infos.infoArray;
+    // Get dyld_all_image_infos via dlsym
+    struct dyld_all_image_infos_patch *allInfos = dlsym(RTLD_DEFAULT, "dyld_all_image_infos");
+    if (!allInfos) {
+        allInfos = dlsym(RTLD_DEFAULT, "_dyld_all_image_infos");
+    }
+    
+    if (!allInfos) {
+        DLOG(@"[DYLD-PATCH] dyld_all_image_infos not found via dlsym");
+        return;
+    }
+    
+    uint32_t realCount = allInfos->infoArrayCount;
+    struct dyld_image_info_patch *infoArray = allInfos->infoArray;
     
     if (!infoArray || realCount == 0) return;
     
@@ -3156,8 +3164,8 @@ static void patchDyldAllImageInfos(void) {
     }
     
     // Replace array and count
-    _dyld_all_image_infos.infoArray = newInfoArray;
-    _dyld_all_image_infos.infoArrayCount = newCount;
+    allInfos->infoArray = newInfoArray;
+    allInfos->infoArrayCount = newCount;
     
     DLOG(@"[DYLD-PATCH] Patched: %u -> %u images", realCount, newCount);
 }
