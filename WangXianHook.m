@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.05 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.06 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -5689,6 +5689,52 @@ static BOOL hook_rsaVerifyData_signature_withPublicKey(id self, SEL _cmd, NSData
     return YES;
 }
 
+// v36.06: Hook AES encrypt/decrypt to see plaintext data
+static IMP orig_aesEncryptData_key_iv = NULL;
+static IMP orig_aesDecryptData_key_iv = NULL;
+
+static NSData *hook_aesEncryptData_key_iv(id self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
+    // Log plaintext before encryption
+    if (data && data.length > 0 && data.length < 4096) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(data.length, 256) * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(data.length, 256)];
+        size_t showLen = MIN(data.length, 256);
+        const uint8_t *bytes = data.bytes;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", bytes[i]];
+            [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
+        }
+        DLOG(@"[AES-ENC] plaintext len=%lu\n  hex: %@\n  txt: %@", (unsigned long)data.length, hex, ascii);
+    }
+    
+    NSData *(*orig)(id, SEL, NSData*, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*, NSData*))orig_aesEncryptData_key_iv;
+    NSData *result = orig ? orig(self, _cmd, data, key, iv) : nil;
+    
+    if (result) {
+        DLOG(@"[AES-ENC] encrypted len=%lu", (unsigned long)result.length);
+    }
+    return result;
+}
+
+static NSData *hook_aesDecryptData_key_iv(id self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
+    NSData *(*orig)(id, SEL, NSData*, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*, NSData*))orig_aesDecryptData_key_iv;
+    NSData *result = orig ? orig(self, _cmd, data, key, iv) : nil;
+    
+    // Log decrypted plaintext
+    if (result && result.length > 0 && result.length < 4096) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(result.length, 256) * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(result.length, 256)];
+        size_t showLen = MIN(result.length, 256);
+        const uint8_t *bytes = result.bytes;
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", bytes[i]];
+            [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
+        }
+        DLOG(@"[AES-DEC] decrypted len=%lu\n  hex: %@\n  txt: %@", (unsigned long)result.length, hex, ascii);
+    }
+    return result;
+}
+
 static void installEncryptUtilsHooks(void) {
     Class encryptCls = NSClassFromString(@"EncryptUtils");
     if (encryptCls) {
@@ -5724,6 +5770,21 @@ static void installEncryptUtilsHooks(void) {
         //     method_setImplementation(m, (IMP)hook_rsaVerifyData_signature_withPublicKey);
         //     _log(@"[INIT] EncryptUtils.rsaVerifyData:signature:withPublicKey: FORCE YES");
         // }
+        
+        // v36.06: Hook AES encrypt/decrypt to see plaintext data
+        m = class_getClassMethod(encryptCls, @selector(aesEncryptData:key:iv:));
+        if (m) {
+            orig_aesEncryptData_key_iv = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_aesEncryptData_key_iv);
+            _log(@"[INIT] EncryptUtils.aesEncryptData:key:iv: HOOKED (log plaintext)");
+        }
+        
+        m = class_getClassMethod(encryptCls, @selector(aesDecryptData:key:iv:));
+        if (m) {
+            orig_aesDecryptData_key_iv = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_aesDecryptData_key_iv);
+            _log(@"[INIT] EncryptUtils.aesDecryptData:key:iv: HOOKED (log plaintext)");
+        }
         
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(metaCls, &mcount);
