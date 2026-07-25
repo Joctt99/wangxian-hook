@@ -3322,6 +3322,38 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
     return result;
 }
 
+// Hook CCHmac (HMAC computation - used by C++ CCFileUtils::hmacSha256Base64)
+// This is the KEY hook that was missing - game C++ code calls this directly!
+typedef void (*CCHmacFunc)(CCHmacAlgorithm algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut);
+static CCHmacFunc orig_CCHmac = NULL;
+
+static void hook_CCHmac(CCHmacAlgorithm algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut) {
+    if (!orig_CCHmac) {
+        orig_CCHmac = (CCHmacFunc)dlsym(RTLD_DEFAULT, "CCHmac");
+        if (!orig_CCHmac) return;
+    }
+    
+    const void *processedData = data;
+    size_t processedDataLength = dataLength;
+    
+    // Check if data contains "7.6.2" version string
+    const char *dataStr = (const char *)data;
+    for (size_t i = 0; i <= dataLength - 5; i++) {
+        if (memcmp(dataStr + i, "7.6.2", 5) == 0) {
+            // Found version string, create modified buffer
+            NSMutableData *modifiedData = [NSMutableData dataWithBytes:data length:dataLength];
+            unsigned char *buf = (unsigned char *)modifiedData.mutableBytes;
+            // Replace "7.6.2" with "7.7.0" (same length)
+            memcpy(buf + i, "7.7.0", 5);
+            processedData = modifiedData.bytes;
+            DLOG(@"[SEC] CCHmac: replaced 7.6.2->7.7.0 in data (len=%zu)", dataLength);
+            break;
+        }
+    }
+    
+    orig_CCHmac(algorithm, key, keyLength, processedData, processedDataLength, macOut);
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -3385,6 +3417,15 @@ static void installSecurityHooks(void) {
     if (sym) {
         rebindSymbol("SecKeyCreateDecryptedData", (void *)hook_SecKeyCreateDecryptedData, (void **)&orig_SecKeyCreateDecryptedData);
         DLOG(@"[SEC] SecKeyCreateDecryptedData: HOOKED (7.62 new API)");
+    }
+    
+    // Hook CCHmac (HMAC SHA256 - used by C++ CCFileUtils)
+    sym = dlsym(RTLD_DEFAULT, "CCHmac");
+    if (sym) {
+        rebindSymbol("CCHmac", (void *)hook_CCHmac, (void **)&orig_CCHmac);
+        DLOG(@"[SEC] CCHmac: HOOKED (replace version before HMAC computation)");
+    } else {
+        DLOG(@"[SEC] CCHmac: NOT found");
     }
     
     DLOG(@"[SEC] Security hooks ready (all crypto APIs hooked)");
