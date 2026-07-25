@@ -1,9 +1,9 @@
 /**
- * WangXianHook v35.83 - Hook EncryptUtils signature verification
- * KEY FIX: Hook EncryptUtils.rsaVerifyData:signature:withPublicKey: -> always return YES
- *          7.62 version adds HMAC SHA256 signature verification that prevents version spoofing
+ * WangXianHook v35.84 - Hook EncryptUtils HMAC to fix signature after version change
+ * KEY FIX: Hook hmacSha256 methods, if input contains "7.6.2", replace with "7.7.0" BEFORE computing
+ *          This ensures signatures are computed with the correct (faked) version number
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
- * FIX: Keep objectForInfoDictionaryKey hook as fallback
+ * FIX: Also hook rsaVerifyData to always return YES
  * BASE: v35.77 stable (no send tampering, no server list injection)
  * FIX: JudgeApp now skips original, forces success
  * FIX: judgeAppInfoWithBaseUrl calls handleAppInfoResult: with fake success data
@@ -74,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.83 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.84 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3955,44 +3955,78 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
     
-    // === IMMEDIATE: Hook EncryptUtils (v35.83) ===
+    // === IMMEDIATE: Hook EncryptUtils (v35.84) ===
     // 7.62 version adds signature verification via EncryptUtils
-    // Hook rsaVerifyData:signature:withPublicKey: to always return YES
+    // Strategy: Hook hmacSha256 methods, if input contains version "7.6.2",
+    //           replace with "7.7.0" BEFORE computing signature
     Class encryptCls = NSClassFromString(@"EncryptUtils");
     if (encryptCls) {
         Class metaCls = object_getClass(encryptCls);
         
+        // Hook hmacSha256Base64WithKey:string: - modify version before computing
+        Method m = class_getClassMethod(encryptCls, @selector(hmacSha256Base64WithKey:string:));
+        if (m) {
+            IMP origImp = method_getImplementation(m);
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                NSString *modifiedString = string;
+                if (string && ([string containsString:@"7.6.2"] || [string containsString:@"978"])) {
+                    modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
+                    DLOG(@"[ENCRYPT] hmacSha256Base64: replaced 7.6.2->7.7.0 in input");
+                }
+                NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))origImp;
+                NSString *result = orig(self, _cmd, key, modifiedString);
+                DLOG(@"[ENCRYPT] hmacSha256Base64:string=%@ -> %@", modifiedString, result);
+                return result;
+            }));
+            _log(@"[INIT] EncryptUtils.hmacSha256Base64WithKey:string: HOOKED (version fix)");
+        }
+        
+        // Hook hmacSha256WithKey:string: - modify version before computing
+        m = class_getClassMethod(encryptCls, @selector(hmacSha256WithKey:string:));
+        if (m) {
+            IMP origImp = method_getImplementation(m);
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
+                NSString *modifiedString = string;
+                if (string && ([string containsString:@"7.6.2"] || [string containsString:@"978"])) {
+                    modifiedString = [string stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
+                    DLOG(@"[ENCRYPT] hmacSha256: replaced 7.6.2->7.7.0 in input");
+                }
+                NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))origImp;
+                NSData *result = orig(self, _cmd, key, modifiedString);
+                DLOG(@"[ENCRYPT] hmacSha256:string=%@ -> %@", modifiedString, result);
+                return result;
+            }));
+            _log(@"[INIT] EncryptUtils.hmacSha256WithKey:string: HOOKED (version fix)");
+        }
+        
+        // Hook hmacSha256WithKey:data: - modify version before computing
+        m = class_getClassMethod(encryptCls, @selector(hmacSha256WithKey:data:));
+        if (m) {
+            IMP origImp = method_getImplementation(m);
+            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSData *data) {
+                NSData *modifiedData = data;
+                if (data) {
+                    NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                    if (dataStr && ([dataStr containsString:@"7.6.2"] || [dataStr containsString:@"978"])) {
+                        NSString *modifiedStr = [dataStr stringByReplacingOccurrencesOfString:@"7.6.2" withString:@"7.7.0"];
+                        modifiedData = [modifiedStr dataUsingEncoding:NSUTF8StringEncoding];
+                        DLOG(@"[ENCRYPT] hmacSha256:data: replaced 7.6.2->7.7.0 in input");
+                    }
+                }
+                NSData *(*orig)(id, SEL, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*))origImp;
+                return orig(self, _cmd, key, modifiedData);
+            }));
+            _log(@"[INIT] EncryptUtils.hmacSha256WithKey:data: HOOKED (version fix)");
+        }
+        
         // Hook rsaVerifyData:signature:withPublicKey: - always return YES
-        Method m = class_getClassMethod(encryptCls, @selector(rsaVerifyData:signature:withPublicKey:));
+        m = class_getClassMethod(encryptCls, @selector(rsaVerifyData:signature:withPublicKey:));
         if (m) {
             method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *data, NSData *signature, SecKeyRef publicKey) {
                 DLOG(@"[ENCRYPT] rsaVerifyData:signature:withPublicKey: -> FORCED YES");
                 return YES;
             }));
             _log(@"[INIT] EncryptUtils.rsaVerifyData:signature:withPublicKey: FORCE YES");
-        }
-        
-        // Hook hmacSha256Base64WithKey:string: - log and return original
-        m = class_getClassMethod(encryptCls, @selector(hmacSha256Base64WithKey:string:));
-        if (m) {
-            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
-                DLOG(@"[ENCRYPT] hmacSha256Base64WithKey:string: string=%@", string);
-                // Call original implementation
-                NSString *(*orig)(id, SEL, NSData*, NSString*) = (NSString*(*)(id, SEL, NSData*, NSString*))method_getImplementation(m);
-                return orig(self, _cmd, key, string);
-            }));
-            _log(@"[INIT] EncryptUtils.hmacSha256Base64WithKey:string: HOOKED");
-        }
-        
-        // Hook hmacSha256WithKey:string: - log and return original
-        m = class_getClassMethod(encryptCls, @selector(hmacSha256WithKey:string:));
-        if (m) {
-            method_setImplementation(m, (IMP)imp_implementationWithBlock(^(id self, SEL _cmd, NSData *key, NSString *string) {
-                DLOG(@"[ENCRYPT] hmacSha256WithKey:string: string=%@", string);
-                NSData *(*orig)(id, SEL, NSData*, NSString*) = (NSData*(*)(id, SEL, NSData*, NSString*))method_getImplementation(m);
-                return orig(self, _cmd, key, string);
-            }));
-            _log(@"[INIT] EncryptUtils.hmacSha256WithKey:string: HOOKED");
         }
         
         unsigned int mcount = 0;
