@@ -45,6 +45,7 @@
 
 #include <execinfo.h>
 #include <signal.h>
+#include <sys/stat.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -3278,6 +3279,12 @@ static void installFileSystemHooks(void) {
 #pragma mark - sysctl Hook (debugger detection prevention)
 // ============================================================
 
+// Hardcoded constants to avoid header import issues
+#define WX_CTL_KERN 1
+#define WX_KERN_PROC 14
+#define WX_KERN_PROC_PID 1
+#define WX_P_TRACED 0x00000800
+
 typedef int (*SysctlFunc)(int *, u_int, char *, size_t *, void *, size_t);
 static SysctlFunc orig_sysctl = NULL;
 
@@ -3285,13 +3292,14 @@ static int hook_sysctl(int *name, u_int namelen, char *oldp, size_t *oldlenp, vo
     int ret = orig_sysctl ? orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen) : -1;
     
     // Check for CTL_KERN / KERN_PROC / KERN_PROC_PID (used for debugger detection)
-    if (namelen == 4 && name && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+    if (namelen == 4 && name && name[0] == WX_CTL_KERN && name[1] == WX_KERN_PROC && name[2] == WX_KERN_PROC_PID) {
         DLOG(@"[SYSCTL] KERN_PROC_PID query (debugger detection) - ret=%d", ret);
         // If the query is about our process, modify the result to hide debugger
-        if (ret == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
-            struct kinfo_proc *info = (struct kinfo_proc *)oldp;
-            // Clear P_TRACED flag to hide debugger
-            info->kp_proc.p_flag &= ~P_TRACED;
+        // kinfo_proc structure: p_flag is at offset 32 on arm64
+        if (ret == 0 && oldp && oldlenp && *oldlenp >= 64) {
+            // Clear P_TRACED flag (bit 11) at offset 32 (kp_proc.p_flag)
+            int *p_flag = (int *)(oldp + 32);
+            *p_flag &= ~WX_P_TRACED;
             DLOG(@"[SYSCTL] Cleared P_TRACED flag (debugger hidden)");
         }
     }
