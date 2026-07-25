@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.02 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.03 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3114,7 +3114,59 @@ static void computeHiddenIndices(void) {
     DLOG(@"[DYLD-HIDE] Total hidden: %u / %u", g_hiddenCount, realCount);
 }
 
+// v36.03: Directly patch dyld_all_image_infos to remove our dylibs
+// This bypasses games that read the struct directly instead of calling dyld APIs
+struct dyld_image_info_patch {
+    const struct mach_header *imageLoadAddress;
+    const char *imageFilePath;
+    void *imageFileModDate;
+};
+
+struct dyld_all_image_infos_patch {
+    uint32_t version;
+    uint32_t infoArrayCount;
+    struct dyld_image_info_patch *infoArray;
+    void *notification;
+    void *processDetachedFromSharedRegion;
+    void *libSystemInitialized;
+    void *dyldImageLoadAddress;
+    // ... more fields, but we only need first few
+};
+
+extern struct dyld_all_image_infos_patch _dyld_all_image_infos;
+
+static void patchDyldAllImageInfos(void) {
+    uint32_t realCount = _dyld_all_image_infos.infoArrayCount;
+    struct dyld_image_info_patch *infoArray = _dyld_all_image_infos.infoArray;
+    
+    if (!infoArray || realCount == 0) return;
+    
+    DLOG(@"[DYLD-PATCH] Patching dyld_all_image_infos: %u images -> removing hidden", realCount);
+    
+    // Build new array without hidden dylibs
+    static struct dyld_image_info_patch newInfoArray[256];
+    uint32_t newCount = 0;
+    
+    for (uint32_t i = 0; i < realCount && newCount < 256; i++) {
+        const char *path = infoArray[i].imageFilePath;
+        if (!shouldHideDylib(path)) {
+            newInfoArray[newCount] = infoArray[i];
+            newCount++;
+        }
+    }
+    
+    // Replace array and count
+    _dyld_all_image_infos.infoArray = newInfoArray;
+    _dyld_all_image_infos.infoArrayCount = newCount;
+    
+    DLOG(@"[DYLD-PATCH] Patched: %u -> %u images", realCount, newCount);
+}
+
 static void installDyldHooks(void) {
+    // v36.03: First, directly patch dyld_all_image_infos struct
+    // This is more effective than fishhook for games that read the struct directly
+    patchDyldAllImageInfos();
+    
     // Compute hidden indices first
     computeHiddenIndices();
     
@@ -3616,9 +3668,10 @@ static void installSecurityHooks(void) {
     installDladdrHook();
     installDlopenHook();
     
-    // v36.01: File system hooks (jailbreak detection prevention)
-    installFileSystemHooks();
-    installSysctlHook();
+    // v36.03: DISABLE file system and sysctl hooks
+    // These hooks may interfere with normal app behavior and trigger detection
+    // installFileSystemHooks();
+    // installSysctlHook();
     
     // v35.49: RE-ENABLED crypto hooks for 7.62
     // Game encrypts version info in packets, need to replace BEFORE encryption
