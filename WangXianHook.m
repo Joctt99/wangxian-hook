@@ -3324,10 +3324,11 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
 
 // Hook CCHmac (HMAC computation - used by C++ CCFileUtils::hmacSha256Base64)
 // This is the KEY hook that was missing - game C++ code calls this directly!
-typedef void (*CCHmacFunc)(CCHmacAlgorithm algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut);
+// Use uint32_t instead of CCHmacAlgorithm since CommonHMAC.h may not be imported
+typedef void (*CCHmacFunc)(uint32_t algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut);
 static CCHmacFunc orig_CCHmac = NULL;
 
-static void hook_CCHmac(CCHmacAlgorithm algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut) {
+static void hook_CCHmac(uint32_t algorithm, const void *key, size_t keyLength, const void *data, size_t dataLength, void *macOut) {
     if (!orig_CCHmac) {
         orig_CCHmac = (CCHmacFunc)dlsym(RTLD_DEFAULT, "CCHmac");
         if (!orig_CCHmac) return;
