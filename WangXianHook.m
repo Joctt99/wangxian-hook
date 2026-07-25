@@ -1,7 +1,7 @@
 /**
- * WangXianHook v35.85 - Fix 0x80000015 response on game server (12003)
- * KEY FIX: Enable 0x80000015 response injection for both login server (5678) and game server (12003)
- *          Game server returns empty 0x80000015 response, causing client to hang
+ * WangXianHook v35.86 - Fix: Game server 0x00000015 is heartbeat, not server list
+ * KEY FIX: Only inject mock server list on login server (5678), NOT game server (12003)
+ *          Game server uses 0x0000015 as heartbeat/ping, injecting server list breaks it
  * FIX: Hook EncryptUtils HMAC to compute signatures with faked version (7.7.0)
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
  * BASE: v35.77 stable (no send tampering, no server list injection)
@@ -74,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.85 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.86 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2263,12 +2263,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v35.85: Intercept 0x80000015 response (empty server list response)
-        // Handle both login server (5678) and game server (12003)
-        // The client matches responses to requests by cmd (response_cmd = request_cmd | 0x80000000)
-        // If we return 0x802EE118, client never processes it!
-        if (cmd == 0x80000015 && (port == 5678 || port == 12003)) {
-            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes) from port %d, injecting mock server list", ret, port);
+        // v35.86: Intercept 0x80000015 response (server list response)
+        // Only handle login server (5678) - game server (12003) uses 0x00000015 as heartbeat/ping
+        // Game server returns 22-byte minimal response, don't inject server list there!
+        if (cmd == 0x80000015 && port == 5678) {
+            DLOG(@"[WXHOOK] 🔥 Intercepted 0x80000015 response (%zd bytes) from login server, injecting mock server list", ret);
             
             // Construct mock response: keep cmd=0x80000015 but fill with server list data
             // Format: pktLen(4) + cmd(4) + seq(4) + server_count(2) + server_data...
