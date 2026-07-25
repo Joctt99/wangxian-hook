@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.01 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.02 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2050,6 +2050,30 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        // v36.02: Auto-respond to 0x00FFFF02 challenge packet
+        // Server sends 0x00FFFF02 as a challenge, client must respond with 0x80FFFF02
+        // Same pattern as 0x00FFFF01 -> 0x80FFFF01 (echo with cmd high bit set)
+        if (cmd == 0x00FFFF02 && port == 12003 && ret >= 8) {
+            // Construct response: copy original data, set cmd high bit to 0x80
+            unsigned char response[512];  // Max packet size we'll handle
+            size_t respLen = ret;
+            if (respLen <= sizeof(response)) {
+                memcpy(response, p, respLen);
+                response[4] = 0x80;  // Change cmd from 0x00FFFF02 to 0x80FFFF02
+                
+                // Send response immediately via orig_send
+                ssize_t sent = orig_send ? orig_send(fd, response, respLen, 0) : -1;
+                DLOG(@"[CHALLENGE-RESP] Auto-responded to 0x00FFFF02 with 0x80FFFF02 (len=%zu, sent=%zd)", respLen, sent);
+                
+                // Log the response packet
+                NSMutableString *respHex = [NSMutableString stringWithCapacity:respLen * 3];
+                for (size_t i = 0; i < respLen; i++) {
+                    [respHex appendFormat:@"%02X ", response[i]];
+                }
+                DLOG(@"[CHALLENGE-RESP] Response hex: %@", respHex);
+            }
+        }
             
             // v35.88: Detailed dump for game server responses (port 12003)
             // Track all responses from game server to find error codes
