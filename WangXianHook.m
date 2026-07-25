@@ -83,7 +83,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.99 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.00 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2955,7 +2955,11 @@ static void installSocketHooks(void) {
 // ============================================================
 
 static const char *g_hiddenDylibs[] = {
-    "WangXianHook", "lnSignature", "libSupport", "liblnSignature", "substrate", "frida", NULL
+    "WangXianHook", "lnSignature", "libSupport", "liblnSignature",
+    "substrate", "frida", "libsubstrate", "libWJHook",
+    "wanxianguoQM", "BackRun", "万能常驻", "libfrida",
+    "libcycript", "Cydia", "MobileSubstrate",
+    NULL
 };
 
 static BOOL shouldHideDylib(const char *name) {
@@ -2970,6 +2974,7 @@ static BOOL shouldHideDylib(const char *name) {
 static uint32_t (*orig_dyld_image_count)(void) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
 
 // Count of hidden images (computed at init)
 static uint32_t g_hiddenCount = 0;
@@ -3033,6 +3038,24 @@ static const struct mach_header *hook_dyld_get_image_header(uint32_t index) {
     return orig_dyld_get_image_header(realIndex);
 }
 
+// Hooked dyld_get_image_vmaddr_slide - return slide for mapped index
+static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t index) {
+    if (!orig_dyld_get_image_vmaddr_slide) return 0;
+    
+    uint32_t fakeCount = orig_dyld_image_count() - g_hiddenCount;
+    if (index >= fakeCount) return 0;
+    
+    // Map fake index to real index
+    uint32_t realIndex = index;
+    for (uint32_t i = 0; i < g_hiddenCount; i++) {
+        if (g_hiddenIndices[i] <= realIndex) {
+            realIndex++;
+        }
+    }
+    
+    return orig_dyld_get_image_vmaddr_slide(realIndex);
+}
+
 // Compute hidden indices at initialization
 static void computeHiddenIndices(void) {
     g_hiddenCount = 0;
@@ -3055,13 +3078,15 @@ static void installDyldHooks(void) {
     orig_dyld_image_count = _dyld_image_count;
     orig_dyld_get_image_name = _dyld_get_image_name;
     orig_dyld_get_image_header = _dyld_get_image_header;
+    orig_dyld_get_image_vmaddr_slide = _dyld_get_image_vmaddr_slide;
     
     // Try to rebind via fishhook (works for calls through PLT)
     rebindSymbol("_dyld_image_count", (void *)hook_dyld_image_count, (void **)&orig_dyld_image_count);
     rebindSymbol("_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     rebindSymbol("_dyld_get_image_header", (void *)hook_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    rebindSymbol("_dyld_get_image_vmaddr_slide", (void *)hook_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide);
     
-    DLOG(@"[DYLD-HOOK] Installed hooks for image_count/get_image_name/get_image_header");
+    DLOG(@"[DYLD-HOOK] Installed hooks for image_count/get_image_name/get_image_header/vmaddr_slide");
 }
 
 // ============================================================
@@ -3095,6 +3120,39 @@ static void installDladdrHook(void) {
         orig_dladdr = (DladdrFunc)dlsym(libdyld, "dladdr");
         rebindSymbol("_dladdr", (void *)hook_dladdr, (void **)&orig_dladdr);
         DLOG(@"[DLADDR-HOOK] Installed, orig=%p", orig_dladdr);
+    }
+}
+
+// ============================================================
+#pragma mark - dlopen Hook (prevent detection of hidden dylibs)
+// ============================================================
+
+typedef void *(*DlopenFunc)(const char *, int);
+static DlopenFunc orig_dlopen = NULL;
+
+static void *hook_dlopen(const char *path, int mode) {
+    void *handle = orig_dlopen ? orig_dlopen(path, mode) : NULL;
+    
+    // If trying to open a hidden dylib, return NULL to pretend it doesn't exist
+    if (handle && path && shouldHideDylib(path)) {
+        DLOG(@"[DLOPEN-HOOK] Blocked dlopen of hidden dylib: %s", path);
+        if (handle) {
+            dlclose(handle);
+        }
+        return NULL;
+    }
+    
+    return handle;
+}
+
+static void installDlopenHook(void) {
+    void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_NOLOAD);
+    if (libdyld) {
+        orig_dlopen = (DlopenFunc)dlsym(libdyld, "dlopen");
+        if (orig_dlopen) {
+            rebindSymbol("_dlopen", (void *)hook_dlopen, (void **)&orig_dlopen);
+            DLOG(@"[DLOPEN-HOOK] Installed, orig=%p", orig_dlopen);
+        }
     }
 }
 
@@ -3376,6 +3434,7 @@ static void installSecurityHooks(void) {
     // Install DYLD hooks to hide injected libraries
     installDyldHooks();
     installDladdrHook();
+    installDlopenHook();
     
     // v35.49: RE-ENABLED crypto hooks for 7.62
     // Game encrypts version info in packets, need to replace BEFORE encryption
