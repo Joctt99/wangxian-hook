@@ -1,8 +1,7 @@
 /**
- * WangXianHook v35.87 - Patch UUID validation response (ispass=NO -> YES)
- * KEY FIX: Game sends UUID to https://x.md5xor.com for validation
- *          Server returns ispass="NO" which causes game to hang
- *          Patch both delegate-mode and completion-mode HTTP responses
+ * WangXianHook v35.88 - Add detailed game server response logging
+ * KEY FIX: Dump all game server (12003) responses to find error codes
+ *          Game server may be returning error codes that cause hang
  * FIX: Hook EncryptUtils HMAC to compute signatures with faked version (7.7.0)
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
  * BASE: v35.77 stable (no send tampering, no server list injection)
@@ -75,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.87 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.88 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1967,6 +1966,37 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            
+            // v35.88: Detailed dump for game server responses (port 12003)
+            // Track all responses from game server to find error codes
+            if (port == 12003) {
+                DLOG(@"[GAME-SRV-RESP] === Game server response dump ===");
+                DLOG(@"[GAME-SRV-RESP] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+                
+                // Dump full hex in 16-byte chunks
+                NSMutableString *lineHex = [NSMutableString stringWithCapacity:48];
+                NSMutableString *lineAscii = [NSMutableString stringWithCapacity:16];
+                for (size_t i = 0; i < ret; i++) {
+                    [lineHex appendFormat:@"%02X ", p[i]];
+                    [lineAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+                    if ((i + 1) % 16 == 0 || i == ret - 1) {
+                        DLOG(@"[GAME-SRV-RESP] %04X: %@ | %@", i - ((i + 1) % 16 == 0 ? 15 : (i % 16)), lineHex, lineAscii);
+                        [lineHex setString:@""];
+                        [lineAscii setString:@""];
+                    }
+                }
+                
+                // Search for common error patterns
+                NSString *dataStr = [[NSString alloc] initWithBytes:p length:ret encoding:NSUTF8StringEncoding];
+                if (dataStr) {
+                    if ([dataStr containsString:@"error"] || [dataStr containsString:@"Error"] || 
+                        [dataStr containsString:@"ERROR"] || [dataStr containsString:@"fail"] ||
+                        [dataStr containsString:@"Fail"] || [dataStr containsString:@"FAIL"] ||
+                        [dataStr containsString:@"版本"] || [dataStr containsString:@"拒绝"]) {
+                        DLOG(@"[GAME-SRV-RESP] ⚠️ ERROR FOUND in response: %@", dataStr);
+                    }
+                }
+            }
         
         // v35.79: Detailed dump for login response (0x802EE121)
         // Dump full response + search for tokens/error codes to understand what server returns
