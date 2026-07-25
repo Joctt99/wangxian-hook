@@ -1,10 +1,10 @@
 /**
- * WangXianHook v35.78 - Targeted version replacement: only replace in cmd=0x002EE121
- * FIX: Only replace version in LOGIN request (cmd=0x002EE121), NOT in server list request
- *      This way: server list returns normally (real version), login succeeds (fake version)
- * FIX: Keep server list injection DISABLED (server returns real list)
- * FIX: Keep all network reachability hooks + SK hooks
- * FIX: PROTO-R-PATCH still active as fallback
+ * WangXianHook v35.79 - Analysis: Dump full login request/response for debugging
+ * BASE: v35.77 stable (disabled send version replacement + disabled server list injection)
+ * ADD: Full hex dump of login request (0x002EE121) and login response (0x802EE121)
+ * ADD: Print version number actually found in login request
+ * ADD: Print detailed response structure (error code, token existence, etc.)
+ * PURPOSE: Understand what version the server sees, what error it returns, and whether it includes a token
  * FIX: NetworkReachabilityProvider.isReachable -> YES
  * FIX: NetworkMonitor.isNetworkAvailable -> YES
  * FIX: Any method containing reachable/connected/available -> returns YES
@@ -78,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.78 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.79 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1497,17 +1497,82 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: v35.78 - ONLY replace in LOGIN request (cmd=0x002EE121)
-    // Why: Replacing in ALL packets causes server list request to fail (empty server list / "no network")
-    //      Login server checks version in login request - only tamper that one request
-    //      Server list request uses real version -> server returns normal list
-    //      Login request uses fake version -> server returns success + valid token
-    if ((port == 5678) && sendLen >= 8 && sendBuf == buf) {
+    // v35.79: Detailed dump for login request (0x002EE121)
+    // Dump full request + search for version numbers to understand what the server sees
+    if (port == 5678 && sendLen >= 8) {
         const unsigned char *p = (const unsigned char *)sendBuf;
         uint32_t sendCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         
-        // Only replace version in LOGIN request (0x002EE121)
+        if (sendCmd == 0x002EE121) {
+            DLOG(@"[LOGIN-REQ] === FULL LOGIN REQUEST DUMP ===");
+            DLOG(@"[LOGIN-REQ] cmd=0x%08X len=%zu", sendCmd, sendLen);
+            
+            // Dump full hex (not just first 256 bytes)
+            NSMutableString *fullHex = [NSMutableString stringWithCapacity:sendLen * 3];
+            NSMutableString *fullAscii = [NSMutableString stringWithCapacity:sendLen];
+            for (size_t i = 0; i < sendLen; i++) {
+                if (i > 0 && i % 16 == 0) {
+                    DLOG(@"[LOGIN-REQ] %04X: %@ | %@", i - 16, fullHex, fullAscii);
+                    [fullHex setString:@""];
+                    [fullAscii setString:@""];
+                }
+                [fullHex appendFormat:@"%02X ", p[i]];
+                [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+            }
+            if (fullHex.length > 0) {
+                DLOG(@"[LOGIN-REQ] %04X: %@ | %@", sendLen - (sendLen % 16), fullHex, fullAscii);
+            }
+            
+            // Search for version patterns
+            const unsigned char ver762[] = {0x37, 0x2E, 0x36, 0x2E, 0x32}; // "7.6.2"
+            const unsigned char ver770[] = {0x37, 0x2E, 0x37, 0x2E, 0x30}; // "7.7.0"
+            const unsigned char ver978[] = {0x39, 0x37, 0x38}; // "978"
+            
+            DLOG(@"[LOGIN-REQ] === VERSION SEARCH ===");
+            for (size_t i = 0; i + 5 <= sendLen; i++) {
+                if (memcmp(p + i, ver762, 5) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND '7.6.2' at offset %zu", i);
+                }
+                if (memcmp(p + i, ver770, 5) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND '7.7.0' at offset %zu", i);
+                }
+                if (memcmp(p + i, ver978, 3) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND '978' at offset %zu", i);
+                }
+            }
+            
+            // Search for common protocol fields
+            const unsigned char tokenPattern[] = {0x74, 0x6F, 0x6B, 0x65, 0x6E}; // "token"
+            const unsigned char signPattern[] = {0x73, 0x69, 0x67, 0x6E}; // "sign"
+            const unsigned char md5Pattern[] = {0x6D, 0x64, 0x35}; // "md5"
+            
+            for (size_t i = 0; i + 5 <= sendLen; i++) {
+                if (memcmp(p + i, tokenPattern, 5) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND 'token' at offset %zu", i);
+                }
+                if (i + 4 <= sendLen && memcmp(p + i, signPattern, 4) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND 'sign' at offset %zu", i);
+                }
+                if (memcmp(p + i, md5Pattern, 3) == 0) {
+                    DLOG(@"[LOGIN-REQ] FOUND 'md5' at offset %zu", i);
+                }
+            }
+            
+            DLOG(@"[LOGIN-REQ] === END LOGIN REQUEST DUMP ===");
+        }
+    }
+    
+    // Version replacement: v35.79 - DISABLED (v35.78 proved modifying send packets breaks signature)
+    // v35.78 RESULT: Modifying login request (0x002EE121) causes immediate "network interruption"
+    // PROOF: Game server verifies packet signature/checksum - byte-level tampering detected
+    // New approach: Dump login request/response to understand what version is sent and what server returns
+    // We need to find where the version comes from and hook at the source (before packet construction)
+    if (0 && (port == 5678) && sendLen >= 8 && sendBuf == buf) {
+        const unsigned char *p = (const unsigned char *)sendBuf;
+        uint32_t sendCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        
         if (sendCmd == 0x002EE121) {
             const unsigned char verPatternWithPrefix[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
             const unsigned char verPatternSimple[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
@@ -1530,19 +1595,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     
                     for (size_t i = 0; i + 5 <= sendLen; i++) {
                         if (i + 7 <= sendLen && memcmp(q + i, verPatternWithPrefix, 7) == 0) {
-                            q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
+                            q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30;
                             verCnt++;
-                            DLOG(@"[VER-REPLACE] Login req: replaced 7.6.2 -> 7.7.0 (with prefix) at offset %zu", i+2);
                         } else if (memcmp(q + i, verPatternSimple, 5) == 0) {
-                            q[i] = 0x37; q[i+1] = 0x2E; q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x30; // "7.7.0"
+                            q[i] = 0x37; q[i+1] = 0x2E; q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x30;
                             verCnt++;
-                            DLOG(@"[VER-REPLACE] Login req: replaced 7.6.2 -> 7.7.0 (simple) at offset %zu", i);
                         }
                     }
                     
                     if (verCnt > 0) {
                         sendBuf = newBuf;
-                        DLOG(@"[VER-REPLACE] Login req: %d version replacements in cmd=0x%08X", verCnt, sendCmd);
                     } else {
                         free(newBuf);
                     }
@@ -1893,6 +1955,80 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         uint32_t cmd      = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+        
+        // v35.79: Detailed dump for login response (0x802EE121)
+        // Dump full response + search for tokens/error codes to understand what server returns
+        if (cmd == 0x802EE121 && port == 5678) {
+            DLOG(@"[LOGIN-RESP] === FULL LOGIN RESPONSE DUMP ===");
+            DLOG(@"[LOGIN-RESP] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            DLOG(@"[LOGIN-RESP] Status byte 12: 0x%02X", p[12]);
+            
+            // Dump full hex
+            NSMutableString *fullHex = [NSMutableString stringWithCapacity:ret * 3];
+            NSMutableString *fullAscii = [NSMutableString stringWithCapacity:ret];
+            for (size_t i = 0; i < ret; i++) {
+                if (i > 0 && i % 16 == 0) {
+                    DLOG(@"[LOGIN-RESP] %04X: %@ | %@", i - 16, fullHex, fullAscii);
+                    [fullHex setString:@""];
+                    [fullAscii setString:@""];
+                }
+                [fullHex appendFormat:@"%02X ", p[i]];
+                [fullAscii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
+            }
+            if (fullHex.length > 0) {
+                DLOG(@"[LOGIN-RESP] %04X: %@ | %@", ret - (ret % 16), fullHex, fullAscii);
+            }
+            
+            // Search for version/token/sign patterns
+            const unsigned char ver762[] = {0x37, 0x2E, 0x36, 0x2E, 0x32};
+            const unsigned char ver978[] = {0x39, 0x37, 0x38};
+            const unsigned char tokenPattern[] = {0x74, 0x6F, 0x6B, 0x65, 0x6E};
+            const unsigned char signPattern[] = {0x73, 0x69, 0x67, 0x6E};
+            
+            DLOG(@"[LOGIN-RESP] === SEARCH RESULTS ===");
+            for (size_t i = 0; i + 5 <= ret; i++) {
+                if (memcmp(p + i, ver762, 5) == 0) {
+                    DLOG(@"[LOGIN-RESP] FOUND '7.6.2' at offset %zu", i);
+                }
+                if (memcmp(p + i, ver978, 3) == 0) {
+                    DLOG(@"[LOGIN-RESP] FOUND '978' at offset %zu", i);
+                }
+                if (memcmp(p + i, tokenPattern, 5) == 0) {
+                    DLOG(@"[LOGIN-RESP] FOUND 'token' at offset %zu", i);
+                }
+                if (i + 4 <= ret && memcmp(p + i, signPattern, 4) == 0) {
+                    DLOG(@"[LOGIN-RESP] FOUND 'sign' at offset %zu", i);
+                }
+            }
+            
+            // Search for error messages
+            const unsigned char errMsg[] = "\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+            for (ssize_t i = 0; i <= ret - 12; i++) {
+                if (memcmp(p + i, errMsg, 12) == 0) {
+                    DLOG(@"[LOGIN-RESP] FOUND error msg '当前版本过低' at offset %zd", i);
+                }
+            }
+            
+            // Check for common token patterns (32-byte hex, 40-byte hex, etc.)
+            DLOG(@"[LOGIN-RESP] === TOKEN SEARCH ===");
+            for (size_t i = 0; i + 32 <= ret; i++) {
+                BOOL isHexToken = YES;
+                for (size_t j = 0; j < 32; j++) {
+                    unsigned char c = p[i + j];
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                        isHexToken = NO;
+                        break;
+                    }
+                }
+                if (isHexToken) {
+                    char tokenStr[33] = {0};
+                    memcpy(tokenStr, p + i, 32);
+                    DLOG(@"[LOGIN-RESP] FOUND 32-byte hex token at offset %zu: %s", i, tokenStr);
+                }
+            }
+            
+            DLOG(@"[LOGIN-RESP] === END LOGIN RESPONSE DUMP ===");
+        }
         
         // v35.34: Only patch 0x802EE121 (version check). Do NOT patch 0x802EE118/0x802EE120.
         // Patching their byte 12 may corrupt non-error status codes and break game server auth.
