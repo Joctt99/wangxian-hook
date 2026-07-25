@@ -1,8 +1,8 @@
 /**
- * WangXianHook v35.89 - Increase log limit + reduce detailed dumps
+ * WangXianHook v35.90 - Disable UITableView cellForRow hook (causes crash)
+ * KEY FIX: DISABLED cellForRowAtIndexPath hook - creates fake cells that crash game
+ * KEY FIX: DISABLED numberOfSections hook - may cause issues
  * KEY FIX: Increase log export limit from 200KB to 500KB
- * KEY FIX: Reduce game server response logging to only error patterns
- *          Detailed hex dumps cause log bloat and truncation
  * FIX: Hook EncryptUtils HMAC to compute signatures with faked version (7.7.0)
  * FIX: Binary patched 7.6.2->7.7.0 + Info.plist patched
  * BASE: v35.77 stable (no send tampering, no server list injection)
@@ -75,7 +75,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v35.89 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v35.90 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4627,32 +4627,37 @@ static void installAllHooks(void) {
     tryHookMieshiServerInfo(0);
     
     // === DEFERRED: UITableView DataSource Hook for server list debugging ===
+    // v35.90: DISABLED cellForRowAtIndexPath hook to prevent crash
+    // The fake cell creation may cause incompatibility with game's custom cells
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class tableViewCls = [UITableView class];
         
+        // Only observe, don't modify - cellForRow hook causes crashes
         Method numberOfRows = class_getInstanceMethod(tableViewCls, @selector(numberOfRowsInSection:));
         if (numberOfRows) {
             IMP orig_impl = method_getImplementation(numberOfRows);
             method_setImplementation(numberOfRows, (IMP)hook_numberOfRowsInSection);
             orig_tableView_numberOfRows = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView numberOfRowsInSection:");
+            DLOG(@"[TV-HOOK] Hooked UITableView numberOfRowsInSection: (observe only)");
         }
         
-        Method cellForRow = class_getInstanceMethod(tableViewCls, @selector(cellForRowAtIndexPath:));
-        if (cellForRow) {
-            IMP orig_impl = method_getImplementation(cellForRow);
-            method_setImplementation(cellForRow, (IMP)hook_cellForRowAtIndexPath);
-            orig_tableView_cellForRow = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView cellForRowAtIndexPath:");
-        }
+        // DISABLED: cellForRowAtIndexPath hook - causes crash
+        // Method cellForRow = class_getInstanceMethod(tableViewCls, @selector(cellForRowAtIndexPath:));
+        // if (cellForRow) {
+        //     IMP orig_impl = method_getImplementation(cellForRow);
+        //     method_setImplementation(cellForRow, (IMP)hook_cellForRowAtIndexPath);
+        //     orig_tableView_cellForRow = orig_impl;
+        //     DLOG(@"[TV-HOOK] Hooked UITableView cellForRowAtIndexPath:");
+        // }
         
-        Method numberOfSections = class_getInstanceMethod(tableViewCls, @selector(numberOfSections));
-        if (numberOfSections) {
-            IMP orig_impl = method_getImplementation(numberOfSections);
-            method_setImplementation(numberOfSections, (IMP)hook_numberOfSections);
-            orig_tableView_numberOfSections = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView numberOfSections");
-        }
+        // DISABLED: numberOfSections hook - may cause issues
+        // Method numberOfSections = class_getInstanceMethod(tableViewCls, @selector(numberOfSections));
+        // if (numberOfSections) {
+        //     IMP orig_impl = method_getImplementation(numberOfSections);
+        //     method_setImplementation(numberOfSections, (IMP)hook_numberOfSections);
+        //     orig_tableView_numberOfSections = orig_impl;
+        //     DLOG(@"[TV-HOOK] Hooked UITableView numberOfSections");
+        // }
     });
     
     // === DEFERRED: NSURLSession Hook for HTTP-based version check/server list ===
