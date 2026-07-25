@@ -3382,13 +3382,14 @@ static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
     NSDictionary *orig = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
     if (!orig) return orig;
     
-    // Check if we've already created a modified version
-    static NSMutableDictionary *g_modifiedInfoDict = nil;
+    static NSDictionary *g_modifiedInfoDict = nil;
     static int g_infoDictLogCount = 0;
     
     if (!g_modifiedInfoDict) {
-        g_modifiedInfoDict = [orig mutableCopy];
-        [g_modifiedInfoDict setObject:@"7.7.0" forKey:@"CFBundleShortVersionString"];
+        NSMutableDictionary *mutableDict = [orig mutableCopy];
+        [mutableDict setObject:@"7.7.0" forKey:@"CFBundleShortVersionString"];
+        g_modifiedInfoDict = [mutableDict copy];
+        [mutableDict release];
         if (g_infoDictLogCount < 3) {
             DLOG(@"[VER-FAKE] infoDictionary: created modified dict, CFBundleShortVersionString = 7.7.0");
             g_infoDictLogCount++;
