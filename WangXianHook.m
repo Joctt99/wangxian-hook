@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.04 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.05 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -3580,6 +3580,86 @@ static CCCryptorStatus hook_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions o
     return status;
 }
 
+// v36.05: Hook CCCryptor functions for streaming AES encryption/decryption
+// Games often use CCCryptorCreate/Update/Final instead of one-shot CCCrypt
+typedef struct _CCCryptor *CCCryptorRef;
+typedef CCCryptorStatus (*CCCryptorCreateFunc)(CCOperation op, CCAlgorithm alg, CCOptions options, const void *key, size_t keyLength, const void *iv, CCCryptorRef *cryptorRef);
+typedef CCCryptorStatus (*CCCryptorUpdateFunc)(CCCryptorRef cryptor, const void *dataIn, size_t dataInLength, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+typedef CCCryptorStatus (*CCCryptorFinalFunc)(CCCryptorRef cryptor, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+typedef CCCryptorStatus (*CCCryptorReleaseFunc)(CCCryptorRef cryptor);
+
+static CCCryptorCreateFunc orig_CCCryptorCreate = NULL;
+static CCCryptorUpdateFunc orig_CCCryptorUpdate = NULL;
+static CCCryptorFinalFunc orig_CCCryptorFinal = NULL;
+
+static int g_cryptorCount = 0;
+
+static CCCryptorStatus hook_CCCryptorCreate(CCOperation op, CCAlgorithm alg, CCOptions options,
+    const void *key, size_t keyLength, const void *iv, CCCryptorRef *cryptorRef) {
+    
+    if (!orig_CCCryptorCreate) {
+        orig_CCCryptorCreate = (CCCryptorCreateFunc)dlsym(RTLD_DEFAULT, "CCCryptorCreate");
+        if (!orig_CCCryptorCreate) return -1;
+    }
+    
+    g_cryptorCount++;
+    const char *opStr = (op == kCCEncrypt) ? "ENC" : (op == kCCDecrypt) ? "DEC" : "?";
+    const char *algStr = (alg == kCCAlgorithmAES) ? "AES" : (alg == kCCAlgorithmDES) ? "DES" : "?";
+    
+    DLOG(@"[CC-CREATE] #%d %s %s keyLen=%zu", g_cryptorCount, opStr, algStr, keyLength);
+    
+    return orig_CCCryptorCreate(op, alg, options, key, keyLength, iv, cryptorRef);
+}
+
+static CCCryptorStatus hook_CCCryptorUpdate(CCCryptorRef cryptor, const void *dataIn, size_t dataInLength,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    
+    if (!orig_CCCryptorUpdate) {
+        orig_CCCryptorUpdate = (CCCryptorUpdateFunc)dlsym(RTLD_DEFAULT, "CCCryptorUpdate");
+        if (!orig_CCCryptorUpdate) return -1;
+    }
+    
+    // Log input data (plaintext for encryption, ciphertext for decryption)
+    if (dataIn && dataInLength > 0 && dataInLength < 4096) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(dataInLength, 256) * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(dataInLength, 256)];
+        size_t showLen = MIN(dataInLength, 256);
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", ((const uint8_t *)dataIn)[i]];
+            [ascii appendFormat:@"%c", (((const uint8_t *)dataIn)[i] >= 0x20 && ((const uint8_t *)dataIn)[i] < 0x7F) ? ((const uint8_t *)dataIn)[i] : '.'];
+        }
+        DLOG(@"[CC-UPDATE] #%d inLen=%zu\n  hex: %@\n  txt: %@", g_cryptorCount, dataInLength, hex, ascii);
+    }
+    
+    CCCryptorStatus status = orig_CCCryptorUpdate(cryptor, dataIn, dataInLength, dataOut, dataOutAvailable, dataOutMoved);
+    
+    return status;
+}
+
+static CCCryptorStatus hook_CCCryptorFinal(CCCryptorRef cryptor, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    
+    if (!orig_CCCryptorFinal) {
+        orig_CCCryptorFinal = (CCCryptorFinalFunc)dlsym(RTLD_DEFAULT, "CCCryptorFinal");
+        if (!orig_CCCryptorFinal) return -1;
+    }
+    
+    CCCryptorStatus status = orig_CCCryptorFinal(cryptor, dataOut, dataOutAvailable, dataOutMoved);
+    
+    // For decryption: log final output (decrypted plaintext)
+    if (status == 0 && dataOut && dataOutMoved && *dataOutMoved > 0 && *dataOutMoved < 4096) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(*dataOutMoved, 256) * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(*dataOutMoved, 256)];
+        size_t showLen = MIN(*dataOutMoved, 256);
+        for (size_t i = 0; i < showLen; i++) {
+            [hex appendFormat:@"%02X ", ((uint8_t *)dataOut)[i]];
+            [ascii appendFormat:@"%c", (((uint8_t *)dataOut)[i] >= 0x20 && ((uint8_t *)dataOut)[i] < 0x7F) ? ((uint8_t *)dataOut)[i] : '.'];
+        }
+        DLOG(@"[CC-FINAL-OUT] #%d decrypted final len=%zu\n  hex: %@\n  txt: %@", g_cryptorCount, *dataOutMoved, hex, ascii);
+    }
+    
+    return status;
+}
+
 // Hook SecKeyCreateEncryptedData (new RSA API in iOS 10+)
 // 7.62 uses this instead of SecKeyEncrypt
 typedef CFDataRef (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plainText, CFErrorRef *error);
@@ -3752,6 +3832,27 @@ static void installSecurityHooks(void) {
         orig_CCCrypt = (CCCryptFunc)sym;
         rebindSymbol("CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
         DLOG(@"[SEC] CCCrypt: HOOKED (replace version before AES encryption)");
+    }
+    
+    // v36.05: Hook CCCryptor streaming functions
+    // Games often use CCCryptorCreate/Update/Final instead of one-shot CCCrypt
+    sym = dlsym(RTLD_DEFAULT, "CCCryptorCreate");
+    if (sym) {
+        orig_CCCryptorCreate = (CCCryptorCreateFunc)sym;
+        rebindSymbol("CCCryptorCreate", (void *)hook_CCCryptorCreate, (void **)&orig_CCCryptorCreate);
+        DLOG(@"[SEC] CCCryptorCreate: HOOKED");
+    }
+    sym = dlsym(RTLD_DEFAULT, "CCCryptorUpdate");
+    if (sym) {
+        orig_CCCryptorUpdate = (CCCryptorUpdateFunc)sym;
+        rebindSymbol("CCCryptorUpdate", (void *)hook_CCCryptorUpdate, (void **)&orig_CCCryptorUpdate);
+        DLOG(@"[SEC] CCCryptorUpdate: HOOKED");
+    }
+    sym = dlsym(RTLD_DEFAULT, "CCCryptorFinal");
+    if (sym) {
+        orig_CCCryptorFinal = (CCCryptorFinalFunc)sym;
+        rebindSymbol("CCCryptorFinal", (void *)hook_CCCryptorFinal, (void **)&orig_CCCryptorFinal);
+        DLOG(@"[SEC] CCCryptorFinal: HOOKED");
     }
     
     // Hook SecKeyCreateEncryptedData (new RSA API - 7.62 uses this)
