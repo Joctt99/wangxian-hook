@@ -3388,8 +3388,7 @@ static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
     if (!g_modifiedInfoDict) {
         NSMutableDictionary *mutableDict = [orig mutableCopy];
         [mutableDict setObject:@"7.7.0" forKey:@"CFBundleShortVersionString"];
-        g_modifiedInfoDict = [mutableDict copy];
-        [mutableDict release];
+        g_modifiedInfoDict = [NSDictionary dictionaryWithDictionary:mutableDict];
         if (g_infoDictLogCount < 3) {
             DLOG(@"[VER-FAKE] infoDictionary: created modified dict, CFBundleShortVersionString = 7.7.0");
             g_infoDictLogCount++;
