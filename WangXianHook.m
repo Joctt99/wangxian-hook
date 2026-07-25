@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.06 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.07 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4307,7 +4307,8 @@ static void installAllHooks(void) {
     DLOG(@"[ACT] Installing all hooks...");
     
     installCrashHandlers();
-    installSecurityHooks();
+    // v36.07: DISABLE all crypto hooks to see if they trigger injection detection
+    // installSecurityHooks();
     installKeyboardProtection();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
@@ -4547,7 +4548,8 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
     
-    installEncryptUtilsHooks();
+    // v36.07: DISABLE EncryptUtils hooks to see if they trigger injection detection
+    // installEncryptUtilsHooks();
     
     // === IMMEDIATE: Network Reachability Hooks ===
     // v35.66: Hook system and third-party network detection classes
