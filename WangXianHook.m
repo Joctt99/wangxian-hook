@@ -43,6 +43,9 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonCryptor.h>
 
+#include <execinfo.h>
+#include <signal.h>
+
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
 static NSString *g_logPath = nil;
@@ -85,52 +88,63 @@ static void log_init(void) {
     }
     
     // === CRASH HANDLER (v35.94) ===
-    // Capture uncaught exceptions and signals to diagnose crashes
-    NSSetUncaughtExceptionHandler(^(NSException *exception) {
-        _log(@"[CRASH] Uncaught exception: %@", exception.name);
-        _log(@"[CRASH] Reason: %@", exception.reason);
-        _log(@"[CRASH] Call stack:\n%@", exception.callStackSymbols);
-        _log(@"[CRASH] User info: %@", exception.userInfo);
-        NSLog(@"[WXHook-CRASH] EXCEPTION: %@ - %@", exception.name, exception.reason);
-    });
+    _log(@"[INIT] Crash handlers installed");
+}
+
+// ============================================================
+#pragma mark - Crash handlers (v35.94)
+// ============================================================
+static void crash_log(NSString *msg) {
+    if (!g_logPath) return;
+    @try {
+        NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+        NSLog(@"[WXHook-CRASH] %@", msg);
+    } @catch (NSException *e) {}
+}
+
+static void handleUncaughtException(NSException *exception) {
+    crash_log([NSString stringWithFormat:@"EXCEPTION: %@", exception.name]);
+    crash_log([NSString stringWithFormat:@"REASON: %@", exception.reason]);
+    crash_log([NSString stringWithFormat:@"STACK:\n%@", exception.callStackSymbols]);
+}
+
+static void handleSignal(int sig) {
+    NSString *sigName = @"";
+    switch (sig) {
+        case SIGABRT: sigName = @"SIGABRT"; break;
+        case SIGSEGV: sigName = @"SIGSEGV"; break;
+        case SIGBUS: sigName = @"SIGBUS"; break;
+        case SIGILL: sigName = @"SIGILL"; break;
+        case SIGFPE: sigName = @"SIGFPE"; break;
+        default: sigName = [NSString stringWithFormat:@"SIG(%d)", sig];
+    }
+    crash_log([NSString stringWithFormat:@"SIGNAL: %@", sigName]);
     
-    // Signal handler wrapper
-    void (*signalHandler)(int) = ^(int sig) {
-        NSString *sigName = @"";
-        switch (sig) {
-            case SIGABRT: sigName = @"SIGABRT"; break;
-            case SIGSEGV: sigName = @"SIGSEGV"; break;
-            case SIGBUS: sigName = @"SIGBUS"; break;
-            case SIGILL: sigName = @"SIGILL"; break;
-            case SIGFPE: sigName = @"SIGFPE"; break;
-            default: sigName = [NSString stringWithFormat:@"SIG(%d)", sig];
+    void *callstack[100];
+    int frames = backtrace(callstack, 100);
+    char **strs = backtrace_symbols(callstack, frames);
+    if (strs) {
+        NSMutableString *stackTrace = [NSMutableString string];
+        for (int i = 0; i < frames; i++) {
+            [stackTrace appendFormat:@"%s\n", strs[i]];
         }
-        _log(@"[CRASH] Signal received: %@", sigName);
-        
-        void *callstack[100];
-        int frames = backtrace(callstack, 100);
-        char **strs = backtrace_symbols(callstack, frames);
-        if (strs) {
-            NSMutableString *stackTrace = [NSMutableString string];
-            for (int i = 0; i < frames; i++) {
-                [stackTrace appendFormat:@"%s\n", strs[i]];
-            }
-            _log(@"[CRASH] Stack trace:\n%@", stackTrace);
-            free(strs);
-        }
-        NSLog(@"[WXHook-CRASH] SIGNAL: %@", sigName);
-        
-        // Re-raise signal to allow normal crash handling
-        signal(sig, SIG_DFL);
-        raise(sig);
-    };
+        crash_log([NSString stringWithFormat:@"BACKTRACE:\n%@", stackTrace]);
+        free(strs);
+    }
     
-    signal(SIGABRT, signalHandler);
-    signal(SIGSEGV, signalHandler);
-    signal(SIGBUS, signalHandler);
-    signal(SIGILL, signalHandler);
-    signal(SIGFPE, signalHandler);
-    
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void installCrashHandlers(void) {
+    NSSetUncaughtExceptionHandler(handleUncaughtException);
+    signal(SIGABRT, handleSignal);
+    signal(SIGSEGV, handleSignal);
+    signal(SIGBUS, handleSignal);
+    signal(SIGILL, handleSignal);
+    signal(SIGFPE, handleSignal);
     _log(@"[INIT] Crash handlers installed");
 }
 
@@ -3817,6 +3831,7 @@ static void entry(void) {
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing all hooks...");
     
+    installCrashHandlers();
     installSecurityHooks();
     installKeyboardProtection();
     
