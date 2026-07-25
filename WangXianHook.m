@@ -83,7 +83,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.00 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.01 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1545,6 +1545,16 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    
+    // v36.01: Check socket validity before sending to prevent crash
+    int sockErr = 0;
+    socklen_t errLen = sizeof(sockErr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen) == 0 && sockErr != 0) {
+        DLOG(@"[SEND-SKIP] fd=%d socket error=%d, skipping send", fd, sockErr);
+        errno = ENOTCONN;
+        return -1;
+    }
+    
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
@@ -1997,6 +2007,15 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
+    
+    // v36.01: Check socket validity before receiving to prevent crash
+    int sockErr = 0;
+    socklen_t errLen = sizeof(sockErr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen) == 0 && sockErr != 0) {
+        DLOG(@"[RECV-SKIP] fd=%d socket error=%d, skipping recv", fd, sockErr);
+        errno = ENOTCONN;
+        return -1;
+    }
     
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
@@ -3164,10 +3183,139 @@ static BOOL shouldHideLine(const char *line) {
     return shouldHideDylib(line);
 }
 
+// ============================================================
+#pragma mark - File Access Hook (jailbreak detection prevention)
+// ============================================================
+
+// Check if path is a jailbreak detection path
+static BOOL isJailbreakPath(const char *path) {
+    if (!path) return NO;
+    static const char *jbPaths[] = {
+        "/Applications/Cydia.app", "/Applications/Sileo.app",
+        "/Applications/Installer.app", "/Applications/Zebra.app",
+        "/Library/MobileSubstrate", "/Library/MobileSubstrate/DynamicLibraries",
+        "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/usr/bin/ssh",
+        "/etc/apt", "/etc/ssh/sshd_config", "/private/var/lib/apt",
+        "/private/var/lib/cydia", "/private/var/tmp/cydia.log",
+        "/usr/lib/libhooker.dylib", "/usr/lib/substitute.dylib",
+        "/usr/lib/substrate", "/usr/lib/substrate/SubstrateLoader.dylib",
+        "/usr/sbin/sshd", "/var/cache/apt", "/var/lib/apt",
+        "/var/lib/cydia", "/var/tmp/cydia.log",
+        "/Applications/RockApp.app", "/Applications/Icy.app",
+        "/usr/lib/libcycript", "/usr/bin/cycript",
+        "/private/var/stash", "/private/var/mobile/Library/SBSettings/Themes",
+        "/boot", "/System/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist",
+        "/Library/MobileSubstrate/CydiaSubstrate.dylib",
+        NULL
+    };
+    for (int i = 0; jbPaths[i]; i++) {
+        if (strcmp(path, jbPaths[i]) == 0 || strstr(path, jbPaths[i])) return YES;
+    }
+    // Check for common jailbreak keywords
+    if (strstr(path, "Cydia") || strstr(path, "Substrate") || strstr(path, "cycript") ||
+        strstr(path, "Sileo") || strstr(path, "libhooker") || strstr(path, "substitute") ||
+        strstr(path, "/apt") || strstr(path, "sshd") || strstr(path, "/bin/bash")) {
+        return YES;
+    }
+    return NO;
+}
+
+// Hook stat - return -1 for jailbreak paths
+typedef int (*StatFunc)(const char *, struct stat *);
+static StatFunc orig_stat = NULL;
+static int hook_stat(const char *path, struct stat *buf) {
+    if (path && isJailbreakPath(path)) {
+        DLOG(@"[FS-HOOK] stat('%s') -> BLOCKED (jailbreak path)", path);
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_stat ? orig_stat(path, buf) : -1;
+}
+
+// Hook lstat - return -1 for jailbreak paths
+static StatFunc orig_lstat = NULL;
+static int hook_lstat(const char *path, struct stat *buf) {
+    if (path && isJailbreakPath(path)) {
+        DLOG(@"[FS-HOOK] lstat('%s') -> BLOCKED (jailbreak path)", path);
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_lstat ? orig_lstat(path, buf) : -1;
+}
+
+// Hook access - return -1 for jailbreak paths
+typedef int (*AccessFunc)(const char *, int);
+static AccessFunc orig_access = NULL;
+static int hook_access(const char *path, int mode) {
+    if (path && isJailbreakPath(path)) {
+        DLOG(@"[FS-HOOK] access('%s', %d) -> BLOCKED (jailbreak path)", path, mode);
+        errno = ENOENT;
+        return -1;
+    }
+    return orig_access ? orig_access(path, mode) : -1;
+}
+
+static void installFileSystemHooks(void) {
+    orig_stat = (StatFunc)dlsym(RTLD_DEFAULT, "stat");
+    orig_lstat = (StatFunc)dlsym(RTLD_DEFAULT, "lstat");
+    orig_access = (AccessFunc)dlsym(RTLD_DEFAULT, "access");
+    
+    if (orig_stat) {
+        rebindSymbol("stat", (void *)hook_stat, (void **)&orig_stat);
+        DLOG(@"[FS-HOOK] stat: HOOKED");
+    }
+    if (orig_lstat) {
+        rebindSymbol("lstat", (void *)hook_lstat, (void **)&orig_lstat);
+        DLOG(@"[FS-HOOK] lstat: HOOKED");
+    }
+    if (orig_access) {
+        rebindSymbol("access", (void *)hook_access, (void **)&orig_access);
+        DLOG(@"[FS-HOOK] access: HOOKED");
+    }
+}
+
+// ============================================================
+#pragma mark - sysctl Hook (debugger detection prevention)
+// ============================================================
+
+typedef int (*SysctlFunc)(int *, u_int, char *, size_t *, void *, size_t);
+static SysctlFunc orig_sysctl = NULL;
+
+static int hook_sysctl(int *name, u_int namelen, char *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int ret = orig_sysctl ? orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+    
+    // Check for CTL_KERN / KERN_PROC / KERN_PROC_PID (used for debugger detection)
+    if (namelen == 4 && name && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+        DLOG(@"[SYSCTL] KERN_PROC_PID query (debugger detection) - ret=%d", ret);
+        // If the query is about our process, modify the result to hide debugger
+        if (ret == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
+            struct kinfo_proc *info = (struct kinfo_proc *)oldp;
+            // Clear P_TRACED flag to hide debugger
+            info->kp_proc.p_flag &= ~P_TRACED;
+            DLOG(@"[SYSCTL] Cleared P_TRACED flag (debugger hidden)");
+        }
+    }
+    
+    return ret;
+}
+
+static void installSysctlHook(void) {
+    orig_sysctl = (SysctlFunc)dlsym(RTLD_DEFAULT, "sysctl");
+    if (orig_sysctl) {
+        rebindSymbol("sysctl", (void *)hook_sysctl, (void **)&orig_sysctl);
+        DLOG(@"[SYSCTL] sysctl: HOOKED (debugger detection prevention)");
+    }
+}
+
 // Hook fopen to detect /proc/self/maps access
 typedef FILE *(*FopenFunc)(const char *, const char *);
 static FopenFunc orig_fopen = NULL;
 static FILE *hook_fopen(const char *path, const char *mode) {
+    // Block jailbreak paths
+    if (path && isJailbreakPath(path)) {
+        DLOG(@"[FS-HOOK] fopen('%s') -> BLOCKED (jailbreak path)", path);
+        return NULL;
+    }
     FILE *f = orig_fopen ? orig_fopen(path, mode) : NULL;
     if (f && path && strstr(path, "/proc/self/maps")) {
         DLOG(@"[PROC] /proc/self/maps opened");
@@ -3435,6 +3583,10 @@ static void installSecurityHooks(void) {
     installDyldHooks();
     installDladdrHook();
     installDlopenHook();
+    
+    // v36.01: File system hooks (jailbreak detection prevention)
+    installFileSystemHooks();
+    installSysctlHook();
     
     // v35.49: RE-ENABLED crypto hooks for 7.62
     // Game encrypts version info in packets, need to replace BEFORE encryption
