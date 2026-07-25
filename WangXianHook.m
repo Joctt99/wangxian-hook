@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.07 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.08 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -4548,8 +4548,8 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
     
-    // v36.07: DISABLE EncryptUtils hooks to see if they trigger injection detection
-    // installEncryptUtilsHooks();
+    // v36.08: Re-enable EncryptUtils hooks to inspect AES plaintext
+    installEncryptUtilsHooks();
     
     // === IMMEDIATE: Network Reachability Hooks ===
     // v35.66: Hook system and third-party network detection classes
@@ -5696,17 +5696,23 @@ static IMP orig_aesEncryptData_key_iv = NULL;
 static IMP orig_aesDecryptData_key_iv = NULL;
 
 static NSData *hook_aesEncryptData_key_iv(id self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
-    // Log plaintext before encryption
     if (data && data.length > 0 && data.length < 4096) {
-        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(data.length, 256) * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(data.length, 256)];
-        size_t showLen = MIN(data.length, 256);
+        size_t showLen = MIN(data.length, 800);
         const uint8_t *bytes = data.bytes;
+        
+        NSMutableString *hex = [NSMutableString stringWithCapacity:showLen * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:showLen];
         for (size_t i = 0; i < showLen; i++) {
             [hex appendFormat:@"%02X ", bytes[i]];
             [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
         }
         DLOG(@"[AES-ENC] plaintext len=%lu\n  hex: %@\n  txt: %@", (unsigned long)data.length, hex, ascii);
+        
+        // Try to parse as JSON string (full data)
+        NSString *jsonStr = [[NSString alloc] initWithBytes:bytes length:data.length encoding:NSUTF8StringEncoding];
+        if (jsonStr) {
+            DLOG(@"[AES-ENC] JSON string: %@", jsonStr);
+        }
     }
     
     NSData *(*orig)(id, SEL, NSData*, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*, NSData*))orig_aesEncryptData_key_iv;
@@ -5722,17 +5728,22 @@ static NSData *hook_aesDecryptData_key_iv(id self, SEL _cmd, NSData *data, NSDat
     NSData *(*orig)(id, SEL, NSData*, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*, NSData*))orig_aesDecryptData_key_iv;
     NSData *result = orig ? orig(self, _cmd, data, key, iv) : nil;
     
-    // Log decrypted plaintext
     if (result && result.length > 0 && result.length < 4096) {
-        NSMutableString *hex = [NSMutableString stringWithCapacity:MIN(result.length, 256) * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:MIN(result.length, 256)];
-        size_t showLen = MIN(result.length, 256);
+        size_t showLen = MIN(result.length, 800);
         const uint8_t *bytes = result.bytes;
+        
+        NSMutableString *hex = [NSMutableString stringWithCapacity:showLen * 3];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:showLen];
         for (size_t i = 0; i < showLen; i++) {
             [hex appendFormat:@"%02X ", bytes[i]];
             [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
         }
         DLOG(@"[AES-DEC] decrypted len=%lu\n  hex: %@\n  txt: %@", (unsigned long)result.length, hex, ascii);
+        
+        NSString *jsonStr = [[NSString alloc] initWithBytes:bytes length:result.length encoding:NSUTF8StringEncoding];
+        if (jsonStr) {
+            DLOG(@"[AES-DEC] JSON string: %@", jsonStr);
+        }
     }
     return result;
 }
