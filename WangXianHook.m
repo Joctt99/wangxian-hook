@@ -1,5 +1,5 @@
 /**
- * WangXianHook v36.12 - FIXED recv hook using dyld interpose
+ * WangXianHook v36.13 - FIXED recv hook using libSystem dlsym
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -10,7 +10,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <mach-o/dyld.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -32,7 +31,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.12 FIXED loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.13 FIXED loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -60,9 +59,22 @@ static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
 // ============================================================
 #pragma mark - Recv Hook (login response patch)
 // ============================================================
-ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
+static ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
 
 ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
+    if (!orig_recv) {
+        void *libSystem = dlopen("/usr/lib/libSystem.dylib", RTLD_NOW);
+        if (libSystem) {
+            orig_recv = (ssize_t (*)(int, void *, size_t, int))dlsym(libSystem, "recv");
+            dlclose(libSystem);
+        }
+        if (!orig_recv) {
+            DLOG(@"[RECV] ERROR: orig_recv is NULL!");
+            return -1;
+        }
+        DLOG(@"[RECV] Lazy init orig_recv at %p", orig_recv);
+    }
+    
     ssize_t ret = orig_recv(sockfd, buf, len, flags);
     if (ret <= 0) return ret;
     
@@ -110,13 +122,7 @@ DYLD_INTERPOSE(hook_recv, recv);
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing MINIMAL hooks...");
     
-    orig_recv = (ssize_t (*)(int, void *, size_t, int))dlsym(RTLD_NEXT, "recv");
-    if (orig_recv) {
-        DLOG(@"[INIT] Found original recv at %p", orig_recv);
-        DLOG(@"[INIT] recv: HOOKED via dyld interpose");
-    } else {
-        DLOG(@"[INIT] WARNING: recv symbol not found");
-    }
+    DLOG(@"[INIT] recv: HOOKED via dyld interpose (lazy init from libSystem)");
     
     Class uidCls = [UIDevice class];
     
@@ -134,7 +140,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] MINIMAL hooks installed - v36.12");
+    DLOG(@"[ACT] MINIMAL hooks installed - v36.13");
 }
 
 // ============================================================
