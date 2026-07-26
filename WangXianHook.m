@@ -1,5 +1,5 @@
 /**
- * WangXianHook v36.17 - Using MSHookFunction for recv hook
+ * WangXianHook v36.18 - Dynamic load libsubstrate for MSHookFunction
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -7,7 +7,7 @@
 #include <objc/message.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <substrate.h>
+#include <dlfcn.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -29,7 +29,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.17 MSHookFunction loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.18 DYNAMIC SUBSTRATE loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -55,7 +55,7 @@ static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
 }
 
 // ============================================================
-#pragma mark - Recv Hook using MSHookFunction
+#pragma mark - Recv Hook using dynamic MSHookFunction
 // ============================================================
 static ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
 
@@ -98,13 +98,28 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing hooks...");
     
-    // Recv hook using MSHookFunction
-    void *recv_sym = dlsym(RTLD_NEXT, "recv");
-    if (recv_sym) {
-        MSHookFunction((void *)recv_sym, (void *)hook_recv, (void **)&orig_recv);
-        DLOG(@"[INIT] recv: HOOKED via MSHookFunction");
+    // Try MSHookFunction via dynamic libsubstrate loading
+    void *libsubstrate = dlopen("/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOW);
+    if (!libsubstrate) {
+        libsubstrate = dlopen("/usr/lib/libsubstrate.dylib", RTLD_NOW);
+    }
+    
+    if (libsubstrate) {
+        void (*MSHookFunction)(void *, void *, void **) = dlsym(libsubstrate, "MSHookFunction");
+        if (MSHookFunction) {
+            void *recv_sym = dlsym(RTLD_NEXT, "recv");
+            if (recv_sym) {
+                MSHookFunction((void *)recv_sym, (void *)hook_recv, (void **)&orig_recv);
+                DLOG(@"[INIT] recv: HOOKED via MSHookFunction");
+            } else {
+                DLOG(@"[INIT] WARNING: recv symbol not found");
+            }
+        } else {
+            DLOG(@"[INIT] WARNING: MSHookFunction not found in libsubstrate");
+        }
+        dlclose(libsubstrate);
     } else {
-        DLOG(@"[INIT] WARNING: recv symbol not found");
+        DLOG(@"[INIT] WARNING: libsubstrate not found, recv hook skipped");
     }
     
     Class uidCls = [UIDevice class];
@@ -123,7 +138,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] Hooks installed - v36.17");
+    DLOG(@"[ACT] Hooks installed - v36.18");
 }
 
 // ============================================================
