@@ -43,12 +43,12 @@ static void initLogger() {
 #define DLOG(fmt, ...) do { \
     NSString *_logStr = [NSString stringWithFormat:@"[WX] " fmt @"\n", ##__VA_ARGS__]; \
     NSLog(@"[WX] " fmt, ##__VA_ARGS__); \
-    if (logFileHandle && logQueue) { \
-        NSData *_data = [_logStr dataUsingEncoding:NSUTF8StringEncoding]; \
-        dispatch_async(logQueue, ^{ \
+    if (logFileHandle) { \
+        @synchronized(logFileHandle) { \
+            NSData *_data = [_logStr dataUsingEncoding:NSUTF8StringEncoding]; \
             [logFileHandle writeData:_data]; \
             [logFileHandle synchronizeFile]; \
-        }); \
+        } \
     } \
 } while (0)
 
@@ -306,6 +306,24 @@ static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
 }
 
+#pragma mark - NSBundle Hooks
+
+static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:[[NSBundle mainBundle] infoDictionary]];
+    [dict setObject:fakeVersion forKey:@"CFBundleShortVersionString"];
+    [dict setObject:fakeVersion forKey:@"CFBundleVersion"];
+    DLOG(@"[BUNDLE] infoDictionary patched: version=%@", fakeVersion);
+    return dict;
+}
+
+static NSString *hook_objectForKey2(id self, SEL _cmd, NSString *key) {
+    if ([key isEqualToString:@"CFBundleShortVersionString"] || [key isEqualToString:@"CFBundleVersion"]) {
+        DLOG(@"[BUNDLE] objectForKey: '%@' -> '%@'", key, fakeVersion);
+        return fakeVersion;
+    }
+    return [NSBundle.mainBundle objectForInfoDictionaryKey:key];
+}
+
 #pragma mark - Entry
 
 __attribute__((constructor))
@@ -313,7 +331,7 @@ static void entry() {
     @autoreleasepool {
         initLogger();
         
-        DLOG(@"=== WangXianHook v36.19 FULL (v36.10 restored) ===");
+        DLOG(@"=== WangXianHook v36.20 FULL (v36.10 restored + NSBundle) ===");
         DLOG(@"[ACT] Installing FULL hooks...");
         
         struct rebinding rebindings[] = {
@@ -390,6 +408,21 @@ static void entry() {
             }
         }
         
+        Class bundleCls = [NSBundle class];
+        if (bundleCls) {
+            Method m = class_getInstanceMethod(bundleCls, @selector(infoDictionary));
+            if (m) {
+                method_setImplementation(m, (IMP)hook_infoDictionary);
+                DLOG(@"[INIT] NSBundle.infoDictionary hooked");
+            }
+            
+            m = class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:));
+            if (m) {
+                method_setImplementation(m, (IMP)hook_objectForKey2);
+                DLOG(@"[INIT] NSBundle.objectForInfoDictionaryKey hooked");
+            }
+        }
+        
         Class udCls = [NSUserDefaults class];
         if (udCls) {
             Method m = class_getInstanceMethod(udCls, @selector(objectForKey:));
@@ -444,6 +477,6 @@ static void entry() {
             if (m) { class_replaceMethod(apsCls, @selector(checkSecurity), (IMP)hook_isJailbroken, "B@:"); DLOG(@"[INIT] APSecurity.checkSecurity: HOOKED"); }
         }
         
-        DLOG(@"[ACT] FULL hooks installed - v36.18");
+        DLOG(@"[ACT] FULL hooks installed - v36.20");
     }
 }
