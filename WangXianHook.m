@@ -1737,6 +1737,43 @@ static void entry(void) {
         if (m) { method_setImplementation(m, (IMP)hook_rsaVerifyData); DLOG(@"[INIT] EncryptUtils.rsaVerifyData hooked"); }
     }
     
+    Class apsCls = NSClassFromString(@"APSecurity");
+    if (apsCls) {
+        DLOG(@"[INIT] APSecurity class FOUND - hooking all methods");
+        
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(apsCls, &methodCount);
+        if (methods) {
+            for (unsigned int i = 0; i < methodCount; i++) {
+                SEL sel = method_getName(methods[i]);
+                NSString *selStr = NSStringFromSelector(sel);
+                if ([selStr containsString:@"showAlert"] || [selStr containsString:@"alert"] ||
+                    [selStr containsString:@"exit"] || [selStr containsString:@"crash"] ||
+                    [selStr containsString:@"block"] || [selStr containsString:@"deny"] ||
+                    [selStr containsString:@"fail"] || [selStr containsString:@"reject"]) {
+                    method_setImplementation(methods[i], (IMP)hook_showAlert);
+                    DLOG(@"[INIT] APSecurity.%@ hooked (blocked)", selStr);
+                }
+            }
+            free(methods);
+        }
+        
+        Method m = class_getInstanceMethod(apsCls, @selector(isJailbroken));
+        if (m) { method_setImplementation(m, (IMP)hook_isJailbroken); DLOG(@"[INIT] APSecurity.isJailbroken hooked"); }
+        
+        m = class_getInstanceMethod(apsCls, @selector(checkSecurity));
+        if (m) {
+            class_replaceMethod(apsCls, @selector(checkSecurity), (IMP)hook_isJailbroken, "B@:");
+            DLOG(@"[INIT] APSecurity.checkSecurity hooked");
+        }
+        
+        m = class_getInstanceMethod(apsCls, @selector(verifySignature));
+        if (m) {
+            class_replaceMethod(apsCls, @selector(verifySignature), (IMP)hook_rsaVerifyData, "B@:@");
+            DLOG(@"[INIT] APSecurity.verifySignature hooked");
+        }
+    }
+    
     init_cpp_hooks();
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
