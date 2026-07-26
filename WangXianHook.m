@@ -7,8 +7,49 @@
 #import <arpa/inet.h>
 #import "fishhook.h"
 
+#pragma mark - File Logger
+
+static NSFileHandle *logFileHandle = nil;
+static dispatch_queue_t logQueue = nil;
+
+static void initLogger() {
+    if (logFileHandle) return;
+    
+    @try {
+        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (!docPath) {
+            docPath = [NSTemporaryDirectory() copy];
+        }
+        NSString *logPath = [docPath stringByAppendingPathComponent:@"wxhook.log"];
+        
+        if (![[NSFileManager defaultManager] fileExistsAtPath:logPath]) {
+            [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
+        }
+        
+        logFileHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (logFileHandle) {
+            [logFileHandle seekToEndOfFile];
+        }
+        
+        logQueue = dispatch_queue_create("com.wx.hooklog", DISPATCH_QUEUE_SERIAL);
+        
+        // 同时也输出到NSLog
+        NSLog(@"[WX] Logger initialized, log file: %@", logPath);
+    } @catch (NSException *e) {
+        NSLog(@"[WX] Logger init failed: %@", e.reason);
+    }
+}
+
 #define DLOG(fmt, ...) do { \
+    NSString *_logStr = [NSString stringWithFormat:@"[WX] " fmt @"\n", ##__VA_ARGS__]; \
     NSLog(@"[WX] " fmt, ##__VA_ARGS__); \
+    if (logFileHandle && logQueue) { \
+        NSData *_data = [_logStr dataUsingEncoding:NSUTF8StringEncoding]; \
+        dispatch_async(logQueue, ^{ \
+            [logFileHandle writeData:_data]; \
+            [logFileHandle synchronizeFile]; \
+        }); \
+    } \
 } while (0)
 
 static NSString *fakeVersion = @"7.7.0";
@@ -269,9 +310,10 @@ static void hook_exitApp(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void entry() {
-    DLOG(@"=== WangXianHook v36.18 FULL (v36.10 restored) ===");
-    
     @autoreleasepool {
+        initLogger();
+        
+        DLOG(@"=== WangXianHook v36.19 FULL (v36.10 restored) ===");
         DLOG(@"[ACT] Installing FULL hooks...");
         
         struct rebinding rebindings[] = {
