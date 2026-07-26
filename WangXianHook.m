@@ -1713,30 +1713,33 @@ static void entry(void) {
         if (m) { method_setImplementation(m, (IMP)hook_exitApp); DLOG(@"[INIT] SC.exitApplication hooked"); }
     }
     
-    Class deviceCls = [UIDevice class];
-    if (deviceCls) {
-        Method m = class_getInstanceMethod(deviceCls, @selector(currentVersion));
-        if (m) { 
-            method_setImplementation(m, (IMP)hook_currentVersion); 
-            DLOG(@"[INIT] UIDevice.currentVersion hooked"); 
+    @try {
+        Class deviceCls = [UIDevice class];
+        if (deviceCls) {
+            DLOG(@"[INIT] UIDevice class obtained");
+            
+            Method m = class_getInstanceMethod(deviceCls, @selector(currentVersion));
+            if (m) { 
+                method_setImplementation(m, (IMP)hook_currentVersion); 
+                DLOG(@"[INIT] UIDevice.currentVersion hooked"); 
+            } else {
+                class_addMethod(deviceCls, @selector(currentVersion), (IMP)hook_currentVersion, "@@:");
+                DLOG(@"[INIT] UIDevice.currentVersion ADDED (method didn't exist)");
+            }
+            
+            m = class_getInstanceMethod(deviceCls, @selector(isJailbroken));
+            if (m) { 
+                method_setImplementation(m, (IMP)hook_isJailbroken); 
+                DLOG(@"[INIT] UIDevice.isJailbroken hooked"); 
+            } else {
+                class_addMethod(deviceCls, @selector(isJailbroken), (IMP)hook_isJailbroken, "B@:");
+                DLOG(@"[INIT] UIDevice.isJailbroken ADDED (method didn't exist)");
+            }
         } else {
-            class_addMethod(deviceCls, @selector(currentVersion), (IMP)hook_currentVersion, "@@:");
-            DLOG(@"[INIT] UIDevice.currentVersion ADDED (method didn't exist)");
+            DLOG(@"[INIT] UIDevice class NOT found");
         }
-        
-        m = class_getInstanceMethod(deviceCls, @selector(isJailbroken));
-        if (m) { 
-            method_setImplementation(m, (IMP)hook_isJailbroken); 
-            DLOG(@"[INIT] UIDevice.isJailbroken hooked"); 
-        } else {
-            class_addMethod(deviceCls, @selector(isJailbroken), (IMP)hook_isJailbroken, "B@:");
-            DLOG(@"[INIT] UIDevice.isJailbroken ADDED (method didn't exist)");
-        }
-        
-        m = class_getInstanceMethod(deviceCls, @selector(model));
-        if (m) {
-            DLOG(@"[INIT] UIDevice.model hook skipped (let system handle)");
-        }
+    } @catch (NSException *e) {
+        DLOG(@"[INIT] UIDevice hook FAILED: %@", e.reason);
     }
     
     Class udCls = [NSUserDefaults class];
