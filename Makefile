@@ -1,8 +1,9 @@
-# WangXianHook Makefile
+# WangXianHook Makefile - Using OFFICIAL fishhook
 # Builds WangXianHook.dylib for iOS arm64
 
 TARGET = WangXianHook.dylib
 SOURCE = WangXianHook.m
+FISHHOOK = fishhook.c
 
 SDK_PATH  = $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC        = $(shell xcrun --sdk iphoneos --find clang)
@@ -25,8 +26,8 @@ CFLAGS += -fobjc-arc
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
+$(TARGET): $(SOURCE) $(FISHHOOK)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(FISHHOOK)
 	@echo "Built: $(TARGET)"
 	@ls -la $(TARGET)
 
