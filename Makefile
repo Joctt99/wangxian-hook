@@ -22,6 +22,7 @@ CFLAGS += -lz
 CFLAGS += -dynamiclib
 CFLAGS += -O2
 CFLAGS += -fobjc-arc
+CFLAGS += -lsubstrate
 
 all: $(TARGET)
 
