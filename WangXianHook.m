@@ -4,6 +4,7 @@
 #import <dlfcn.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
+#import <arpa/inet.h>
 #import "fishhook.h"
 
 #define DLOG(fmt, ...) do { \
