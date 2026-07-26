@@ -278,11 +278,15 @@ static NSString *hook_virtualImsi(id self, SEL _cmd) { return @"4630478513710736
 
 #pragma mark - NSBundle Hooks
 
+static NSString *(*orig_bundleObjectForKey)(id, SEL, NSString *) = NULL;
 static NSString *hook_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CFBundleShortVersionString"] || [key isEqualToString:@"CFBundleVersion"]) {
         return fakeVersion;
     }
-    return [NSBundle.mainBundle objectForInfoDictionaryKey:key];
+    if (orig_bundleObjectForKey) {
+        return orig_bundleObjectForKey(self, _cmd, key);
+    }
+    return @"";
 }
 
 #pragma mark - NSUserDefaults Hooks
@@ -309,6 +313,18 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *request
 
 static void (*orig_alertShow)(id, SEL) = NULL;
 static void hook_alertShow(id self, SEL _cmd) { DLOG(@"[ALERT] show BLOCKED"); }
+
+// UIAlertController.presentViewController:animated:completion: 的参数不同，需要单独处理
+static void (*orig_presentVC)(id, SEL, id, BOOL, void (^)(void)) = NULL;
+static void hook_presentVC(id self, SEL _cmd, id vc, BOOL animated, void (^completion)(void)) {
+    if ([vc isKindOfClass:[UIAlertController class]]) {
+        DLOG(@"[ALERT] UIAlertController present BLOCKED");
+        return;
+    }
+    if (orig_presentVC) {
+        orig_presentVC(self, _cmd, vc, animated, completion);
+    }
+}
 
 #pragma mark - SignatureKit Hooks
 
@@ -342,37 +358,43 @@ static BOOL hook_rsaVerifyData(id self, SEL _cmd, NSData *data, NSData *signatur
 __attribute__((constructor))
 static void entry() {
     @autoreleasepool {
-        initLogger();
-        
-        DLOG(@"=== WangXianHook v36.10 loaded @ %s ===", __DATE__);
-        DLOG(@"App: %s", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
-        DLOG(@"[ACT] Installing all hooks...");
-        
-        // Socket hooks
-        struct rebinding rebindings[] = {
-            {"connect", (void *)hook_connect, (void **)&orig_connect},
-            {"send", (void *)hook_send, (void **)&orig_send},
-            {"recv", (void *)hook_recv, (void **)&orig_recv},
-            {"recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom},
-            {"recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg},
-            {"close", (void *)hook_close, (void **)&orig_close},
-            {"write", (void *)hook_write, (void **)&orig_write},
-            {"read", (void *)hook_read, (void **)&orig_read},
-        };
-        rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
-        
-        if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-        if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
-        if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-        if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
-        if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
-        if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
-        if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
-        if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-        
-        DLOG(@"[SOCK] Hooks: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
+        @try {
+            initLogger();
+            
+            DLOG(@"=== WangXianHook v36.10 loaded @ %s ===", __DATE__);
+            DLOG(@"App: %s", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
+            DLOG(@"[ACT] Installing all hooks...");
+            
+            // Socket hooks
+            @try {
+                struct rebinding rebindings[] = {
+                    {"connect", (void *)hook_connect, (void **)&orig_connect},
+                    {"send", (void *)hook_send, (void **)&orig_send},
+                    {"recv", (void *)hook_recv, (void **)&orig_recv},
+                    {"recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom},
+                    {"recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg},
+                    {"close", (void *)hook_close, (void **)&orig_close},
+                    {"write", (void *)hook_write, (void **)&orig_write},
+                    {"read", (void *)hook_read, (void **)&orig_read},
+                };
+                rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+                
+                if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
+                if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+                if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+                if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+                if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+                if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+                if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+                if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+                
+                DLOG(@"[SOCK] Hooks: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
+            } @catch (NSException *e) {
+                DLOG(@"[INIT] Socket hooks FAILED: %@", e.reason);
+            }
         
         // NSUserDefaults
+        @try {
         Class udCls = [NSUserDefaults class];
         if (udCls) {
             Method m = class_getInstanceMethod(udCls, @selector(objectForKey:));
@@ -381,15 +403,23 @@ static void entry() {
             if (m) { orig_boolForKey = (BOOL (*)(id, SEL, NSString *))method_getImplementation(m); method_setImplementation(m, (IMP)hook_boolForKey); }
             DLOG(@"[INIT] NSUserDefaults hooked (objectForKey + boolForKey)");
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] NSUserDefaults FAILED: %@", e.reason); }
         
         // NSBundle
+        @try {
         Class bundleCls = [NSBundle class];
         if (bundleCls) {
             Method m = class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:));
-            if (m) { method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey); DLOG(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.x->7.7.0)"); }
+            if (m) {
+                orig_bundleObjectForKey = (NSString *(*)(id, SEL, NSString *))method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_objectForInfoDictionaryKey);
+                DLOG(@"[INIT] NSBundle.objectForInfoDictionaryKey: HOOKED (version fake 7.6.x->7.7.0)");
+            }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] NSBundle FAILED: %@", e.reason); }
         
         // UIDevice
+        @try {
         Class deviceCls = [UIDevice class];
         if (deviceCls) {
             Method m = class_getInstanceMethod(deviceCls, @selector(currentVersion));
@@ -414,29 +444,41 @@ static void entry() {
             m = class_getInstanceMethod(deviceCls, @selector(virtualImsi));
             if (m) { method_setImplementation(m, (IMP)hook_virtualImsi); DLOG(@"[INIT] UIDevice.virtualImsi: HOOKED"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] UIDevice FAILED: %@", e.reason); }
         
         // NSURLSession
+        @try {
         Class sessCls = [NSURLSession class];
         if (sessCls) {
             Method m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:completionHandler:));
             if (m) { orig_dtwrc = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtwrc); DLOG(@"[INIT] NSURLSession.dataTask+comp observe"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] NSURLSession FAILED: %@", e.reason); }
         
         // UIAlertView
+        @try {
         Class alertCls = [UIAlertView class];
         if (alertCls) {
             Method m = class_getInstanceMethod(alertCls, @selector(show));
             if (m) { orig_alertShow = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertShow); DLOG(@"[INIT] UIAlertView.show: hook"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] UIAlertView FAILED: %@", e.reason); }
         
         // UIAlertController
+        @try {
         Class alertCtrlCls = [UIAlertController class];
         if (alertCtrlCls) {
-            Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
-            if (m) { method_setImplementation(m, (IMP)hook_alertShow); DLOG(@"[INIT] UIAlertController.present: hook"); }
+            Method m = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
+            if (m) {
+                orig_presentVC = (void (*)(id, SEL, id, BOOL, void (^)(void)))method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_presentVC);
+                DLOG(@"[INIT] UIAlertController.present: hook");
+            }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] UIAlertController FAILED: %@", e.reason); }
         
         // SignatureKit
+        @try {
         Class skCls = NSClassFromString(@"SignatureKit");
         if (skCls) {
             Method m = class_getClassMethod(skCls, @selector(showAlert:));
@@ -446,8 +488,10 @@ static void entry() {
             m = class_getClassMethod(skCls, @selector(judgeNet));
             if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); DLOG(@"[INIT] SK.judgeNet: BLOCK"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] SignatureKit FAILED: %@", e.reason); }
         
         // SignatureCheck
+        @try {
         Class scCls = NSClassFromString(@"SignatureCheck");
         if (scCls) {
             Method m = class_getClassMethod(scCls, @selector(exitApplication));
@@ -457,8 +501,10 @@ static void entry() {
             m = class_getClassMethod(scCls, @selector(showTipViewEND:));
             if (m) { method_setImplementation(m, (IMP)hook_showAlert); DLOG(@"[INIT] SC.showTipViewEND: SUPPRESS"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] SignatureCheck FAILED: %@", e.reason); }
         
         // EncryptUtils
+        @try {
         Class euCls = NSClassFromString(@"EncryptUtils");
         if (euCls) {
             Method m = class_getClassMethod(euCls, @selector(hmacSha256WithKey:string:));
@@ -467,8 +513,10 @@ static void entry() {
             m = class_getClassMethod(euCls, @selector(rsaVerifyData:signature:withPublicKey:));
             if (m) { method_setImplementation(m, (IMP)hook_rsaVerifyData); DLOG(@"[INIT] EncryptUtils.rsaVerifyData: HOOKED (force YES)"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] EncryptUtils FAILED: %@", e.reason); }
         
         // APSecurity (7.6.3新增)
+        @try {
         Class apsCls = NSClassFromString(@"APSecurity");
         if (apsCls) {
             DLOG(@"[INIT] APSecurity class FOUND - hooking");
@@ -491,7 +539,11 @@ static void entry() {
             m = class_getInstanceMethod(apsCls, @selector(checkSecurity));
             if (m) { class_replaceMethod(apsCls, @selector(checkSecurity), (IMP)hook_isJailbroken, "B@:"); DLOG(@"[INIT] APSecurity.checkSecurity: HOOKED"); }
         }
+        } @catch (NSException *e) { DLOG(@"[INIT] APSecurity FAILED: %@", e.reason); }
         
         DLOG(@"[ACT] All hooks installed - v36.10");
+        } @catch (NSException *e) {
+            NSLog(@"[WX] entry() FATAL: %@", e.reason);
+        }
     }
 }
