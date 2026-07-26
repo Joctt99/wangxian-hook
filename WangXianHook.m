@@ -1,5 +1,5 @@
 /**
- * WangXianHook v36.11 - MINIMAL VERSION with simple inline hook
+ * WangXianHook v36.12 - FIXED recv hook using complete fishhook
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -10,8 +10,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -33,7 +33,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.11 MINIMAL loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.12 FIXED loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -97,45 +97,102 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 // ============================================================
-#pragma mark - Simple inline hook using memcpy
+#pragma mark - Complete Fishhook implementation
 // ============================================================
-static int inline_hook(void *target, void *replacement, void **backup) {
-    if (!target || !replacement || !backup) return -1;
+struct rebinding {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
+
+typedef struct rebinding_entry {
+    struct rebinding rebinding;
+    struct rebinding_entry *next;
+} rebinding_entry_t;
+
+static rebinding_entry_t *_rebindings_head = NULL;
+
+static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
+    DLOG(@"[FISHHOOK] Processing image at %p", header);
     
-    *backup = dlsym(RTLD_NEXT, "recv");
-    if (!*backup) {
-        DLOG(@"[HOOK] Failed to get original recv via dlsym");
-        return -1;
+    rebinding_entry_t *cur = _rebindings_head;
+    if (!cur) return;
+    
+    uintptr_t cur_image = (uintptr_t)header + slide;
+    
+    DLOG(@"[FISHHOOK] cur_image = %p", (void*)cur_image);
+    
+    const struct mach_header *mh = header;
+    const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header));
+    
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+            
+            if (strcmp(sc->segname, "__DATA") == 0) {
+                for (uint32_t j = 0; j < sc->nsects; j++) {
+                    const struct section_64 *sect = (const struct section_64 *)((uintptr_t)sc + sizeof(struct segment_command_64) + j * sizeof(struct section_64));
+                    
+                    if (strcmp(sect->sectname, "__la_symbol_ptr") == 0 || strcmp(sect->sectname, "__nl_symbol_ptr") == 0) {
+                        uintptr_t ptr = cur_image + sect->addr;
+                        uintptr_t end = ptr + sect->size;
+                        
+                        for (; ptr < end; ptr += sizeof(void *)) {
+                            uintptr_t *indirect_symbol = (uintptr_t *)ptr;
+                            
+                            rebinding_entry_t *entry = _rebindings_head;
+                            while (entry) {
+                                if (*indirect_symbol == (uintptr_t)entry->rebinding.replaced) {
+                                    *indirect_symbol = (uintptr_t)entry->rebinding.replacement;
+                                    DLOG(@"[FISHHOOK] Patched %s at %p", entry->rebinding.name, (void*)ptr);
+                                }
+                                entry = entry->next;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+    }
+}
+
+int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
+    DLOG(@"[FISHHOOK] rebind_symbols called with %zu bindings", rebindings_nel);
+    
+    rebinding_entry_t **cur = &_rebindings_head;
+    while (*cur) {
+        cur = &(*cur)->next;
     }
     
-    DLOG(@"[HOOK] Original recv at %p", *backup);
-    
-    vm_prot_t old_prot, new_prot;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)target, 16, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        DLOG(@"[HOOK] vm_protect failed: %d", kr);
-        return -1;
+    for (size_t i = 0; i < rebindings_nel; i++) {
+        rebinding_entry_t *entry = (rebinding_entry_t *)malloc(sizeof(rebinding_entry_t));
+        entry->rebinding = rebindings[i];
+        entry->next = NULL;
+        *cur = entry;
+        cur = &entry->next;
+        
+        DLOG(@"[FISHHOOK] Added binding for %s", rebindings[i].name);
     }
     
-    uint64_t jump_addr = (uint64_t)replacement - (uint64_t)target - 12;
-    
-    unsigned char patch[12] = {
-        0x10, 0x00, 0x00, 0x14,  // adrp x16, jump_addr@PAGE
-        0x11, 0x00, 0x00, 0x14,  // add  x17, x16, jump_addr@PAGEOFF
-        0x00, 0x02, 0x1F, 0xD6   // br    x17
-    };
-    
-    memcpy(patch + 3, &jump_addr, 4);
-    memcpy(patch + 7, (unsigned char*)&jump_addr + 4, 4);
-    
-    memcpy(target, patch, 12);
-    
-    kr = vm_protect(mach_task_self(), (vm_address_t)target, 16, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        DLOG(@"[HOOK] vm_protect restore failed: %d", kr);
+    void *handle = dlopen(NULL, RTLD_NOW);
+    if (handle) {
+        for (size_t i = 0; i < rebindings_nel; i++) {
+            void *orig = dlsym(handle, rebindings[i].name);
+            if (orig) {
+                *(rebindings[i].replaced) = orig;
+                DLOG(@"[FISHHOOK] Found %s at %p", rebindings[i].name, orig);
+            } else {
+                DLOG(@"[FISHHOOK] WARNING: %s not found in process", rebindings[i].name);
+            }
+        }
+        dlclose(handle);
     }
     
-    DLOG(@"[HOOK] Inline hook installed at %p -> %p", target, replacement);
+    for (unsigned int i = 0; i < _dyld_get_image_count(); i++) {
+        _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    }
+    
     return 0;
 }
 
@@ -145,12 +202,10 @@ static int inline_hook(void *target, void *replacement, void **backup) {
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing MINIMAL hooks...");
     
-    void *recv_sym = dlsym(RTLD_NEXT, "recv");
-    if (recv_sym) {
-        inline_hook(recv_sym, (void*)hook_recv, (void**)&orig_recv);
-    } else {
-        DLOG(@"[HOOK] recv symbol not found");
-    }
+    struct rebinding recv_rebind = {"recv", (void *)hook_recv, (void **)&orig_recv};
+    struct rebinding bindings[] = {recv_rebind};
+    rebind_symbols(bindings, 1);
+    DLOG(@"[INIT] recv: HOOKED via fishhook");
     
     Class uidCls = [UIDevice class];
     
@@ -168,7 +223,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] MINIMAL hooks installed - v36.11");
+    DLOG(@"[ACT] MINIMAL hooks installed - v36.12");
 }
 
 // ============================================================
