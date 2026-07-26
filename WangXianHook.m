@@ -1,6 +1,5 @@
 /**
- * WangXianHook v36.14 - RESTORED from v36.09 working version
- * Using embedded fishhook for socket hooks
+ * WangXianHook v36.15 - SIMPLE fishhook implementation
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -12,13 +11,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <mach-o/dyld.h>
-#include <mach-o/nlist.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
 static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES;
-static NSString *g_loginToken = nil;
 
 static void _log(NSString *msg) {
     if (!g_logEnabled || !g_logPath) return;
@@ -35,13 +32,13 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.14 RESTORED loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.15 SIMPLE loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
 
 // ============================================================
-#pragma mark - Fishhook Implementation
+#pragma mark - Simple Fishhook
 // ============================================================
 struct rebinding {
     const char *name;
@@ -49,146 +46,38 @@ struct rebinding {
     void **replaced;
 };
 
-typedef struct rebinding_entry {
-    struct rebinding rebinding;
-    struct rebinding_entry *next;
-} rebinding_entry_t;
-
-static rebinding_entry_t *_rebindings_head = NULL;
-
-static uint8_t _swap_bytes_64(uint64_t value) {
-    uint8_t swapped = 0;
-    for (int i = 0; i < 8; i++) {
-        swapped |= ((value >> (i * 8)) & 0xFF) << ((7 - i) * 8);
-    }
-    return swapped;
-}
-
-static uint32_t _swap_bytes_32(uint32_t value) {
-    return ((value >> 24) & 0xFF) | ((value >> 8) & 0xFF00) | ((value << 8) & 0xFF0000) | ((value << 24) & 0xFF000000);
-}
-
-static uint16_t _swap_bytes_16(uint16_t value) {
-    return ((value >> 8) & 0xFF) | ((value << 8) & 0xFF00);
-}
-
-static uint64_t _read_uleb128(const uint8_t **data) {
-    uint64_t result = 0;
-    uint8_t shift = 0;
-    uint8_t byte;
-    do {
-        byte = **data;
-        (*data)++;
-        result |= ((uint64_t)(byte & 0x7F)) << shift;
-        shift += 7;
-    } while (byte & 0x80);
-    return result;
-}
-
-static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
-    rebinding_entry_t *cur = _rebindings_head;
-    if (!cur) return;
-    
-    const struct mach_header *mh = header;
-    const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header));
-    
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        if (lc->cmd == LC_DYLD_INFO_ONLY) {
-            const struct dyld_info_command *dic = (const struct dyld_info_command *)lc;
-            
-            const uint8_t *rebase_info = (const uint8_t *)((uintptr_t)mh + dic->rebase_off);
-            const uint8_t *bind_info = (const uint8_t *)((uintptr_t)mh + dic->bind_off);
-            const uint8_t *weak_bind_info = (const uint8_t *)((uintptr_t)mh + dic->weak_bind_off);
-            const uint8_t *lazy_bind_info = (const uint8_t *)((uintptr_t)mh + dic->lazy_bind_off);
-            
-            const uint8_t *info = bind_info;
-            uintptr_t segment_offset = 0;
-            uint64_t image_base = (uintptr_t)mh + slide;
-            
-            while (info < bind_info + dic->bind_size) {
-                uint64_t it = _read_uleb128(&info);
-                uint64_t type = it & 0xF;
-                uint64_t segment_index = (it >> 8) & 0xFF;
-                uint64_t segment_offset = _read_uleb128(&info);
-                
-                if (type == BIND_TYPE_POINTER) {
-                    uint64_t symbol_name_offset = _read_uleb128(&info);
-                    const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
-                    
-                    uintptr_t *indirect_symbol = (uintptr_t *)(image_base + segment_offset);
-                    
-                    rebinding_entry_t *entry = _rebindings_head;
-                    while (entry) {
-                        if (strcmp(symbol_name, entry->rebinding.name) == 0) {
-                            if (*entry->rebinding.replaced == NULL) {
-                                *entry->rebinding.replaced = (void *)*indirect_symbol;
-                            }
-                            *indirect_symbol = (uintptr_t)entry->rebinding.replacement;
-                            DLOG(@"[FISHHOOK] Rebound %s at %p", symbol_name, indirect_symbol);
-                        }
-                        entry = entry->next;
-                    }
-                }
-                
-                while ((info - bind_info) < dic->bind_size && (*info & 0xF) == BIND_OPCODE_DONE) {
-                    info++;
-                }
-            }
-            
-            info = lazy_bind_info;
-            while (info < lazy_bind_info + dic->lazy_bind_size) {
-                uint64_t it = _read_uleb128(&info);
-                uint64_t type = it & 0xF;
-                uint64_t segment_index = (it >> 8) & 0xFF;
-                uint64_t seg_offset = _read_uleb128(&info);
-                
-                if (type == BIND_TYPE_POINTER) {
-                    uint64_t symbol_name_offset = _read_uleb128(&info);
-                    const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
-                    
-                    uintptr_t *indirect_symbol = (uintptr_t *)(image_base + seg_offset);
-                    
-                    rebinding_entry_t *entry = _rebindings_head;
-                    while (entry) {
-                        if (strcmp(symbol_name, entry->rebinding.name) == 0) {
-                            if (*entry->rebinding.replaced == NULL) {
-                                *entry->rebinding.replaced = (void *)*indirect_symbol;
-                            }
-                            *indirect_symbol = (uintptr_t)entry->rebinding.replacement;
-                            DLOG(@"[FISHHOOK] Rebound lazy %s at %p", symbol_name, indirect_symbol);
-                        }
-                        entry = entry->next;
-                    }
-                }
-            }
-            
-            return;
-        }
-        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
-    }
-}
-
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
     DLOG(@"[FISHHOOK] rebind_symbols called with %zu bindings", rebindings_nel);
     
-    rebinding_entry_t **cur = &_rebindings_head;
-    while (*cur) {
-        cur = &(*cur)->next;
+    void *libSystem = dlopen("/usr/lib/libSystem.dylib", RTLD_NOW);
+    if (!libSystem) {
+        DLOG(@"[FISHHOOK] ERROR: Cannot open libSystem");
+        return -1;
     }
     
     for (size_t i = 0; i < rebindings_nel; i++) {
-        rebinding_entry_t *entry = (rebinding_entry_t *)malloc(sizeof(rebinding_entry_t));
-        entry->rebinding = rebindings[i];
-        entry->next = NULL;
-        *cur = entry;
-        cur = &entry->next;
+        void *orig = dlsym(libSystem, rebindings[i].name);
+        if (orig) {
+            *(rebindings[i].replaced) = orig;
+            DLOG(@"[FISHHOOK] Found %s at %p", rebindings[i].name, orig);
+        } else {
+            DLOG(@"[FISHHOOK] WARNING: %s not found", rebindings[i].name);
+        }
     }
     
-    for (unsigned int i = 0; i < _dyld_get_image_count(); i++) {
-        _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-    }
+    dlclose(libSystem);
     
-    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+    void *handle = dlopen(NULL, RTLD_NOW);
+    if (handle) {
+        for (size_t i = 0; i < rebindings_nel; i++) {
+            void **sym_ptr = (void **)dlsym(handle, rebindings[i].name);
+            if (sym_ptr) {
+                *sym_ptr = rebindings[i].replacement;
+                DLOG(@"[FISHHOOK] Rebound %s -> %p", rebindings[i].name, rebindings[i].replacement);
+            }
+        }
+        dlclose(handle);
+    }
     
     return 0;
 }
@@ -231,18 +120,6 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
             unsigned char *p = (unsigned char *)buf;
             uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
             
-            if (cmd == 0x802EE120 && ret >= 14) {
-                unsigned char status = p[12];
-                unsigned char tokenLen = p[13];
-                if (status == 0x00 && tokenLen > 0 && ret >= 14 + tokenLen) {
-                    NSString *token = [[NSString alloc] initWithBytes:p + 14 length:tokenLen encoding:NSUTF8StringEncoding];
-                    if (token) {
-                        g_loginToken = [token copy];
-                        DLOG(@"[TOKEN-EXTRACT] 0x802EE120 token: %@ (len=%u)", g_loginToken, tokenLen);
-                    }
-                }
-            }
-            
             if (cmd == 0x802EE121 && ret >= 90) {
                 const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
                 BOOL hasError = NO;
@@ -272,7 +149,7 @@ static void installAllHooks(void) {
     struct rebinding recv_rebind = {"recv", (void*)hook_recv, (void**)&orig_recv};
     struct rebinding bindings[] = {recv_rebind};
     rebind_symbols(bindings, 1);
-    DLOG(@"[INIT] recv: HOOKED via fishhook");
+    DLOG(@"[INIT] recv: HOOKED via simple fishhook");
     
     Class uidCls = [UIDevice class];
     
@@ -290,7 +167,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] Hooks installed - v36.14");
+    DLOG(@"[ACT] Hooks installed - v36.15");
 }
 
 // ============================================================
