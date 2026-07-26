@@ -84,7 +84,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.08 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.09 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -5696,27 +5696,54 @@ static IMP orig_aesEncryptData_key_iv = NULL;
 static IMP orig_aesDecryptData_key_iv = NULL;
 
 static NSData *hook_aesEncryptData_key_iv(id self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
+    NSData *modifiedData = data;
+    
     if (data && data.length > 0 && data.length < 4096) {
-        size_t showLen = MIN(data.length, 800);
-        const uint8_t *bytes = data.bytes;
-        
-        NSMutableString *hex = [NSMutableString stringWithCapacity:showLen * 3];
-        NSMutableString *ascii = [NSMutableString stringWithCapacity:showLen];
-        for (size_t i = 0; i < showLen; i++) {
-            [hex appendFormat:@"%02X ", bytes[i]];
-            [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
-        }
-        DLOG(@"[AES-ENC] plaintext len=%lu\n  hex: %@\n  txt: %@", (unsigned long)data.length, hex, ascii);
-        
-        // Try to parse as JSON string (full data)
-        NSString *jsonStr = [[NSString alloc] initWithBytes:bytes length:data.length encoding:NSUTF8StringEncoding];
+        NSString *jsonStr = [[NSString alloc] initWithBytes:data.bytes length:data.length encoding:NSUTF8StringEncoding];
         if (jsonStr) {
-            DLOG(@"[AES-ENC] JSON string: %@", jsonStr);
+            if ([jsonStr containsString:@"NEW_USER_ENTER_SERVER_REQ"]) {
+                NSError *error = nil;
+                NSData *jsonData = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
+                NSMutableDictionary *dict = [NSJSONSerialization JSONObjectWithData:jsonData options:NSJSONReadingMutableContainers error:&error];
+                
+                if (dict && !error) {
+                    NSString *oldSessionId = dict[@"sessionId"];
+                    NSString *oldTicket = dict[@"ticket"];
+                    
+                    if (!oldSessionId || [oldSessionId isEqualToString:@""]) {
+                        dict[@"sessionId"] = @"test_session_1234567890abcdef";
+                        DLOG(@"[AES-PATCH] Replaced empty sessionId with fake value");
+                    }
+                    if (!oldTicket || [oldTicket isEqualToString:@""]) {
+                        dict[@"ticket"] = @"test_ticket_abcdef1234567890";
+                        DLOG(@"[AES-PATCH] Replaced empty ticket with fake value");
+                    }
+                    
+                    NSData *newJsonData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&error];
+                    if (newJsonData && !error) {
+                        modifiedData = newJsonData;
+                        NSString *newJsonStr = [[NSString alloc] initWithData:newJsonData encoding:NSUTF8StringEncoding];
+                        DLOG(@"[AES-PATCH] Modified JSON: %@", newJsonStr);
+                    }
+                }
+            }
+            
+            size_t showLen = MIN(modifiedData.length, 800);
+            const uint8_t *bytes = modifiedData.bytes;
+            
+            NSMutableString *hex = [NSMutableString stringWithCapacity:showLen * 3];
+            NSMutableString *ascii = [NSMutableString stringWithCapacity:showLen];
+            for (size_t i = 0; i < showLen; i++) {
+                [hex appendFormat:@"%02X ", bytes[i]];
+                [ascii appendFormat:@"%c", (bytes[i] >= 0x20 && bytes[i] < 0x7F) ? bytes[i] : '.'];
+            }
+            DLOG(@"[AES-ENC] plaintext len=%lu\n  hex: %@\n  txt: %@", (unsigned long)modifiedData.length, hex, ascii);
+            DLOG(@"[AES-ENC] JSON string: %@", [[NSString alloc] initWithData:modifiedData encoding:NSUTF8StringEncoding]);
         }
     }
     
     NSData *(*orig)(id, SEL, NSData*, NSData*, NSData*) = (NSData*(*)(id, SEL, NSData*, NSData*, NSData*))orig_aesEncryptData_key_iv;
-    NSData *result = orig ? orig(self, _cmd, data, key, iv) : nil;
+    NSData *result = orig ? orig(self, _cmd, modifiedData, key, iv) : nil;
     
     if (result) {
         DLOG(@"[AES-ENC] encrypted len=%lu", (unsigned long)result.length);
