@@ -1230,7 +1230,7 @@ static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) 
     
     const struct sockaddr *finalAddr = addr;
     struct sockaddr_in newAddr;
-    if (port == 5678 || port == 12003) {
+    if (port == 5678) {
         memset(&newAddr, 0, sizeof(newAddr));
         newAddr.sin_family = AF_INET;
         inet_aton(g_loginServerIP, &newAddr.sin_addr);
