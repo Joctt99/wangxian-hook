@@ -47,10 +47,14 @@ static NSString *fakeVersion = @"7.7.0";
 
 #pragma mark - Socket Hooks
 
+typedef int (*SocketFunc)(int, int, int);
+static SocketFunc orig_socket = NULL;
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
 static ConnectFunc orig_connect = NULL;
 typedef ssize_t (*SendFunc)(int, const void *, size_t, int);
 static SendFunc orig_send = NULL;
+typedef ssize_t (*SendtoFunc)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+static SendtoFunc orig_sendto = NULL;
 typedef ssize_t (*RecvFunc)(int, void *, size_t, int);
 static RecvFunc orig_recv = NULL;
 typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
@@ -142,6 +146,14 @@ static void handleChallenge(int sockfd, unsigned char *buf, ssize_t len) {
 
 #pragma mark - Socket Hook Implementations
 
+static int hook_socket(int domain, int type, int protocol) {
+    if (!orig_socket) orig_socket = (SocketFunc)dlsym(RTLD_NEXT, "socket");
+    if (!orig_socket) return -1;
+    int fd = orig_socket(domain, type, protocol);
+    DLOG(@"[SOCK] socket(%d, %d, %d) = %d", domain, type, protocol, fd);
+    return fd;
+}
+
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     if (!orig_connect) return -1;
@@ -166,6 +178,8 @@ static ssize_t hook_send(int sockfd, const void *buf, size_t len, int flags) {
     if (len >= 8) {
         uint32_t cmd = (cbuf[4] << 24) | (cbuf[5] << 16) | (cbuf[6] << 8) | cbuf[7];
         DLOG(@"[SEND-CMD] fd=%d %s:%d cmd=0x%08X len=%zu", sockfd, getHostForFd(sockfd), getPortForFd(sockfd), cmd, len);
+    } else {
+        DLOG(@"[SEND] fd=%d %s:%d len=%zu (short)", sockfd, getHostForFd(sockfd), getPortForFd(sockfd), len);
     }
     
     // 版本替换 7.6.x -> 7.7.0
@@ -190,6 +204,13 @@ static ssize_t hook_send(int sockfd, const void *buf, size_t len, int flags) {
     }
     
     return orig_send(sockfd, buf, len, flags);
+}
+
+static ssize_t hook_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    if (!orig_sendto) orig_sendto = (SendtoFunc)dlsym(RTLD_NEXT, "sendto");
+    if (!orig_sendto) return -1;
+    DLOG(@"[SENDTO] fd=%d len=%zu", sockfd, len);
+    return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
 }
 
 static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
@@ -305,8 +326,24 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 
 static NSURLSessionDataTask *(*orig_dtwrc)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)) = NULL;
 static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *request, void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
-    DLOG(@"[NSURL] %@", request.URL.absoluteString);
-    return orig_dtwrc(self, _cmd, request, completionHandler);
+    DLOG(@"[NSURL] Request: %@ %@", request.HTTPMethod, request.URL.absoluteString);
+    if (request.HTTPBody) {
+        NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+        DLOG(@"[NSURL] Body: %@", bodyStr);
+    }
+    
+    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (data) {
+            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            DLOG(@"[NSURL] Response: %@", respStr);
+        }
+        if (error) {
+            DLOG(@"[NSURL] Error: %@", error.localizedDescription);
+        }
+        if (completionHandler) completionHandler(data, response, error);
+    };
+    
+    return orig_dtwrc(self, _cmd, request, wrappedHandler);
 }
 
 #pragma mark - Alert Hooks
@@ -368,8 +405,10 @@ static void entry() {
             // Socket hooks
             @try {
                 struct rebinding rebindings[] = {
+                    {"socket", (void *)hook_socket, (void **)&orig_socket},
                     {"connect", (void *)hook_connect, (void **)&orig_connect},
                     {"send", (void *)hook_send, (void **)&orig_send},
+                    {"sendto", (void *)hook_sendto, (void **)&orig_sendto},
                     {"recv", (void *)hook_recv, (void **)&orig_recv},
                     {"recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom},
                     {"recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg},
@@ -377,10 +416,12 @@ static void entry() {
                     {"write", (void *)hook_write, (void **)&orig_write},
                     {"read", (void *)hook_read, (void **)&orig_read},
                 };
-                rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+                int rebindCount = rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
                 
+                if (!orig_socket) orig_socket = (SocketFunc)dlsym(RTLD_NEXT, "socket");
                 if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
                 if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+                if (!orig_sendto) orig_sendto = (SendtoFunc)dlsym(RTLD_NEXT, "sendto");
                 if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
                 if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
                 if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
@@ -388,7 +429,7 @@ static void entry() {
                 if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
                 if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
                 
-                DLOG(@"[SOCK] Hooks: connect=%p send=%p recv=%p", orig_connect, orig_send, orig_recv);
+                DLOG(@"[SOCK] rebind_symbols returned %d, connect=%p send=%p recv=%p", rebindCount, orig_connect, orig_send, orig_recv);
             } @catch (NSException *e) {
                 DLOG(@"[INIT] Socket hooks FAILED: %@", e.reason);
             }
