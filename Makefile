@@ -3,6 +3,7 @@
 
 TARGET = WangXianHook.dylib
 SOURCE = WangXianHook.m
+PROTO = ProtocolPatcher.m
 FISHHOOK = fishhook.c
 
 SDK_PATH  = $(shell xcrun --sdk iphoneos --show-sdk-path)
@@ -29,8 +30,8 @@ CFLAGS += -fno-rtti
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCE) $(FISHHOOK)
-	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x c $(FISHHOOK) -o $(TARGET)
+$(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
+	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@ls -la $(TARGET)
 
