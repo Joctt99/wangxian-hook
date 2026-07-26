@@ -1,12 +1,13 @@
 /**
- * WangXianHook v36.16 - NO RECV HOOK
- * Only keep: version fake + jailbreak bypass
- * Remove: all socket hooks (recv, send, etc.)
+ * WangXianHook v36.17 - Using MSHookFunction for recv hook
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include <objc/message.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <substrate.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -28,7 +29,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.16 NO RECV HOOK loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.17 MSHookFunction loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -54,10 +55,57 @@ static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
 }
 
 // ============================================================
+#pragma mark - Recv Hook using MSHookFunction
+// ============================================================
+static ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
+
+static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
+    ssize_t ret = orig_recv(sockfd, buf, len, flags);
+    if (ret <= 0) return ret;
+    
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getpeername(sockfd, (struct sockaddr*)&addr, &addrlen) == 0) {
+        int port = ntohs(addr.sin_port);
+        
+        if (port == 5678 && ret >= 12) {
+            unsigned char *p = (unsigned char *)buf;
+            uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+            
+            if (cmd == 0x802EE121 && ret >= 90) {
+                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
+                BOOL hasError = NO;
+                for (ssize_t i = 0; i <= ret - 12; i++) {
+                    if (memcmp(p + i, errMsg, 12) == 0) {
+                        hasError = YES;
+                        break;
+                    }
+                }
+                if (hasError) {
+                    p[12] = 0x00;
+                    DLOG(@"[PROTO-R-PATCH] 0x802EE121: patched error status to 0x00");
+                }
+            }
+        }
+    }
+    
+    return ret;
+}
+
+// ============================================================
 #pragma mark - Install Hooks
 // ============================================================
 static void installAllHooks(void) {
-    DLOG(@"[ACT] Installing MINIMAL hooks...");
+    DLOG(@"[ACT] Installing hooks...");
+    
+    // Recv hook using MSHookFunction
+    void *recv_sym = dlsym(RTLD_NEXT, "recv");
+    if (recv_sym) {
+        MSHookFunction((void *)recv_sym, (void *)hook_recv, (void **)&orig_recv);
+        DLOG(@"[INIT] recv: HOOKED via MSHookFunction");
+    } else {
+        DLOG(@"[INIT] WARNING: recv symbol not found");
+    }
     
     Class uidCls = [UIDevice class];
     
@@ -75,7 +123,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] MINIMAL hooks installed - v36.16");
+    DLOG(@"[ACT] Hooks installed - v36.17");
 }
 
 // ============================================================
