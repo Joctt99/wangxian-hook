@@ -1497,6 +1497,76 @@ static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
 }
 
+#pragma mark - UIDevice Hooks (v36.10 restored)
+
+static NSString *fakeVersion = @"7.7.0";
+
+static NSString *hook_currentVersion(id self, SEL _cmd) {
+    DLOG(@"[VER-FAKE] currentVersion -> '%@'", fakeVersion);
+    return fakeVersion;
+}
+
+static BOOL hook_isJailbroken(id self, SEL _cmd) {
+    DLOG(@"[JAIL-FAKE] isJailbroken -> NO");
+    return NO;
+}
+
+#pragma mark - NSUserDefaults Hooks (v36.10 restored)
+
+static id hook_objectForKey(id self, SEL _cmd, NSString *key) {
+    id result = objc_msgSend(self, @selector(objectForKey:), key);
+    DLOG(@"[NSUD] objectForKey: '%@' => '%@'", key, result);
+    return result;
+}
+
+static void hook_setObjectForKey(id self, SEL _cmd, id obj, NSString *key) {
+    DLOG(@"[NSUD] setObject: '%@' forKey: '%@'", obj, key);
+    objc_msgSend(self, @selector(setObject:forKey:), obj, key);
+}
+
+#pragma mark - EncryptUtils Hooks (v36.10 restored)
+
+static BOOL hook_rsaVerifyData(id self, SEL _cmd, NSData *data, NSData *signature, NSString *publicKey) {
+    DLOG(@"[ENC] rsaVerifyData: FORCED YES (data=%zu sig=%zu)", data.length, signature.length);
+    return YES;
+}
+
+#pragma mark - System Call Hooks (v36.10 restored)
+
+static ssize_t hook_write(int fd, const void *buf, size_t count) {
+    if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+    if (!orig_write || !buf) return -1;
+    
+    const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
+    
+    DLOG(@"[WRITE-DEBUG] fd=%d %s:%d len=%zu", fd, host ?: "unknown", port, count);
+    DLOG_HEX(buf, count < 256 ? count : 256);
+    
+    return orig_write(fd, buf, count);
+}
+
+typedef ssize_t (*ReadFunc)(int fd, void *buf, size_t count);
+static ReadFunc orig_read = NULL;
+
+static ssize_t hook_read(int fd, void *buf, size_t count) {
+    if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+    if (!orig_read || !buf) return -1;
+    
+    ssize_t ret = orig_read(fd, buf, count);
+    const char *host = getHostForFd(fd);
+    int port = getPortForFd(fd);
+    
+    if (ret > 0) {
+        DLOG(@"[READ-DEBUG] fd=%d %s:%d len=%zd", fd, host ?: "unknown", port, ret);
+        DLOG_HEX(buf, ret < 256 ? ret : 256);
+        
+        patchVersionCheckResponse((unsigned char *)buf, ret);
+    }
+    
+    return ret;
+}
+
 #pragma mark - Symbol Rebinding
 
 static int rebindSymbol(const char *symbolName, void *replacement, void **original) {
@@ -1577,6 +1647,8 @@ static void entry(void) {
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
     int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
     int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
+    int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
+    int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
     
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
@@ -1584,9 +1656,11 @@ static void entry(void) {
     if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
     if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+    if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     
-    DLOG(@"[SOCK] Patched: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d close=%d", c, s, r, rf, rm, cl);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p close=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_close);
+    DLOG(@"[SOCK] Patched: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d close=%d write=%d read=%d", c, s, r, rf, rm, cl, w, rd);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p close=%p write=%p read=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_close, orig_write, orig_read);
     
     if (!orig_connect) DLOG(@"[SOCK-WARN] connect hook failed");
     if (!orig_recv) DLOG(@"[SOCK-WARN] recv hook failed");
@@ -1633,6 +1707,30 @@ static void entry(void) {
     if (scCls) {
         Method m = class_getClassMethod(scCls, @selector(exitApplication));
         if (m) { method_setImplementation(m, (IMP)hook_exitApp); DLOG(@"[INIT] SC.exitApplication hooked"); }
+    }
+    
+    Class deviceCls = [UIDevice class];
+    if (deviceCls) {
+        Method m = class_getInstanceMethod(deviceCls, @selector(currentVersion));
+        if (m) { method_setImplementation(m, (IMP)hook_currentVersion); DLOG(@"[INIT] UIDevice.currentVersion hooked"); }
+        
+        m = class_getInstanceMethod(deviceCls, @selector(isJailbroken));
+        if (m) { method_setImplementation(m, (IMP)hook_isJailbroken); DLOG(@"[INIT] UIDevice.isJailbroken hooked"); }
+    }
+    
+    Class udCls = [NSUserDefaults class];
+    if (udCls) {
+        Method m = class_getInstanceMethod(udCls, @selector(objectForKey:));
+        if (m) { method_setImplementation(m, (IMP)hook_objectForKey); DLOG(@"[INIT] NSUserDefaults.objectForKey hooked"); }
+        
+        m = class_getInstanceMethod(udCls, @selector(setObject:forKey:));
+        if (m) { method_setImplementation(m, (IMP)hook_setObjectForKey); DLOG(@"[INIT] NSUserDefaults.setObject:forKey: hooked"); }
+    }
+    
+    Class euCls = NSClassFromString(@"EncryptUtils");
+    if (euCls) {
+        Method m = class_getInstanceMethod(euCls, @selector(rsaVerifyData:signature:withPublicKey:));
+        if (m) { method_setImplementation(m, (IMP)hook_rsaVerifyData); DLOG(@"[INIT] EncryptUtils.rsaVerifyData hooked"); }
     }
     
     init_cpp_hooks();
