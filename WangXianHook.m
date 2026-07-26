@@ -50,6 +50,7 @@
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
 static NSString *g_logPath = nil;
+static NSString *g_loginToken = nil;  // v36.10: Store token from 0x802EE120 response
 static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
@@ -84,7 +85,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.09 loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.10 loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -2173,6 +2174,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         // v35.34: Only patch 0x802EE121 (version check). Do NOT patch 0x802EE118/0x802EE120.
         // Patching their byte 12 may corrupt non-error status codes and break game server auth.
+        
+        // v36.10: Extract token from 0x802EE120 response for use as sessionId
+        if (cmd == 0x802EE120 && port == 5678 && ret >= 14) {
+            unsigned char status = p[12];
+            unsigned char tokenLen = p[13];
+            if (status == 0x00 && tokenLen > 0 && ret >= 14 + tokenLen) {
+                NSString *token = [[NSString alloc] initWithBytes:p + 14 length:tokenLen encoding:NSUTF8StringEncoding];
+                if (token) {
+                    g_loginToken = [token copy];
+                    DLOG(@"[TOKEN-EXTRACT] 0x802EE120 token: %@ (len=%u)", g_loginToken, tokenLen);
+                }
+            }
+        }
+        
         if (cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
@@ -5711,12 +5726,22 @@ static NSData *hook_aesEncryptData_key_iv(id self, SEL _cmd, NSData *data, NSDat
                     NSString *oldTicket = dict[@"ticket"];
                     
                     if (!oldSessionId || [oldSessionId isEqualToString:@""]) {
-                        dict[@"sessionId"] = @"test_session_1234567890abcdef";
-                        DLOG(@"[AES-PATCH] Replaced empty sessionId with fake value");
+                        if (g_loginToken) {
+                            dict[@"sessionId"] = g_loginToken;
+                            DLOG(@"[AES-PATCH] Replaced empty sessionId with login token: %@", g_loginToken);
+                        } else {
+                            dict[@"sessionId"] = @"test_session_1234567890abcdef";
+                            DLOG(@"[AES-PATCH] Replaced empty sessionId with fake value (no login token)");
+                        }
                     }
                     if (!oldTicket || [oldTicket isEqualToString:@""]) {
-                        dict[@"ticket"] = @"test_ticket_abcdef1234567890";
-                        DLOG(@"[AES-PATCH] Replaced empty ticket with fake value");
+                        if (g_loginToken) {
+                            dict[@"ticket"] = g_loginToken;
+                            DLOG(@"[AES-PATCH] Replaced empty ticket with login token: %@", g_loginToken);
+                        } else {
+                            dict[@"ticket"] = @"test_ticket_abcdef1234567890";
+                            DLOG(@"[AES-PATCH] Replaced empty ticket with fake value (no login token)");
+                        }
                     }
                     
                     NSData *newJsonData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&error];
