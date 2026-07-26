@@ -155,7 +155,7 @@ int rebind_symbols(struct rebinding bindings[], size_t bindings_nel) {
     g_rebindings = (struct rebinding *)malloc(bindings_nel * sizeof(struct rebinding));
     memcpy(g_rebindings, bindings, bindings_nel * sizeof(struct rebinding));
     
-    for (unsigned int i = 0; i < _dyld_get_image_count(); i++) {
+    for (unsigned int i = 0; i < _dyld_image_count(); i++) {
         _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
     }
     
