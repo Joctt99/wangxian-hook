@@ -30,6 +30,8 @@
 #include <sys/mman.h>
 #include <zlib.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import <Security/Security.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -2398,6 +2400,55 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
     return result;
 }
 
+#pragma mark - CCCrypt / SecKey Hooks
+
+typedef int (*CCCryptFunc)(uint32_t op, uint32_t alg, uint32_t options,
+                           const void *key, size_t keyLen,
+                           const void *iv,
+                           const void *dataIn, size_t dataInLen,
+                           void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+static CCCryptFunc orig_CCCrypt = NULL;
+
+static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
+                        const void *key, size_t keyLen,
+                        const void *iv,
+                        const void *dataIn, size_t dataInLen,
+                        void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    if (!orig_CCCrypt) orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
+    if (!orig_CCCrypt) return -1;
+    
+    const char *opStr = (op == 0) ? "ENC" : "DEC";
+    DLOG(@"[CC-AES] #%d %s inLen=%zu keyLen=%zu", op, opStr, dataInLen, keyLen);
+    
+    int ret = orig_CCCrypt(op, alg, options, key, keyLen, iv, dataIn, dataInLen, dataOut, dataOutAvailable, dataOutMoved);
+    
+    if (dataOutMoved && *dataOutMoved > 0) {
+        DLOG(@"[CC-AES-OUT] #%d %s len=%zu", op, opStr, *dataOutMoved);
+    }
+    return ret;
+}
+
+typedef OSStatus (*SecKeyEncryptFunc)(SecKeyRef key, SecPadding padding, const uint8_t *plainText, size_t plainTextLen, uint8_t *cipherText, size_t *cipherTextLen);
+static SecKeyEncryptFunc orig_SecKeyEncrypt = NULL;
+
+static OSStatus hook_SecKeyEncrypt(SecKeyRef key, SecPadding padding, const uint8_t *plainText, size_t plainTextLen, uint8_t *cipherText, size_t *cipherTextLen) {
+    if (!orig_SecKeyEncrypt) orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_NEXT, "SecKeyEncrypt");
+    if (!orig_SecKeyEncrypt) return errSecParam;
+    DLOG(@"[SEC] SecKeyEncrypt plainLen=%zu cipherLen=%zu", plainTextLen, cipherTextLen ? *cipherTextLen : 0);
+    return orig_SecKeyEncrypt(key, padding, plainText, plainTextLen, cipherText, cipherTextLen);
+}
+
+typedef OSStatus (*SecKeyDecryptFunc)(SecKeyRef key, SecPadding padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen);
+static SecKeyDecryptFunc orig_SecKeyDecrypt = NULL;
+
+static OSStatus hook_SecKeyDecrypt(SecKeyRef key, SecPadding padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen) {
+    if (!orig_SecKeyDecrypt) orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_NEXT, "SecKeyDecrypt");
+    if (!orig_SecKeyDecrypt) return errSecParam;
+    OSStatus ret = orig_SecKeyDecrypt(key, padding, cipherText, cipherTextLen, plainText, plainTextLen);
+    DLOG(@"[SEC] SecKeyDecrypt cipherLen=%zu plainLen=%zu ret=%d", cipherTextLen, plainTextLen ? *plainTextLen : 0, (int)ret);
+    return ret;
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -2422,6 +2473,28 @@ static void installSecurityHooks(void) {
         void *fp = dlsym(syslib, "fopen");
         void *fg = dlsym(syslib, "fgets");
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
+    }
+    
+    // Hook CCCrypt for AES encryption logging
+    orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
+    if (orig_CCCrypt) {
+        int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+        DLOG(@"[SEC] CCCrypt hook: rebind=%d addr=%p", r1, orig_CCCrypt);
+    } else {
+        DLOG(@"[SEC] CCCrypt not found via dlsym");
+    }
+    
+    // Hook SecKeyEncrypt / SecKeyDecrypt for RSA logging
+    orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_NEXT, "SecKeyEncrypt");
+    if (orig_SecKeyEncrypt) {
+        int r2 = rebindSymbol("_SecKeyEncrypt", (void *)hook_SecKeyEncrypt, (void **)&orig_SecKeyEncrypt);
+        DLOG(@"[SEC] SecKeyEncrypt hook: rebind=%d addr=%p", r2, orig_SecKeyEncrypt);
+    }
+    
+    orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_NEXT, "SecKeyDecrypt");
+    if (orig_SecKeyDecrypt) {
+        int r3 = rebindSymbol("_SecKeyDecrypt", (void *)hook_SecKeyDecrypt, (void **)&orig_SecKeyDecrypt);
+        DLOG(@"[SEC] SecKeyDecrypt hook: rebind=%d addr=%p", r3, orig_SecKeyDecrypt);
     }
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
