@@ -1301,8 +1301,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         
         if (cmd == 0x002EE118 || cmd == 0x002EE119 || cmd == 0x002EE120 ||
             cmd == 0x0002A018 || cmd == 0x0002A017) {
-            const char *oldVer = "7.5.0";
-            const char *newVer = "7.6.0";
+            const char *oldVer = "7.6.3";
+            const char *newVer = "7.7.0";
             size_t oldVerLen = strlen(oldVer);
             for (size_t i = 0; i <= len - oldVerLen; i++) {
                 if (memcmp(cbuf + i, oldVer, oldVerLen) == 0) {
@@ -1311,7 +1311,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     unsigned char *mp = (unsigned char *)sendBuf;
                     memcpy(mp + i, newVer, strlen(newVer));
                     modified = YES;
-                    DLOG(@"[SEND-DEBUG] Version replaced 7.5.0->7.6.0");
+                    DLOG(@"[SEND-DEBUG] Version replaced %s->%s", oldVer, newVer);
                     break;
                 }
             }
