@@ -88,7 +88,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
     
     struct sockaddr_in *sin = (struct sockaddr_in *)addr;
     int port = ntohs(sin->sin_port);
-    const char *host = inet_ntoa(sin->sin_addr);
+    char host[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
     
     DLOG(@"[CONNECT] fd=%d %s:%d", sockfd, host, port);
     
