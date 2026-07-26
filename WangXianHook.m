@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <dlfcn.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -1514,15 +1513,19 @@ static BOOL hook_isJailbroken(id self, SEL _cmd) {
 
 #pragma mark - NSUserDefaults Hooks (v36.10 restored)
 
+static id (*orig_objectForKey)(id, SEL, NSString *) = NULL;
+
 static id hook_objectForKey(id self, SEL _cmd, NSString *key) {
-    id result = objc_msgSend(self, @selector(objectForKey:), key);
+    id result = orig_objectForKey(self, _cmd, key);
     DLOG(@"[NSUD] objectForKey: '%@' => '%@'", key, result);
     return result;
 }
 
+static void (*orig_setObjectForKey)(id, SEL, id, NSString *) = NULL;
+
 static void hook_setObjectForKey(id self, SEL _cmd, id obj, NSString *key) {
     DLOG(@"[NSUD] setObject: '%@' forKey: '%@'", obj, key);
-    objc_msgSend(self, @selector(setObject:forKey:), obj, key);
+    orig_setObjectForKey(self, _cmd, obj, key);
 }
 
 #pragma mark - EncryptUtils Hooks (v36.10 restored)
@@ -1722,10 +1725,10 @@ static void entry(void) {
     Class udCls = [NSUserDefaults class];
     if (udCls) {
         Method m = class_getInstanceMethod(udCls, @selector(objectForKey:));
-        if (m) { method_setImplementation(m, (IMP)hook_objectForKey); DLOG(@"[INIT] NSUserDefaults.objectForKey hooked"); }
+        if (m) { orig_objectForKey = (id (*)(id, SEL, NSString *))method_getImplementation(m); method_setImplementation(m, (IMP)hook_objectForKey); DLOG(@"[INIT] NSUserDefaults.objectForKey hooked"); }
         
         m = class_getInstanceMethod(udCls, @selector(setObject:forKey:));
-        if (m) { method_setImplementation(m, (IMP)hook_setObjectForKey); DLOG(@"[INIT] NSUserDefaults.setObject:forKey: hooked"); }
+        if (m) { orig_setObjectForKey = (void (*)(id, SEL, id, NSString *))method_getImplementation(m); method_setImplementation(m, (IMP)hook_setObjectForKey); DLOG(@"[INIT] NSUserDefaults.setObject:forKey: hooked"); }
     }
     
     Class euCls = NSClassFromString(@"EncryptUtils");
