@@ -1726,6 +1726,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
+        // 挑战包自动响应: 0x00FFFF01 / 0x00FFFF02
+        if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
+            DLOG(@"[CHALLENGE] Received challenge cmd=0x%08X len=%zd", cmd, ret);
+            
+            // 构造响应包: cmd改为0x80FFFF01/0x80FFFF02, 其他内容不变
+            unsigned char *respBuf = (unsigned char *)malloc(ret);
+            if (respBuf) {
+                memcpy(respBuf, buf, ret);
+                respBuf[4] = 0x80; // cmd高字节改为0x80
+                
+                // 发送响应
+                ssize_t sent = orig_send(fd, respBuf, ret, 0);
+                DLOG(@"[CHALLENGE] Sent response cmd=0x80%02X%02X%02X sent=%zd", 
+                    respBuf[5], respBuf[6], respBuf[7], sent);
+                free(respBuf);
+            }
+        }
+        
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
