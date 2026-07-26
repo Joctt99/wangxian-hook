@@ -1137,6 +1137,29 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         patchVersionCheckResponse((unsigned char *)buf, ret);
         parseLoginResponse((unsigned char *)buf, ret);
+        
+        if (port == 12003 && ret >= 12) {
+            unsigned char *p = (unsigned char *)buf;
+            uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                           ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            
+            if (cmd == 0x00FFFF02) {
+                DLOG(@"[CHALLENGE] Received 0x00FFFF02 challenge packet (%zd bytes)", ret);
+                
+                unsigned char response[32] = {0};
+                response[0] = 0x00; response[1] = 0x00; response[2] = 0x00; response[3] = 0x20;
+                response[4] = 0x80; response[5] = 0xFF; response[6] = 0xFF; response[7] = 0x02;
+                response[8] = 0x00; response[9] = 0x00; response[10] = 0x00; response[11] = 0x00;
+                
+                if (ret >= 12) {
+                    memcpy(response + 12, p + 12, MIN(ret - 12, 20));
+                }
+                
+                ssize_t sendRet = orig_send(fd, response, 32, 0);
+                DLOG(@"[CHALLENGE] Sent 0x80FFFF02 response (%zd bytes)", sendRet);
+                DLOG_HEX(response, 32);
+            }
+        }
     } else if (ret == 0) {
         DLOG(@"[RECV-DEBUG] fd=%d %s:%d ret=0 (connection closed)", fd, host ?: "unknown", port);
     } else {
