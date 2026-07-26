@@ -1,5 +1,5 @@
 /**
- * WangXianHook v36.12 - FIXED recv hook using complete fishhook
+ * WangXianHook v36.12 - FIXED recv hook using dyld interpose
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -11,7 +11,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <mach-o/dyld.h>
-#include <mach-o/nlist.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -61,9 +60,9 @@ static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
 // ============================================================
 #pragma mark - Recv Hook (login response patch)
 // ============================================================
-static ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
+ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
 
-static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
+ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
     ssize_t ret = orig_recv(sockfd, buf, len, flags);
     if (ret <= 0) return ret;
     
@@ -97,104 +96,13 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 // ============================================================
-#pragma mark - Complete Fishhook implementation
+#pragma mark - Dyld interpose structure
 // ============================================================
-struct rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+__attribute__((used)) static struct{ const void *replacement; const void *replacee; } _interpose_##_replacee \
+__attribute__((section("__DATA,__interpose"))) = { (const void *)(unsigned long)&_replacement, (const void *)(unsigned long)&_replacee };
 
-typedef struct rebinding_entry {
-    struct rebinding rebinding;
-    struct rebinding_entry *next;
-} rebinding_entry_t;
-
-static rebinding_entry_t *_rebindings_head = NULL;
-
-static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
-    DLOG(@"[FISHHOOK] Processing image at %p", header);
-    
-    rebinding_entry_t *cur = _rebindings_head;
-    if (!cur) return;
-    
-    uintptr_t cur_image = (uintptr_t)header + slide;
-    
-    DLOG(@"[FISHHOOK] cur_image = %p", (void*)cur_image);
-    
-    const struct mach_header *mh = header;
-    const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header));
-    
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
-            
-            if (strcmp(sc->segname, "__DATA") == 0) {
-                for (uint32_t j = 0; j < sc->nsects; j++) {
-                    const struct section_64 *sect = (const struct section_64 *)((uintptr_t)sc + sizeof(struct segment_command_64) + j * sizeof(struct section_64));
-                    
-                    if (strcmp(sect->sectname, "__la_symbol_ptr") == 0 || strcmp(sect->sectname, "__nl_symbol_ptr") == 0) {
-                        uintptr_t ptr = cur_image + sect->addr;
-                        uintptr_t end = ptr + sect->size;
-                        
-                        for (; ptr < end; ptr += sizeof(void *)) {
-                            uintptr_t *indirect_symbol = (uintptr_t *)ptr;
-                            
-                            rebinding_entry_t *entry = _rebindings_head;
-                            while (entry) {
-                                if (*indirect_symbol == (uintptr_t)entry->rebinding.replaced) {
-                                    *indirect_symbol = (uintptr_t)entry->rebinding.replacement;
-                                    DLOG(@"[FISHHOOK] Patched %s at %p", entry->rebinding.name, (void*)ptr);
-                                }
-                                entry = entry->next;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
-    }
-}
-
-int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
-    DLOG(@"[FISHHOOK] rebind_symbols called with %zu bindings", rebindings_nel);
-    
-    rebinding_entry_t **cur = &_rebindings_head;
-    while (*cur) {
-        cur = &(*cur)->next;
-    }
-    
-    for (size_t i = 0; i < rebindings_nel; i++) {
-        rebinding_entry_t *entry = (rebinding_entry_t *)malloc(sizeof(rebinding_entry_t));
-        entry->rebinding = rebindings[i];
-        entry->next = NULL;
-        *cur = entry;
-        cur = &entry->next;
-        
-        DLOG(@"[FISHHOOK] Added binding for %s", rebindings[i].name);
-    }
-    
-    void *handle = dlopen(NULL, RTLD_NOW);
-    if (handle) {
-        for (size_t i = 0; i < rebindings_nel; i++) {
-            void *orig = dlsym(handle, rebindings[i].name);
-            if (orig) {
-                *(rebindings[i].replaced) = orig;
-                DLOG(@"[FISHHOOK] Found %s at %p", rebindings[i].name, orig);
-            } else {
-                DLOG(@"[FISHHOOK] WARNING: %s not found in process", rebindings[i].name);
-            }
-        }
-        dlclose(handle);
-    }
-    
-    for (unsigned int i = 0; i < _dyld_get_image_count(); i++) {
-        _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-    }
-    
-    return 0;
-}
+DYLD_INTERPOSE(hook_recv, recv);
 
 // ============================================================
 #pragma mark - Install Hooks
@@ -202,10 +110,13 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing MINIMAL hooks...");
     
-    struct rebinding recv_rebind = {"recv", (void *)hook_recv, (void **)&orig_recv};
-    struct rebinding bindings[] = {recv_rebind};
-    rebind_symbols(bindings, 1);
-    DLOG(@"[INIT] recv: HOOKED via fishhook");
+    orig_recv = (ssize_t (*)(int, void *, size_t, int))dlsym(RTLD_NEXT, "recv");
+    if (orig_recv) {
+        DLOG(@"[INIT] Found original recv at %p", orig_recv);
+        DLOG(@"[INIT] recv: HOOKED via dyld interpose");
+    } else {
+        DLOG(@"[INIT] WARNING: recv symbol not found");
+    }
     
     Class uidCls = [UIDevice class];
     
