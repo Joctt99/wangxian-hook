@@ -95,29 +95,39 @@ static ReadFunc orig_read = NULL;
 #pragma mark - Protocol Patching
 
 static void patchLoginResponse(unsigned char *buf, ssize_t len) {
-    if (len < 12) return;
+    if (len < 16) return;
     
     uint32_t cmd = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
     
     if (cmd == 0x802EE121) {
-        uint32_t status = (buf[8] << 24) | (buf[9] << 16) | (buf[10] << 8) | buf[11];
+        unsigned char status = buf[12];
         if (status != 0) {
-            buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x00;
-            DLOG(@"[PROTO-PATCH] Login response patched: status %u -> 0", status);
+            DLOG(@"[PROTO-PATCH] 0x802EE121 login response, status byte 12: 0x%02X -> 0x00", status);
+            buf[12] = 0x00;
+            
+            if (len > 15) {
+                memset(buf + 15, 0, 60);
+                DLOG(@"[PROTO-PATCH] Cleared error msg1 at offset 15");
+            }
+            if (len > 76) {
+                memset(buf + 76, 0, 18);
+                DLOG(@"[PROTO-PATCH] Cleared error msg2 at offset 76");
+            }
+            DLOG(@"[PROTO-PATCH] Response length preserved: %zd bytes", len);
         }
     }
 }
 
 static void patchVersionCheckResponse(unsigned char *buf, ssize_t len) {
-    if (len < 12) return;
+    if (len < 16) return;
     
     uint32_t cmd = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
     
     if (cmd == 0x802EE118) {
-        uint32_t status = (buf[8] << 24) | (buf[9] << 16) | (buf[10] << 8) | buf[11];
+        unsigned char status = buf[12];
         if (status != 0) {
-            buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x00; buf[11] = 0x00;
-            DLOG(@"[PROTO-PATCH] Version check response patched: status %u -> 0", status);
+            buf[12] = 0x00;
+            DLOG(@"[PROTO-PATCH] 0x802EE118 version check, status byte 12: 0x%02X -> 0x00", status);
         }
     }
 }
@@ -160,7 +170,7 @@ static ssize_t hook_send(int sockfd, const void *buf, size_t len, int flags) {
                 memcpy(mp + i, newVer, strlen(newVer));
                 ssize_t ret = orig_send(sockfd, sendBuf, len, flags);
                 free(sendBuf);
-                DLOG(@"[SEND] Version replaced 7.6.3->7.7.0");
+                DLOG(@"[SEND] Version replaced 7.6.3->7.7.0 at offset %zu", i);
                 return ret;
             }
         }
