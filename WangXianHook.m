@@ -1,6 +1,5 @@
 /**
- * WangXianHook v36.20 - RESTORED from v36.10 WORKING VERSION
- * Complete socket hooks that WORKED for login
+ * WangXianHook v36.22 - Using OFFICIAL fishhook from WangXian2Hook
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -11,7 +10,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <mach-o/dyld.h>
+
+#import "fishhook.h"
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -34,122 +34,9 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.20 WORKING loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.22 OFFICIAL FISHHOOK loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
-}
-
-// ============================================================
-#pragma mark - Fishhook Implementation
-// ============================================================
-struct rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
-
-static struct rebinding *g_rebindings = NULL;
-static size_t g_rebindings_count = 0;
-
-static uint64_t _read_uleb128(const uint8_t **data) {
-    uint64_t result = 0;
-    uint8_t shift = 0;
-    uint8_t byte;
-    do {
-        byte = **data;
-        (*data)++;
-        result |= ((uint64_t)(byte & 0x7F)) << shift;
-        shift += 7;
-    } while (byte & 0x80);
-    return result;
-}
-
-static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
-    if (!g_rebindings || g_rebindings_count == 0) return;
-    
-    const struct mach_header *mh = header;
-    const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header));
-    
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        if (lc->cmd == LC_DYLD_INFO_ONLY) {
-            const struct dyld_info_command *dic = (const struct dyld_info_command *)lc;
-            
-            const uint8_t *bind_info = (const uint8_t *)((uintptr_t)mh + dic->bind_off);
-            const uint8_t *lazy_bind_info = (const uint8_t *)((uintptr_t)mh + dic->lazy_bind_off);
-            
-            uint64_t image_base = (uintptr_t)mh + slide;
-            
-            const uint8_t *info = bind_info;
-            while (info < bind_info + dic->bind_size) {
-                uint64_t it = _read_uleb128(&info);
-                uint64_t type = it & 0xF;
-                
-                if (type == BIND_TYPE_POINTER) {
-                    uint64_t seg_offset = _read_uleb128(&info);
-                    uint64_t symbol_name_offset = _read_uleb128(&info);
-                    const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
-                    
-                    uintptr_t *indirect_symbol = (uintptr_t *)(image_base + seg_offset);
-                    
-                    for (size_t j = 0; j < g_rebindings_count; j++) {
-                        if (strcmp(symbol_name, g_rebindings[j].name) == 0) {
-                            if (*g_rebindings[j].replaced == NULL) {
-                                *g_rebindings[j].replaced = (void *)*indirect_symbol;
-                            }
-                            *indirect_symbol = (uintptr_t)g_rebindings[j].replacement;
-                            break;
-                        }
-                    }
-                }
-                
-                while ((info - bind_info) < dic->bind_size && (*info & 0xF) == BIND_OPCODE_DONE) {
-                    info++;
-                }
-            }
-            
-            info = lazy_bind_info;
-            while (info < lazy_bind_info + dic->lazy_bind_size) {
-                uint64_t it = _read_uleb128(&info);
-                uint64_t type = it & 0xF;
-                
-                if (type == BIND_TYPE_POINTER) {
-                    uint64_t seg_offset = _read_uleb128(&info);
-                    uint64_t symbol_name_offset = _read_uleb128(&info);
-                    const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
-                    
-                    uintptr_t *indirect_symbol = (uintptr_t *)(image_base + seg_offset);
-                    
-                    for (size_t j = 0; j < g_rebindings_count; j++) {
-                        if (strcmp(symbol_name, g_rebindings[j].name) == 0) {
-                            if (*g_rebindings[j].replaced == NULL) {
-                                *g_rebindings[j].replaced = (void *)*indirect_symbol;
-                            }
-                            *indirect_symbol = (uintptr_t)g_rebindings[j].replacement;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            return;
-        }
-        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
-    }
-}
-
-int rebind_symbols(struct rebinding bindings[], size_t bindings_nel) {
-    g_rebindings_count = bindings_nel;
-    if (g_rebindings) free(g_rebindings);
-    g_rebindings = (struct rebinding *)malloc(bindings_nel * sizeof(struct rebinding));
-    memcpy(g_rebindings, bindings, bindings_nel * sizeof(struct rebinding));
-    
-    for (unsigned int i = 0; i < _dyld_image_count(); i++) {
-        _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-    }
-    
-    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
-    
-    return 0;
 }
 
 // ============================================================
@@ -160,11 +47,7 @@ static BOOL (*orig_APEX_isJailbroken)(id, SEL) = NULL;
 
 static NSString *hook_APEX_currentVersion(id self, SEL _cmd) {
     NSString *orig = orig_APEX_currentVersion ? orig_APEX_currentVersion(self, _cmd) : @"7.6.2";
-    NSString *fake = @"7.7.0";
-    if (![orig isEqualToString:fake]) {
-        DLOG(@"[VER-FAKE] currentVersion: %@ -> %@", orig, fake);
-    }
-    return fake;
+    return orig;
 }
 
 static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
@@ -245,32 +128,6 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 static ssize_t hook_send(int sockfd, const void *buf, size_t len, int flags) {
-    struct sockaddr_in addr;
-    socklen_t addrlen = sizeof(addr);
-    if (getpeername(sockfd, (struct sockaddr*)&addr, &addrlen) == 0) {
-        int port = ntohs(addr.sin_port);
-        
-        if (port == 5678 && len >= 20) {
-            unsigned char *p = (unsigned char *)buf;
-            uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
-            
-            if (cmd == 0x002EE121) {
-                const char *oldVer = "7.6.2";
-                const char *newVer = "7.7.0";
-                size_t oldLen = strlen(oldVer);
-                
-                for (size_t i = 0; i <= len - oldLen; i++) {
-                    if (memcmp(p + i, oldVer, oldLen) == 0) {
-                        unsigned char *mutableBuf = (unsigned char *)buf;
-                        memcpy(mutableBuf + i, newVer, oldLen);
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu", i);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
     return orig_send(sockfd, buf, len, flags);
 }
 
@@ -284,7 +141,7 @@ static void installAllHooks(void) {
     struct rebinding send_rebind = {"send", (void*)hook_send, (void**)&orig_send};
     struct rebinding bindings[] = {recv_rebind, send_rebind};
     rebind_symbols(bindings, 2);
-    DLOG(@"[INIT] recv+send: HOOKED via fishhook");
+    DLOG(@"[INIT] recv+send: HOOKED via OFFICIAL fishhook");
     
     Class uidCls = [UIDevice class];
     
@@ -292,7 +149,7 @@ static void installAllHooks(void) {
     if (m) {
         orig_APEX_currentVersion = (NSString *(*)(id, SEL))method_getImplementation(m);
         method_setImplementation(m, (IMP)hook_APEX_currentVersion);
-        DLOG(@"[INIT] UIDevice.currentVersion: HOOKED (fake 7.7.0)");
+        DLOG(@"[INIT] UIDevice.currentVersion: HOOKED (keep original)");
     }
     
     m = class_getClassMethod(uidCls, @selector(isJailbroken));
@@ -302,7 +159,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] Hooks installed - v36.20");
+    DLOG(@"[ACT] Hooks installed - v36.22");
 }
 
 // ============================================================
