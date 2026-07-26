@@ -1,4 +1,4 @@
-# WangXianHook Makefile - Using OFFICIAL fishhook
+# WangXianHook Makefile - Using OFFICIAL fishhook (C++ support)
 # Builds WangXianHook.dylib for iOS arm64
 
 TARGET = WangXianHook.dylib
@@ -20,14 +20,17 @@ CFLAGS += -framework Security
 CFLAGS += -framework CoreGraphics
 CFLAGS += -lobjc
 CFLAGS += -lz
+CFLAGS += -lc++
 CFLAGS += -dynamiclib
 CFLAGS += -O2
 CFLAGS += -fobjc-arc
+CFLAGS += -fno-exceptions
+CFLAGS += -fno-rtti
 
 all: $(TARGET)
 
 $(TARGET): $(SOURCE) $(FISHHOOK)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(FISHHOOK)
+	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@ls -la $(TARGET)
 
