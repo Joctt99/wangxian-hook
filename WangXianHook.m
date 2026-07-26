@@ -1,6 +1,5 @@
 /**
- * WangXianHook v36.11 - MINIMAL VERSION
- * Only keep: recv hook (login patch), version fake, jailbreak bypass
+ * WangXianHook v36.11 - MINIMAL VERSION with simple inline hook
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -11,6 +10,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -96,15 +97,47 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 // ============================================================
-#pragma mark - Fishhook-style rebind
+#pragma mark - Simple inline hook using memcpy
 // ============================================================
-struct rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
-
-extern int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
+static int inline_hook(void *target, void *replacement, void **backup) {
+    if (!target || !replacement || !backup) return -1;
+    
+    *backup = dlsym(RTLD_NEXT, "recv");
+    if (!*backup) {
+        DLOG(@"[HOOK] Failed to get original recv via dlsym");
+        return -1;
+    }
+    
+    DLOG(@"[HOOK] Original recv at %p", *backup);
+    
+    vm_prot_t old_prot, new_prot;
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)target, 16, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        DLOG(@"[HOOK] vm_protect failed: %d", kr);
+        return -1;
+    }
+    
+    uint64_t jump_addr = (uint64_t)replacement - (uint64_t)target - 12;
+    
+    unsigned char patch[12] = {
+        0x10, 0x00, 0x00, 0x14,  // adrp x16, jump_addr@PAGE
+        0x11, 0x00, 0x00, 0x14,  // add  x17, x16, jump_addr@PAGEOFF
+        0x00, 0x02, 0x1F, 0xD6   // br    x17
+    };
+    
+    memcpy(patch + 3, &jump_addr, 4);
+    memcpy(patch + 7, (unsigned char*)&jump_addr + 4, 4);
+    
+    memcpy(target, patch, 12);
+    
+    kr = vm_protect(mach_task_self(), (vm_address_t)target, 16, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        DLOG(@"[HOOK] vm_protect restore failed: %d", kr);
+    }
+    
+    DLOG(@"[HOOK] Inline hook installed at %p -> %p", target, replacement);
+    return 0;
+}
 
 // ============================================================
 #pragma mark - Install Hooks
@@ -112,10 +145,12 @@ extern int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing MINIMAL hooks...");
     
-    struct rebinding recv_rebind = {"recv", (void *)hook_recv, (void **)&orig_recv};
-    struct rebinding bindings[] = {recv_rebind};
-    rebind_symbols(bindings, 1);
-    DLOG(@"[INIT] recv: HOOKED via rebind_symbols");
+    void *recv_sym = dlsym(RTLD_NEXT, "recv");
+    if (recv_sym) {
+        inline_hook(recv_sym, (void*)hook_recv, (void**)&orig_recv);
+    } else {
+        DLOG(@"[HOOK] recv symbol not found");
+    }
     
     Class uidCls = [UIDevice class];
     
