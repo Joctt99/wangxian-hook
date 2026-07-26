@@ -1478,6 +1478,62 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
     
+    // UUID注入: 7.6.3版本的设备信息包(0x000EE007)缺少UUID字段，需要注入
+    // 对比v35.38(7.6.2): 179字节(含UUID), v36.10(7.6.3): 143字节(缺UUID)
+    // v35.38包结构: ...GPU\x00 \x00$180C4F27-4414-4623-ACEB-0C12B30E48FD \x00\x01\x00
+    // v36.10包结构: ...GPU\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00 (UUID位置全0)
+    if (port == 12003 && sendLen >= 12 && sendBuf == buf) {
+        const unsigned char *p = (const unsigned char *)sendBuf;
+        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        if (cmd == 0x000EE007) {
+            // 查找 "Apple Inc. Apple A18 Pro GPU" 后面的字段
+            const char *gpuEnd = "Apple Inc. Apple A18 Pro GPU";
+            size_t gpuEndLen = strlen(gpuEnd);
+            for (size_t i = 0; i + gpuEndLen + 10 <= sendLen; i++) {
+                if (memcmp(p + i, gpuEnd, gpuEndLen) == 0) {
+                    size_t uuidOffset = i + gpuEndLen;
+                    // 检查UUID位置是否全0（需要注入）
+                    BOOL needsUuid = YES;
+                    for (size_t j = uuidOffset; j < uuidOffset + 10 && j < sendLen; j++) {
+                        if (p[j] != 0) { needsUuid = NO; break; }
+                    }
+                    if (needsUuid) {
+                        // 分配新缓冲区，插入UUID字段
+                        // 格式: \x00\x24 (长度36) + UUID字符串
+                        NSString *uuid = [[UIDevice currentDevice].identifierForVendor UUIDString];
+                        if (!uuid) uuid = @"180C4F27-4414-4623-ACEB-0C12B30E48FD";
+                        const char *uuidStr = [uuid UTF8String];
+                        size_t uuidStrLen = strlen(uuidStr);
+                        
+                        size_t insertLen = 2 + uuidStrLen; // \x00\x24 + UUID
+                        void *newBuf = malloc(sendLen + insertLen);
+                        if (newBuf) {
+                            memcpy(newBuf, buf, uuidOffset);
+                            unsigned char *q = (unsigned char *)newBuf + uuidOffset;
+                            q[0] = 0x00; q[1] = 0x24; // 长度36
+                            memcpy(q + 2, uuidStr, uuidStrLen);
+                            memcpy(q + 2 + uuidStrLen, (unsigned char *)buf + uuidOffset, sendLen - uuidOffset);
+                            
+                            // 更新包长度 (前4字节)
+                            uint32_t newPktLen = (uint32_t)(sendLen + insertLen);
+                            q = (unsigned char *)newBuf;
+                            q[0] = (newPktLen >> 24) & 0xFF;
+                            q[1] = (newPktLen >> 16) & 0xFF;
+                            q[2] = (newPktLen >> 8) & 0xFF;
+                            q[3] = newPktLen & 0xFF;
+                            
+                            sendBuf = newBuf;
+                            sendLen = sendLen + insertLen;
+                            DLOG(@"[UUID-INJECT] Injected UUID into 0x000EE007: %@ (new len=%zu)", uuid, sendLen);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
     return ret;
@@ -1726,23 +1782,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // 挑战包自动响应: 0x00FFFF01 / 0x00FFFF02
-        if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
-            DLOG(@"[CHALLENGE] Received challenge cmd=0x%08X len=%zd", cmd, ret);
-            
-            // 构造响应包: cmd改为0x80FFFF01/0x80FFFF02, 其他内容不变
-            unsigned char *respBuf = (unsigned char *)malloc(ret);
-            if (respBuf) {
-                memcpy(respBuf, buf, ret);
-                respBuf[4] = 0x80; // cmd高字节改为0x80
-                
-                // 发送响应
-                ssize_t sent = orig_send(fd, respBuf, ret, 0);
-                DLOG(@"[CHALLENGE] Sent response cmd=0x80%02X%02X%02X sent=%zd", 
-                    respBuf[5], respBuf[6], respBuf[7], sent);
-                free(respBuf);
-            }
-        }
+        // 挑战包由游戏客户端自身处理（0x00FFF495 RSA签名响应），不需要hook回复
+        // 0x00FFFF01/0x00FFFF02 是RSA密钥交换挑战，客户端会自动用SecKeyCreateSignature签名
         
         if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
