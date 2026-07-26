@@ -574,7 +574,7 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
             [dataStr containsString:@"code"] || [dataStr containsString:@"sign"] ||
             [dataStr containsString:@"ENDTIME"]) {
             DLOG(@"[HTTP-DATA] Response contains key info: %@", dataStr);
-            [ProtocolPatcher patchServerResponse:dataStr];
+            [ProtocolPatcher patchServerResponse:[dataStr dataUsingEncoding:NSUTF8StringEncoding]];
         }
     }
     
@@ -1172,7 +1172,7 @@ static unsigned char *gzipDecompress(const unsigned char *data, size_t len, size
     strm.avail_in = len;
     
     size_t bufSize = len * 4;
-    unsigned char *buf = malloc(bufSize);
+    unsigned char *buf = (unsigned char *)malloc(bufSize);
     if (!buf) { inflateEnd(&strm); return NULL; }
     
     unsigned char *outBuf = buf;
@@ -1187,7 +1187,7 @@ static unsigned char *gzipDecompress(const unsigned char *data, size_t len, size
         size_t produced = bufSize - strm.avail_out;
         if (produced > 0) {
             totalOut += produced;
-            unsigned char *newBuf = realloc(outBuf, totalOut + bufSize);
+            unsigned char *newBuf = (unsigned char *)realloc(outBuf, totalOut + bufSize);
             if (!newBuf) { free(outBuf); inflateEnd(&strm); return NULL; }
             buf = newBuf + totalOut - produced;
             outBuf = newBuf;
@@ -1200,7 +1200,7 @@ static unsigned char *gzipDecompress(const unsigned char *data, size_t len, size
     
     inflateEnd(&strm);
     
-    unsigned char *finalBuf = realloc(outBuf, totalOut + 1);
+    unsigned char *finalBuf = (unsigned char *)realloc(outBuf, totalOut + 1);
     if (finalBuf) {
         finalBuf[totalOut] = '\0';
         *outLen = totalOut;
@@ -1223,7 +1223,7 @@ static unsigned char *gzipCompress(const unsigned char *data, size_t len, size_t
     strm.avail_in = len;
     
     size_t bufSize = len + (len / 10) + 12;
-    unsigned char *buf = malloc(bufSize);
+    unsigned char *buf = (unsigned char *)malloc(bufSize);
     if (!buf) { deflateEnd(&strm); return NULL; }
     
     unsigned char *outBuf = buf;
@@ -1238,7 +1238,7 @@ static unsigned char *gzipCompress(const unsigned char *data, size_t len, size_t
         size_t produced = bufSize - strm.avail_out;
         if (produced > 0) {
             totalOut += produced;
-            unsigned char *newBuf = realloc(outBuf, totalOut + bufSize);
+            unsigned char *newBuf = (unsigned char *)realloc(outBuf, totalOut + bufSize);
             if (!newBuf) { free(outBuf); deflateEnd(&strm); return NULL; }
             buf = newBuf + totalOut - produced;
             outBuf = newBuf;
