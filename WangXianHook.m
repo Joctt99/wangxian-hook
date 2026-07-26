@@ -1,14 +1,6 @@
 /**
  * WangXianHook v36.11 - MINIMAL VERSION
  * Only keep: recv hook (login patch), version fake, jailbreak bypass
- * Remove: all socket hooks (connect/send/recvfrom/recvmsg/write/read)
- * Remove: NSUserDefaults hooks
- * Remove: NSBundle hooks
- * Remove: NSURLSession/NSURLConnection hooks
- * Remove: UITableView hooks
- * Remove: NSDictionary hooks
- * Remove: SignatureKit hooks
- * Remove: EncryptUtils hooks
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -81,7 +73,6 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
         
         if (port == 5678 && ret >= 12) {
             unsigned char *p = (unsigned char *)buf;
-            uint32_t pktLenBE = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
             uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
             
             if (cmd == 0x802EE121 && ret >= 90) {
@@ -105,25 +96,26 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 // ============================================================
+#pragma mark - Fishhook-style rebind
+// ============================================================
+struct rebinding {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
+
+extern int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
+
+// ============================================================
 #pragma mark - Install Hooks
 // ============================================================
 static void installAllHooks(void) {
     DLOG(@"[ACT] Installing MINIMAL hooks...");
     
-    orig_recv = (ssize_t (*)(int, void *, size_t, int))dlsym(RTLD_NEXT, "recv");
-    
-    void *libSystem = dlopen("/usr/lib/libSystem.dylib", RTLD_NOW);
-    if (libSystem) {
-        typedef int (*rebindSymbol_t)(const char *, void *, void **);
-        rebindSymbol_t rebind = (rebindSymbol_t)dlsym(libSystem, "rebind_symbols");
-        if (rebind) {
-            struct rebinding recv_rebind = {"recv", (void *)hook_recv, (void **)&orig_recv};
-            struct rebinding bindings[] = {recv_rebind};
-            rebind(bindings, 1);
-            DLOG(@"[INIT] recv: HOOKED via rebind_symbols");
-        }
-        dlclose(libSystem);
-    }
+    struct rebinding recv_rebind = {"recv", (void *)hook_recv, (void **)&orig_recv};
+    struct rebinding bindings[] = {recv_rebind};
+    rebind_symbols(bindings, 1);
+    DLOG(@"[INIT] recv: HOOKED via rebind_symbols");
     
     Class uidCls = [UIDevice class];
     
