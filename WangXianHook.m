@@ -1,6 +1,6 @@
 /**
- * WangXianHook v36.19 - RESTORED from v36.09 FULL VERSION
- * Complete fishhook implementation that WORKED for login
+ * WangXianHook v36.20 - RESTORED from v36.10 WORKING VERSION
+ * Complete socket hooks that WORKED for login
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -12,8 +12,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <mach-o/dyld.h>
-#include <mach-o/nlist.h>
-#include <sys/stat.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
@@ -36,7 +34,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        DLOG(@"=== WangXianHook v36.19 FULL RESTORED loaded @ %s %s ===", __DATE__, __TIME__);
+        DLOG(@"=== WangXianHook v36.20 WORKING loaded @ %s %s ===", __DATE__, __TIME__);
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
     }
 }
@@ -52,10 +50,6 @@ struct rebinding {
 
 static struct rebinding *g_rebindings = NULL;
 static size_t g_rebindings_count = 0;
-
-static uint32_t _swap_bytes_32(uint32_t value) {
-    return ((value >> 24) & 0xFF) | ((value >> 8) & 0xFF00) | ((value << 8) & 0xFF0000) | ((value << 24) & 0xFF000000);
-}
 
 static uint64_t _read_uleb128(const uint8_t **data) {
     uint64_t result = 0;
@@ -85,14 +79,13 @@ static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t
             
             uint64_t image_base = (uintptr_t)mh + slide;
             
-            // Process regular bindings
             const uint8_t *info = bind_info;
             while (info < bind_info + dic->bind_size) {
                 uint64_t it = _read_uleb128(&info);
                 uint64_t type = it & 0xF;
-                uint64_t seg_offset = _read_uleb128(&info);
                 
                 if (type == BIND_TYPE_POINTER) {
+                    uint64_t seg_offset = _read_uleb128(&info);
                     uint64_t symbol_name_offset = _read_uleb128(&info);
                     const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
                     
@@ -104,7 +97,6 @@ static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t
                                 *g_rebindings[j].replaced = (void *)*indirect_symbol;
                             }
                             *indirect_symbol = (uintptr_t)g_rebindings[j].replacement;
-                            DLOG(@"[FISHHOOK] Rebound %s at %p", symbol_name, indirect_symbol);
                             break;
                         }
                     }
@@ -115,14 +107,13 @@ static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t
                 }
             }
             
-            // Process lazy bindings
             info = lazy_bind_info;
             while (info < lazy_bind_info + dic->lazy_bind_size) {
                 uint64_t it = _read_uleb128(&info);
                 uint64_t type = it & 0xF;
-                uint64_t seg_offset = _read_uleb128(&info);
                 
                 if (type == BIND_TYPE_POINTER) {
+                    uint64_t seg_offset = _read_uleb128(&info);
                     uint64_t symbol_name_offset = _read_uleb128(&info);
                     const char *symbol_name = (const char *)((uintptr_t)mh + symbol_name_offset);
                     
@@ -134,7 +125,6 @@ static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t
                                 *g_rebindings[j].replaced = (void *)*indirect_symbol;
                             }
                             *indirect_symbol = (uintptr_t)g_rebindings[j].replacement;
-                            DLOG(@"[FISHHOOK] Rebound lazy %s at %p", symbol_name, indirect_symbol);
                             break;
                         }
                     }
@@ -148,8 +138,6 @@ static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t
 }
 
 int rebind_symbols(struct rebinding bindings[], size_t bindings_nel) {
-    DLOG(@"[FISHHOOK] rebind_symbols called with %zu bindings", bindings_nel);
-    
     g_rebindings_count = bindings_nel;
     if (g_rebindings) free(g_rebindings);
     g_rebindings = (struct rebinding *)malloc(bindings_nel * sizeof(struct rebinding));
@@ -185,9 +173,10 @@ static BOOL hook_APEX_isJailbroken(id self, SEL _cmd) {
 }
 
 // ============================================================
-#pragma mark - Recv Hook
+#pragma mark - Socket Hooks
 // ============================================================
 static ssize_t (*orig_recv)(int, void *, size_t, int) = NULL;
+static ssize_t (*orig_send)(int, const void *, size_t, int) = NULL;
 
 static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
     ssize_t ret = orig_recv(sockfd, buf, len, flags);
@@ -229,9 +218,60 @@ static ssize_t hook_recv(int sockfd, void *buf, size_t len, int flags) {
                 }
             }
         }
+        
+        if (port == 12003 && ret >= 12) {
+            unsigned char *p = (unsigned char *)buf;
+            uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+            
+            if (cmd == 0x00FFFF02) {
+                DLOG(@"[CHALLENGE] Received 0x00FFFF02 challenge packet (%zd bytes)", ret);
+                
+                unsigned char response[32] = {0};
+                response[0] = 0x00; response[1] = 0x00; response[2] = 0x00; response[3] = 0x20;
+                response[4] = 0x80; response[5] = 0xFF; response[6] = 0xFF; response[7] = 0x02;
+                response[8] = 0x00; response[9] = 0x00; response[10] = 0x00; response[11] = 0x00;
+                
+                if (ret >= 12) {
+                    memcpy(response + 12, p + 12, MIN(ret - 12, 20));
+                }
+                
+                ssize_t sendRet = orig_send(sockfd, response, 32, 0);
+                DLOG(@"[CHALLENGE] Sent 0x80FFFF02 response (%zd bytes)", sendRet);
+            }
+        }
     }
     
     return ret;
+}
+
+static ssize_t hook_send(int sockfd, const void *buf, size_t len, int flags) {
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getpeername(sockfd, (struct sockaddr*)&addr, &addrlen) == 0) {
+        int port = ntohs(addr.sin_port);
+        
+        if (port == 5678 && len >= 20) {
+            unsigned char *p = (unsigned char *)buf;
+            uint32_t cmd = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+            
+            if (cmd == 0x002EE121) {
+                const char *oldVer = "7.6.2";
+                const char *newVer = "7.7.0";
+                size_t oldLen = strlen(oldVer);
+                
+                for (size_t i = 0; i <= len - oldLen; i++) {
+                    if (memcmp(p + i, oldVer, oldLen) == 0) {
+                        unsigned char *mutableBuf = (unsigned char *)buf;
+                        memcpy(mutableBuf + i, newVer, oldLen);
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu", i);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    return orig_send(sockfd, buf, len, flags);
 }
 
 // ============================================================
@@ -241,9 +281,10 @@ static void installAllHooks(void) {
     DLOG(@"[ACT] Installing hooks...");
     
     struct rebinding recv_rebind = {"recv", (void*)hook_recv, (void**)&orig_recv};
-    struct rebinding bindings[] = {recv_rebind};
-    rebind_symbols(bindings, 1);
-    DLOG(@"[INIT] recv: HOOKED via fishhook");
+    struct rebinding send_rebind = {"send", (void*)hook_send, (void**)&orig_send};
+    struct rebinding bindings[] = {recv_rebind, send_rebind};
+    rebind_symbols(bindings, 2);
+    DLOG(@"[INIT] recv+send: HOOKED via fishhook");
     
     Class uidCls = [UIDevice class];
     
@@ -261,7 +302,7 @@ static void installAllHooks(void) {
         DLOG(@"[INIT] UIDevice.isJailbroken: HOOKED (return NO)");
     }
     
-    DLOG(@"[ACT] Hooks installed - v36.19");
+    DLOG(@"[ACT] Hooks installed - v36.20");
 }
 
 // ============================================================
