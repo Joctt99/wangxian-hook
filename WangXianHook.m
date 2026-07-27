@@ -1,18 +1,20 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.23 - REMOVED mock data injection, OBSERVE ONLY
- * FIX: Removed ALL fakeServerList/mock data injection that was interfering with real data
- * FIX: Removed duplicate UITableView hooks (now only one set of OBSERVE-ONLY hooks)
- * FIX: ProtocolPatcher only patches errorCode, never modifies payload data
- * KEY: Real server data reaches client (MieshiServerInfo parsed), now let it flow naturally
- * PRINCIPLE: Patch ERROR RESPONSES caused by injection detection, but do NOT modify NORMAL FLOW data
+ * WangXianHook v36.24 - REMOVED challenge packet auto-response
+ * FIX: Removed challenge packet (0x00FFFF01/0x00FFFF02) auto-response
+ * WHY: Normal client does NOT respond to these packets, auto-response causes server disconnect
+ * FIX: Challenge packets are now LOG ONLY, let game handle them normally
+ * 
+ * PREVIOUS (v36.23):
+ * - REMOVED mock data injection, OBSERVE ONLY
+ * - ProtocolPatcher only patches errorCode, never modifies payload data
  * 
  * RESTORED (needed for injection detection bypass):
  * - 0x802EE121 response patching (status→0, clear '版本过低' message)
- * - 0x00FFFF02 challenge packet auto-response
  * - '版本过低'/'当前版本' message clearing in responses
  * 
  * KEPT REMOVED (breaks normal protocol):
+ * - Challenge packet auto-response (causes disconnect)
  * - Server list IP replacement
  * - Version number modification (7.6.3→7.7.0)
  * - Server list status/serverType/clientid/serverid patching
@@ -76,7 +78,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.23 loaded ===");
+        _log(@"=== WangXianHook v36.24 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -254,7 +256,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v35.33 诊断面板";
+            lbl.text = @"WXHook v36.24 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1489,13 +1491,45 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement DISABLED: Changing version breaks packet signature/MD5
-    // Game server verifies packet integrity, so any byte modification causes rejection.
-    // The root cause is injection detection, not version mismatch.
+    // Analyze device info packets (0x000EE007) - compare with normal client format
+    if (len >= 12 && port == 5678) {
+        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        if (cmd == 0x000EE007) {
+            NSMutableString *deviceInfo = [NSMutableString string];
+            [deviceInfo appendFormat:@"[DEVICE-INFO] Device info packet analysis:\n"];
+            [deviceInfo appendFormat:@"  Total length: %zu bytes (normal client: 178 bytes)\n", len];
+            [deviceInfo appendFormat:@"  Hex data: "];
+            for (size_t i = 0; i < len && i < 64; i++) {
+                [deviceInfo appendFormat:@"%02X ", p[i]];
+            }
+            if (len > 64) [deviceInfo appendFormat:@"...\n"];
+            else [deviceInfo appendFormat:@"\n"];
+            
+            // Check for UUID field in payload
+            if (len > 12) {
+                NSString *payloadStr = [[NSString alloc] initWithBytes:p+12 length:(NSUInteger)(len-12) encoding:NSUTF8StringEncoding];
+                if (payloadStr) {
+                    [deviceInfo appendFormat:@"  Payload text: %@\n", payloadStr];
+                }
+                
+                // Look for UUID pattern (8-4-4-4-12 hex format)
+                NSRegularExpression *uuidRegex = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" options:0 error:nil];
+                NSArray *uuidMatches = [uuidRegex matchesInString:[[NSString alloc] initWithBytes:p length:len encoding:NSUTF8StringEncoding] ?: @"" options:0 range:NSMakeRange(0, len)];
+                if (uuidMatches.count > 0) {
+                    [deviceInfo appendFormat:@"  UUID found: %@\n", [uuidRegex stringByMatchesInString:[[NSString alloc] initWithBytes:p length:len encoding:NSUTF8StringEncoding] ?: @"" options:0 range:NSMakeRange(0, len) withTemplate:@"$0"]];
+                } else {
+                    [deviceInfo appendFormat:@"  No UUID found in packet!\n"];
+                }
+            }
+            DLOG(@"%@", deviceInfo);
+        }
+    }
     
     // NO PACKET MODIFICATION IN SEND HOOK
     // Normal client sends 0x000EE007 with proper UUID (178 bytes)
     // Modifying any packet data breaks integrity verification and triggers injection detection
+    // UUID injection will be added after confirming the correct format via analysis
 
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
@@ -1745,23 +1779,46 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // RESTORED: Handle injection-detection triggered error responses
-        // Normal client doesn't see these, but injected client does - need to compensate
-        
-        // Auto-respond to challenge packets (injection detection triggers these)
-        if (port == 12003 && (cmd == 0x00FFFF01 || cmd == 0x00FFFF02)) {
-            unsigned char *respBuf = (unsigned char *)malloc(ret);
-            if (respBuf) {
-                memcpy(respBuf, buf, ret);
-                respBuf[4] = 0x80;
-                ssize_t sent = orig_send ? orig_send(fd, respBuf, ret, 0) : -1;
-                NSMutableString *respHex = [NSMutableString stringWithCapacity:ret * 3];
-                for (size_t i = 0; i < (size_t)ret; i++) {
-                    [respHex appendFormat:@"%02X ", respBuf[i]];
-                }
-                DLOG(@"[CHALLENGE-RESP] Auto-responded to 0x%08X with 0x%08X (len=%zd, sent=%zd)", cmd, cmd | 0x80000000, (size_t)ret, sent);
-                free(respBuf);
+        // Challenge packets (0x00FFFF01/0x00FFFF02) - LOG ONLY, DO NOT RESPOND
+        // Analysis: Normal client does NOT send responses to these packets
+        // They may be internal game protocol packets, not server verification
+        // Auto-responding causes server to disconnect immediately
+        if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
+            NSMutableString *challengeDetail = [NSMutableString string];
+            [challengeDetail appendFormat:@"[CHALLENGE-LOG] cmd=0x%08X len=%zd port=%d\n", cmd, (size_t)ret, port];
+            [challengeDetail appendFormat:@"  Full hex: "];
+            for (ssize_t i = 0; i < ret && i < 64; i++) {
+                [challengeDetail appendFormat:@"%02X ", p[i]];
             }
+            if (ret > 64) [challengeDetail appendFormat:@"...\n"];
+            else [challengeDetail appendFormat:@"\n"];
+            
+            // Parse packet structure for analysis
+            if (ret >= 12) {
+                uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                uint32_t seq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                               ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                [challengeDetail appendFormat:@"  Parsed: pktLen=%u seq=0x%08X\n", pktLen, seq];
+                
+                // Check for payload data after header
+                if (ret > 12) {
+                    [challengeDetail appendFormat:@"  Payload (%zd bytes): ", ret - 12];
+                    for (ssize_t i = 12; i < ret && i < 32; i++) {
+                        [challengeDetail appendFormat:@"%02X ", p[i]];
+                    }
+                    if (ret > 32) [challengeDetail appendFormat:@"..."];
+                    [challengeDetail appendFormat:@"\n"];
+                }
+                
+                // Try to decode payload as ASCII
+                NSString *payloadStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+                if (payloadStr && payloadStr.length > 0) {
+                    [challengeDetail appendFormat:@"  Payload text: %@\n", payloadStr];
+                }
+            }
+            [challengeDetail appendFormat:@"  NOTE: Not responding - let game handle this packet normally\n"];
+            DLOG(@"%@", challengeDetail);
         }
         
         if (cmd == 0x802EE113) {
@@ -1854,55 +1911,40 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            unsigned char *b = (unsigned char *)buf;
             
+            // Parse and log server list details without modifying
             NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
             if (bodyStr) {
-                BOOL patched = NO;
-                
-                NSString *status6 = @"\"status\":6";
-                NSString *status1 = @"\"status\":1";
-                NSString *serverType2 = @"\"serverType\":2";
-                NSString *serverType1 = @"\"serverType\":1";
-                NSString *clientid0 = @"\"clientid\":0";
-                NSString *clientid1 = @"\"clientid\":1";
-                NSString *serverid0 = @"\"serverid\":0";
-                NSString *serverid1 = @"\"serverid\":1";
-                
-                if ([bodyStr containsString:status6]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:serverType2]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing serverType:2 -> serverType:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:clientid0]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing clientid:0 -> clientid:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:serverid0]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing serverid:0 -> serverid:1");
-                    patched = YES;
-                }
-                if (patched) {
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverid0 withString:serverid1];
-                    
-                    NSData *newData = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
-                    if (newData && [newData length] <= len) {
-                        memcpy(buf, newData.bytes, [newData length]);
-                        ret = [newData length];
-                        uint32_t newPktLen = (uint32_t)ret;
-                        b[0] = (newPktLen >> 24) & 0xFF;
-                        b[1] = (newPktLen >> 16) & 0xFF;
-                        b[2] = (newPktLen >> 8) & 0xFF;
-                        b[3] = newPktLen & 0xFF;
-                        DLOG(@"[SERVERLIST-PATCH] Server list patched, new len=%zd", ret);
+                // Log port information - critical for game server connection
+                NSRegularExpression *portRegex = [NSRegularExpression regularExpressionWithPattern:@"\"port\"\\s*:\\s*(\\d+)" options:0 error:nil];
+                NSArray *portMatches = [portRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+                if (portMatches.count > 0) {
+                    for (NSTextCheckingResult *match in portMatches) {
+                        NSString *portStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                        DLOG(@"[SERVERLIST-INFO] Found port in response: %@", portStr);
                     }
+                } else {
+                    DLOG(@"[SERVERLIST-INFO] No port field found in response (game may use default port 12003)");
                 }
+                
+                // Log IP information
+                NSRegularExpression *ipRegex = [NSRegularExpression regularExpressionWithPattern:@"\"ip\"\\s*:\\s*\"([^\"]+)\"" options:0 error:nil];
+                NSArray *ipMatches = [ipRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+                for (NSTextCheckingResult *match in ipMatches) {
+                    NSString *ipStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                    DLOG(@"[SERVERLIST-INFO] Found IP in response: %@", ipStr);
+                }
+                
+                // Log status information
+                NSRegularExpression *statusRegex = [NSRegularExpression regularExpressionWithPattern:@"\"status\"\\s*:\\s*(\\d+)" options:0 error:nil];
+                NSArray *statusMatches = [statusRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+                for (NSTextCheckingResult *match in statusMatches) {
+                    NSString *statusStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                    DLOG(@"[SERVERLIST-INFO] Found status in response: %@", statusStr);
+                }
+                
+                // IMPORTANT: Do NOT modify server list data - let game use original data
+                DLOG(@"[SERVERLIST-INFO] Server list data preserved as-is (not modified)");
             }
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
@@ -2476,6 +2518,37 @@ static OSStatus hook_SecKeyDecrypt(SecKeyRef key, SecPadding padding, const uint
     return ret;
 }
 
+// SecKeyCreateDecryptedData hook (iOS 10+)
+typedef OSStatus (*SecKeyCreateDecryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFDataRef *plaintext);
+static SecKeyCreateDecryptedDataFunc orig_SecKeyCreateDecryptedData = NULL;
+
+static OSStatus hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFDataRef *plaintext) {
+    if (!orig_SecKeyCreateDecryptedData) {
+        orig_SecKeyCreateDecryptedData = (SecKeyCreateDecryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateDecryptedData");
+    }
+    if (!orig_SecKeyCreateDecryptedData) return errSecParam;
+    OSStatus ret = orig_SecKeyCreateDecryptedData(key, algorithm, ciphertext, plaintext);
+    DLOG(@"[SEC] SecKeyCreateDecryptedData cipherLen=%lu ret=%d", ciphertext ? CFDataGetLength(ciphertext) : 0, (int)ret);
+    if (plaintext && *plaintext) {
+        DLOG(@"[SEC] SecKeyCreateDecryptedData plainLen=%lu", CFDataGetLength(*plaintext));
+    }
+    return ret;
+}
+
+// SecKeyCreateEncryptedData hook (iOS 10+)
+typedef OSStatus (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFDataRef *ciphertext);
+static SecKeyCreateEncryptedDataFunc orig_SecKeyCreateEncryptedData = NULL;
+
+static OSStatus hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFDataRef *ciphertext) {
+    if (!orig_SecKeyCreateEncryptedData) {
+        orig_SecKeyCreateEncryptedData = (SecKeyCreateEncryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateEncryptedData");
+    }
+    if (!orig_SecKeyCreateEncryptedData) return errSecParam;
+    OSStatus ret = orig_SecKeyCreateEncryptedData(key, algorithm, plaintext, ciphertext);
+    DLOG(@"[SEC] SecKeyCreateEncryptedData plainLen=%lu ret=%d", plaintext ? CFDataGetLength(plaintext) : 0, (int)ret);
+    return ret;
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -2523,6 +2596,20 @@ static void installSecurityHooks(void) {
     if (orig_SecKeyDecrypt) {
         int r3 = rebindSymbol("_SecKeyDecrypt", (void *)hook_SecKeyDecrypt, (void **)&orig_SecKeyDecrypt);
         DLOG(@"[SEC] SecKeyDecrypt hook: rebind=%d addr=%p", r3, orig_SecKeyDecrypt);
+    }
+    
+    // Hook SecKeyCreateDecryptedData (iOS 10+ decrypt API)
+    orig_SecKeyCreateDecryptedData = (SecKeyCreateDecryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateDecryptedData");
+    if (orig_SecKeyCreateDecryptedData) {
+        int r4 = rebindSymbol("_SecKeyCreateDecryptedData", (void *)hook_SecKeyCreateDecryptedData, (void **)&orig_SecKeyCreateDecryptedData);
+        DLOG(@"[SEC] SecKeyCreateDecryptedData hook: rebind=%d addr=%p", r4, orig_SecKeyCreateDecryptedData);
+    }
+    
+    // Hook SecKeyCreateEncryptedData (iOS 10+ encrypt API)
+    orig_SecKeyCreateEncryptedData = (SecKeyCreateEncryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateEncryptedData");
+    if (orig_SecKeyCreateEncryptedData) {
+        int r5 = rebindSymbol("_SecKeyCreateEncryptedData", (void *)hook_SecKeyCreateEncryptedData, (void **)&orig_SecKeyCreateEncryptedData);
+        DLOG(@"[SEC] SecKeyCreateEncryptedData hook: rebind=%d addr=%p", r5, orig_SecKeyCreateEncryptedData);
     }
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
