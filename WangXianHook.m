@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.10 loaded ===");
+        _log(@"=== WangXianHook v36.11 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -867,6 +867,19 @@ static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
             if ([desc isKindOfClass:[NSString class]] && [desc containsString:@"维护"]) {
                 DLOG(@"[MSI-PATCH] description=%@ -> 运行", desc);
                 mutDict[@"description"] = @"运行";
+            }
+        }
+        
+        if ([mutDict objectForKey:@"ip"]) {
+            NSString *ip = mutDict[@"ip"];
+            if ([ip isKindOfClass:[NSString class]]) {
+                if ([ip isEqualToString:@"47.100.14.198"] || [ip isEqualToString:@"47.100.204.160"]) {
+                    DLOG(@"[MSI-PATCH] ip=%@ -> 47.100.222.229", ip);
+                    mutDict[@"ip"] = @"47.100.222.229";
+                } else if ([ip hasPrefix:@"47.100.222."] && ![ip isEqualToString:@"47.100.222.229"]) {
+                    DLOG(@"[MSI-PATCH] ip=%@ (partial match) -> 47.100.222.229", ip);
+                    mutDict[@"ip"] = @"47.100.222.229";
+                }
             }
         }
         
