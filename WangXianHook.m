@@ -1826,14 +1826,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            const char *status6 = "\"status\":6";
-            const char *status1 = "\"status\":1";
-            const char *serverType2 = "\"serverType\":2";
-            const char *serverType1 = "\"serverType\":1";
-            const char *clientid0 = "\"clientid\":0";
-            const char *clientid1 = "\"clientid\":1";
-            const char *serverid0 = "\"serverid\":0";
-            const char *serverid1 = "\"serverid\":1";
+            NSString *status6 = @"\"status\":6";
+            NSString *status1 = @"\"status\":1";
+            NSString *serverType2 = @"\"serverType\":2";
+            NSString *serverType1 = @"\"serverType\":1";
+            NSString *clientid0 = @"\"clientid\":0";
+            NSString *clientid1 = @"\"clientid\":1";
+            NSString *serverid0 = @"\"serverid\":0";
+            NSString *serverid1 = @"\"serverid\":1";
             
             NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
             if (bodyStr) {
@@ -2033,14 +2033,14 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                 }
             }
             
-            const char *status6 = "\"status\":6";
-            const char *status1 = "\"status\":1";
-            const char *serverType2 = "\"serverType\":2";
-            const char *serverType1 = "\"serverType\":1";
-            const char *clientid0 = "\"clientid\":0";
-            const char *clientid1 = "\"clientid\":1";
-            const char *serverid0 = "\"serverid\":0";
-            const char *serverid1 = "\"serverid\":1";
+            NSString *status6 = @"\"status\":6";
+            NSString *status1 = @"\"status\":1";
+            NSString *serverType2 = @"\"serverType\":2";
+            NSString *serverType1 = @"\"serverType\":1";
+            NSString *clientid0 = @"\"clientid\":0";
+            NSString *clientid1 = @"\"clientid\":1";
+            NSString *serverid0 = @"\"serverid\":0";
+            NSString *serverid1 = @"\"serverid\":1";
             
             NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
             if (bodyStr) {
