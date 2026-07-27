@@ -72,7 +72,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.19 loaded ===");
+        _log(@"=== WangXianHook v36.20 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -873,16 +873,12 @@ static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
             }
         }
         
+        // NO IP REPLACEMENT - keep original server IP
+        // Normal client connects to 47.100.14.198 for both login and game servers
         if ([mutDict objectForKey:@"ip"]) {
             NSString *ip = mutDict[@"ip"];
             if ([ip isKindOfClass:[NSString class]]) {
-                if ([ip isEqualToString:@"47.100.14.198"] || [ip isEqualToString:@"47.100.204.160"]) {
-                    DLOG(@"[MSI-PATCH] ip=%@ -> 47.100.222.229", ip);
-                    mutDict[@"ip"] = @"47.100.222.229";
-                } else if ([ip hasPrefix:@"47.100.222."] && ![ip isEqualToString:@"47.100.222.229"]) {
-                    DLOG(@"[MSI-PATCH] ip=%@ (partial match) -> 47.100.222.229", ip);
-                    mutDict[@"ip"] = @"47.100.222.229";
-                }
+                DLOG(@"[MSI] Server IP: %@ (not modified)", ip);
             }
         }
         
