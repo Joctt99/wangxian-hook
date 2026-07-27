@@ -1,6 +1,7 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.19 - BALANCED PATCHING STRATEGY
+ * WangXianHook v36.21 - FIXED: Server list empty bug
+ * FIX: ProtocolPatcher no longer clears payload data (only patches errorCode)
  * PRINCIPLE: Patch ERROR RESPONSES caused by injection detection, but do NOT modify NORMAL FLOW data
  * 
  * RESTORED (needed for injection detection bypass):
@@ -72,7 +73,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.20 loaded ===");
+        _log(@"=== WangXianHook v36.21 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
