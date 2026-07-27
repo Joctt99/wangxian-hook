@@ -1493,31 +1493,35 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     
     // Analyze device info packets (0x000EE007) - compare with normal client format
     if (len >= 12 && port == 5678) {
-        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        const unsigned char *dp = (const unsigned char *)buf;
+        uint32_t cmd = ((uint32_t)dp[4] << 24) | ((uint32_t)dp[5] << 16) |
+                       ((uint32_t)dp[6] << 8)  | (uint32_t)dp[7];
         if (cmd == 0x000EE007) {
             NSMutableString *deviceInfo = [NSMutableString string];
             [deviceInfo appendFormat:@"[DEVICE-INFO] Device info packet analysis:\n"];
             [deviceInfo appendFormat:@"  Total length: %zu bytes (normal client: 178 bytes)\n", len];
             [deviceInfo appendFormat:@"  Hex data: "];
             for (size_t i = 0; i < len && i < 64; i++) {
-                [deviceInfo appendFormat:@"%02X ", p[i]];
+                [deviceInfo appendFormat:@"%02X ", dp[i]];
             }
             if (len > 64) [deviceInfo appendFormat:@"...\n"];
             else [deviceInfo appendFormat:@"\n"];
             
             // Check for UUID field in payload
             if (len > 12) {
-                NSString *payloadStr = [[NSString alloc] initWithBytes:p+12 length:(NSUInteger)(len-12) encoding:NSUTF8StringEncoding];
+                NSString *payloadStr = [[NSString alloc] initWithBytes:dp+12 length:(NSUInteger)(len-12) encoding:NSUTF8StringEncoding];
                 if (payloadStr) {
                     [deviceInfo appendFormat:@"  Payload text: %@\n", payloadStr];
                 }
                 
                 // Look for UUID pattern (8-4-4-4-12 hex format)
                 NSRegularExpression *uuidRegex = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" options:0 error:nil];
-                NSArray *uuidMatches = [uuidRegex matchesInString:[[NSString alloc] initWithBytes:p length:len encoding:NSUTF8StringEncoding] ?: @"" options:0 range:NSMakeRange(0, len)];
+                NSString *fullStr = [[NSString alloc] initWithBytes:dp length:len encoding:NSUTF8StringEncoding] ?: @"";
+                NSArray *uuidMatches = [uuidRegex matchesInString:fullStr options:0 range:NSMakeRange(0, len)];
                 if (uuidMatches.count > 0) {
-                    [deviceInfo appendFormat:@"  UUID found: %@\n", [uuidRegex stringByMatchesInString:[[NSString alloc] initWithBytes:p length:len encoding:NSUTF8StringEncoding] ?: @"" options:0 range:NSMakeRange(0, len) withTemplate:@"$0"]];
+                    NSTextCheckingResult *match = uuidMatches[0];
+                    NSString *uuidStr = [fullStr substringWithRange:match.range];
+                    [deviceInfo appendFormat:@"  UUID found: %@\n", uuidStr];
                 } else {
                     [deviceInfo appendFormat:@"  No UUID found in packet!\n"];
                 }
