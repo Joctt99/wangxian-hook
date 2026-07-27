@@ -1819,23 +1819,18 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *b = (unsigned char *)buf;
-            const char *oldIP1 = "47.100.14.198";
-            const char *oldIP2 = "47.100.204.160";
             const char *newIP = "47.100.222.229";
-            size_t oldIP1Len = strlen(oldIP1);
-            size_t oldIP2Len = strlen(oldIP2);
             size_t newIPLen = strlen(newIP);
             
-            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP1Len; i++) {
-                if (memcmp(p + i, oldIP1, oldIP1Len) == 0) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP1, i, newIP);
-                    memcpy(b + i, newIP, newIPLen);
-                }
-            }
-            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP2Len; i++) {
-                if (memcmp(p + i, oldIP2, oldIP2Len) == 0) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP2, i, newIP);
-                    memcpy(b + i, newIP, newIPLen);
+            const char *oldIPs[] = {"47.100.14.198", "47.100.204.160", "101.132.180.110", NULL};
+            for (int ipIdx = 0; oldIPs[ipIdx]; ipIdx++) {
+                const char *oldIP = oldIPs[ipIdx];
+                size_t oldIPLen = strlen(oldIP);
+                for (ssize_t i = 0; i <= ret - (ssize_t)oldIPLen; i++) {
+                    if (memcmp(p + i, oldIP, oldIPLen) == 0) {
+                        DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP, i, newIP);
+                        memcpy(b + i, newIP, newIPLen);
+                    }
                 }
             }
             
@@ -2026,23 +2021,18 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *b = (unsigned char *)buf;
-            const char *oldIP1 = "47.100.14.198";
-            const char *oldIP2 = "47.100.204.160";
             const char *newIP = "47.100.222.229";
-            size_t oldIP1Len = strlen(oldIP1);
-            size_t oldIP2Len = strlen(oldIP2);
             size_t newIPLen = strlen(newIP);
             
-            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP1Len; i++) {
-                if (memcmp(p + i, oldIP1, oldIP1Len) == 0) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP1, i, newIP);
-                    memcpy(b + i, newIP, newIPLen);
-                }
-            }
-            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP2Len; i++) {
-                if (memcmp(p + i, oldIP2, oldIP2Len) == 0) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP2, i, newIP);
-                    memcpy(b + i, newIP, newIPLen);
+            const char *oldIPs[] = {"47.100.14.198", "47.100.204.160", "101.132.180.110", NULL};
+            for (int ipIdx = 0; oldIPs[ipIdx]; ipIdx++) {
+                const char *oldIP = oldIPs[ipIdx];
+                size_t oldIPLen = strlen(oldIP);
+                for (ssize_t i = 0; i <= ret - (ssize_t)oldIPLen; i++) {
+                    if (memcmp(p + i, oldIP, oldIPLen) == 0) {
+                        DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP, i, newIP);
+                        memcpy(b + i, newIP, newIPLen);
+                    }
                 }
             }
             
