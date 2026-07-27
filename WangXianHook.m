@@ -3356,11 +3356,13 @@ static void installAllHooks(void) {
                         }
                         
                         if ([dataSource respondsToSelector:@selector(numberOfSections)]) {
-                            NSInteger sections = [dataSource performSelector:@selector(numberOfSections)];
+                            NSNumber *sectionsNum = [dataSource performSelector:@selector(numberOfSections)];
+                            NSInteger sections = [sectionsNum integerValue];
                             DLOG(@"[TV-RELOAD] numberOfSections=%ld", (long)sections);
                             for (NSInteger s = 0; s < sections; s++) {
                                 if ([dataSource respondsToSelector:@selector(numberOfRowsInSection:)]) {
-                                    NSInteger rows = [dataSource performSelector:@selector(numberOfRowsInSection:) withObject:@(s)];
+                                    NSNumber *rowsNum = [dataSource performSelector:@selector(numberOfRowsInSection:) withObject:@(s)];
+                                    NSInteger rows = [rowsNum integerValue];
                                     DLOG(@"[TV-RELOAD] numberOfRowsInSection:%ld=%ld", (long)s, (long)rows);
                                 }
                             }
