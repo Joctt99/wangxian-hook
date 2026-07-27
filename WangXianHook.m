@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.14 loaded ===");
+        _log(@"=== WangXianHook v36.15 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1456,38 +1456,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: Change "7.6.3" -> "7.7.0" in send packets to login server (5678)
-    // Pattern: \x00\x05 (length 5) + "7.6.3" (hex: 37 2E 36 2E 33)
-    // Apply to login server (port 5678) so server returns real success response with valid session
-    if (port == 5678 && sendLen >= 7 && sendBuf == buf) {
-        const unsigned char *p = (const unsigned char *)sendBuf;
-        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x33};
-        BOOL found = NO;
-        for (size_t i = 0; i + 7 <= sendLen; i++) {
-            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
-        }
-        if (found) {
-            void *newBuf = malloc(sendLen);
-            if (newBuf) {
-                memcpy(newBuf, buf, sendLen);
-                unsigned char *q = (unsigned char *)newBuf;
-                int cnt = 0;
-                for (size_t i = 0; i + 7 <= sendLen; i++) {
-                    if (memcmp(q + i, verPattern, 7) == 0) {
-                        q[i+4] = 0x37; q[i+6] = 0x30; // Change "7.6.3" -> "7.7.0"
-                        cnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.3 -> 7.7.0 at offset %zu (login server)", i+2);
-                    }
-                }
-                if (cnt > 0) {
-                    sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total %d version replacements for login server packet", cnt);
-                } else {
-                    free(newBuf);
-                }
-            }
-        }
-    }
+    // Version replacement DISABLED: 7.6.3 IS the latest version.
+    // The "版本过低" error is triggered locally by the app's injection detection, not server-side.
     
     // UUID注入: 7.6.3版本的设备信息包(0x000EE007)缺少UUID字段，需要注入
     // 对比v35.38(7.6.2): 179字节(含UUID), v36.10(7.6.3): 143字节(缺UUID)
@@ -2499,6 +2469,55 @@ static void installDladdrHook(void) {
 }
 
 // ============================================================
+#pragma mark - dlsym Hook (hide hook framework symbols)
+// ============================================================
+
+typedef void* (*DlsymFunc)(void *, const char *);
+static DlsymFunc orig_dlsym = NULL;
+
+static void* hook_dlsym(void *handle, const char *symbol) {
+    if (!orig_dlsym) {
+        void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_NOLOAD);
+        if (libdyld) {
+            orig_dlsym = (DlsymFunc)dlsym(libdyld, "dlsym");
+        }
+    }
+    if (!orig_dlsym) return NULL;
+    
+    NSString *symStr = [NSString stringWithUTF8String:symbol];
+    NSString *lowerSym = [symStr lowercaseString];
+    
+    const char *hiddenSymbols[] = {
+        "substrate", "fishhook", "mshookfunction", "rebind_symbols",
+        "mshookmsg", "mshookclass", "mshookselector",
+        "cydia", "cydiasubstrate", "theos",
+        NULL
+    };
+    
+    for (int i = 0; hiddenSymbols[i]; i++) {
+        if ([lowerSym containsString:[NSString stringWithUTF8String:hiddenSymbols[i]]]) {
+            DLOG(@"[DLSYM-HIDE] Returning NULL for symbol: '%s'", symbol);
+            return NULL;
+        }
+    }
+    
+    void *result = orig_dlsym(handle, symbol);
+    if (result) {
+        DLOG(@"[DLSYM-LOG] symbol='%s' -> %p", symbol, result);
+    }
+    return result;
+}
+
+static void installDlsymHook(void) {
+    void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_NOLOAD);
+    if (libdyld) {
+        orig_dlsym = (DlsymFunc)dlsym(libdyld, "dlsym");
+        rebindSymbol("_dlsym", (void *)hook_dlsym, (void **)&orig_dlsym);
+        DLOG(@"[DLSYM-HOOK] Installed, orig=%p", orig_dlsym);
+    }
+}
+
+// ============================================================
 #pragma mark - /proc/self/maps filtering (Linux fallback)
 // ============================================================
 
@@ -2595,6 +2614,7 @@ static void installSecurityHooks(void) {
     // Install DYLD hooks to hide injected libraries
     installDyldHooks();
     installDladdrHook();
+    installDlsymHook();
     
     // Hook fopen/fgets for /proc/self/maps (Linux fallback)
     void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
