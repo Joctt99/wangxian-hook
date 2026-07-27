@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.13 loaded ===");
+        _log(@"=== WangXianHook v36.14 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1456,16 +1456,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: Change "7.6.2" -> "7.7.0" in send packets to game server (12003)
-    // Pattern: \x00\x05 (length 5) + "7.6.2" (hex: 37 2E 36 2E 32)
-    // Only for game server (port 12003) to avoid breaking login server's signature-protected packets
-    // Version replacement DISABLED in v35.32: Changing 7.6.2 -> 7.7.0 breaks packet signature/MD5
-    // Game server verifies packet integrity, so any byte modification causes connection close.
-    // The version check is already bypassed at login server (5678) via 0x802EE121 response replacement.
-    // So game server (12003) should receive original 7.6.2 version as-is.
-    if (0 && port == 12003 && sendLen >= 7 && sendBuf == buf) {
+    // Version replacement: Change "7.6.3" -> "7.7.0" in send packets to login server (5678)
+    // Pattern: \x00\x05 (length 5) + "7.6.3" (hex: 37 2E 36 2E 33)
+    // Apply to login server (port 5678) so server returns real success response with valid session
+    if (port == 5678 && sendLen >= 7 && sendBuf == buf) {
         const unsigned char *p = (const unsigned char *)sendBuf;
-        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
+        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x33};
         BOOL found = NO;
         for (size_t i = 0; i + 7 <= sendLen; i++) {
             if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
@@ -1478,14 +1474,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 int cnt = 0;
                 for (size_t i = 0; i + 7 <= sendLen; i++) {
                     if (memcmp(q + i, verPattern, 7) == 0) {
-                        q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30; // "7.7.0"
+                        q[i+4] = 0x37; q[i+6] = 0x30; // Change "7.6.3" -> "7.7.0"
                         cnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.2 -> 7.7.0 at offset %zu (game server)", i+2);
+                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.3 -> 7.7.0 at offset %zu (login server)", i+2);
                     }
                 }
                 if (cnt > 0) {
                     sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total %d version replacements for game server packet", cnt);
+                    DLOG(@"[VER-REPLACE] Total %d version replacements for login server packet", cnt);
                 } else {
                     free(newBuf);
                 }
@@ -1824,24 +1820,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (bodyStr) {
                 BOOL patched = NO;
                 
-                NSString *oldIP1 = @"47.100.14.198";
-                NSString *oldIP2 = @"47.100.204.160";
-                NSString *oldIP3 = @"101.132.180.110";
-                NSString *newIP = @"47.100.222.229";
-                
-                if ([bodyStr containsString:oldIP1]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP1, newIP);
-                    patched = YES;
-                }
-                if ([bodyStr containsString:oldIP2]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP2, newIP);
-                    patched = YES;
-                }
-                if ([bodyStr containsString:oldIP3]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP3, newIP);
-                    patched = YES;
-                }
-                
                 NSString *status6 = @"\"status\":6";
                 NSString *status1 = @"\"status\":1";
                 NSString *serverType2 = @"\"serverType\":2";
@@ -1868,9 +1846,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     patched = YES;
                 }
                 if (patched) {
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP1 withString:newIP];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP2 withString:newIP];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP3 withString:newIP];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
@@ -2034,24 +2009,6 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             if (bodyStr) {
                 BOOL patched = NO;
                 
-                NSString *oldIP1 = @"47.100.14.198";
-                NSString *oldIP2 = @"47.100.204.160";
-                NSString *oldIP3 = @"101.132.180.110";
-                NSString *newIP = @"47.100.222.229";
-                
-                if ([bodyStr containsString:oldIP1]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP1, newIP);
-                    patched = YES;
-                }
-                if ([bodyStr containsString:oldIP2]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP2, newIP);
-                    patched = YES;
-                }
-                if ([bodyStr containsString:oldIP3]) {
-                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP3, newIP);
-                    patched = YES;
-                }
-                
                 NSString *status6 = @"\"status\":6";
                 NSString *status1 = @"\"status\":1";
                 NSString *serverType2 = @"\"serverType\":2";
@@ -2078,9 +2035,6 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     patched = YES;
                 }
                 if (patched) {
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP1 withString:newIP];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP2 withString:newIP];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP3 withString:newIP];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
