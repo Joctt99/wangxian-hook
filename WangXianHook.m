@@ -1,8 +1,10 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.22 - Enhanced server list debugging
- * FIX: ProtocolPatcher no longer clears payload data (only patches errorCode)
- * NEW: Added detailed UITableView data source logging to track server list data flow
+ * WangXianHook v36.23 - REMOVED mock data injection, OBSERVE ONLY
+ * FIX: Removed ALL fakeServerList/mock data injection that was interfering with real data
+ * FIX: Removed duplicate UITableView hooks (now only one set of OBSERVE-ONLY hooks)
+ * FIX: ProtocolPatcher only patches errorCode, never modifies payload data
+ * KEY: Real server data reaches client (MieshiServerInfo parsed), now let it flow naturally
  * PRINCIPLE: Patch ERROR RESPONSES caused by injection detection, but do NOT modify NORMAL FLOW data
  * 
  * RESTORED (needed for injection detection bypass):
@@ -74,7 +76,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.22 loaded ===");
+        _log(@"=== WangXianHook v36.23 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -676,24 +678,12 @@ static NSString *msi_string_hook(id self, SEL _cmd);
 static NSInteger msi_int_hook(id self, SEL _cmd);
 
 // ============================================================
-#pragma mark - UITableView DataSource hooks (force server list)
+#pragma mark - UITableView DataSource hooks (OBSERVE ONLY, NO MODIFICATION)
 // ============================================================
 
 static IMP orig_tableView_numberOfRows = NULL;
 static IMP orig_tableView_cellForRow = NULL;
 static IMP orig_tableView_numberOfSections = NULL;
-
-static NSMutableArray *fakeServerList = nil;
-
-static void initFakeServerList(void) {
-    if (fakeServerList) return;
-    fakeServerList = [NSMutableArray arrayWithArray:@[
-        @{@"serverid": @1, @"name": @"测试服务器1", @"ip": @"127.0.0.1", @"port": @5678, @"status": @1},
-        @{@"serverid": @2, @"name": @"测试服务器2", @"ip": @"127.0.0.1", @"port": @5679, @"status": @1},
-        @{@"serverid": @3, @"name": @"测试服务器3", @"ip": @"127.0.0.1", @"port": @5680, @"status": @1},
-    ]];
-    DLOG(@"[FAKE-SERVER] Initialized fake server list: %@", fakeServerList);
-}
 
 static BOOL isServerListDataSource(id self) {
     @try {
@@ -701,17 +691,13 @@ static BOOL isServerListDataSource(id self) {
             id ds = [self dataSource];
             if (ds) {
                 NSString *dsName = NSStringFromClass([ds class]);
-                DLOG(@"[TV-DS-CHECK] tableView.dataSource class: %@", dsName);
-                if ([dsName containsString:@"Server"] || [dsName containsString:@"server"] || 
-                    [dsName containsString:@"List"] || [dsName containsString:@"list"] ||
-                    [dsName containsString:@"Login"] || [dsName containsString:@"login"]) {
-                    return YES;
-                }
+                return ([dsName containsString:@"Server"] || [dsName containsString:@"server"] || 
+                        [dsName containsString:@"List"] || [dsName containsString:@"list"] ||
+                        [dsName containsString:@"Login"] || [dsName containsString:@"login"]);
             }
         }
         Class cls = [self class];
         NSString *clsName = NSStringFromClass(cls);
-        DLOG(@"[TV-DS-CHECK] self class: %@", clsName);
         return ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
                 [clsName containsString:@"List"] || [clsName containsString:@"list"] ||
                 [clsName containsString:@"Login"] || [clsName containsString:@"login"]);
@@ -728,47 +714,46 @@ static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section
     NSString *clsName = NSStringFromClass(cls);
     
     if (isServerListDataSource(self)) {
-        DLOG(@"[TV-CALL] -[%@ numberOfRowsInSection:%ld] -> %ld (original)", clsName, (long)section, (long)ret);
+        DLOG(@"[TV-OBSERVE] -[%@ numberOfRowsInSection:%ld] -> %ld", clsName, (long)section, (long)ret);
         
         @try {
             id dataSource = [self respondsToSelector:@selector(dataSource)] ? [self dataSource] : nil;
             if (dataSource) {
                 NSString *dsCls = NSStringFromClass([dataSource class]);
-                DLOG(@"[TV-DS] tableView.dataSource=%@ (%@)", dataSource, dsCls);
+                DLOG(@"[TV-OBSERVE] dataSource=%@ (%@)", dataSource, dsCls);
                 
                 if ([dataSource respondsToSelector:@selector(serverList)] || [dataSource respondsToSelector:@selector(servers)]) {
                     id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
                     if ([serverList isKindOfClass:[NSArray class]]) {
-                        DLOG(@"[TV-DS] dataSource.serverList count=%lu", (unsigned long)[serverList count]);
+                        DLOG(@"[TV-OBSERVE] serverList count=%lu", (unsigned long)[serverList count]);
                         for (NSUInteger i = 0; i < [serverList count] && i < 5; i++) {
                             id item = serverList[i];
-                            DLOG(@"[TV-DS]   [%lu] = %@ (%@)", i, item, NSStringFromClass([item class]));
+                            DLOG(@"[TV-OBSERVE]   [%lu] = %@ (%@)", i, item, NSStringFromClass([item class]));
                             if ([item isKindOfClass:[NSDictionary class]]) {
                                 NSDictionary *dict = (NSDictionary *)item;
-                                DLOG(@"[TV-DS]     keys=%@", [dict allKeys]);
-                                DLOG(@"[TV-DS]     name=%@ ip=%@ port=%@ status=%@", dict[@"name"], dict[@"ip"], dict[@"port"], dict[@"status"]);
+                                DLOG(@"[TV-OBSERVE]     keys=%@", [dict allKeys]);
+                                DLOG(@"[TV-OBSERVE]     name=%@ ip=%@ port=%@ status=%@", dict[@"name"], dict[@"ip"], dict[@"port"], dict[@"status"]);
+                            } else if ([item respondsToSelector:@selector(name)] && [item respondsToSelector:@selector(ip)] && [item respondsToSelector:@selector(port)]) {
+                                DLOG(@"[TV-OBSERVE]     name=%@ ip=%@ port=%@", 
+                                     [item performSelector:@selector(name)], 
+                                     [item performSelector:@selector(ip)], 
+                                     [item performSelector:@selector(port)]);
                             }
                         }
                     } else {
-                        DLOG(@"[TV-DS] dataSource.serverList is NOT NSArray: %@", NSStringFromClass([serverList class]));
+                        DLOG(@"[TV-OBSERVE] serverList is NOT NSArray: %@", serverList ? NSStringFromClass([serverList class]) : @"nil");
                     }
                 }
                 
                 if ([dataSource respondsToSelector:@selector(dataArray)] || [dataSource respondsToSelector:@selector(items)]) {
                     id data = [dataSource performSelector:[dataSource respondsToSelector:@selector(dataArray)] ? @selector(dataArray) : @selector(items)];
                     if ([data isKindOfClass:[NSArray class]]) {
-                        DLOG(@"[TV-DS] dataSource.dataArray/items count=%lu", (unsigned long)[data count]);
+                        DLOG(@"[TV-OBSERVE] dataArray/items count=%lu", (unsigned long)[data count]);
                     }
                 }
             }
         } @catch (NSException *e) {
-            DLOG(@"[TV-DS] Exception: %@", e);
-        }
-        
-        if (ret == 0) {
-            initFakeServerList();
-            ret = fakeServerList.count;
-            DLOG(@"[TV-PATCH] -[%@ numberOfRowsInSection:%ld] FORCE -> %ld (fake)", clsName, (long)section, (long)ret);
+            DLOG(@"[TV-OBSERVE] Exception: %@", e);
         }
     }
     return ret;
@@ -789,7 +774,7 @@ static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPat
             detailText = [(UITableViewCell*)ret detailTextLabel].text ?: @"";
         }
         
-        DLOG(@"[TV-CALL] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@' detail='%@'", clsName, 
+        DLOG(@"[TV-OBSERVE] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@' detail='%@'", clsName, 
              (long)indexPath.section, (long)indexPath.row, text, detailText);
         
         @try {
@@ -799,35 +784,21 @@ static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPat
                     id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
                     if ([serverList isKindOfClass:[NSArray class]] && indexPath.row < [serverList count]) {
                         id item = serverList[indexPath.row];
-                        DLOG(@"[TV-CELL-DATA] Row %ld data: %@ (%@)", (long)indexPath.row, item, NSStringFromClass([item class]));
+                        DLOG(@"[TV-OBSERVE] Row %ld data: %@ (%@)", (long)indexPath.row, item, NSStringFromClass([item class]));
                         if ([item isKindOfClass:[NSDictionary class]]) {
                             NSDictionary *dict = (NSDictionary *)item;
-                            DLOG(@"[TV-CELL-DATA]   name=%@ status=%@ ip=%@ port=%@", 
+                            DLOG(@"[TV-OBSERVE]   name=%@ status=%@ ip=%@ port=%@", 
                                  dict[@"name"], dict[@"status"], dict[@"ip"], dict[@"port"]);
-                        } else if ([item respondsToSelector:@selector(name)]) {
-                            id name = [item performSelector:@selector(name)];
-                            DLOG(@"[TV-CELL-DATA]   name=%@", name);
+                        } else if ([item respondsToSelector:@selector(name)] && [item respondsToSelector:@selector(ip)]) {
+                            DLOG(@"[TV-OBSERVE]   name=%@ ip=%@", 
+                                 [item performSelector:@selector(name)], 
+                                 [item performSelector:@selector(ip)]);
                         }
                     }
                 }
             }
         } @catch (NSException *e) {
-            DLOG(@"[TV-CELL-DATA] Exception: %@", e);
-        }
-        
-        if (!ret || (ret && [text isEqualToString:@""])) {
-            DLOG(@"[TV-PATCH] Creating fake cell for server list");
-            UITableViewCell *newCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-            if (newCell) {
-                initFakeServerList();
-                if (indexPath.row < fakeServerList.count) {
-                    NSDictionary *server = fakeServerList[indexPath.row];
-                    newCell.textLabel.text = server[@"name"] ?: @"测试服务器";
-                    newCell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                    DLOG(@"[TV-PATCH] Created fake cell: %@", server[@"name"]);
-                }
-                ret = newCell;
-            }
+            DLOG(@"[TV-OBSERVE] Exception: %@", e);
         }
     }
     return ret;
@@ -841,11 +812,7 @@ static NSInteger hook_numberOfSections(id self, SEL _cmd) {
     NSString *clsName = NSStringFromClass(cls);
     
     if (isServerListDataSource(self)) {
-        DLOG(@"[TV-CALL] -[%@ numberOfSections] -> %ld", clsName, (long)ret);
-        if (ret == 0) {
-            ret = 1;
-            DLOG(@"[TV-PATCH] -[%@ numberOfSections] FORCE -> 1", clsName);
-        }
+        DLOG(@"[TV-OBSERVE] -[%@ numberOfSections] -> %ld", clsName, (long)ret);
     }
     return ret;
 }
@@ -2593,20 +2560,6 @@ static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
 #pragma mark - Observation-only hooks (log, don't modify)
 // ============================================================
 
-// UITableView data source hooks - trace server list display
-static NSInteger (*orig_numberOfRows)(id, SEL, NSInteger) = NULL;
-static NSInteger (*orig_numberOfSections)(id, SEL) = NULL;
-static NSInteger hook_numberOfRows(id self, SEL _cmd, NSInteger section) {
-    NSInteger ret = orig_numberOfRows ? orig_numberOfRows(self, _cmd, section) : 0;
-    NSString *cls = NSStringFromClass([self class]);
-    if ([cls containsString:@"Server"] || [cls containsString:@"server"] || 
-        [cls containsString:@"List"] || [cls containsString:@"list"] ||
-        [cls containsString:@"Table"] || [cls containsString:@"table"]) {
-        DLOG(@"[TABLE] numberOfRowsInSection:%ld -> %ld class=%@", (long)section, (long)ret, cls);
-    }
-    return ret;
-}
-
 // NSDictionary objectForKey: - trace server list parsing (minimal logging)
 static id (*orig_dictObjectForKey)(id, SEL, id) = NULL;
 static int g_dictLogCount = 0;
@@ -2842,15 +2795,6 @@ static void installAllHooks(void) {
     if (vcCls) {
         Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
         if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe"); }
-    }
-    
-    // === DIAGNOSTIC: UITableView data source hooks ===
-    Class tvCls = [UITableView class];
-    if (tvCls) {
-        Method m = class_getInstanceMethod(tvCls, @selector(numberOfRowsInSection:));
-        if (m) { orig_numberOfRows = (NSInteger (*)(id, SEL, NSInteger))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfRows); _log(@"[INIT] UITableView.numberOfRowsInSection: observe"); }
-        m = class_getInstanceMethod(tvCls, @selector(numberOfSections));
-        if (m) { orig_numberOfSections = (NSInteger (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_numberOfSections); _log(@"[INIT] UITableView.numberOfSections: observe"); }
     }
     
     // === DIAGNOSTIC: UIAlertView show hook ===
@@ -3271,27 +3215,6 @@ static void installAllHooks(void) {
     // === DEFERRED: Hook NSJSONSerialization for decrypted data modification ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         installJSONSerializationHook();
-    });
-    
-    // === DEFERRED: Force inject mock server list if real list is empty ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-            NSArray *serverList = [defaults objectForKey:@"serverList"];
-            if (!serverList || serverList.count == 0) {
-                DLOG(@"[FORCE-INJECT] Server list empty, injecting mock data");
-                NSArray *mockServers = @[
-                    @{@"serverid": @1, @"name": @"测试服务器", @"ip": @"127.0.0.1", 
-                      @"port": @5678, @"status": @1, @"serverType": @1, @"clientid": @1,
-                      @"category": @"一区", @"description": @"运行中"}
-                ];
-                [defaults setObject:mockServers forKey:@"serverList"];
-                [defaults synchronize];
-                DLOG(@"[FORCE-INJECT] Mock server list injected: %@", mockServers);
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[FORCE-INJECT] Exception: %@", e);
-        }
     });
     
     // === DEFERRED: Scan all server-related classes and hook their init methods ===
