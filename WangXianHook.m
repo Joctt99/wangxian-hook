@@ -1,10 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.25 - Added crash handler for debugging
+ * WangXianHook v36.26 - Fixed crash in hook_send device info analysis
+ * FIX: Simplified device info packet analysis to avoid Objective-C exceptions in threads
+ * FIX: Added @try/@catch protection around all packet analysis code
  * FIX: Added signal handlers (SIGABRT/SIGSEGV/SIGILL/SIGBUS/SIGFPE/SIGTRAP) to capture crash info
- * FIX: Removed challenge packet (0x00FFFF01/0x00FFFF02) auto-response in v36.24
+ * FIX: Removed challenge packet (0x00FFFF01/0x00FFFF02) auto-response
  * WHY: Normal client does NOT respond to these packets, auto-response causes server disconnect
- * FIX: Challenge packets are now LOG ONLY, let game handle them normally
+ * NOTE: Multiple hook libraries detected (libWJHook.dylib + WangXianHook.dylib)
  * 
  * PREVIOUS (v36.23):
  * - REMOVED mock data injection, OBSERVE ONLY
@@ -134,7 +136,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.25 loaded ===");
+        _log(@"=== WangXianHook v36.26 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -313,7 +315,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.25 诊断面板";
+            lbl.text = @"WXHook v36.26 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1548,42 +1550,31 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Analyze device info packets (0x000EE007) - compare with normal client format
+    // Analyze device info packets (0x000EE007) - simplified to avoid crashes
     if (len >= 12 && port == 5678) {
         const unsigned char *dp = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)dp[4] << 24) | ((uint32_t)dp[5] << 16) |
                        ((uint32_t)dp[6] << 8)  | (uint32_t)dp[7];
         if (cmd == 0x000EE007) {
-            NSMutableString *deviceInfo = [NSMutableString string];
-            [deviceInfo appendFormat:@"[DEVICE-INFO] Device info packet analysis:\n"];
-            [deviceInfo appendFormat:@"  Total length: %zu bytes (normal client: 178 bytes)\n", len];
-            [deviceInfo appendFormat:@"  Hex data: "];
-            for (size_t i = 0; i < len && i < 64; i++) {
-                [deviceInfo appendFormat:@"%02X ", dp[i]];
-            }
-            if (len > 64) [deviceInfo appendFormat:@"...\n"];
-            else [deviceInfo appendFormat:@"\n"];
-            
-            // Check for UUID field in payload
-            if (len > 12) {
-                NSString *payloadStr = [[NSString alloc] initWithBytes:dp+12 length:(NSUInteger)(len-12) encoding:NSUTF8StringEncoding];
-                if (payloadStr) {
-                    [deviceInfo appendFormat:@"  Payload text: %@\n", payloadStr];
+            @try {
+                // Simple hex dump only - no complex regex or string operations
+                NSMutableString *hex = [NSMutableString string];
+                for (size_t i = 0; i < len && i < 64; i++) {
+                    [hex appendFormat:@"%02X ", dp[i]];
                 }
+                DLOG(@"[DEVICE-INFO] len=%zu hex(64): %@", len, hex);
                 
-                // Look for UUID pattern (8-4-4-4-12 hex format)
-                NSRegularExpression *uuidRegex = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" options:0 error:nil];
-                NSString *fullStr = [[NSString alloc] initWithBytes:dp length:len encoding:NSUTF8StringEncoding] ?: @"";
-                NSArray *uuidMatches = [uuidRegex matchesInString:fullStr options:0 range:NSMakeRange(0, len)];
-                if (uuidMatches.count > 0) {
-                    NSTextCheckingResult *match = uuidMatches[0];
-                    NSString *uuidStr = [fullStr substringWithRange:match.range];
-                    [deviceInfo appendFormat:@"  UUID found: %@\n", uuidStr];
-                } else {
-                    [deviceInfo appendFormat:@"  No UUID found in packet!\n"];
+                // Simple ASCII decode attempt
+                if (len > 12) {
+                    NSString *payload = [[NSString alloc] initWithBytes:dp+12 length:MIN(len-12, 100) encoding:NSUTF8StringEncoding];
+                    if (payload) {
+                        DLOG(@"[DEVICE-INFO] payload: %@", payload);
+                    }
                 }
+            } @catch (NSException *e) {
+                // Silently ignore any errors in packet analysis
+                DLOG(@"[DEVICE-INFO] Analysis skipped due to exception: %@", e.reason);
             }
-            DLOG(@"%@", deviceInfo);
         }
     }
     
