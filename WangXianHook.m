@@ -1,7 +1,8 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.21 - FIXED: Server list empty bug
+ * WangXianHook v36.22 - Enhanced server list debugging
  * FIX: ProtocolPatcher no longer clears payload data (only patches errorCode)
+ * NEW: Added detailed UITableView data source logging to track server list data flow
  * PRINCIPLE: Patch ERROR RESPONSES caused by injection detection, but do NOT modify NORMAL FLOW data
  * 
  * RESTORED (needed for injection detection bypass):
@@ -73,7 +74,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.21 loaded ===");
+        _log(@"=== WangXianHook v36.22 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -700,6 +701,7 @@ static BOOL isServerListDataSource(id self) {
             id ds = [self dataSource];
             if (ds) {
                 NSString *dsName = NSStringFromClass([ds class]);
+                DLOG(@"[TV-DS-CHECK] tableView.dataSource class: %@", dsName);
                 if ([dsName containsString:@"Server"] || [dsName containsString:@"server"] || 
                     [dsName containsString:@"List"] || [dsName containsString:@"list"] ||
                     [dsName containsString:@"Login"] || [dsName containsString:@"login"]) {
@@ -709,6 +711,7 @@ static BOOL isServerListDataSource(id self) {
         }
         Class cls = [self class];
         NSString *clsName = NSStringFromClass(cls);
+        DLOG(@"[TV-DS-CHECK] self class: %@", clsName);
         return ([clsName containsString:@"Server"] || [clsName containsString:@"server"] || 
                 [clsName containsString:@"List"] || [clsName containsString:@"list"] ||
                 [clsName containsString:@"Login"] || [clsName containsString:@"login"]);
@@ -726,6 +729,41 @@ static NSInteger hook_numberOfRowsInSection(id self, SEL _cmd, NSInteger section
     
     if (isServerListDataSource(self)) {
         DLOG(@"[TV-CALL] -[%@ numberOfRowsInSection:%ld] -> %ld (original)", clsName, (long)section, (long)ret);
+        
+        @try {
+            id dataSource = [self respondsToSelector:@selector(dataSource)] ? [self dataSource] : nil;
+            if (dataSource) {
+                NSString *dsCls = NSStringFromClass([dataSource class]);
+                DLOG(@"[TV-DS] tableView.dataSource=%@ (%@)", dataSource, dsCls);
+                
+                if ([dataSource respondsToSelector:@selector(serverList)] || [dataSource respondsToSelector:@selector(servers)]) {
+                    id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
+                    if ([serverList isKindOfClass:[NSArray class]]) {
+                        DLOG(@"[TV-DS] dataSource.serverList count=%lu", (unsigned long)[serverList count]);
+                        for (NSUInteger i = 0; i < [serverList count] && i < 5; i++) {
+                            id item = serverList[i];
+                            DLOG(@"[TV-DS]   [%lu] = %@ (%@)", i, item, NSStringFromClass([item class]));
+                            if ([item isKindOfClass:[NSDictionary class]]) {
+                                NSDictionary *dict = (NSDictionary *)item;
+                                DLOG(@"[TV-DS]     keys=%@", [dict allKeys]);
+                                DLOG(@"[TV-DS]     name=%@ ip=%@ port=%@ status=%@", dict[@"name"], dict[@"ip"], dict[@"port"], dict[@"status"]);
+                            }
+                        }
+                    } else {
+                        DLOG(@"[TV-DS] dataSource.serverList is NOT NSArray: %@", NSStringFromClass([serverList class]));
+                    }
+                }
+                
+                if ([dataSource respondsToSelector:@selector(dataArray)] || [dataSource respondsToSelector:@selector(items)]) {
+                    id data = [dataSource performSelector:[dataSource respondsToSelector:@selector(dataArray)] ? @selector(dataArray) : @selector(items)];
+                    if ([data isKindOfClass:[NSArray class]]) {
+                        DLOG(@"[TV-DS] dataSource.dataArray/items count=%lu", (unsigned long)[data count]);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[TV-DS] Exception: %@", e);
+        }
         
         if (ret == 0) {
             initFakeServerList();
@@ -746,8 +784,36 @@ static UITableViewCell *hook_cellForRowAtIndexPath(id self, SEL _cmd, NSIndexPat
     if (isServerListDataSource(self)) {
         NSString *text = @"";
         if (ret && ret.textLabel) text = ret.textLabel.text ?: @"";
-        DLOG(@"[TV-CALL] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@'", clsName, 
-             (long)indexPath.section, (long)indexPath.row, text);
+        NSString *detailText = @"";
+        if (ret && [ret respondsToSelector:@selector(detailTextLabel)] && [(UITableViewCell*)ret detailTextLabel]) {
+            detailText = [(UITableViewCell*)ret detailTextLabel].text ?: @"";
+        }
+        
+        DLOG(@"[TV-CALL] -[%@ cellForRowAtIndexPath:{%ld,%ld}] -> text='%@' detail='%@'", clsName, 
+             (long)indexPath.section, (long)indexPath.row, text, detailText);
+        
+        @try {
+            id dataSource = [self respondsToSelector:@selector(dataSource)] ? [self dataSource] : nil;
+            if (dataSource) {
+                if ([dataSource respondsToSelector:@selector(serverList)] || [dataSource respondsToSelector:@selector(servers)]) {
+                    id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
+                    if ([serverList isKindOfClass:[NSArray class]] && indexPath.row < [serverList count]) {
+                        id item = serverList[indexPath.row];
+                        DLOG(@"[TV-CELL-DATA] Row %ld data: %@ (%@)", (long)indexPath.row, item, NSStringFromClass([item class]));
+                        if ([item isKindOfClass:[NSDictionary class]]) {
+                            NSDictionary *dict = (NSDictionary *)item;
+                            DLOG(@"[TV-CELL-DATA]   name=%@ status=%@ ip=%@ port=%@", 
+                                 dict[@"name"], dict[@"status"], dict[@"ip"], dict[@"port"]);
+                        } else if ([item respondsToSelector:@selector(name)]) {
+                            id name = [item performSelector:@selector(name)];
+                            DLOG(@"[TV-CELL-DATA]   name=%@", name);
+                        }
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[TV-CELL-DATA] Exception: %@", e);
+        }
         
         if (!ret || (ret && [text isEqualToString:@""])) {
             DLOG(@"[TV-PATCH] Creating fake cell for server list");
@@ -3268,10 +3334,46 @@ static void installAllHooks(void) {
             DLOG(@"[TV-HOOK] Found didSelectRowAtIndexPath in UITableView");
         }
         
-        // Also hook reloadData to detect when server list table is reloaded
+        // Hook reloadData to detect when server list table is reloaded
         Method reloadData = class_getInstanceMethod(tableViewCls, @selector(reloadData));
         if (reloadData) {
-            DLOG(@"[TV-HOOK] Found reloadData in UITableView");
+            IMP orig_reload = method_getImplementation(reloadData);
+            IMP new_reload = imp_implementationWithBlock(^(id self, SEL _cmd) {
+                NSString *clsName = NSStringFromClass([self class]);
+                DLOG(@"[TV-RELOAD] -[%@ reloadData] called", clsName);
+                
+                @try {
+                    id dataSource = [self respondsToSelector:@selector(dataSource)] ? [self dataSource] : nil;
+                    if (dataSource) {
+                        NSString *dsCls = NSStringFromClass([dataSource class]);
+                        DLOG(@"[TV-RELOAD] dataSource=%@", dsCls);
+                        
+                        if ([dataSource respondsToSelector:@selector(serverList)] || [dataSource respondsToSelector:@selector(servers)]) {
+                            id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
+                            if ([serverList isKindOfClass:[NSArray class]]) {
+                                DLOG(@"[TV-RELOAD] serverList count=%lu", (unsigned long)[serverList count]);
+                            }
+                        }
+                        
+                        if ([dataSource respondsToSelector:@selector(numberOfSections)]) {
+                            NSInteger sections = [dataSource performSelector:@selector(numberOfSections)];
+                            DLOG(@"[TV-RELOAD] numberOfSections=%ld", (long)sections);
+                            for (NSInteger s = 0; s < sections; s++) {
+                                if ([dataSource respondsToSelector:@selector(numberOfRowsInSection:)]) {
+                                    NSInteger rows = [dataSource performSelector:@selector(numberOfRowsInSection:) withObject:@(s)];
+                                    DLOG(@"[TV-RELOAD] numberOfRowsInSection:%ld=%ld", (long)s, (long)rows);
+                                }
+                            }
+                        }
+                    }
+                } @catch (NSException *e) {
+                    DLOG(@"[TV-RELOAD] Exception: %@", e);
+                }
+                
+                ((void(*)(id, SEL))orig_reload)(self, _cmd);
+            });
+            method_setImplementation(reloadData, new_reload);
+            DLOG(@"[TV-HOOK] Hooked UITableView reloadData");
         }
     });
     
