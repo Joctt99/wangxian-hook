@@ -1,22 +1,25 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.18 - BASED ON NORMAL CLIENT LOG ANALYSIS
- * CRITICAL FIX: Removed ALL protocol packet modifications that interfere with normal login flow
- * - Removed 0x802EE121 response patching (server doesn't return this separately in normal flow)
- * - Removed server list IP replacement (causes connection to wrong game server)
- * - Removed version string modification (7.6.3 works correctly without modification)
- * - Removed 0x00FFFF02 challenge response (normal client doesn't receive this packet)
- * - Removed server list status/serverType/clientid/serverid patching (breaks protocol sync)
- * - Removed '版本过低' message clearing (let normal flow handle it)
+ * WangXianHook v36.19 - BALANCED PATCHING STRATEGY
+ * PRINCIPLE: Patch ERROR RESPONSES caused by injection detection, but do NOT modify NORMAL FLOW data
+ * 
+ * RESTORED (needed for injection detection bypass):
+ * - 0x802EE121 response patching (status→0, clear '版本过低' message)
+ * - 0x00FFFF02 challenge packet auto-response
+ * - '版本过低'/'当前版本' message clearing in responses
+ * 
+ * KEPT REMOVED (breaks normal protocol):
+ * - Server list IP replacement
+ * - Version number modification (7.6.3→7.7.0)
+ * - Server list status/serverType/clientid/serverid patching
+ * - UUID injection into 0x000EE007
  * 
  * RETAINED:
- * - Socket hooks (connect/send/recv) for logging only
- * - Encryption hooks (CCCrypt/SecKey) for logging only
- * - UIAlertView/UIAlertController hooks to monitor alerts
+ * - Socket hooks (connect/send/recv) for logging
+ * - Encryption hooks (CCCrypt/SecKey) for logging
+ * - UIAlertView/UIAlertController hooks
  * - dlsym hook to hide injection detection
  * - SignatureKit hooks for monitoring
- * 
- * PRINCIPLE: Don't modify any protocol data - only observe and log
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -69,7 +72,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.18 loaded ===");
+        _log(@"=== WangXianHook v36.19 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1712,23 +1715,54 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // LOG ONLY - NO PACKET MODIFICATION
-        // Normal client doesn't receive 0x00FFFF02 challenge, doesn't need auto-response
-        // Normal client receives server list directly without separate login response
+        // RESTORED: Handle injection-detection triggered error responses
+        // Normal client doesn't see these, but injected client does - need to compensate
+        
+        // Auto-respond to challenge packets (injection detection triggers these)
+        if (port == 12003 && (cmd == 0x00FFFF01 || cmd == 0x00FFFF02)) {
+            unsigned char *respBuf = (unsigned char *)malloc(ret);
+            if (respBuf) {
+                memcpy(respBuf, buf, ret);
+                respBuf[4] = 0x80;
+                ssize_t sent = orig_send ? orig_send(fd, respBuf, ret, 0) : -1;
+                NSMutableString *respHex = [NSMutableString stringWithCapacity:ret * 3];
+                for (size_t i = 0; i < (size_t)ret; i++) {
+                    [respHex appendFormat:@"%02X ", respBuf[i]];
+                }
+                DLOG(@"[CHALLENGE-RESP] Auto-responded to 0x%08X with 0x%08X (len=%zd, sent=%zd)", cmd, cmd | 0x80000000, (size_t)ret, sent);
+                free(respBuf);
+            }
+        }
         
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             // LOG ONLY - don't modify server list data
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            // LOG ONLY - don't modify version/auth responses
-        } else if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
-            DLOG(@"[PROTO-R] Challenge packet 0x%08X detected - normal client doesn't receive this", cmd);
-            // This shouldn't happen in normal flow - indicates injection detected
+            
+            // Patch status byte to 0 for error responses (injection detection causes non-zero status)
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (injection detection response)", p[12]);
+                ((unsigned char *)buf)[12] = 0;
+            }
         }
     }
     
-    // Removed '版本过低' message clearing - let normal flow handle it
+    // RESTORED: Clear '版本过低' messages from responses (injection detection causes these)
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-R] Cleared '版本过低' at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+        }
+    }
+    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+            DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+        }
+    }
     
     return ret;
 }
@@ -1935,13 +1969,24 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RF] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // LOG ONLY - NO PACKET MODIFICATION
+        // RESTORED: Patch injection-detection error responses
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RF] Version/auth response 0x%08X (no modification)", cmd);
+            DLOG(@"[PROTO-RF] Version/auth response 0x%08X", cmd);
+            if (ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-RF-PATCH] Status %u -> 0 (injection detection)", p[12]);
+                ((unsigned char *)buf)[12] = 0;
+            }
         }
     }
     
-    // NO PACKET MODIFICATION - removed '版本过低' clearing
+    // RESTORED: Clear '版本过低' messages
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-RF] Cleared '版本过低' at offset %zd", i);
+            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+        }
+    }
     
     return ret;
 }
@@ -1995,13 +2040,24 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // LOG ONLY - NO PACKET MODIFICATION
+        // RESTORED: Patch injection-detection error responses
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RM] Version/auth response 0x%08X (no modification)", cmd);
+            DLOG(@"[PROTO-RM] Version/auth response 0x%08X", cmd);
+            if (iov->iov_len >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-RM-PATCH] Status %u -> 0 (injection detection)", p[12]);
+                ((unsigned char *)iov->iov_base)[12] = 0;
+            }
         }
     }
     
-    // NO PACKET MODIFICATION - removed '版本过低' clearing
+    // RESTORED: Clear '版本过低' messages
+    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow) && i <= (ssize_t)iov->iov_len - (ssize_t)sizeof(verLow); i++) {
+        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+            DLOG(@"[PATCH-RM] Cleared '版本过低' at offset %zd", i);
+            memset((unsigned char *)iov->iov_base + i, ' ', sizeof(verLow));
+        }
+    }
     
     return ret;
 }
