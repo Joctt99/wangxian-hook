@@ -1,22 +1,22 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v35.33 - DIAG: Add recv ret=0/ret=-1 logging and close() backtrace for game server (12003) to identify who closes connection
- * FIX: Bytes 8-11 is SEQUENCE NUMBER (matches send packet), NOT status code - zeroing it broke protocol sync causing game server to close connection
- * FIX: 0x802EE121 replacement now preserves original sequence number instead of zeroing it
- * FIX: Removed invalid 0x80000015 bytes 8-11 patching (was zeroing sequence number)
- * FIX: Removed bytes 8-11 patching for 0x802EE118/0x802EE120 (keep byte 12 status patching only)
- * RESTORE: SK.judgeAppInfoWithBaseUrl calls original to allow normal device authorization flow
- * FIX: Added pan gesture for movable log button (drag to reposition)
- * FIX: Clear error messages from version check response (0x802EE121) - root cause of network disconnect on most devices
- * FIX: Stop corrupting version string in 0x8002A016 (was misidentified as server list response)
- * FIX: Set requiresExclusiveTouchType=NO on gesture recognizers to avoid blocking system gestures
- * FIX: Set userInteractionEnabled=NO on hidden log button to prevent accidental interaction
- * FIX: Enhanced socket hook initialization with dlsym fallback for ALL hooks (connect, send, recv, recvfrom, recvmsg, write, read, close)
- * FIX: Added close() hook for proper fd cleanup and tracking
- * FIX: Enhanced fd tracking mechanism with active flags, reuse slots, and expanded capacity (64 fds)
- * FIX: Comprehensive type checking for all containsString calls to prevent NSDictionary/NSString crashes
- * FIX: Fixed triple-tap gesture crash by setting cancelsTouchesInView=NO
- * Tracks: Signature, Environment, Debug, Security, Ban detection
+ * WangXianHook v36.18 - BASED ON NORMAL CLIENT LOG ANALYSIS
+ * CRITICAL FIX: Removed ALL protocol packet modifications that interfere with normal login flow
+ * - Removed 0x802EE121 response patching (server doesn't return this separately in normal flow)
+ * - Removed server list IP replacement (causes connection to wrong game server)
+ * - Removed version string modification (7.6.3 works correctly without modification)
+ * - Removed 0x00FFFF02 challenge response (normal client doesn't receive this packet)
+ * - Removed server list status/serverType/clientid/serverid patching (breaks protocol sync)
+ * - Removed '版本过低' message clearing (let normal flow handle it)
+ * 
+ * RETAINED:
+ * - Socket hooks (connect/send/recv) for logging only
+ * - Encryption hooks (CCCrypt/SecKey) for logging only
+ * - UIAlertView/UIAlertController hooks to monitor alerts
+ * - dlsym hook to hide injection detection
+ * - SignatureKit hooks for monitoring
+ * 
+ * PRINCIPLE: Don't modify any protocol data - only observe and log
  */
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.17 loaded ===");
+        _log(@"=== WangXianHook v36.18 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1460,61 +1460,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // Game server verifies packet integrity, so any byte modification causes rejection.
     // The root cause is injection detection, not version mismatch.
     
-    // UUID注入: 7.6.3版本的设备信息包(0x000EE007)缺少UUID字段，需要注入
-    // 对比v35.38(7.6.2): 179字节(含UUID), v36.10(7.6.3): 143字节(缺UUID)
-    // v35.38包结构: ...GPU\x00 \x00$180C4F27-4414-4623-ACEB-0C12B30E48FD \x00\x01\x00
-    // v36.10包结构: ...GPU\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00 (UUID位置全0)
-    if (port == 12003 && sendLen >= 12 && sendBuf == buf) {
-        const unsigned char *p = (const unsigned char *)sendBuf;
-        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (cmd == 0x000EE007) {
-            // 查找 "Apple Inc. Apple A18 Pro GPU" 后面的字段
-            const char *gpuEnd = "Apple Inc. Apple A18 Pro GPU";
-            size_t gpuEndLen = strlen(gpuEnd);
-            for (size_t i = 0; i + gpuEndLen + 10 <= sendLen; i++) {
-                if (memcmp(p + i, gpuEnd, gpuEndLen) == 0) {
-                    size_t uuidOffset = i + gpuEndLen;
-                    // 检查UUID位置是否全0（需要注入）
-                    BOOL needsUuid = YES;
-                    for (size_t j = uuidOffset; j < uuidOffset + 10 && j < sendLen; j++) {
-                        if (p[j] != 0) { needsUuid = NO; break; }
-                    }
-                    if (needsUuid) {
-                        // 分配新缓冲区，插入UUID字段
-                        // 格式: \x00\x24 (长度36) + UUID字符串
-                        NSString *uuid = [[UIDevice currentDevice].identifierForVendor UUIDString];
-                        if (!uuid) uuid = @"180C4F27-4414-4623-ACEB-0C12B30E48FD";
-                        const char *uuidStr = [uuid UTF8String];
-                        size_t uuidStrLen = strlen(uuidStr);
-                        
-                        size_t insertLen = 2 + uuidStrLen; // \x00\x24 + UUID
-                        void *newBuf = malloc(sendLen + insertLen);
-                        if (newBuf) {
-                            memcpy(newBuf, buf, uuidOffset);
-                            unsigned char *q = (unsigned char *)newBuf + uuidOffset;
-                            q[0] = 0x00; q[1] = 0x24; // 长度36
-                            memcpy(q + 2, uuidStr, uuidStrLen);
-                            memcpy(q + 2 + uuidStrLen, (unsigned char *)buf + uuidOffset, sendLen - uuidOffset);
-                            
-                            // 更新包长度 (前4字节)
-                            uint32_t newPktLen = (uint32_t)(sendLen + insertLen);
-                            q = (unsigned char *)newBuf;
-                            q[0] = (newPktLen >> 24) & 0xFF;
-                            q[1] = (newPktLen >> 16) & 0xFF;
-                            q[2] = (newPktLen >> 8) & 0xFF;
-                            q[3] = newPktLen & 0xFF;
-                            
-                            sendBuf = newBuf;
-                            sendLen = sendLen + insertLen;
-                            DLOG(@"[UUID-INJECT] Injected UUID into 0x000EE007: %@ (new len=%zu)", uuid, sendLen);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    // NO PACKET MODIFICATION IN SEND HOOK
+    // Normal client sends 0x000EE007 with proper UUID (178 bytes)
+    // Modifying any packet data breaks integrity verification and triggers injection detection
 
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
@@ -1764,127 +1712,23 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // 挑战包自动响应: 0x00FFFF01/0x00FFFF02是RSA密钥交换挑战
-        // 将cmd从0x00FFFF02改为0x80FFFF02（第5字节从0x00改为0x80），其余数据保持不变
-        if (port == 12003 && (cmd == 0x00FFFF01 || cmd == 0x00FFFF02)) {
-            unsigned char *respBuf = (unsigned char *)malloc(ret);
-            if (respBuf) {
-                memcpy(respBuf, buf, ret);
-                respBuf[4] = 0x80; // 将0x00改为0x80
-                ssize_t sent = orig_send ? orig_send(fd, respBuf, ret, 0) : -1;
-                
-                NSMutableString *respHex = [NSMutableString stringWithCapacity:ret * 3];
-                for (size_t i = 0; i < (size_t)ret; i++) {
-                    [respHex appendFormat:@"%02X ", respBuf[i]];
-                }
-                DLOG(@"[CHALLENGE-RESP] Auto-responded to 0x%08X with 0x%08X (len=%zd, sent=%zd)", cmd, cmd | 0x80000000, (size_t)ret, sent);
-                DLOG(@"[CHALLENGE-RESP] Response hex: %@", respHex);
-                free(respBuf);
-            }
-        }
+        // LOG ONLY - NO PACKET MODIFICATION
+        // Normal client doesn't receive 0x00FFFF02 challenge, doesn't need auto-response
+        // Normal client receives server list directly without separate login response
         
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            unsigned char *b = (unsigned char *)buf;
-            
-            NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
-            if (bodyStr) {
-                BOOL patched = NO;
-                
-                NSString *status6 = @"\"status\":6";
-                NSString *status1 = @"\"status\":1";
-                NSString *serverType2 = @"\"serverType\":2";
-                NSString *serverType1 = @"\"serverType\":1";
-                NSString *clientid0 = @"\"clientid\":0";
-                NSString *clientid1 = @"\"clientid\":1";
-                NSString *serverid0 = @"\"serverid\":0";
-                NSString *serverid1 = @"\"serverid\":1";
-                
-                if ([bodyStr containsString:status6]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:serverType2]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing serverType:2 -> serverType:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:clientid0]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing clientid:0 -> clientid:1");
-                    patched = YES;
-                }
-                if ([bodyStr containsString:serverid0]) {
-                    DLOG(@"[SERVERLIST-PATCH] Replacing serverid:0 -> serverid:1");
-                    patched = YES;
-                }
-                if (patched) {
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
-                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverid0 withString:serverid1];
-                    
-                    NSData *newData = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
-                    if (newData && [newData length] <= len) {
-                        memcpy(buf, newData.bytes, [newData length]);
-                        ret = [newData length];
-                        uint32_t newPktLen = (uint32_t)ret;
-                        b[0] = (newPktLen >> 24) & 0xFF;
-                        b[1] = (newPktLen >> 16) & 0xFF;
-                        b[2] = (newPktLen >> 8) & 0xFF;
-                        b[3] = newPktLen & 0xFF;
-                        DLOG(@"[SERVERLIST-PATCH] Server list patched, new len=%zd", ret);
-                    }
-                }
-            }
+            // LOG ONLY - don't modify server list data
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
-            DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-
-            if (cmd == 0x802EE121 && ret >= 90) {
-                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
-                BOOL hasError = NO;
-                for (ssize_t i = 0; i <= ret - 12; i++) {
-                    if (memcmp(p + i, errMsg, 12) == 0) {
-                        hasError = YES;
-                        break;
-                    }
-                }
-                if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
-                    unsigned char *b = (unsigned char *)buf;
-                    // Preserve original sequence number at bytes 8-11 (matches send packet)
-                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
-                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    // Restore original sequence number (DO NOT zero it - breaks protocol sync)
-                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
-                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
-                    b[12] = 0x00; // status 0 = success
-                    ret = 13;
-                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
-                }
-            } else {
-                // Only patch byte 12 (status code), NOT bytes 8-11 (sequence number)
-                if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq# at 8-11)", p[12]);
-                    ((unsigned char *)buf)[12] = 0;
-                }
-            }
+            DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            // LOG ONLY - don't modify version/auth responses
+        } else if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
+            DLOG(@"[PROTO-R] Challenge packet 0x%08X detected - normal client doesn't receive this", cmd);
+            // This shouldn't happen in normal flow - indicates injection detected
         }
     }
     
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-        }
-    }
-    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-            DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
-        }
-    }
+    // Removed '版本过低' message clearing - let normal flow handle it
     
     return ret;
 }
@@ -1910,36 +1754,8 @@ static ssize_t hook_write(int fd, const void *buf, size_t len) {
             DLOG(@"[WRITE-CMD] cmd=0x%08X", cmd);
         }
     }
-    // Version replacement DISABLED in v35.32 (breaks packet signature)
-    if (0 && port == 12003 && len >= 7) {
-        const unsigned char *p = (const unsigned char *)buf;
-        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x32};
-        BOOL found = NO;
-        for (size_t i = 0; i + 7 <= len; i++) {
-            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
-        }
-        if (found) {
-            void *newBuf = malloc(len);
-            if (newBuf) {
-                memcpy(newBuf, buf, len);
-                unsigned char *q = (unsigned char *)newBuf;
-                int cnt = 0;
-                for (size_t i = 0; i + 7 <= len; i++) {
-                    if (memcmp(q + i, verPattern, 7) == 0) {
-                        q[i+2] = 0x37; q[i+3] = 0x2E; q[i+4] = 0x37; q[i+5] = 0x2E; q[i+6] = 0x30;
-                        cnt++;
-                        DLOG(@"[VER-REPLACE] Write: replaced 7.6.2 -> 7.7.0 at offset %zu (game server)", i+2);
-                    }
-                }
-                if (cnt > 0) {
-                    ssize_t wr = orig_write ? orig_write(fd, newBuf, len) : -1;
-                    free(newBuf);
-                    return wr;
-                }
-                free(newBuf);
-            }
-        }
-    }
+    // NO PACKET MODIFICATION IN WRITE HOOK
+    // Version replacement removed - modifying packet data breaks integrity verification
     return orig_write ? orig_write(fd, buf, len) : -1;
 }
 
@@ -2119,25 +1935,13 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RF] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
+        // LOG ONLY - NO PACKET MODIFICATION
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RF] Version check response 0x%08X", cmd);
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RF-PATCH] Version status %u -> 0, clearing error messages", p[12]);
-                ((unsigned char *)buf)[12] = 0;
-                if (ret > 13) {
-                    memset((unsigned char *)buf + 13, 0, ret - 13);
-                }
-            }
+            DLOG(@"[PROTO-RF] Version/auth response 0x%08X (no modification)", cmd);
         }
     }
     
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-RF] Detected '版本过低' at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-        }
-    }
+    // NO PACKET MODIFICATION - removed '版本过低' clearing
     
     return ret;
 }
@@ -2191,25 +1995,13 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
+        // LOG ONLY - NO PACKET MODIFICATION
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RM] Version check response 0x%08X", cmd);
-            if (iov->iov_len >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RM-PATCH] Version status %u -> 0, clearing error messages", p[12]);
-                ((unsigned char *)iov->iov_base)[12] = 0;
-                if (ret > 13) {
-                    memset((unsigned char *)iov->iov_base + 13, 0, ret - 13);
-                }
-            }
+            DLOG(@"[PROTO-RM] Version/auth response 0x%08X (no modification)", cmd);
         }
     }
     
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow) && i <= (ssize_t)iov->iov_len - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-RM] Detected '版本过低' at offset %zd", i);
-            memset((unsigned char *)iov->iov_base + i, ' ', sizeof(verLow));
-        }
-    }
+    // NO PACKET MODIFICATION - removed '版本过低' clearing
     
     return ret;
 }
