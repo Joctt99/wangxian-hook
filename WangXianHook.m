@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.12 loaded ===");
+        _log(@"=== WangXianHook v36.13 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1819,33 +1819,38 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *b = (unsigned char *)buf;
-            const char *newIP = "47.100.222.229";
-            size_t newIPLen = strlen(newIP);
-            
-            const char *oldIPs[] = {"47.100.14.198", "47.100.204.160", "101.132.180.110", NULL};
-            for (int ipIdx = 0; oldIPs[ipIdx]; ipIdx++) {
-                const char *oldIP = oldIPs[ipIdx];
-                size_t oldIPLen = strlen(oldIP);
-                for (ssize_t i = 0; i <= ret - (ssize_t)oldIPLen; i++) {
-                    if (memcmp(p + i, oldIP, oldIPLen) == 0) {
-                        DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP, i, newIP);
-                        memcpy(b + i, newIP, newIPLen);
-                    }
-                }
-            }
-            
-            NSString *status6 = @"\"status\":6";
-            NSString *status1 = @"\"status\":1";
-            NSString *serverType2 = @"\"serverType\":2";
-            NSString *serverType1 = @"\"serverType\":1";
-            NSString *clientid0 = @"\"clientid\":0";
-            NSString *clientid1 = @"\"clientid\":1";
-            NSString *serverid0 = @"\"serverid\":0";
-            NSString *serverid1 = @"\"serverid\":1";
             
             NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
             if (bodyStr) {
                 BOOL patched = NO;
+                
+                NSString *oldIP1 = @"47.100.14.198";
+                NSString *oldIP2 = @"47.100.204.160";
+                NSString *oldIP3 = @"101.132.180.110";
+                NSString *newIP = @"47.100.222.229";
+                
+                if ([bodyStr containsString:oldIP1]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP1, newIP);
+                    patched = YES;
+                }
+                if ([bodyStr containsString:oldIP2]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP2, newIP);
+                    patched = YES;
+                }
+                if ([bodyStr containsString:oldIP3]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP3, newIP);
+                    patched = YES;
+                }
+                
+                NSString *status6 = @"\"status\":6";
+                NSString *status1 = @"\"status\":1";
+                NSString *serverType2 = @"\"serverType\":2";
+                NSString *serverType1 = @"\"serverType\":1";
+                NSString *clientid0 = @"\"clientid\":0";
+                NSString *clientid1 = @"\"clientid\":1";
+                NSString *serverid0 = @"\"serverid\":0";
+                NSString *serverid1 = @"\"serverid\":1";
+                
                 if ([bodyStr containsString:status6]) {
                     DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
                     patched = YES;
@@ -1863,6 +1868,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     patched = YES;
                 }
                 if (patched) {
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP1 withString:newIP];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP2 withString:newIP];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP3 withString:newIP];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
@@ -2021,33 +2029,38 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             unsigned char *b = (unsigned char *)buf;
-            const char *newIP = "47.100.222.229";
-            size_t newIPLen = strlen(newIP);
-            
-            const char *oldIPs[] = {"47.100.14.198", "47.100.204.160", "101.132.180.110", NULL};
-            for (int ipIdx = 0; oldIPs[ipIdx]; ipIdx++) {
-                const char *oldIP = oldIPs[ipIdx];
-                size_t oldIPLen = strlen(oldIP);
-                for (ssize_t i = 0; i <= ret - (ssize_t)oldIPLen; i++) {
-                    if (memcmp(p + i, oldIP, oldIPLen) == 0) {
-                        DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP, i, newIP);
-                        memcpy(b + i, newIP, newIPLen);
-                    }
-                }
-            }
-            
-            NSString *status6 = @"\"status\":6";
-            NSString *status1 = @"\"status\":1";
-            NSString *serverType2 = @"\"serverType\":2";
-            NSString *serverType1 = @"\"serverType\":1";
-            NSString *clientid0 = @"\"clientid\":0";
-            NSString *clientid1 = @"\"clientid\":1";
-            NSString *serverid0 = @"\"serverid\":0";
-            NSString *serverid1 = @"\"serverid\":1";
             
             NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
             if (bodyStr) {
                 BOOL patched = NO;
+                
+                NSString *oldIP1 = @"47.100.14.198";
+                NSString *oldIP2 = @"47.100.204.160";
+                NSString *oldIP3 = @"101.132.180.110";
+                NSString *newIP = @"47.100.222.229";
+                
+                if ([bodyStr containsString:oldIP1]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP1, newIP);
+                    patched = YES;
+                }
+                if ([bodyStr containsString:oldIP2]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP2, newIP);
+                    patched = YES;
+                }
+                if ([bodyStr containsString:oldIP3]) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%@', replacing with '%@'", oldIP3, newIP);
+                    patched = YES;
+                }
+                
+                NSString *status6 = @"\"status\":6";
+                NSString *status1 = @"\"status\":1";
+                NSString *serverType2 = @"\"serverType\":2";
+                NSString *serverType1 = @"\"serverType\":1";
+                NSString *clientid0 = @"\"clientid\":0";
+                NSString *clientid1 = @"\"clientid\":1";
+                NSString *serverid0 = @"\"serverid\":0";
+                NSString *serverid1 = @"\"serverid\":1";
+                
                 if ([bodyStr containsString:status6]) {
                     DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
                     patched = YES;
@@ -2065,6 +2078,9 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     patched = YES;
                 }
                 if (patched) {
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP1 withString:newIP];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP2 withString:newIP];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:oldIP3 withString:newIP];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
                     bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
