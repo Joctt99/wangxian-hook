@@ -1,7 +1,8 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.24 - REMOVED challenge packet auto-response
- * FIX: Removed challenge packet (0x00FFFF01/0x00FFFF02) auto-response
+ * WangXianHook v36.25 - Added crash handler for debugging
+ * FIX: Added signal handlers (SIGABRT/SIGSEGV/SIGILL/SIGBUS/SIGFPE/SIGTRAP) to capture crash info
+ * FIX: Removed challenge packet (0x00FFFF01/0x00FFFF02) auto-response in v36.24
  * WHY: Normal client does NOT respond to these packets, auto-response causes server disconnect
  * FIX: Challenge packets are now LOG ONLY, let game handle them normally
  * 
@@ -49,6 +50,60 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
+#include <signal.h>
+#include <execinfo.h>
+
+static void signalHandler(int sig) {
+    NSString *sigName = nil;
+    switch(sig) {
+        case SIGABRT: sigName = @"SIGABRT"; break;
+        case SIGSEGV: sigName = @"SIGSEGV"; break;
+        case SIGILL: sigName = @"SIGILL"; break;
+        case SIGBUS: sigName = @"SIGBUS"; break;
+        case SIGFPE: sigName = @"SIGFPE"; break;
+        case SIGTRAP: sigName = @"SIGTRAP"; break;
+        case SIGEMT: sigName = @"SIGEMT"; break;
+        default: sigName = [NSString stringWithFormat:@"SIG%d", sig];
+    }
+    
+    void *callstack[128];
+    int frames = backtrace(callstack, 128);
+    char **strs = backtrace_symbols(callstack, frames);
+    
+    NSMutableString *crashInfo = [NSMutableString string];
+    [crashInfo appendFormat:@"\n=== CRASH (%@) ===\n", sigName];
+    [crashInfo appendFormat:@"Signal: %d (%@)\n", sig, sigName];
+    [crashInfo appendFormat:@"Backtrace (%d frames):\n", frames];
+    for (int i = 0; i < frames && i < 30; i++) {
+        if (strs[i]) {
+            [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
+        }
+    }
+    [crashInfo appendFormat:@"====================\n"];
+    
+    if (g_logPath) {
+        @try {
+            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+        } @catch (NSException *e) {}
+    }
+    
+    if (strs) free(strs);
+    
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void setupSignalHandlers(void) {
+    signal(SIGABRT, signalHandler);
+    signal(SIGSEGV, signalHandler);
+    signal(SIGILL, signalHandler);
+    signal(SIGBUS, signalHandler);
+    signal(SIGFPE, signalHandler);
+    signal(SIGTRAP, signalHandler);
+}
+
 static void _log(NSString *msg) {
     if (!g_logPath || !g_logEnabled) return;
     
@@ -78,8 +133,10 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.24 loaded ===");
+        setupSignalHandlers();
+        _log(@"=== WangXianHook v36.25 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
+        _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
     }
 }
@@ -256,7 +313,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.24 诊断面板";
+            lbl.text = @"WXHook v36.25 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
