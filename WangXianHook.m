@@ -1784,10 +1784,96 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // 挑战包由游戏客户端自身处理（0x00FFF495 RSA签名响应），不需要hook回复
-        // 0x00FFFF01/0x00FFFF02 是RSA密钥交换挑战，客户端会自动用SecKeyCreateSignature签名
+        // 挑战包自动响应: 0x00FFFF01/0x00FFFF02是RSA密钥交换挑战
+        // 将cmd从0x00FFFF02改为0x80FFFF02（第5字节从0x00改为0x80），其余数据保持不变
+        if (port == 12003 && (cmd == 0x00FFFF01 || cmd == 0x00FFFF02)) {
+            unsigned char *respBuf = (unsigned char *)malloc(ret);
+            if (respBuf) {
+                memcpy(respBuf, buf, ret);
+                respBuf[4] = 0x80; // 将0x00改为0x80
+                ssize_t sent = orig_send ? orig_send(fd, respBuf, ret, 0) : -1;
+                
+                NSMutableString *respHex = [NSMutableString stringWithCapacity:ret * 3];
+                for (size_t i = 0; i < (size_t)ret; i++) {
+                    [respHex appendFormat:@"%02X ", respBuf[i]];
+                }
+                DLOG(@"[CHALLENGE-RESP] Auto-responded to 0x%08X with 0x%08X (len=%zd, sent=%zd)", cmd, cmd | 0x80000000, (size_t)ret, sent);
+                DLOG(@"[CHALLENGE-RESP] Response hex: %@", respHex);
+                free(respBuf);
+            }
+        }
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        if (cmd == 0x802EE113) {
+            DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            unsigned char *b = (unsigned char *)buf;
+            const char *oldIP1 = "47.100.14.198";
+            const char *oldIP2 = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            size_t oldIP1Len = strlen(oldIP1);
+            size_t oldIP2Len = strlen(oldIP2);
+            size_t newIPLen = strlen(newIP);
+            
+            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP1Len; i++) {
+                if (memcmp(p + i, oldIP1, oldIP1Len) == 0) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP1, i, newIP);
+                    memcpy(b + i, newIP, newIPLen);
+                }
+            }
+            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP2Len; i++) {
+                if (memcmp(p + i, oldIP2, oldIP2Len) == 0) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP2, i, newIP);
+                    memcpy(b + i, newIP, newIPLen);
+                }
+            }
+            
+            const char *status6 = "\"status\":6";
+            const char *status1 = "\"status\":1";
+            const char *serverType2 = "\"serverType\":2";
+            const char *serverType1 = "\"serverType\":1";
+            const char *clientid0 = "\"clientid\":0";
+            const char *clientid1 = "\"clientid\":1";
+            const char *serverid0 = "\"serverid\":0";
+            const char *serverid1 = "\"serverid\":1";
+            
+            NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
+            if (bodyStr) {
+                BOOL patched = NO;
+                if ([bodyStr containsString:status6]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:serverType2]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing serverType:2 -> serverType:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:clientid0]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing clientid:0 -> clientid:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:serverid0]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing serverid:0 -> serverid:1");
+                    patched = YES;
+                }
+                if (patched) {
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverid0 withString:serverid1];
+                    
+                    NSData *newData = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
+                    if (newData && [newData length] <= len) {
+                        memcpy(buf, newData.bytes, [newData length]);
+                        ret = [newData length];
+                        uint32_t newPktLen = (uint32_t)ret;
+                        b[0] = (newPktLen >> 24) & 0xFF;
+                        b[1] = (newPktLen >> 16) & 0xFF;
+                        b[2] = (newPktLen >> 8) & 0xFF;
+                        b[3] = newPktLen & 0xFF;
+                        DLOG(@"[SERVERLIST-PATCH] Server list patched, new len=%zd", ret);
+                    }
+                }
+            }
+        } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
             if (cmd == 0x802EE121 && ret >= 90) {
@@ -1924,7 +2010,77 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-R] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        if (cmd == 0x802EE113) {
+            DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
+            unsigned char *b = (unsigned char *)buf;
+            const char *oldIP1 = "47.100.14.198";
+            const char *oldIP2 = "47.100.204.160";
+            const char *newIP = "47.100.222.229";
+            size_t oldIP1Len = strlen(oldIP1);
+            size_t oldIP2Len = strlen(oldIP2);
+            size_t newIPLen = strlen(newIP);
+            
+            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP1Len; i++) {
+                if (memcmp(p + i, oldIP1, oldIP1Len) == 0) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP1, i, newIP);
+                    memcpy(b + i, newIP, newIPLen);
+                }
+            }
+            for (ssize_t i = 0; i <= ret - (ssize_t)oldIP2Len; i++) {
+                if (memcmp(p + i, oldIP2, oldIP2Len) == 0) {
+                    DLOG(@"[SERVERLIST-PATCH] Found IP '%s' at offset %zd, replacing with '%s'", oldIP2, i, newIP);
+                    memcpy(b + i, newIP, newIPLen);
+                }
+            }
+            
+            const char *status6 = "\"status\":6";
+            const char *status1 = "\"status\":1";
+            const char *serverType2 = "\"serverType\":2";
+            const char *serverType1 = "\"serverType\":1";
+            const char *clientid0 = "\"clientid\":0";
+            const char *clientid1 = "\"clientid\":1";
+            const char *serverid0 = "\"serverid\":0";
+            const char *serverid1 = "\"serverid\":1";
+            
+            NSString *bodyStr = [[NSString alloc] initWithBytes:buf length:(NSUInteger)ret encoding:NSUTF8StringEncoding];
+            if (bodyStr) {
+                BOOL patched = NO;
+                if ([bodyStr containsString:status6]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing status:6 -> status:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:serverType2]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing serverType:2 -> serverType:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:clientid0]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing clientid:0 -> clientid:1");
+                    patched = YES;
+                }
+                if ([bodyStr containsString:serverid0]) {
+                    DLOG(@"[SERVERLIST-PATCH] Replacing serverid:0 -> serverid:1");
+                    patched = YES;
+                }
+                if (patched) {
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:status6 withString:status1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverType2 withString:serverType1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:clientid0 withString:clientid1];
+                    bodyStr = [bodyStr stringByReplacingOccurrencesOfString:serverid0 withString:serverid1];
+                    
+                    NSData *newData = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
+                    if (newData && [newData length] <= len) {
+                        memcpy(buf, newData.bytes, [newData length]);
+                        ret = [newData length];
+                        uint32_t newPktLen = (uint32_t)ret;
+                        b[0] = (newPktLen >> 24) & 0xFF;
+                        b[1] = (newPktLen >> 16) & 0xFF;
+                        b[2] = (newPktLen >> 8) & 0xFF;
+                        b[3] = newPktLen & 0xFF;
+                        DLOG(@"[SERVERLIST-PATCH] Server list patched, new len=%zd", ret);
+                    }
+                }
+            }
+        } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
             if (cmd == 0x802EE121 && ret >= 90) {
