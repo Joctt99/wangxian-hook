@@ -69,7 +69,7 @@ static void log_init(void) {
     [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
-        _log(@"=== WangXianHook v36.16 loaded ===");
+        _log(@"=== WangXianHook v36.17 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         g_isActivated = YES;
     }
@@ -1456,38 +1456,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Version replacement: Change "7.6.3" -> "7.7.0" in send packets to LOGIN server (5678)
-    // Pattern: \x00\x05 (length 5) + "7.6.3" (hex: 37 2E 36 2E 33)
-    // Apply to login server (port 5678) so server returns REAL success response with valid session token
-    if (port == 5678 && sendLen >= 7 && sendBuf == buf) {
-        const unsigned char *p = (const unsigned char *)sendBuf;
-        const unsigned char verPattern[] = {0x00, 0x05, 0x37, 0x2E, 0x36, 0x2E, 0x33};
-        BOOL found = NO;
-        for (size_t i = 0; i + 7 <= sendLen; i++) {
-            if (memcmp(p + i, verPattern, 7) == 0) { found = YES; break; }
-        }
-        if (found) {
-            void *newBuf = malloc(sendLen);
-            if (newBuf) {
-                memcpy(newBuf, buf, sendLen);
-                unsigned char *q = (unsigned char *)newBuf;
-                int cnt = 0;
-                for (size_t i = 0; i + 7 <= sendLen; i++) {
-                    if (memcmp(q + i, verPattern, 7) == 0) {
-                        q[i+4] = 0x37; q[i+6] = 0x30; // Change "7.6.3" -> "7.7.0"
-                        cnt++;
-                        DLOG(@"[VER-REPLACE] Send: replaced 7.6.3 -> 7.7.0 at offset %zu (login server)", i+2);
-                    }
-                }
-                if (cnt > 0) {
-                    sendBuf = newBuf;
-                    DLOG(@"[VER-REPLACE] Total %d version replacements for login server packet", cnt);
-                } else {
-                    free(newBuf);
-                }
-            }
-        }
-    }
+    // Version replacement DISABLED: Changing version breaks packet signature/MD5
+    // Game server verifies packet integrity, so any byte modification causes rejection.
+    // The root cause is injection detection, not version mismatch.
     
     // UUID注入: 7.6.3版本的设备信息包(0x000EE007)缺少UUID字段，需要注入
     // 对比v35.38(7.6.2): 179字节(含UUID), v36.10(7.6.3): 143字节(缺UUID)
