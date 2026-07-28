@@ -1809,12 +1809,40 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         int sockFlags = fcntl(sockfd, F_GETFL, 0);
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
-        DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d host=%s port=%d", sockfd, sockFlags, isNonBlocking, host, port);
         
-        // DISABLED port rewrite for v36.40 - let game connect directly
-        // Only track connection info for logging
+        // v36.41: Port rewrite for game server (12003 -> 58158)
+        // Normal client uses 58158 port for game server connections
+        // 12003 port sends challenge packets and disconnects
+        BOOL needRewrite = (port == 12003 && g_gameServerInfoUpdated);
+        
+        if (needRewrite) {
+            // Create a new addr with rewritten port
+            struct sockaddr_in newAddr = *in;
+            newAddr.sin_port = htons(58158);
+            port = 58158;
+            
+            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, host);
+            trackFd(sockfd, host, 58158);
+            DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (PORT REWRITE 12003->58158)", sockfd, host, port, isNonBlocking);
+            
+            struct timeval startTV;
+            gettimeofday(&startTV, NULL);
+            
+            int result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
+            
+            struct timeval endTV;
+            gettimeofday(&endTV, NULL);
+            double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
+            
+            DLOG(@"[SOCK] connect END fd=%d %s:58158 result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+                 sockfd, host, result, errno, strerror(errno), elapsed, isNonBlocking);
+            
+            return result;
+        }
+        
+        // Original connection - no rewrite needed
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (NO REWRITE)", sockfd, host, port, isNonBlocking);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d", sockfd, host, port, isNonBlocking);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
@@ -1857,8 +1885,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (port == 5678) {
-            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu", fd, cmd, len);
+        if (port == 5678 || port == 58158) {
+            const char *serverType = (port == 5678) ? "LOGIN" : "GAME";
+            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu [%s]", fd, cmd, len, serverType);
         }
     }
     
@@ -1874,8 +1903,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Analyze device info packets (0x000EE007) - simplified to avoid crashes
-    if (len >= 12 && port == 5678) {
+    // Analyze device info packets (0x000EE007) - on both login server (5678) and game server (58158)
+    if (len >= 12 && (port == 5678 || port == 58158)) {
         const unsigned char *dp = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)dp[4] << 24) | ((uint32_t)dp[5] << 16) |
                        ((uint32_t)dp[6] << 8)  | (uint32_t)dp[7];
@@ -1953,6 +1982,55 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             } @catch (NSException *e) {
                 DLOG(@"[SERVER-SELECT] Analysis exception: %@", e.reason);
             }
+        }
+    }
+
+    // Analyze game server packets (58158 port)
+    if (len >= 12 && port == 58158) {
+        const unsigned char *gp = (const unsigned char *)buf;
+        uint32_t gcmd = ((uint32_t)gp[4] << 24) | ((uint32_t)gp[5] << 16) |
+                        ((uint32_t)gp[6] << 8)  | (uint32_t)gp[7];
+        
+        @try {
+            // Log game data packets (0x00FFF493)
+            if (gcmd == 0x00FFF493) {
+                NSMutableString *detail = [NSMutableString stringWithCapacity:256];
+                [detail appendFormat:@"[GAME-DATA] cmd=0x%08X len=%zu\n", gcmd, len];
+                [detail appendFormat:@"  Full hex: "];
+                size_t showLen = len > 64 ? 64 : len;
+                for (size_t i = 0; i < showLen; i++) {
+                    [detail appendFormat:@"%02X ", gp[i]];
+                }
+                if (len > 64) [detail appendFormat:@"...\n"];
+                else [detail appendFormat:@"\n"];
+                DLOG(@"%@", detail);
+            }
+            // Log heartbeat packets (0x00000015)
+            else if (gcmd == 0x00000015) {
+                NSMutableString *detail = [NSMutableString stringWithCapacity:128];
+                [detail appendFormat:@"[GAME-HEARTBEAT] cmd=0x%08X len=%zu\n", gcmd, len];
+                [detail appendFormat:@"  Full hex: "];
+                for (size_t i = 0; i < len; i++) {
+                    [detail appendFormat:@"%02X ", gp[i]];
+                }
+                [detail appendFormat:@"\n"];
+                DLOG(@"%@", detail);
+            }
+            // Log server select packets (0x0000F013) on game server
+            else if (gcmd == 0x0000F013) {
+                NSMutableString *detail = [NSMutableString stringWithCapacity:256];
+                [detail appendFormat:@"[GAME-SERVER-SELECT] cmd=0x%08X len=%zu\n", gcmd, len];
+                [detail appendFormat:@"  Full hex: "];
+                size_t showLen = len > 128 ? 128 : len;
+                for (size_t i = 0; i < showLen; i++) {
+                    [detail appendFormat:@"%02X ", gp[i]];
+                }
+                if (len > 128) [detail appendFormat:@"...\n"];
+                else [detail appendFormat:@"\n"];
+                DLOG(@"%@", detail);
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[GAME-ANALYZE] Exception: %@", e.reason);
         }
     }
 
@@ -2295,6 +2373,30 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
             DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd", i);
             memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+        }
+    }
+    
+    // Analyze game server (58158) responses
+    if (port == 58158 && ret >= 8) {
+        @try {
+            uint32_t rcmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            
+            // Log game data responses
+            if (rcmd == 0x80FFF493 || rcmd == 0x80FFFF01 || rcmd == 0x80FFFF02) {
+                NSMutableString *detail = [NSMutableString stringWithCapacity:256];
+                [detail appendFormat:@"[GAME-RECV] cmd=0x%08X len=%zd port=58158\n", rcmd, ret];
+                [detail appendFormat:@"  Full hex: "];
+                size_t showLen = ret > 64 ? 64 : (size_t)ret;
+                for (ssize_t i = 0; i < showLen; i++) {
+                    [detail appendFormat:@"%02X ", p[i]];
+                }
+                if ((size_t)ret > 64) [detail appendFormat:@"...\n"];
+                else [detail appendFormat:@"\n"];
+                DLOG(@"%@", detail);
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[GAME-RECV] Exception: %@", e.reason);
         }
     }
     
