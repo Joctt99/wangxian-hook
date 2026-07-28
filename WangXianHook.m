@@ -1,12 +1,16 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.52 - SIMPLE port rewrite, DIRECT blocking connect
+ * WangXianHook v36.53 - Non-blocking connect, NO select wait
  * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
+ * 
+ * v36.53 CRITICAL FIXES:
+ * - Non-blocking connect with port rewrite (12003->58158), NO select wait
+ * - Let game handle async connection itself (no timeout, no close)
+ * - Previous select() was causing 5-second timeout, blocking caused hang
  * 
  * v36.52 CRITICAL FIXES:
  * - SIMPLE port rewrite: 12003 -> 58158 with DIRECT blocking connect (no O_NONBLOCK, no select)
  * - Use setsockopt(SO_SNDTIMEO, 10s) as safety net instead of non-blocking mode
- * - Non-blocking mode + select() was causing 5-second timeout on 58158
  * 
  * v36.51 CRITICAL FIXES:
  * - RE-ENABLE port rewrite: 12003 -> 58158 (normal client uses 58158!)
@@ -1843,9 +1847,17 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
 #if MINIMAL_MODE
-        // v36.52: SIMPLE port rewrite - DIRECT blocking connect (no O_NONBLOCK, no select)
-        // Non-blocking mode + select() was causing 5-second timeout on 58158
+        // v36.53: Non-blocking connect with port rewrite (NO select wait)
+        // Let game handle async connection itself (no timeout, no close)
         BOOL needRewrite = (port == 12003);
+        BOOL isGameServer = (port == 58158 || port == 12003);
+        
+        if (isGameServer && !isNonBlocking) {
+            int flags = fcntl(sockfd, F_GETFL, 0);
+            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+            isNonBlocking = YES;
+            DLOG(@"[SOCK] Set O_NONBLOCK for game server %s:%d", host, port);
+        }
         
         struct sockaddr_in connectAddr = *(struct sockaddr_in *)addr;
         if (needRewrite) {
@@ -1854,14 +1866,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             DLOG(@"[REWRITE] Game server 12003 -> 58158");
         }
         
-        // Set socket timeout before connect (safety net)
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d (v36.52 SIMPLE REWRITE)", sockfd, host, port);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (v36.53 NO WAIT)", sockfd, host, port, isNonBlocking);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
@@ -1872,8 +1878,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed);
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
         
         return result;
 #else
@@ -3437,7 +3443,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.52 - SIMPLE port rewrite, DIRECT blocking connect");
+    DLOG(@"[VERSION] WangXianHook v36.53 - Non-blocking connect, NO select wait");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
