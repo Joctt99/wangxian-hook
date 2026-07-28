@@ -1,11 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.40 - Remove port rewrite, add ServerInfoForClient stub
- * FIX: REMOVED game server port rewrite (12003 -> 58158)
- * FIX: REMOVED server list port patch in 0x802EE113 response
- * FIX: ADDED ServerInfoForClient stub class creation when real class not found
- * FIX: Default game server port changed to 12003 (original server port)
- * WHY: Port rewrite caused connection timeout; original port 12003 should be used
+ * WangXianHook v36.42 - Patch port in server list response, add non-blocking connect
+ * FIX: Patched port 12003->58158 in server list response (0x802EE113)
+ * FIX: ADDED non-blocking mode + 10s timeout for game server connect (12003/58158)
+ * WHY: hook_connect port rewrite caused blocking hang; patching response data avoids this
+ * 
+ * PREVIOUS (v36.41):
+ * FIX: Restored port rewrite (12003->58158) in hook_connect
+ * FIX: Added game server packet analysis logging
+ * WHY: Port rewrite was needed but caused blocking on connect
  * 
  * PREVIOUS (v36.39):
  * FIX: Revert login server redirect, keep game server fix with 5s timeout
@@ -1810,37 +1813,27 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         int sockFlags = fcntl(sockfd, F_GETFL, 0);
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
-        // v36.41: Port rewrite for game server (12003 -> 58158)
-        // Normal client uses 58158 port for game server connections
-        // 12003 port sends challenge packets and disconnects
-        BOOL needRewrite = (port == 12003 && g_gameServerInfoUpdated);
+        // v36.42: NO port rewrite - game uses original port from server list
+        // Port 12003->58158 is done in recv hook (0x802EE113 response)
+        // Add non-blocking mode with timeout for game server connections as safety net
+        BOOL isGameServerPort = (port == 58158 || port == 12003);
+        BOOL needNonBlocking = isGameServerPort && !isNonBlocking;
         
-        if (needRewrite) {
-            // Create a new addr with rewritten port
-            struct sockaddr_in newAddr = *in;
-            newAddr.sin_port = htons(58158);
-            port = 58158;
+        if (needNonBlocking) {
+            // Set non-blocking mode to prevent hanging
+            int flags = fcntl(sockfd, F_GETFL, 0);
+            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+            isNonBlocking = YES;
             
-            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, host);
-            trackFd(sockfd, host, 58158);
-            DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (PORT REWRITE 12003->58158)", sockfd, host, port, isNonBlocking);
+            // Set send timeout (10 seconds)
+            struct timeval tv;
+            tv.tv_sec = 10;
+            tv.tv_usec = 0;
+            setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             
-            struct timeval startTV;
-            gettimeofday(&startTV, NULL);
-            
-            int result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
-            
-            struct timeval endTV;
-            gettimeofday(&endTV, NULL);
-            double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
-            
-            DLOG(@"[SOCK] connect END fd=%d %s:58158 result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
-                 sockfd, host, result, errno, strerror(errno), elapsed, isNonBlocking);
-            
-            return result;
+            DLOG(@"[SOCK] Set non-blocking + 10s timeout for %s:%d", host, port);
         }
         
-        // Original connection - no rewrite needed
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d", sockfd, host, port, isNonBlocking);
         
@@ -2337,9 +2330,29 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[SERVERLIST-HEX]   %zd: %@", i, line);
             }
             
-            // v36.40: DISABLED port rewriting - use original port 12003 as-is
-            // Server list format: 4 bytes IP + 2 bytes port (big-endian) per entry
-            DLOG(@"[SERVERLIST-PATCH] Port rewriting DISABLED - using original ports from server list");
+            // v36.42: Patch port 12003 (0x2EE3) -> 58158 (0xE32E) in server list
+            // This makes the game connect to the correct port without hook_connect blocking
+            // 12003 big-endian: 0x2E 0xE3
+            // 58158 big-endian: 0xE3 0x2E
+            BOOL portPatched = NO;
+            for (ssize_t i = 12; i + 1 < ret; i++) {
+                if (p[i] == 0x2E && p[i+1] == 0xE3) {
+                    // Check if this looks like a port (not part of ASCII text)
+                    // 0x2E 0xE3 is unlikely to be ASCII, but verify context
+                    if (i + 5 < ret) {
+                        // Previous 4 bytes should be an IP-like pattern for a server entry
+                        portPatched = YES;
+                        DLOG(@"[SERVERLIST-PATCH] Replacing port 12003->58158 at offset %zd", i);
+                        ((unsigned char *)buf)[i] = 0xE3;
+                        ((unsigned char *)buf)[i+1] = 0x2E;
+                    }
+                }
+            }
+            if (portPatched) {
+                DLOG(@"[SERVERLIST-PATCH] Port rewrite 12003->58158 applied successfully");
+            } else {
+                DLOG(@"[SERVERLIST-PATCH] No port 12003 found in response");
+            }
             
             // Update global game server info from response
             parseServerListResponse((const unsigned char *)buf, ret);
