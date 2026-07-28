@@ -1,7 +1,19 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.50 - CRITICAL FIX: Remove data corruption in read hook
+ * WangXianHook v36.51 - RE-ENABLE port rewrite (12003->58158)
  * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
+ * 
+ * v36.51 CRITICAL FIXES:
+ * - RE-ENABLE port rewrite: 12003 -> 58158 (normal client uses 58158!)
+ * - Add non-blocking mode and select() timeout for game server connections
+ * - FIX: Remove ret=13 truncation in hook_read() - it was destroying 0x802EE121 responses!
+ * - FIX: Limit '版本过低' clearing to ONLY port=5678 (login server), NOT port=12003 (game server)
+ * - FIX: Add port check (5678) to 0x802EE121 patch in both recv and read hooks
+ * 
+ * PROBLEM ANALYSIS:
+ * Normal client connects to port 58158 for game server, but game gets port 12003 from server list.
+ * Port 12003 rejects connections or uses different protocol than port 58158.
+ * We MUST rewrite 12003 -> 58158 to match normal client behavior.
  * 
  * v36.50 CRITICAL FIXES:
  * - FIX: Remove ret=13 truncation in hook_read() - it was destroying 0x802EE121 responses!
@@ -9,19 +21,6 @@
  * - FIX: Add port check (5678) to 0x802EE121 patch in both recv and read hooks
  * - FIX: Remove '版本过低'/'当前版本' clearing from read hook entirely
  * - FIX: Rewrite hook_alertControllerPresent with better error handling to prevent SIGSEGV
- * 
- * PROBLEM ANALYSIS:
- * The game uses both recv() and read() for socket I/O. 
- * When read() was used for 0x802EE121, it truncated the 94-byte response to 13 bytes,
- * removing sessionId and other critical data. This caused the "stuck at login" issue.
- * 
- * v36.49 Fixes:
- * - FIX: Don't truncate ret to 13 bytes in hook_recv
- * 
- * v36.48 Fixes:
- * - FIX: 0x802EE121 patch logic ALWAYS enabled (was disabled by MINIMAL_MODE)
- * - FIX: Clear '版本过低' messages ALWAYS enabled
- * - KEEP: Crypto hooks disabled
  * 
  * PREVIOUS (v36.46):
  * MINIMAL MODE - Only 0x802EE121 patch
@@ -1850,14 +1849,73 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
 #if MINIMAL_MODE
-        // v36.47: EXTREME MINIMAL MODE - No connect modifications, just log
+        // v36.51: RE-ENABLE port rewrite - game MUST connect to port 58158 (not 12003)
+        // Normal client always connects to 58158, but server list returns 12003
+        BOOL needRewrite = (port == 12003);
+        BOOL isGameServer = (port == 58158 || port == 12003);
+        
+        if (isGameServer && !isNonBlocking) {
+            int flags = fcntl(sockfd, F_GETFL, 0);
+            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+            isNonBlocking = YES;
+            DLOG(@"[SOCK] Set O_NONBLOCK for game server %s:%d", host, port);
+        }
+        
+        struct sockaddr_in connectAddr = *(struct sockaddr_in *)addr;
+        if (needRewrite) {
+            connectAddr.sin_port = htons(58158);
+            port = 58158;
+            DLOG(@"[REWRITE] Game server 12003 -> 58158");
+        }
+        
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (v36.47 NO MODS)", sockfd, host, port, isNonBlocking);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (v36.51 PORT REWRITE)", sockfd, host, port, isNonBlocking);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        int result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&connectAddr, sizeof(connectAddr)) : -1;
+        
+        if (isGameServer && isNonBlocking && result == -1 && errno == EINPROGRESS) {
+            DLOG(@"[SOCK] connect returned EINPROGRESS, waiting with select...");
+            
+            fd_set writefds;
+            FD_ZERO(&writefds);
+            FD_SET(sockfd, &writefds);
+            
+            struct timeval timeout;
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
+            
+            int selResult = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+            
+            if (selResult > 0) {
+                int sockErr = 0;
+                socklen_t errLen = sizeof(sockErr);
+                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen);
+                
+                if (sockErr == 0) {
+                    result = 0;
+                    DLOG(@"[SOCK] select returned success, SO_ERROR=0");
+                } else {
+                    result = -1;
+                    errno = sockErr;
+                    DLOG(@"[SOCK] select returned but SO_ERROR=%d (%s)", sockErr, strerror(sockErr));
+                }
+            } else if (selResult == 0) {
+                result = -1;
+                errno = ETIMEDOUT;
+                DLOG(@"[SOCK] select timeout after 5 seconds");
+            } else {
+                result = -1;
+                DLOG(@"[SOCK] select error: %d (%s)", errno, strerror(errno));
+            }
+            
+            // Restore blocking mode
+            int origFlags = fcntl(sockfd, F_GETFL, 0);
+            fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
+            DLOG(@"[SOCK] Restored blocking mode");
+        }
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
@@ -3428,7 +3486,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.50 - CRITICAL FIX: Remove data corruption in read hook");
+    DLOG(@"[VERSION] WangXianHook v36.51 - RE-ENABLE port rewrite (12003->58158)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
