@@ -1,12 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.33 - Fix binary parsing overwriting correct IP
- * FIX: Set g_gameServerInfoUpdated = YES to prevent binary parsing from overwriting
- * FIX: Improved IP validation in binary parsing (b1 1-223, exclude 127)
- * FIX: Added log when skipping update in binary parsing
- * WHY: Binary parsing incorrectly set wrong game server IP (47.230.160.150)
+ * WangXianHook v36.34 - Add detailed connect/packet logging
+ * FIX: Added non-blocking socket detection in hook_connect
+ * FIX: Added connection timing logs (elapsed time)
+ * FIX: Added detailed 0x0000F013 packet TLV parsing
+ * FIX: Added EINPROGRESS detection for non-blocking connects
+ * WHY: Need to understand why 58158 connection times out
  * 
- * PREVIOUS (v36.32):
+ * PREVIOUS (v36.33):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -155,7 +156,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.33 loaded ===");
+        _log(@"=== WangXianHook v36.34 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -334,7 +335,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.33 诊断面板";
+            lbl.text = @"WXHook v36.34 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1635,13 +1636,15 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
+        int sockFlags = fcntl(sockfd, F_GETFL, 0);
+        BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
+        DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d", sockfd, sockFlags, isNonBlocking);
+        
         const struct sockaddr *finalAddr = addr;
         struct sockaddr_in newAddr;
         
-        // Rewrite game server port 12003 -> 58158
-        // Normal client uses port 58158, injected version uses 12003
         if (port == 12003) {
-            DLOG(@"[CONNECT] Rewriting game server %s:12003 -> %s:%d", host, g_gameServerIP, 58158);
+            DLOG(@"[CONNECT] Rewriting game server %s:12003 -> %s:58158", host, g_gameServerIP);
             memset(&newAddr, 0, sizeof(newAddr));
             newAddr.sin_family = AF_INET;
             inet_aton(g_gameServerIP, &newAddr.sin_addr);
@@ -1653,20 +1656,34 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         }
         
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d", sockfd, host, port, isNonBlocking);
+        
+        struct timeval startTV;
+        gettimeofday(&startTV, NULL);
         
         int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
-        DLOG(@"[SOCK] connect result=%d errno=%d", result, errno);
+        
+        struct timeval endTV;
+        gettimeofday(&endTV, NULL);
+        double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
+        
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
+        
+        if (result != 0 && errno == EINPROGRESS) {
+            DLOG(@"[SOCK] connect EINPROGRESS - connection in progress (non-blocking mode)");
+        }
+        
         return result;
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
         port = ntohs(in6->sin6_port);
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect6 fd=%d [%s]:%d", sockfd, host, port);
+        DLOG(@"[SOCK] connect6 START fd=%d [%s]:%d", sockfd, host, port);
         
         int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
-        DLOG(@"[SOCK] connect6 result=%d errno=%d", result, errno);
+        DLOG(@"[SOCK] connect6 END fd=%d [%s]:%d result=%d errno=%d(%s)", sockfd, host, port, result, errno, strerror(errno));
         return result;
     }
     
@@ -1731,10 +1748,59 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
     
-    // NO PACKET MODIFICATION IN SEND HOOK
-    // Normal client sends 0x000EE007 with proper UUID (178 bytes)
-    // Modifying any packet data breaks integrity verification and triggers injection detection
-    // UUID injection will be added after confirming the correct format via analysis
+    // Analyze 0x0000F013 packet - select server / enter game
+    if (len >= 12 && port == 5678) {
+        const unsigned char *fp = (const unsigned char *)buf;
+        uint32_t fcmd = ((uint32_t)fp[4] << 24) | ((uint32_t)fp[5] << 16) |
+                        ((uint32_t)fp[6] << 8)  | (uint32_t)fp[7];
+        if (fcmd == 0x0000F013) {
+            @try {
+                NSMutableString *detail = [NSMutableString stringWithCapacity:256];
+                [detail appendFormat:@"[SERVER-SELECT] cmd=0x%08X len=%zu\n", fcmd, len];
+                [detail appendFormat:@"  Full hex: "];
+                for (size_t i = 0; i < len && i < 128; i++) {
+                    [detail appendFormat:@"%02X ", fp[i]];
+                }
+                if (len > 128) [detail appendFormat:@"...\n"];
+                else [detail appendFormat:@"\n"];
+                
+                if (len >= 12) {
+                    uint32_t pktLen = ((uint32_t)fp[0] << 24) | ((uint32_t)fp[1] << 16) |
+                                      ((uint32_t)fp[2] << 8)  | (uint32_t)fp[3];
+                    uint32_t field1 = ((uint32_t)fp[8] << 24) | ((uint32_t)fp[9] << 16) |
+                                      ((uint32_t)fp[10] << 8) | (uint32_t)fp[11];
+                    [detail appendFormat:@"  Header: pktLen=%u field1=0x%08X\n", pktLen, field1];
+                }
+                
+                // Parse TLV-style fields after header
+                size_t offset = 12;
+                int fieldIdx = 0;
+                while (offset + 2 < len && fieldIdx < 10) {
+                    uint16_t fieldLen = (fp[offset] << 8) | fp[offset + 1];
+                    offset += 2;
+                    if (offset + fieldLen > len) break;
+                    
+                    NSMutableString *fieldHex = [NSMutableString string];
+                    for (uint16_t i = 0; i < fieldLen && i < 32; i++) {
+                        [fieldHex appendFormat:@"%02X ", fp[offset + i]];
+                    }
+                    
+                    NSString *fieldStr = [[NSString alloc] initWithBytes:fp+offset length:fieldLen encoding:NSUTF8StringEncoding];
+                    if (fieldStr && fieldStr.length > 0 && fieldLen < 64) {
+                        [detail appendFormat:@"  Field[%d] len=%u hex=[%@] str='%@'\n", fieldIdx, fieldLen, fieldHex, fieldStr];
+                    } else {
+                        [detail appendFormat:@"  Field[%d] len=%u hex=[%@]\n", fieldIdx, fieldLen, fieldHex];
+                    }
+                    offset += fieldLen;
+                    fieldIdx++;
+                }
+                
+                DLOG(@"%@", detail);
+            } @catch (NSException *e) {
+                DLOG(@"[SERVER-SELECT] Analysis exception: %@", e.reason);
+            }
+        }
+    }
 
     ssize_t ret = orig_send ? orig_send(fd, sendBuf, sendLen, flags) : -1;
     if (sendBuf != buf) free(sendBuf);
