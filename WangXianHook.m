@@ -1,13 +1,16 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.47 - EXTREME MINIMAL MODE
- * MODE: EXTREME MINIMAL - Only 0x802EE121 patch, NO crypto hooks, NO socket modifications
+ * WangXianHook v36.48 - FIXED: 0x802EE121 patch always enabled
+ * MODE: FIXED - Always patch login response, crypto hooks disabled
  * 
- * v36.47 Critical Fixes:
- * - DISABLE all crypto function hooks (SecKeyCreateEncryptedData etc.) that corrupt encryption data
- * - DISABLE all socket modifications (port rewrite, non-blocking, etc.)
- * - FIX hook_alertControllerPresent SIGSEGV crash
- * - Only keep 0x802EE121 login response patch
+ * v36.48 Critical Fixes:
+ * - FIX: 0x802EE121 patch logic ALWAYS enabled (was disabled by MINIMAL_MODE)
+ * - FIX: Clear '版本过低' messages ALWAYS enabled
+ * - KEEP: Crypto hooks disabled (v36.47 fix - avoid corrupting encryption data)
+ * - KEEP: hook_alertControllerPresent SIGSEGV fix
+ * 
+ * PREVIOUS (v36.47):
+ * EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks
  * 
  * PREVIOUS (v36.46):
  * MINIMAL MODE - Only 0x802EE121 patch
@@ -2417,33 +2420,34 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
-#if !MINIMAL_MODE
-            // Patch status byte to 0 for error responses (injection detection causes non-zero status)
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (injection detection response)", p[12]);
+            // v36.48: ALWAYS patch status byte for 0x802EE121 - critical for login
+            if (cmd == 0x802EE121 && ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (critical login patch)", p[12]);
                 ((unsigned char *)buf)[12] = 0;
+                ret = 13;
             }
-#endif
+        }
+    }
+    
+    // v36.48: ALWAYS clear '版本过低' messages - critical for login
+    {
+        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                DLOG(@"[PATCH-R] Cleared '版本过低' at offset %zd", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+            }
+        }
+        static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+            if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd", i);
+                memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+            }
         }
     }
     
 #if !MINIMAL_MODE
-    // RESTORED: Clear '版本过低' messages from responses (injection detection causes these)
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-R] Cleared '版本过低' at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-        }
-    }
-    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-            DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
-        }
-    }
-    
     // Analyze game server (58158) responses
     if (port == 58158 && ret >= 8) {
         @try {
@@ -3440,7 +3444,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.47 - EXTREME MINIMAL MODE: Only 0x802EE121 patch, NO crypto hooks");
+    DLOG(@"[VERSION] WangXianHook v36.48 - FIX: 0x802EE121 patch always enabled, crypto hooks disabled");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
