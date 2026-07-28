@@ -1,7 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.55 - SIMPLE direct connect, NO rewrite
+ * WangXianHook v36.56 - Add 12003 logging, game server patch
  * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
+ * 
+ * v36.56 CRITICAL FIXES:
+ * - Add 12003 port logging support (send/recv)
+ * - Add game server response patch (status byte, error text)
+ * - Update close hook to track both 58158 and 12003 ports
+ * - Add detailed game server response analysis
  * 
  * v36.55 CRITICAL FIXES:
  * - SIMPLE direct connect: NO port rewrite, NO non-blocking, NO select
@@ -1825,19 +1831,23 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
 
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    // v36.56: Track both 58158 and 12003 port closures
     for (int i = 0; i < g_trackedCount; i++) {
-        if (g_trackedFds[i] == fd && g_trackedActive[i] && g_trackedPorts[i] == g_gameServerPort) {
-            DLOG(@"[CLOSE-TRACE] close(%d) for game server %s:%d", fd, g_trackedHosts[i], g_trackedPorts[i]);
-            void *callstack[8];
-            int frames = backtrace(callstack, 8);
-            char **strs = backtrace_symbols(callstack, frames);
-            if (strs) {
-                for (int j = 1; j < frames && j < 6; j++) {
-                    DLOG(@"[BT] %d: %s", j, strs[j] ? strs[j] : "?");
+        if (g_trackedFds[i] == fd && g_trackedActive[i]) {
+            int port = g_trackedPorts[i];
+            if (port == 58158 || port == 12003) {
+                DLOG(@"[CLOSE-TRACE] close(%d) for game server %s:%d (matched port %d)", fd, g_trackedHosts[i], port, port);
+                void *callstack[8];
+                int frames = backtrace(callstack, 8);
+                char **strs = backtrace_symbols(callstack, frames);
+                if (strs) {
+                    for (int j = 1; j < frames && j < 8; j++) {
+                        DLOG(@"[BT] %d: %s", j, strs[j] ? strs[j] : "?");
+                    }
+                    free(strs);
                 }
-                free(strs);
+                break;
             }
-            break;
         }
     }
     clearTrackedFd(fd);
@@ -1972,8 +1982,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (port == 5678 || port == 58158) {
-            const char *serverType = (port == 5678) ? "LOGIN" : "GAME";
+        // v36.56: Add 12003 port logging (game server without port rewrite)
+        if (port == 5678 || port == 58158 || port == 12003) {
+            const char *serverType = (port == 5678) ? "LOGIN" : (port == 58158 ? "GAME-58158" : "GAME-12003");
             DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu [%s]", fd, cmd, len, serverType);
         }
     }
@@ -1990,8 +2001,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Analyze device info packets (0x000EE007) - on both login server (5678) and game server (58158)
-    if (len >= 12 && (port == 5678 || port == 58158)) {
+    // Analyze device info packets (0x000EE007) - on login server (5678), game server (58158 and 12003)
+    if (len >= 12 && (port == 5678 || port == 58158 || port == 12003)) {
         const unsigned char *dp = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)dp[4] << 24) | ((uint32_t)dp[5] << 16) |
                        ((uint32_t)dp[6] << 8)  | (uint32_t)dp[7];
@@ -2474,25 +2485,69 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     
 #if !MINIMAL_MODE
-    // Analyze game server (58158) responses
-    if (port == 58158 && ret >= 8) {
+    // v36.56: Analyze game server (58158 and 12003) responses
+    if ((port == 58158 || port == 12003) && ret >= 8) {
         @try {
             uint32_t rcmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
             
-            // Log game data responses
-            if (rcmd == 0x80FFF493 || rcmd == 0x80FFFF01 || rcmd == 0x80FFFF02) {
-                NSMutableString *detail = [NSMutableString stringWithCapacity:256];
-                [detail appendFormat:@"[GAME-RECV] cmd=0x%08X len=%zd port=58158\n", rcmd, ret];
-                [detail appendFormat:@"  Full hex: "];
-                size_t showLen = ret > 64 ? 64 : (size_t)ret;
-                for (ssize_t i = 0; i < showLen; i++) {
-                    [detail appendFormat:@"%02X ", p[i]];
-                }
-                if ((size_t)ret > 64) [detail appendFormat:@"...\n"];
-                else [detail appendFormat:@"\n"];
-                DLOG(@"%@", detail);
+            const char *gamePort = (port == 58158) ? "58158" : "12003";
+            
+            // Log ALL game server responses with detailed analysis
+            NSMutableString *detail = [NSMutableString stringWithCapacity:512];
+            [detail appendFormat:@"[GAME-RECV] cmd=0x%08X len=%zd port=%s\n", rcmd, ret, gamePort];
+            [detail appendFormat:@"  Full hex: "];
+            size_t showLen = ret > 128 ? 128 : (size_t)ret;
+            for (ssize_t i = 0; i < showLen; i++) {
+                [detail appendFormat:@"%02X ", p[i]];
             }
+            if ((size_t)ret > 128) [detail appendFormat:@"...\n"];
+            else [detail appendFormat:@"\n"];
+            
+            // Check for status/error bytes in response
+            if (ret >= 13) {
+                uint8_t status = p[12];
+                [detail appendFormat:@"  Status byte at offset 12: %u (0x%02X)\n", status, status];
+                if (status != 0) {
+                    [detail appendFormat:@"  WARNING: Non-zero status detected!\n"];
+                    // v36.56: Patch game server error responses
+                    // If status != 0, patch it to 0 (success)
+                    if (port == 12003) {
+                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 in game server response (port=12003)", status);
+                        ((unsigned char *)buf)[12] = 0;
+                        [detail appendFormat:@"  PATCHED: status set to 0\n"];
+                    }
+                }
+            }
+            
+            // Check for error text in response
+            NSString *payloadStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+            if (payloadStr && payloadStr.length > 0) {
+                [detail appendFormat:@"  Payload text: %@\n", payloadStr];
+                // Check for error keywords
+                if ([payloadStr containsString:@"版本过低"] || [payloadStr containsString:@"当前版本"]) {
+                    [detail appendFormat:@"  WARNING: Error text found in response!\n"];
+                    DLOG(@"[GAME-PATCH] Error text found in game server response: %@", payloadStr);
+                    // Clear error text for 12003 port
+                    if (port == 12003) {
+                        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+                        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+                            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                                DLOG(@"[GAME-PATCH] Cleared '版本过低' at offset %zd", i);
+                                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Specific game commands
+            if (rcmd == 0x80FFF493 || rcmd == 0x80FFFF01 || rcmd == 0x80FFFF02 ||
+                rcmd == 0x80EE0007 || rcmd == 0x80EE0700 || rcmd == 0x00FFFF01 || rcmd == 0x00FFFF02) {
+                [detail appendFormat:@"  [Game protocol packet - cmd=0x%08X]\n", rcmd];
+            }
+            
+            DLOG(@"%@", detail);
         } @catch (NSException *e) {
             DLOG(@"[GAME-RECV] Exception: %@", e.reason);
         }
@@ -3436,7 +3491,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.55 - SIMPLE direct connect, NO rewrite");
+    DLOG(@"[VERSION] WangXianHook v36.56 - Add 12003 logging, game server patch");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
