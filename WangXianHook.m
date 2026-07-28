@@ -1,19 +1,22 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.59 - MSI stub fix, port rewrite, correct presentVC hook
+ * WangXianHook v36.60 - Remove port rewrite, timeout-safe connect, clean server list parsing
  * MODE: FULL - All hooks enabled
- * 
- * v36.59 CRITICAL FIXES:
- * 1. [PORT-REWRITE] Only rewrite PORT 12003->58158, NEVER change IP address!
- *    v36.58 bug: incorrectly overwrote host with g_gameServerIP, leading to wrong IP
- * 2. [MSI-STUB] Preserve ORIGINAL ip/port from initWithDictionary, don't override
- *    Game knows which server it selected - stub shouldn't replace its choice!
- * 3. [SIGSEGV-FIX] Removed broken UIAlertController.present hook (WRONG sig!)
- *    - Previous signature was missing viewController param, causing SIGSEGV
- *    - Also, method was hooked on wrong class (called on presenting VC, not alert)
- *    - Correctly merged alert-blocking logic into hook_presentVC
- * 4. [SERVERLIST-PARSE] Try BOTH endian orders for IP/port + ASCII pattern search
- * 5. [GAME-PATCH] Apply status=0 patch for BOTH ports 12003 AND 58158
+ *
+ * v36.60 CRITICAL FIXES:
+ * 1. [PORT-REWRITE] COMPLETELY DISABLED port rewrite 12003->58158!
+ *    - v36.59 caused connect HANG (no connect END log) because 58158 is unreachable
+ *    - Now use game's ORIGINAL target port directly (12003 works for handshake)
+ * 2. [CONNECT-TIMEOUT] Added NON-BLOCKING connect with 15s select + getsockopt + restore flags
+ *    - Prevents indefinite hang even on bad ports
+ *    - Restores O_NONBLOCK flag to original state before returning to game
+ * 3. [SERVERLIST-PARSE] DISABLED false-positive 4-byte raw IP scan entirely!
+ *    - v36.59 stored 20 garbage servers first (e.g. 16.228.184.128:58764)
+ *      which are actually bytes of the ASCII string "47.100.14.198" misinterpreted
+ *    - Now ONLY ASCII IP pattern scan (we know it finds 47.100.14.198 etc.)
+ *    - If port can't be detected near an ASCII IP -> DEFAULT PORT = 12003
+ *      (12003 is the only port we've confirmed completes handshake in tests)
+ * 4. [LOGGING] Very detailed connect START/END logs with errno strings and select diagnostics
  */
 /*
  * HISTORY:
@@ -213,7 +216,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.59 loaded ===");
+        _log(@"=== WangXianHook v36.60 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -392,7 +395,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.59 诊断面板";
+            lbl.text = @"WXHook v36.60 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1895,7 +1898,7 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                 DLOG(@"[SERVERLIST-PARSE] Stored %d servers for rotation", g_serverCount);
             }
         } else {
-            DLOG(@"[SERVERLIST-PARSE] Binary response, trying binary parsing...");
+            DLOG(@"[SERVERLIST-PARSE] Binary/mixed response, parsing...");
             DLOG(@"[SERVERLIST-PARSE] First 64 bytes hex:");
             for (int i = 0; i < MIN(64, len-12); i++) {
                 printf("%02x ", data[12+i]);
@@ -1906,76 +1909,154 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
             const unsigned char *body = data + 12;
             ssize_t bodyLen = len - 12;
             
-            // v36.59: Reset server list before binary parsing
+            // v36.60: CLEAN REWRITE of binary parsing
+            // BUG in v36.59: Raw 4-byte IP scan produced 100% false positives!
+            //   e.g. bytes of ASCII strings ("47.100.14.198" encoded) got treated as binary IP
+            //   resulting in garbage servers like "16.228.184.128:58764" being stored FIRST,
+            //   crowding out the 12 real ASCII IPs that were found but never stored (MAX_SERVERS=20).
+            // FIX:
+            //   1. DISABLE raw 4-byte IP scan entirely.
+            //   2. ONLY use ASCII IP pattern scan (we know it finds real IPs from the log).
+            //   3. If we can't find a port near an ASCII IP, DEFAULT TO PORT 12003!
+            //      (from previous tests v36.55 we know at least 12003 accepts connections and completes handshake,
+            //       whereas 58158 hangs completely)
+            
             g_serverCount = 0;
-            
-            // v36.59: Parse servers using TLV format first (type-length-value)
-            // Look for patterns like: ip(4 bytes BE) + port(2 bytes BE) + serverid(2-4 bytes)
-            // Also try little-endian for IP and port as game may use host byte order
-            
             NSMutableArray *foundServers = [NSMutableArray array];
+            const int DEFAULT_GAME_PORT = 12003;
             
-            for (ssize_t offset = 0; offset < bodyLen - 6 && g_serverCount < MAX_SERVERS; offset++) {
-                // Try BIG ENDIAN first: IP bytes in order b1.b2.b3.b4
-                int b1 = body[offset];
-                int b2 = body[offset+1];
-                int b3 = body[offset+2];
-                int b4 = body[offset+3];
-                
-                if (b1 >= 1 && b1 <= 223 && b1 != 127 && b4 >= 1 && b4 <= 223) {
-                    // Valid-looking IP bytes - try both byte orders
-                    char ipBE[64], ipLE[64];
-                    snprintf(ipBE, sizeof(ipBE), "%d.%d.%d.%d", b1, b2, b3, b4);
-                    snprintf(ipLE, sizeof(ipLE), "%d.%d.%d.%d", b4, b3, b2, b1);
-                    
-                    // Big-endian port
-                    int portBE = (body[offset+4] << 8) | body[offset+5];
-                    // Little-endian port
-                    int portLE = (body[offset+5] << 8) | body[offset+4];
-                    
-                    // Try all combinations - valid port range is 1024-65535 for game servers
-                    char *selectedIP = NULL;
-                    int selectedPort = 0;
-                    
-                    if (portBE >= 1024 && portBE < 65536) {
-                        selectedIP = ipBE;
-                        selectedPort = portBE;
-                        DLOG(@"[SERVERLIST-PARSE] Candidate BE: %s:%d (raw: %02x %02x %02x %02x %02x %02x)",
-                             selectedIP, selectedPort,
-                             b1, b2, b3, b4, body[offset+4], body[offset+5]);
+            DLOG(@"[SERVERLIST-PARSE] (v36.60) Scanning ONLY for ASCII IP patterns (no false-positive raw byte scan)");
+            DLOG(@"[SERVERLIST-PARSE] (v36.60) Default fallback port = %d", DEFAULT_GAME_PORT);
+            
+            for (ssize_t offset = 0; offset < bodyLen - 7 && g_serverCount < MAX_SERVERS; offset++) {
+                if (body[offset] >= '1' && body[offset] <= '9') {
+                    char candidate[128];
+                    ssize_t i = 0;
+                    ssize_t start = offset;
+                    while (offset < bodyLen && i < 63 &&
+                           ((body[offset] >= '0' && body[offset] <= '9') || body[offset] == '.')) {
+                        candidate[i++] = (char)body[offset++];
                     }
-                    if (portLE >= 1024 && portLE < 65536) {
-                        if (!selectedIP || (portLE == 12003 || portLE == 58158)) {
-                            selectedIP = ipLE;
-                            selectedPort = portLE;
-                            DLOG(@"[SERVERLIST-PARSE] Candidate LE: %s:%d (raw: %02x %02x %02x %02x %02x %02x)",
-                                 selectedIP, selectedPort,
-                                 b1, b2, b3, b4, body[offset+4], body[offset+5]);
+                    candidate[i] = '\0';
+                    
+                    int dots = 0;
+                    int octets[4] = {0, 0, 0, 0};
+                    int octIdx = 0;
+                    int curVal = 0;
+                    BOOL validFormat = YES;
+                    for (ssize_t j = 0; candidate[j]; j++) {
+                        if (candidate[j] == '.') {
+                            if (j == 0 || candidate[j+1] == '.' || candidate[j+1] == '\0') { validFormat = NO; break; }
+                            dots++;
+                            if (curVal > 255) { validFormat = NO; break; }
+                            octets[octIdx++] = curVal;
+                            curVal = 0;
+                        } else if (candidate[j] >= '0' && candidate[j] <= '9') {
+                            curVal = curVal * 10 + (candidate[j] - '0');
+                            if (curVal > 255) { validFormat = NO; break; }
+                        } else {
+                            validFormat = NO;
+                            break;
                         }
                     }
+                    if (octIdx < 3) validFormat = NO;  // need at least 3 dots (i.e. 4 octets)
+                    if (validFormat && dots == 3) {
+                        octets[3] = curVal;
+                        if (octets[3] > 255) validFormat = NO;
+                    }
+                    if (octets[0] == 0 || octets[0] == 127 || octets[0] >= 224) validFormat = NO;
+                    if (octets[3] == 0) validFormat = NO;
                     
-                    if (selectedIP && selectedPort > 0) {
-                        // Avoid duplicates
-                        NSString *key = [NSString stringWithFormat:@"%s:%d", selectedIP, selectedPort];
+                    if (dots == 3 && validFormat && i > 6) {
+                        DLOG(@"[SERVERLIST-PARSE] Valid ASCII IP at %zd: '%s' (octets=%d.%d.%d.%d)",
+                             start, candidate, octets[0], octets[1], octets[2], octets[3]);
+                        
+                        int assignedPort = DEFAULT_GAME_PORT;
+                        BOOL portFound = NO;
+                        
+                        // Try to find ASCII port first - pattern after IP: "port":12003 or :12003
+                        // Search up to 60 bytes after IP for the first : followed by digits
+                        ssize_t maxSearch = (offset + 100 < bodyLen) ? (offset + 100) : bodyLen;
+                        for (ssize_t pOffset = offset; pOffset < maxSearch - 6 && !portFound; pOffset++) {
+                            // Try ASCII: :<number>
+                            if (body[pOffset] == ':' && (body[pOffset+1] >= '1' && body[pOffset+1] <= '9')) {
+                                ssize_t k = pOffset + 1;
+                                int p = 0;
+                                while (k < maxSearch && body[k] >= '0' && body[k] <= '9' && p < 65536) {
+                                    p = p * 10 + (body[k] - '0');
+                                    k++;
+                                }
+                                if (p >= 1024 && p < 65536) {
+                                    assignedPort = p;
+                                    portFound = YES;
+                                    DLOG(@"[SERVERLIST-PARSE]   -> Found ASCII port %d at offset %zd", assignedPort, pOffset);
+                                }
+                            }
+                            
+                            // Also check for "port":<digits> pattern
+                            if (pOffset + 7 < maxSearch &&
+                                body[pOffset]=='p' && body[pOffset+1]=='o' && body[pOffset+2]=='r' &&
+                                body[pOffset+3]=='t' && body[pOffset+5]=='\"' &&
+                                body[pOffset+6] >= '1' && body[pOffset+6] <= '9') {
+                                ssize_t k = pOffset + 6;
+                                int p = 0;
+                                while (k < maxSearch && body[k] >= '0' && body[k] <= '9' && p < 65536) {
+                                    p = p * 10 + (body[k] - '0');
+                                    k++;
+                                }
+                                if (p >= 1024 && p < 65536) {
+                                    assignedPort = p;
+                                    portFound = YES;
+                                    DLOG(@"[SERVERLIST-PARSE]   -> Found port via \"port\" keyword: %d at offset %zd",
+                                         assignedPort, pOffset);
+                                }
+                            }
+                            
+                            // Try raw 2-byte binary port (network byte order): first reasonable port within 40 bytes
+                            if (!portFound && pOffset <= offset + 40) {
+                                int portBE = (body[pOffset] << 8) | body[pOffset+1];
+                                int portLE = (body[pOffset+1] << 8) | body[pOffset];
+                                // Check if looks like game server port (12003 or 58158 or range 10000-60000)
+                                if (portBE == 12003 || portBE == 58158 || (portBE >= 10000 && portBE < 60000)) {
+                                    assignedPort = portBE;
+                                    portFound = YES;
+                                    DLOG(@"[SERVERLIST-PARSE]   -> Found binary BE port %d at %zd (raw=%02x%02x)",
+                                         assignedPort, pOffset, body[pOffset], body[pOffset+1]);
+                                } else if (portLE == 12003 || portLE == 58158 || (portLE >= 10000 && portLE < 60000)) {
+                                    assignedPort = portLE;
+                                    portFound = YES;
+                                    DLOG(@"[SERVERLIST-PARSE]   -> Found binary LE port %d at %zd (raw=%02x%02x)",
+                                         assignedPort, pOffset, body[pOffset], body[pOffset+1]);
+                                }
+                            }
+                        }
+                        
+                        if (!portFound) {
+                            DLOG(@"[SERVERLIST-PARSE]   -> No port found, using DEFAULT port %d",
+                                 DEFAULT_GAME_PORT);
+                        }
+                        
+                        // De-dupe and store
+                        NSString *key = [NSString stringWithFormat:@"%s:%d", candidate, assignedPort];
                         BOOL duplicate = NO;
                         for (NSString *s in foundServers) {
                             if ([s isEqualToString:key]) { duplicate = YES; break; }
                         }
-                        if (!duplicate) {
+                        if (!duplicate && g_serverCount < MAX_SERVERS) {
                             [foundServers addObject:key];
+                            strncpy(g_serverList[g_serverCount].ip, candidate, 63);
+                            g_serverList[g_serverCount].port = assignedPort;
+                            DLOG(@"[SERVERLIST-PARSE] STORED server %d: %s:%d (portSource=%@)",
+                                 g_serverCount,
+                                 g_serverList[g_serverCount].ip,
+                                 g_serverList[g_serverCount].port,
+                                 portFound ? @"detected" : @"DEFAULT");
                             
-                            // Store in server list
-                            strncpy(g_serverList[g_serverCount].ip, selectedIP, 63);
-                            g_serverList[g_serverCount].port = selectedPort;
-                            DLOG(@"[SERVERLIST-PARSE] Binary server %d: %s:%d", 
-                                 g_serverCount, g_serverList[g_serverCount].ip, g_serverList[g_serverCount].port);
-                            
-                            // Set first valid server as default
                             if (g_serverCount == 0) {
-                                strncpy(g_gameServerIP, selectedIP, 63);
-                                g_gameServerPort = selectedPort;
+                                strncpy(g_gameServerIP, candidate, 63);
+                                g_gameServerPort = assignedPort;
                                 g_currentServerIndex = 0;
-                                DLOG(@"[SERVERLIST-PARSE] Set default game server: %s:%d", 
+                                DLOG(@"[SERVERLIST-PARSE] Set DEFAULT game server: %s:%d",
                                      g_gameServerIP, g_gameServerPort);
                             }
                             g_serverCount++;
@@ -1984,74 +2065,29 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                 }
             }
             
-            // v36.59: Also check for ASCII-encoded IPs with preceding/surrounding data
-            // Pattern: 47.100.14.198 as individual ASCII digits, not binary
-            DLOG(@"[SERVERLIST-PARSE] Searching for ASCII IP patterns...");
-            for (ssize_t offset = 0; offset < bodyLen - 12; offset++) {
-                if (body[offset] >= '1' && body[offset] <= '9') {
-                    // Try to find ASCII IP: digits.digits.digits.digits:digits
-                    // Example: "47.100.14.198" then port value nearby
-                    char candidate[128];
-                    ssize_t i = 0;
-                    ssize_t start = offset;
-                    while (offset < bodyLen && i < 63 && 
-                           ((body[offset] >= '0' && body[offset] <= '9') || body[offset] == '.')) {
-                        candidate[i++] = (char)body[offset++];
-                    }
-                    candidate[i] = '\0';
-                    
-                    // Check if looks like IP
-                    int dots = 0;
-                    for (ssize_t j = 0; candidate[j]; j++) {
-                        if (candidate[j] == '.') dots++;
-                    }
-                    
-                    if (dots == 3 && i > 6) {
-                        DLOG(@"[SERVERLIST-PARSE] Found ASCII IP pattern at %zd: '%s'", start, candidate);
-                        // Look for port following this IP (usually within 4-20 bytes)
-                        for (ssize_t pOffset = offset; pOffset < offset + 30 && pOffset < bodyLen - 2; pOffset++) {
-                            int portA = (body[pOffset] << 8) | body[pOffset+1];
-                            int portB = (body[pOffset+1] << 8) | body[pOffset];
-                            int fport = 0;
-                            if (portA >= 1024 && portA < 65536) fport = portA;
-                            else if (portB >= 1024 && portB < 65536) fport = portB;
-                            
-                            if (fport > 0) {
-                                NSString *key = [NSString stringWithFormat:@"%s:%d", candidate, fport];
-                                BOOL duplicate = NO;
-                                for (NSString *s in foundServers) {
-                                    if ([s isEqualToString:key]) { duplicate = YES; break; }
-                                }
-                                if (!duplicate && g_serverCount < MAX_SERVERS) {
-                                    [foundServers addObject:key];
-                                    strncpy(g_serverList[g_serverCount].ip, candidate, 63);
-                                    g_serverList[g_serverCount].port = fport;
-                                    DLOG(@"[SERVERLIST-PARSE] ASCII server %d: %s:%d",
-                                         g_serverCount, candidate, fport);
-                                    
-                                    if (g_serverCount == 0) {
-                                        strncpy(g_gameServerIP, candidate, 63);
-                                        g_gameServerPort = fport;
-                                        g_currentServerIndex = 0;
-                                        DLOG(@"[SERVERLIST-PARSE] Set default: %s:%d", g_gameServerIP, g_gameServerPort);
-                                    }
-                                    g_serverCount++;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            
             if (g_serverCount > 0) {
-                DLOG(@"[SERVERLIST-PARSE] Stored %d servers for rotation", g_serverCount);
+                DLOG(@"[SERVERLIST-PARSE] Final: Stored %d servers for rotation", g_serverCount);
                 for (int i = 0; i < g_serverCount; i++) {
-                    DLOG(@"[SERVERLIST-PARSE]   [%d] %s:%d", i, 
-                         g_serverList[i].ip, g_serverList[i].port);
+                    DLOG(@"[SERVERLIST-PARSE]   [%d] %s:%d",
+                         i, g_serverList[i].ip, g_serverList[i].port);
                 }
             } else {
-                DLOG(@"[SERVERLIST-PARSE] No servers found in binary response");
+                DLOG(@"[SERVERLIST-PARSE] No servers found! (Game may still use its own internal parsing)");
+                // v36.60: If even ASCII scan fails, at least populate with known-working defaults
+                // so that the rotation mechanism has something to try (in case we're called for fallback)
+                const char *defaultIP = "47.100.14.198";
+                if (strlen(g_gameServerIP) < 7) {
+                    strncpy(g_gameServerIP, defaultIP, 63);
+                }
+                if (g_gameServerPort < 1024) {
+                    g_gameServerPort = DEFAULT_GAME_PORT;
+                }
+                strncpy(g_serverList[0].ip, g_gameServerIP, 63);
+                g_serverList[0].port = g_gameServerPort;
+                g_serverCount = 1;
+                g_currentServerIndex = 0;
+                DLOG(@"[SERVERLIST-PARSE] Populated fallback server %s:%d as last resort",
+                     g_gameServerIP, g_gameServerPort);
             }
         }
     } @catch (NSException *e) {
@@ -2118,66 +2154,158 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
-        // v36.59: Port rewrite - ONLY rewrite PORT 12003 -> 58158
-        // NEVER change the IP address! Keep original IP from game logic
-        BOOL isGameServerPort = (port == 12003 || port == 58158);
-        BOOL needPortRewrite = (port == 12003);
+        // v36.60: DISABLED port rewrite 12003->58158! 58158 is unreachable and hangs connect()
+        // Use game's ORIGINAL target port directly.
+        // Known working port from previous tests: 12003 (at least handshake works)
+        BOOL isGameServerPort = (port == 12003 || port == 58158 || (port >= 10000 && port < 65536));
         
-        // Save original address for logging
-        char origHost[64];
         int origPort = port;
+        char origHost[64];
         strncpy(origHost, host, 63);
         origHost[63] = '\0';
         
-        struct sockaddr_in newAddr = *in;
+        // v36.60: Track fd BEFORE connect (so close hook can log)
+        trackFd(sockfd, host, port);
         
-        if (needPortRewrite) {
-            // v36.59 FIX: Only rewrite PORT, keep original IP address!
-            newAddr.sin_port = htons(58158);
-            port = 58158;
-            // DO NOT change host variable! Keep original IP for logging and tracking
-            DLOG(@"[REWRITE-PORT] Game server %s:%d -> %s:%d (PORT ONLY, IP preserved)", 
-                 origHost, origPort, origHost, port);
+        // v36.60: Print connection diagnostics
+        BOOL hasPreexistingConnectError = (orig_connect == NULL);
+        DLOG(@"[SOCK] connect START fd=%d target=%s:%d isGamePort=%d orig_fn=%@",
+             sockfd, host, port, isGameServerPort ? 1 : 0,
+             orig_connect ? @"OK" : @"NULL");
+        
+        if (hasPreexistingConnectError) {
+            DLOG(@"[SOCK] FATAL: orig_connect is NULL! dlsym failed.");
+            errno = EACCES;
+            return -1;
         }
         
-        // v36.59: Detailed connection logging
-        trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d host=%s port=%d origPort=%d rewrite=%d", 
-             sockfd, host, port, origPort, needPortRewrite ? 1 : 0);
+        // v36.60: NON-BLOCKING CONNECT with timeout (to prevent hanging)
+        // Steps: (1) save flags, (2) set O_NONBLOCK, (3) connect (returns EINPROGRESS),
+        //        (4) select with timeout, (5) check result via getsockopt, (6) restore flags
+        int savedFlags = fcntl(sockfd, F_GETFL, 0);
+        if (savedFlags < 0) savedFlags = 0;
+        
+        int setResult = fcntl(sockfd, F_SETFL, savedFlags | O_NONBLOCK);
+        if (setResult < 0) {
+            DLOG(@"[SOCK] Warning: cannot set O_NONBLOCK, will use blocking connect (fd=%d errno=%d %s)",
+                 sockfd, errno, strerror(errno));
+        }
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        // Use rewritten address if port rewrite needed (IP unchanged, port changed)
-        int result;
-        if (needPortRewrite) {
-            result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
+        // Try connect (will return immediately with EINPROGRESS if O_NONBLOCK worked)
+        int interimResult = orig_connect(sockfd, addr, addrlen);
+        int connectErrno = errno;
+        int finalResult = interimResult;
+        
+        if (interimResult < 0 && connectErrno == EINPROGRESS) {
+            // Non-blocking connect in progress - use select to wait
+            DLOG(@"[SOCK] connect in progress (EINPROGRESS). Waiting with 15s timeout...");
+            fd_set writeSet, errSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&errSet);
+            FD_SET(sockfd, &writeSet);
+            FD_SET(sockfd, &errSet);
+            
+            struct timeval timeoutTV;
+            timeoutTV.tv_sec = 15;   // 15 seconds timeout (generous for mobile networks)
+            timeoutTV.tv_usec = 0;
+            
+            int selResult = select(sockfd + 1, NULL, &writeSet, &errSet, &timeoutTV);
+            connectErrno = errno;
+            
+            if (selResult == 0) {
+                // Timeout!
+                finalResult = -1;
+                connectErrno = ETIMEDOUT;
+                DLOG(@"[SOCK] connect TIMEOUT after 15s (fd=%d target=%s:%d)", sockfd, host, port);
+            } else if (selResult < 0) {
+                // select error
+                finalResult = -1;
+                DLOG(@"[SOCK] select() failed ret=%d errno=%d %s", selResult, connectErrno, strerror(connectErrno));
+            } else {
+                // select success - check which set fired and use getsockopt for real result
+                if (FD_ISSET(sockfd, &errSet)) {
+                    // Error occurred
+                    socklen_t optLen = sizeof(connectErrno);
+                    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &connectErrno, &optLen);
+                    finalResult = -1;
+                    DLOG(@"[SOCK] select fired error set, SO_ERROR=%d %s", connectErrno, strerror(connectErrno));
+                } else if (FD_ISSET(sockfd, &writeSet)) {
+                    // Write-ready: double-check with SO_ERROR that connect really succeeded
+                    socklen_t optLen = sizeof(connectErrno);
+                    connectErrno = 0;
+                    int optResult = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &connectErrno, &optLen);
+                    if (optResult < 0) {
+                        connectErrno = errno;
+                        finalResult = -1;
+                    } else if (connectErrno == 0) {
+                        finalResult = 0;
+                    } else {
+                        finalResult = -1;
+                    }
+                    DLOG(@"[SOCK] select fired write set, SO_ERROR=%d %s finalResult=%d",
+                         connectErrno, strerror(connectErrno), finalResult);
+                }
+            }
+        } else if (interimResult == 0) {
+            // connect succeeded immediately!
+            connectErrno = 0;
+            DLOG(@"[SOCK] connect succeeded immediately (fd=%d)", sockfd);
         } else {
-            result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+            // Other error (not EINPROGRESS) - log it
+            DLOG(@"[SOCK] connect failed immediately ret=%d errno=%d %s",
+                 interimResult, connectErrno, strerror(connectErrno));
+            finalResult = interimResult;
         }
+        
+        // Restore original socket flags (disable O_NONBLOCK so game sees expected blocking behavior)
+        if (setResult == 0) {
+            fcntl(sockfd, F_SETFL, savedFlags);
+            DLOG(@"[SOCK] Restored socket flags to 0x%x (non-blocking removed)", savedFlags);
+        }
+        
+        // Set global errno to the real error
+        errno = connectErrno;
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d host=%s port=%d result=%d errno=%d(%s) elapsed=%.3fs", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed);
+        // v36.60: Very detailed END log
+        if (finalResult == 0) {
+            DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d result=%d errno=%d elapsed=%.3fs",
+                 sockfd, host, port, finalResult, errno, elapsed);
+        } else {
+            DLOG(@"[SOCK] connect END fd=%d FAILED target=%s:%d result=%d errno=%d(%s) elapsed=%.3fs",
+                 sockfd, host, port, finalResult, errno, strerror(errno), elapsed);
+        }
         
-        // If connection failed on game server port, try next server for rotation
-        if (isGameServerPort && result != 0) {
-            DLOG(@"[SOCK] Game server connection failed, attempting rotation...");
+        // Update fd tracking with actual port (in case it was changed)
+        g_fdInfo[sockfd % MAX_FDS].lastActivity = CFAbsoluteTimeGetCurrent();
+        
+        // Try server rotation on failure
+        if (isGameServerPort && finalResult != 0) {
+            DLOG(@"[SOCK] Game server %s:%d FAILED -> attempting rotation...", host, port);
             @try {
                 BOOL rotated = tryNextServer();
                 if (rotated) {
-                    DLOG(@"[SOCK] Next server available: %s:%d (game will use its own connection logic)", 
-                         g_gameServerIP, g_gameServerPort);
+                    DLOG(@"[SOCK] Rotation succeeded. Global g_gameServerInfo now: %s:%d (index %d/%d failCount=%d)",
+                         g_gameServerIP, g_gameServerPort,
+                         g_currentServerIndex + 1, g_serverCount, g_connectionFailCount);
+                } else {
+                    DLOG(@"[SOCK] Rotation unavailable (only %d server(s) known, failCount=%d)",
+                         g_serverCount, g_connectionFailCount);
                 }
             } @catch (NSException *e) {
                 DLOG(@"[SOCK] Exception during rotation: %@", e.reason);
+            } @catch (...) {
+                DLOG(@"[SOCK] Unknown error during rotation");
             }
         }
         
-        return result;
+        return finalResult;
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
@@ -3818,7 +3946,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.59 - MSI stub fix, port rewrite, correct presentVC hook");
+    DLOG(@"[VERSION] WangXianHook v36.60 - Remove port rewrite, timeout-safe connect, clean server list parse");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
