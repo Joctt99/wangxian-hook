@@ -1,14 +1,15 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.35 - Disable port rewrite, add timeout, dump server list
- * FIX: DISABLED port rewrite (12003->58158) - let game connect natively
- * FIX: Added SO_SNDTIMEO=10s timeout to prevent infinite blocking
- * FIX: Set non-blocking mode for game server connections
- * FIX: DISABLED parseServerListResponse - don't modify server list data
- * FIX: Added detailed hex dump of 0x802EE113 server list response
- * WHY: Need to understand why 58158 connection hangs in blocking mode
+ * WangXianHook v36.36 - Re-enable port rewrite + non-blocking connect
+ * FIX: RE-ENABLED port rewrite (12003 -> 58158) 
+ * FIX: Set non-blocking mode BEFORE connect to prevent hanging
+ * FIX: Added proper EINPROGRESS handling
+ * FIX: Restore blocking mode after successful connect
+ * FIX: Keep SO_SNDTIMEO=10s timeout
+ * WHY: v36.35 proved 12003 doesn't work; v36.34 proved 58158 blocks forever
+ * Solution: 58158 + non-blocking = game can poll with select()
  * 
- * PREVIOUS (v36.34):
+ * PREVIOUS (v36.35):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -157,7 +158,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.35 loaded ===");
+        _log(@"=== WangXianHook v36.36 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -336,7 +337,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.35 诊断面板";
+            lbl.text = @"WXHook v36.36 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1650,25 +1651,32 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         DLOG(@"[CONNECT-TIMEOUT] fd=%d set SO_SNDTIMEO=10s", sockfd);
         
-        // Make non-blocking for game server connections (port 12003)
+        // CRITICAL: Set non-blocking BEFORE port rewrite and connect
         // This prevents blocking indefinitely if server is slow/unreachable
+        // The game will get EINPROGRESS and can poll with select()
         BOOL shouldSetNonBlocking = (port == 12003);
         if (shouldSetNonBlocking && !isNonBlocking) {
             int newFlags = sockFlags | O_NONBLOCK;
             fcntl(sockfd, F_SETFL, newFlags);
             isNonBlocking = YES;
-            DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode (was blocking)", sockfd);
+            DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode BEFORE connect", sockfd);
         }
         
         const struct sockaddr *finalAddr = addr;
         struct sockaddr_in newAddr;
         
-        // DISABLED port rewrite for v36.35 - let game connect to native port
-        // The game uses 12003, let it try that first
-        // If 12003 doesn't work, we'll investigate further
+        // RE-ENABLED port rewrite for v36.36
+        // Game tries 12003, but server only accepts 58158
         if (port == 12003) {
-            DLOG(@"[CONNECT-NATIVE] Game server %s:12003 (no rewrite, connecting natively)", host);
-            // NO REWRITE - connect to original IP:12003
+            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158 (non-blocking=%d)", host, g_gameServerIP, isNonBlocking);
+            memset(&newAddr, 0, sizeof(newAddr));
+            newAddr.sin_family = AF_INET;
+            inet_aton(g_gameServerIP, &newAddr.sin_addr);
+            newAddr.sin_port = htons(58158);
+            finalAddr = (const struct sockaddr *)&newAddr;
+            addrlen = sizeof(newAddr);
+            strncpy(host, g_gameServerIP, 63);
+            port = 58158;
         }
         
         trackFd(sockfd, host, port);
@@ -1686,10 +1694,26 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
              sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
         
-        if (result != 0 && errno == EINPROGRESS) {
-            DLOG(@"[SOCK] connect EINPROGRESS - connection in progress (non-blocking mode)");
-        } else if (result != 0) {
-            DLOG(@"[SOCK] connect FAILED - will retry or report error");
+        // IMPORTANT: After connect returns, handle the result
+        if (result == 0) {
+            DLOG(@"[SOCK] connect SUCCESS - connection established immediately");
+            // Restore blocking mode if we set non-blocking
+            if (shouldSetNonBlocking && !isNonBlocking) {
+                fcntl(sockfd, F_SETFL, sockFlags);
+                DLOG(@"[SOCK] Restored blocking mode after successful connect");
+            }
+        } else if (errno == EINPROGRESS) {
+            DLOG(@"[SOCK] connect EINPROGRESS - connection in progress (normal for non-blocking)");
+            // Game should use select/poll to wait for connection
+            // Do NOT restore blocking mode yet - let game handle it
+        } else if (errno == EINTR) {
+            DLOG(@"[SOCK] connect EINTR - interrupted system call");
+        } else {
+            DLOG(@"[SOCK] connect FAILED errno=%d(%s) - unrecoverable error", errno, strerror(errno));
+            // Restore blocking mode on failure
+            if (shouldSetNonBlocking) {
+                fcntl(sockfd, F_SETFL, sockFlags);
+            }
         }
         
         return result;
