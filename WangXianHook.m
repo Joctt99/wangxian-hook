@@ -1,14 +1,15 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.42 - Patch port in server list response, add non-blocking connect
+ * WangXianHook v36.43 - Restore port rewrite with non-blocking safety net
+ * FIX: Restored port rewrite 12003->58158 in hook_connect
+ * FIX: ADDED non-blocking mode + 10s timeout before connect for game server
+ * FIX: Changed default game server port to 58158 (matching normal client)
+ * WHY: Server list response not received; port rewrite needed with blocking prevention
+ * 
+ * PREVIOUS (v36.42):
  * FIX: Patched port 12003->58158 in server list response (0x802EE113)
  * FIX: ADDED non-blocking mode + 10s timeout for game server connect (12003/58158)
  * WHY: hook_connect port rewrite caused blocking hang; patching response data avoids this
- * 
- * PREVIOUS (v36.41):
- * FIX: Restored port rewrite (12003->58158) in hook_connect
- * FIX: Added game server packet analysis logging
- * WHY: Port rewrite was needed but caused blocking on connect
  * 
  * PREVIOUS (v36.39):
  * FIX: Revert login server redirect, keep game server fix with 5s timeout
@@ -940,7 +941,7 @@ static id msi_init_hook(id self, SEL _cmd) {
 // ============================================================
 
 // Game server config variables (defined early for stub class access)
-static int g_gameServerPort = 12003;
+static int g_gameServerPort = 58158;
 static char g_gameServerIP[64] = "47.100.14.198";
 static BOOL g_gameServerInfoUpdated = YES;
 
@@ -1813,27 +1814,47 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         int sockFlags = fcntl(sockfd, F_GETFL, 0);
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
-        // v36.42: NO port rewrite - game uses original port from server list
-        // Port 12003->58158 is done in recv hook (0x802EE113 response)
-        // Add non-blocking mode with timeout for game server connections as safety net
-        BOOL isGameServerPort = (port == 58158 || port == 12003);
-        BOOL needNonBlocking = isGameServerPort && !isNonBlocking;
+        // v36.43: Restore port rewrite 12003->58158 with non-blocking safety net
+        // Normal client uses port 58158 for game server; 12003 disconnects
+        BOOL needRewrite = (port == 12003 && g_gameServerInfoUpdated);
         
-        if (needNonBlocking) {
-            // Set non-blocking mode to prevent hanging
-            int flags = fcntl(sockfd, F_GETFL, 0);
-            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-            isNonBlocking = YES;
+        if (needRewrite) {
+            // Rewrite port 12003 -> 58158
+            struct sockaddr_in newAddr = *in;
+            newAddr.sin_port = htons(58158);
             
-            // Set send timeout (10 seconds)
-            struct timeval tv;
-            tv.tv_sec = 10;
-            tv.tv_usec = 0;
-            setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            // Set non-blocking + timeout before connecting (safety net)
+            if (!isNonBlocking) {
+                int flags = fcntl(sockfd, F_GETFL, 0);
+                fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+                isNonBlocking = YES;
+                struct timeval tv;
+                tv.tv_sec = 10;
+                tv.tv_usec = 0;
+                setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            }
             
-            DLOG(@"[SOCK] Set non-blocking + 10s timeout for %s:%d", host, port);
+            port = 58158;
+            trackFd(sockfd, host, port);
+            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158 (non_blocking=%d)", host, host, isNonBlocking);
+            DLOG(@"[SOCK] connect START fd=%d %s:58158 non_blocking=%d (PORT REWRITE)", sockfd, host, port, isNonBlocking);
+            
+            struct timeval startTV;
+            gettimeofday(&startTV, NULL);
+            
+            int result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
+            
+            struct timeval endTV;
+            gettimeofday(&endTV, NULL);
+            double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
+            
+            DLOG(@"[SOCK] connect END fd=%d %s:58158 result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+                 sockfd, host, result, errno, strerror(errno), elapsed, isNonBlocking);
+            
+            return result;
         }
         
+        // Original connection (login server, etc.)
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d", sockfd, host, port, isNonBlocking);
         
@@ -3376,6 +3397,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
+    DLOG(@"[VERSION] WangXianHook v36.43 - Port rewrite 12003->58158 with non-blocking");
     DLOG(@"[ACT] Installing all hooks...");
     
     installSecurityHooks();
