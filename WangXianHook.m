@@ -1,12 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.29 - Fixed UIAlertController crash, removed IP rewriting
- * FIX: Removed broken login server IP rewriting (47.100.222.229 is correct login server)
- * FIX: Fixed UIAlertController crash by adding @try/@catch and respondsToSelector checks
- * FIX: Reverted hook_connect to pass-through mode (no IP rewriting)
- * WHY: IP rewriting broke the login connection completely
+ * WangXianHook v36.30 - Fixed game server port rewriting
+ * FIX: Added game server port rewriting: 12003 -> 58158
+ * FIX: Set default game server IP to 47.100.14.198 (from normal client log)
+ * FIX: Added g_gameServerIP global variable with default value
+ * WHY: Game uses port 12003 in injected mode, but correct port is 58158
  * 
- * PREVIOUS (v36.28):
+ * PREVIOUS (v36.29):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -155,7 +155,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.29 loaded ===");
+        _log(@"=== WangXianHook v36.30 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -334,7 +334,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.29 诊断面板";
+            lbl.text = @"WXHook v36.30 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1421,7 +1421,7 @@ static int g_trackedCount = 0;
 static BOOL g_trackedActive[MAX_TRACKED_FDS];
 
 static int g_gameServerPort = 58158;
-static char g_gameServerIP[64] = {0};
+static char g_gameServerIP[64] = "47.100.14.198";
 static BOOL g_gameServerInfoUpdated = NO;
 
 static void clearTrackedFd(int fd) {
@@ -1600,10 +1600,28 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
+        
+        const struct sockaddr *finalAddr = addr;
+        struct sockaddr_in newAddr;
+        
+        // Rewrite game server: port 12003 -> 58158
+        // Game uses port 12003 in injected mode, but correct port is 58158
+        if (port == 12003) {
+            DLOG(@"[CONNECT] Rewriting game server %s:12003 -> %s:%d", host, g_gameServerIP, g_gameServerPort);
+            memset(&newAddr, 0, sizeof(newAddr));
+            newAddr.sin_family = AF_INET;
+            inet_aton(g_gameServerIP, &newAddr.sin_addr);
+            newAddr.sin_port = htons((uint16_t)g_gameServerPort);
+            finalAddr = (const struct sockaddr *)&newAddr;
+            addrlen = sizeof(newAddr);
+            strncpy(host, g_gameServerIP, 63);
+            port = g_gameServerPort;
+        }
+        
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
         
-        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
         DLOG(@"[SOCK] connect result=%d errno=%d", result, errno);
         return result;
     } else if (addr->sa_family == AF_INET6) {
