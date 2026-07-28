@@ -1,13 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.56 - Add 12003 logging, game server patch
- * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
+ * WangXianHook v36.57 - Server rotation, alert crash fix, full game server logging
+ * MODE: FULL - All hooks enabled including game server analysis
  * 
- * v36.56 CRITICAL FIXES:
- * - Add 12003 port logging support (send/recv)
- * - Add game server response patch (status byte, error text)
- * - Update close hook to track both 58158 and 12003 ports
- * - Add detailed game server response analysis
+ * v36.57 CRITICAL FIXES:
+ * - Implement server list rotation/retry (tryNextServer)
+ * - Fix hook_alertControllerPresent SIGSEGV crash (NULL checks, main thread)
+ * - Enhanced game server response logging (all ports and commands)
+ * - MINIMAL_MODE=0: Enable ALL hooks including crypto and game server analysis
  * 
  * v36.55 CRITICAL FIXES:
  * - SIMPLE direct connect: NO port rewrite, NO non-blocking, NO select
@@ -108,12 +108,13 @@
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
+// v36.57: FULL MODE - Enable all hooks including game server analysis, crypto hooks
 // v36.47: EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks, NO socket modifications
 // v36.47: Critical fix - Disable all crypto function hooks that corrupt encryption data
 // v36.47: Critical fix - Fix hook_alertControllerPresent SIGSEGV crash
-#define MINIMAL_MODE 1
-#define DISABLE_CRYPTO_HOOKS 1
-#define DISABLE_SOCKET_MODS 1
+#define MINIMAL_MODE 0
+#define DISABLE_CRYPTO_HOOKS 0
+#define DISABLE_SOCKET_MODS 0
 #define DISABLE_UI_HOOKS 0
 
 static NSString *g_logPath = nil;
@@ -205,7 +206,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.40 loaded ===");
+        _log(@"=== WangXianHook v36.57 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -384,7 +385,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.40 诊断面板";
+            lbl.text = @"WXHook v36.57 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -983,9 +984,21 @@ static id msi_init_hook(id self, SEL _cmd) {
 // ============================================================
 
 // Game server config variables (defined early for stub class access)
-static int g_gameServerPort = 58158;
+static int g_gameServerPort = 12003;  // v36.57: Default to 12003 (no port rewrite)
 static char g_gameServerIP[64] = "47.100.14.198";
 static BOOL g_gameServerInfoUpdated = YES;
+
+// v36.57: Server list for rotation/retry
+#define MAX_SERVERS 20
+typedef struct {
+    char ip[64];
+    int port;
+} ServerInfo;
+
+static ServerInfo g_serverList[MAX_SERVERS];
+static int g_serverCount = 0;
+static int g_currentServerIndex = 0;
+static int g_connectionFailCount = 0;
 
 static NSMutableDictionary *g_msiStubData = nil;
 
@@ -1477,44 +1490,74 @@ static void hook_alertViewShow(id self, SEL _cmd) {
 
 static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
 static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
+    // v36.57: FIX - Complete NULL checks, main thread enforcement, safe block handling
     @try {
-        // v36.50: Add NULL checks and type validation before any operation
+        // Check orig function pointer
         if (!orig_alertControllerPresent) {
             DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL");
-            // Can't call original, just return
             return;
         }
         
-        // Validate function pointer is not NULL
         if ((void *)orig_alertControllerPresent == NULL) {
             DLOG(@"[DIAG-ALERT] orig_alertControllerPresent function pointer is NULL");
             return;
         }
         
-        if (self && [self isKindOfClass:[UIAlertController class]]) {
-            NSString *title = [self title];
-            NSString *msg = [self message];
-            DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
-            
-            if (title || msg) {
-                NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
-                NSString *lowerTitle = title ? [title lowercaseString] : @"";
-                if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
-                    [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
-                    [lowerMsg containsString:@"升级"]) {
-                    DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
-                    return;
+        // Check self is valid before any messaging
+        if (!self || self == nil) {
+            DLOG(@"[DIAG-ALERT] self is nil, cannot present");
+            return;
+        }
+        
+        // Log and check for version-related alerts
+        if ([self isKindOfClass:[UIAlertController class]]) {
+            @try {
+                NSString *title = [self title];
+                NSString *msg = [self message];
+                DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", 
+                     title ? title : @"<nil>", msg ? msg : @"<nil>");
+                
+                if (title || msg) {
+                    NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
+                    NSString *lowerTitle = title ? [title lowercaseString] : @"";
+                    if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
+                        [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+                        [lowerMsg containsString:@"升级"]) {
+                        DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", 
+                             title ? title : @"", msg ? msg : @"");
+                        return;
+                    }
                 }
+            } @catch (NSException *e) {
+                DLOG(@"[DIAG-ALERT] Exception in alert check: %@", e.reason);
             }
         }
         
-        // Call original
-        orig_alertControllerPresent(self, _cmd, animated, completion);
+        // v36.57: Ensure completion block is not nil (use empty block as fallback)
+        dispatch_block_t safeCompletion = completion;
+        if (!safeCompletion) {
+            safeCompletion = ^{};
+        }
+        
+        // v36.57: Ensure UI operations run on main thread
+        if ([NSThread isMainThread]) {
+            orig_alertControllerPresent(self, _cmd, animated, safeCompletion);
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    orig_alertControllerPresent(self, _cmd, animated, safeCompletion);
+                } @catch (NSException *e) {
+                    DLOG(@"[DIAG-ALERT] Exception in main thread present: %@", e.reason);
+                } @catch (...) {
+                    DLOG(@"[DIAG-ALERT] Unknown exception in main thread present");
+                }
+            });
+        }
     } @catch (NSException *e) {
-        DLOG(@"[DIAG-ALERT] Exception in alert hook: %@", e.reason);
+        DLOG(@"[DIAG-ALERT] Exception in alert hook outer: %@", e.reason);
     }
     @catch (...) {
-        DLOG(@"[DIAG-ALERT] Unknown exception in alert hook");
+        DLOG(@"[DIAG-ALERT] Unknown exception in alert hook outer");
     }
 }
 
@@ -1761,20 +1804,29 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
             }
             
             if (ips.count > 0 && ports.count > 0) {
-                for (NSUInteger i = 0; i < MIN(ips.count, ports.count); i++) {
+                // v36.57: Store servers in list for rotation
+                g_serverCount = 0;
+                for (NSUInteger i = 0; i < MIN(ips.count, ports.count) && g_serverCount < MAX_SERVERS; i++) {
                     int portInt = [ports[i] intValue];
                     if (portInt > 0 && portInt < 65536) {
                         NSString *ipStr = ips[i];
-                        DLOG(@"[SERVERLIST-PARSE] Server %lu: %@:%d", (unsigned long)i, ipStr, portInt);
+                        DLOG(@"[SERVERLIST-PARSE] Server %d: %@:%d", g_serverCount, ipStr, portInt);
                         
-                        if (!g_gameServerInfoUpdated) {
+                        // Store in server list for rotation
+                        strncpy(g_serverList[g_serverCount].ip, [ipStr UTF8String], 63);
+                        g_serverList[g_serverCount].port = portInt;
+                        g_serverCount++;
+                        
+                        // Set first valid server as default
+                        if (g_serverCount == 1) {
                             strncpy(g_gameServerIP, [ipStr UTF8String], 63);
                             g_gameServerPort = portInt;
-                            g_gameServerInfoUpdated = YES;
-                            DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
+                            g_currentServerIndex = 0;
+                            DLOG(@"[SERVERLIST-PARSE] Set default game server: %s:%d", g_gameServerIP, g_gameServerPort);
                         }
                     }
                 }
+                DLOG(@"[SERVERLIST-PARSE] Stored %d servers for rotation", g_serverCount);
             }
         } else {
             DLOG(@"[SERVERLIST-PARSE] Binary response, trying binary parsing...");
@@ -1788,8 +1840,10 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
             const unsigned char *body = data + 12;
             ssize_t bodyLen = len - 12;
             
-            int serverCount = 0;
-            for (ssize_t offset = 0; offset < bodyLen - 6 && serverCount < 20; offset++) {
+            // v36.57: Reset server list before binary parsing
+            g_serverCount = 0;
+            
+            for (ssize_t offset = 0; offset < bodyLen - 6 && g_serverCount < MAX_SERVERS; offset++) {
                 int b1 = body[offset];
                 int b2 = body[offset+1];
                 int b3 = body[offset+2];
@@ -1804,29 +1858,58 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                     if (offset + 6 < bodyLen) {
                         int port = (body[offset+5] << 8) | body[offset+6];
                         if (port > 0 && port < 65536) {
-                            DLOG(@"[SERVERLIST-PARSE] Binary found server %d: %s:%d", serverCount, ipStr, port);
+                            // v36.57: Store in server list
+                            strncpy(g_serverList[g_serverCount].ip, ipStr, 63);
+                            g_serverList[g_serverCount].port = port;
+                            DLOG(@"[SERVERLIST-PARSE] Binary found server %d: %s:%d", g_serverCount, ipStr, port);
                             
-                            if (!g_gameServerInfoUpdated) {
+                            // Set first valid server as default
+                            if (g_serverCount == 0) {
                                 strncpy(g_gameServerIP, ipStr, 63);
                                 g_gameServerPort = port;
-                                g_gameServerInfoUpdated = YES;
-                                DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
-                            } else {
-                                DLOG(@"[SERVERLIST-PARSE] Skipping update, game server already set: %s:%d", g_gameServerIP, g_gameServerPort);
+                                g_currentServerIndex = 0;
+                                DLOG(@"[SERVERLIST-PARSE] Set default game server: %s:%d", g_gameServerIP, g_gameServerPort);
                             }
-                            serverCount++;
+                            g_serverCount++;
                         }
                     }
                 }
             }
             
-            if (serverCount == 0) {
+            if (g_serverCount > 0) {
+                DLOG(@"[SERVERLIST-PARSE] Stored %d servers for rotation", g_serverCount);
+            } else {
                 DLOG(@"[SERVERLIST-PARSE] No servers found in binary response");
             }
         }
     } @catch (NSException *e) {
         DLOG(@"[SERVERLIST-PARSE] Exception: %@", e.reason);
     }
+}
+
+// v36.57: Function to try next server in rotation
+static BOOL tryNextServer(void) {
+    if (g_serverCount <= 1) {
+        DLOG(@"[SERVER-ROTATE] Only %d server(s) available, cannot rotate", g_serverCount);
+        return NO;
+    }
+    
+    g_connectionFailCount++;
+    g_currentServerIndex = (g_currentServerIndex + 1) % g_serverCount;
+    
+    strncpy(g_gameServerIP, g_serverList[g_currentServerIndex].ip, 63);
+    g_gameServerPort = g_serverList[g_currentServerIndex].port;
+    
+    DLOG(@"[SERVER-ROTATE] Switching to server %d/%d: %s:%d (fail count=%d)", 
+         g_currentServerIndex + 1, g_serverCount, g_gameServerIP, g_gameServerPort, g_connectionFailCount);
+    
+    // Update stub data
+    if (g_msiStubData) {
+        [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
+        [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
+    }
+    
+    return YES;
 }
 
 static int hook_close(int fd) {
@@ -1951,6 +2034,19 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
              sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
+        
+        // v36.57: If connection failed on game server, try next server for retry
+        if (isGameServer && result != 0) {
+            DLOG(@"[SOCK] Game server %s:%d connection failed, attempting rotation...", host, port);
+            @try {
+                BOOL rotated = tryNextServer();
+                if (rotated) {
+                    DLOG(@"[SOCK] Rotated to %s:%d for retry", g_gameServerIP, g_gameServerPort);
+                }
+            } @catch (NSException *e) {
+                DLOG(@"[SOCK] Exception during rotation: %@", e.reason);
+            }
+        }
         
         return result;
 #endif
@@ -2352,6 +2448,18 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
         if (ret == 0) {
             DLOG(@"[RECV-CLOSE] fd=%d %s:%d ret=0 (server closed connection gracefully)", fd, host, port);
+            // v36.57: Game server disconnected, try next server
+            if (port == 12003 || port == 58158) {
+                DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
+                @try {
+                    BOOL rotated = tryNextServer();
+                    if (rotated) {
+                        DLOG(@"[SERVER-ROTATE] Rotated to %s:%d, game should retry connection", g_gameServerIP, g_gameServerPort);
+                    }
+                } @catch (NSException *e) {
+                    DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
+                }
+            }
         } else {
             DLOG(@"[RECV-ERR] fd=%d %s:%d ret=%zd errno=%d (%s)", fd, host, port, ret, errno, strerror(errno));
         }
@@ -2485,71 +2593,115 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     
 #if !MINIMAL_MODE
-    // v36.56: Analyze game server (58158 and 12003) responses
-    if ((port == 58158 || port == 12003) && ret >= 8) {
+    // v36.57: Enhanced game server response analysis (ALL ports, detailed logging)
+    // Analyze responses on game ports (12003, 58158) - log EVERYTHING
+    if ((port == 12003 || port == 58158) && ret >= 4) {
         @try {
             uint32_t rcmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                             ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
             
             const char *gamePort = (port == 58158) ? "58158" : "12003";
             
-            // Log ALL game server responses with detailed analysis
-            NSMutableString *detail = [NSMutableString stringWithCapacity:512];
-            [detail appendFormat:@"[GAME-RECV] cmd=0x%08X len=%zd port=%s\n", rcmd, ret, gamePort];
-            [detail appendFormat:@"  Full hex: "];
-            size_t showLen = ret > 128 ? 128 : (size_t)ret;
+            // v36.57: Build comprehensive log with hex dump
+            NSMutableString *detail = [NSMutableString stringWithCapacity:1024];
+            [detail appendFormat:@"[GAME-RECV] cmd=0x%08X pktLen=%u recvLen=%zd port=%s fd=%d host=%s\n", 
+                 rcmd, pktLen, ret, gamePort, fd, host];
+            
+            // Hex dump - show up to 256 bytes for thorough analysis
+            [detail appendFormat:@"  HEX(%zd bytes): ", ret];
+            size_t showLen = ret > 256 ? 256 : (size_t)ret;
             for (ssize_t i = 0; i < showLen; i++) {
                 [detail appendFormat:@"%02X ", p[i]];
+                if ((i+1) % 32 == 0 && (ssize_t)i+1 < showLen) {
+                    [detail appendFormat:@"\n  CONT: "];
+                }
             }
-            if ((size_t)ret > 128) [detail appendFormat:@"...\n"];
+            if ((size_t)ret > 256) [detail appendFormat:@"...TRUNCATED\n"];
             else [detail appendFormat:@"\n"];
             
-            // Check for status/error bytes in response
-            if (ret >= 13) {
-                uint8_t status = p[12];
-                [detail appendFormat:@"  Status byte at offset 12: %u (0x%02X)\n", status, status];
-                if (status != 0) {
-                    [detail appendFormat:@"  WARNING: Non-zero status detected!\n"];
-                    // v36.56: Patch game server error responses
-                    // If status != 0, patch it to 0 (success)
-                    if (port == 12003) {
-                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 in game server response (port=12003)", status);
-                        ((unsigned char *)buf)[12] = 0;
-                        [detail appendFormat:@"  PATCHED: status set to 0\n"];
+            // ASCII interpretation of payload (offset 12 onwards)
+            if (ret > 12) {
+                NSString *asciiPayload = [[NSString alloc] initWithBytes:p+12 length:MIN((NSUInteger)(ret-12), 200) encoding:NSUTF8StringEncoding];
+                if (asciiPayload && asciiPayload.length > 0) {
+                    // Check if it's printable text or binary
+                    BOOL hasPrintable = NO;
+                    for (NSUInteger i = 0; i < MIN(asciiPayload.length, 50); i++) {
+                        unichar c = [asciiPayload characterAtIndex:i];
+                        if ((c >= 0x20 && c < 0x7F) || c == 0x0A || c == 0x0D) { hasPrintable = YES; break; }
+                    }
+                    if (hasPrintable) {
+                        [detail appendFormat:@"  ASCII payload: %@\n", asciiPayload];
                     }
                 }
             }
             
-            // Check for error text in response
-            NSString *payloadStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
-            if (payloadStr && payloadStr.length > 0) {
-                [detail appendFormat:@"  Payload text: %@\n", payloadStr];
-                // Check for error keywords
-                if ([payloadStr containsString:@"版本过低"] || [payloadStr containsString:@"当前版本"]) {
-                    [detail appendFormat:@"  WARNING: Error text found in response!\n"];
-                    DLOG(@"[GAME-PATCH] Error text found in game server response: %@", payloadStr);
-                    // Clear error text for 12003 port
+            // Status byte analysis
+            if (ret >= 13) {
+                uint8_t status = p[12];
+                [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
+                if (status != 0) {
+                    [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
+                    // v36.57: Patch game server error responses for port 12003
                     if (port == 12003) {
-                        static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-                        for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-                            if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                                DLOG(@"[GAME-PATCH] Cleared '版本过低' at offset %zd", i);
-                                memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=12003)", status);
+                        ((unsigned char *)buf)[12] = 0;
+                        [detail appendFormat:@"  [PATCH] Status patched to 0\n"];
+                    }
+                }
+            }
+            
+            // Check for specific error keywords in payload
+            if (ret > 12) {
+                NSData *payloadData = [NSData dataWithBytes:p+12 length:(NSUInteger)(ret-12)];
+                NSString *payloadStr = [[NSString alloc] initWithData:payloadData encoding:NSUTF8StringEncoding];
+                if (payloadStr && payloadStr.length > 0) {
+                    if ([payloadStr containsString:@"版本过低"] || [payloadStr containsString:@"当前版本"] || 
+                        [payloadStr containsString:@"版本太旧"]) {
+                        [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
+                        DLOG(@"[GAME-PATCH] Error text found: %@", payloadStr);
+                        // Clear error text for 12003 port
+                        if (port == 12003) {
+                            static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+                            static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+                            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
+                                if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
+                                    DLOG(@"[GAME-PATCH] Cleared '版本过低' at offset %zd", i);
+                                    memset((unsigned char *)buf + i, ' ', sizeof(verLow));
+                                }
+                            }
+                            for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
+                                if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
+                                    DLOG(@"[GAME-PATCH] Cleared '当前版本' at offset %zd", i);
+                                    memset((unsigned char *)buf + i, ' ', sizeof(curVer));
+                                }
                             }
                         }
                     }
                 }
             }
             
-            // Specific game commands
-            if (rcmd == 0x80FFF493 || rcmd == 0x80FFFF01 || rcmd == 0x80FFFF02 ||
-                rcmd == 0x80EE0007 || rcmd == 0x80EE0700 || rcmd == 0x00FFFF01 || rcmd == 0x00FFFF02) {
-                [detail appendFormat:@"  [Game protocol packet - cmd=0x%08X]\n", rcmd];
+            // v36.57: Categorize known game protocol commands
+            if (rcmd == 0x00FFFF01 || rcmd == 0x00FFFF02) {
+                [detail appendFormat:@"  [CHALLENGE] Server challenge packet (cmd=0x%08X)\n", rcmd];
+            } else if (rcmd == 0x80FFFF01 || rcmd == 0x80FFFF02) {
+                [detail appendFormat:@"  [RESPONSE] Challenge response packet (cmd=0x%08X)\n", rcmd];
+            } else if (rcmd == 0x00EEE007 || rcmd == 0x80EEE007) {
+                [detail appendFormat:@"  [DEVICE-INFO] Device info response (cmd=0x%08X)\n", rcmd];
+            } else if (rcmd == 0x00F493 || rcmd == 0x80F493) {
+                [detail appendFormat:@"  [ENCRYPTED] Encrypted game data (cmd=0x%08X)\n", rcmd];
+            } else if (rcmd == 0x80EE0007 || rcmd == 0x80EE0700) {
+                [detail appendFormat:@"  [GAME-PROTO] Game protocol packet (cmd=0x%08X)\n", rcmd];
+            } else if (rcmd >= 0x80000000) {
+                [detail appendFormat:@"  [SERVER-RESP] Server response (cmd=0x%08X)\n", rcmd];
+            } else {
+                [detail appendFormat:@"  [UNKNOWN] Unknown command (cmd=0x%08X) - possible protocol data\n", rcmd];
             }
             
             DLOG(@"%@", detail);
         } @catch (NSException *e) {
-            DLOG(@"[GAME-RECV] Exception: %@", e.reason);
+            DLOG(@"[GAME-RECV] Exception during analysis: %@", e.reason);
         }
     }
 #endif
@@ -3491,7 +3643,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.56 - Add 12003 logging, game server patch");
+    DLOG(@"[VERSION] WangXianHook v36.57 - Server rotation, alert crash fix, full game server logging");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
