@@ -1,13 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.37 - Non-blocking connect + select() wait
- * FIX: Set non-blocking mode on game server socket BEFORE connect
- * FIX: After connect returns EINPROGRESS, use select() to wait up to 15s
- * FIX: Restore blocking mode after connection completes
- * FIX: Game sees synchronous connect result (0 or -1), not EINPROGRESS
- * WHY: Game does NOT support non-blocking connect - expects synchronous result
+ * WangXianHook v36.38 - Login server redirect + server list port patch
+ * FIX: Redirect backup login server (47.100.222.229:5678) to primary (47.100.14.198:58158)
+ * FIX: Patch server list response (0x802EE113) port 12003 -> 58158
+ * FIX: Re-enabled parseServerListResponse to update global game server info
+ * WHY: Game detects injection and switches to backup server with wrong port
  * 
- * PREVIOUS (v36.36):
+ * PREVIOUS (v36.37):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -156,7 +155,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.37 loaded ===");
+        _log(@"=== WangXianHook v36.38 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -335,7 +334,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.37 诊断面板";
+            lbl.text = @"WXHook v36.38 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1644,8 +1643,25 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         const struct sockaddr *finalAddr = addr;
         struct sockaddr_in newAddr;
+        BOOL isGameServer = NO;
         
-        // RE-ENABLED port rewrite for game server
+        // RE-ENABLED: Login server rewrite backup -> primary
+        // Normal client connects to 47.100.14.198:58158 for BOTH login and game
+        // Injected client is detected and switched to backup server 47.100.222.229:5678
+        // Rewrite backup login to primary server
+        if (strcmp(host, "47.100.222.229") == 0 && port == 5678) {
+            DLOG(@"[REWRITE] Login backup %s:5678 -> %s:58158", host, g_gameServerIP);
+            memset(&newAddr, 0, sizeof(newAddr));
+            newAddr.sin_family = AF_INET;
+            inet_aton(g_gameServerIP, &newAddr.sin_addr);
+            newAddr.sin_port = htons(58158);
+            finalAddr = (const struct sockaddr *)&newAddr;
+            addrlen = sizeof(newAddr);
+            strncpy(host, g_gameServerIP, 63);
+            port = 58158;
+        }
+        
+        // RE-ENABLED: Game server port rewrite 12003 -> 58158
         if (port == 12003) {
             DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, g_gameServerIP);
             memset(&newAddr, 0, sizeof(newAddr));
@@ -1656,9 +1672,9 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             addrlen = sizeof(newAddr);
             strncpy(host, g_gameServerIP, 63);
             port = 58158;
+            isGameServer = YES;
             
             // KEY: Set non-blocking mode so connect returns immediately
-            // Then we'll use select() to wait for connection
             if (!isNonBlocking) {
                 int newFlags = sockFlags | O_NONBLOCK;
                 fcntl(sockfd, F_SETFL, newFlags);
@@ -1668,7 +1684,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         }
         
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d", sockfd, host, port, isNonBlocking);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d game_server=%d", sockfd, host, port, isNonBlocking, isGameServer);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
@@ -1676,7 +1692,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
         
         // KEY FIX: If connect returns EINPROGRESS (non-blocking), wait with select()
-        if (result != 0 && errno == EINPROGRESS && port == 58158) {
+        if (result != 0 && errno == EINPROGRESS && isGameServer) {
             DLOG(@"[CONNECT-WAIT] EINPROGRESS - waiting for connection with select()...");
             
             fd_set writeSet;
@@ -1688,7 +1704,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             waitTime.tv_usec = 0;
             
             int selectResult = select(sockfd + 1, NULL, &writeSet, NULL, &waitTime);
-            DLOG(@"[CONNECT-WAIT] select() returned=%d", selectResult);
+            DLOG(@"[CONNECT-WAIT] select() returned=%d errno=%d(%s)", selectResult, errno, strerror(errno));
             
             if (selectResult > 0) {
                 int sockErr = 0;
@@ -1718,10 +1734,10 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
                 DLOG(@"[CONNECT-WAIT] Restored blocking mode");
             }
-        } else if (result == 0) {
-            // Restore blocking mode if we had temporarily set non-blocking
+        } else if (result == 0 && isGameServer) {
+            // Restore blocking mode after successful connect
             int origFlags = fcntl(sockfd, F_GETFL, 0);
-            if ((origFlags & O_NONBLOCK) && port == 58158) {
+            if (origFlags & O_NONBLOCK) {
                 fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
                 DLOG(@"[SOCK] Restored blocking mode after successful connect");
             }
@@ -1731,8 +1747,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d game_server=%d", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking, isGameServer);
         
         return result;
     } else if (addr->sa_family == AF_INET6) {
@@ -2155,7 +2171,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
-            // DETAILED HEX DUMP of server list response for comparison with normal client
+            // DETAILED HEX DUMP of server list response
             DLOG(@"[SERVERLIST-HEX] Full response hex (%zd bytes):", ret);
             for (ssize_t i = 0; i < ret; i += 32) {
                 NSMutableString *line = [NSMutableString string];
@@ -2165,8 +2181,30 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[SERVERLIST-HEX]   %zd: %@", i, line);
             }
             
-            // DISABLED parseServerListResponse for v36.35 - don't modify server list data
-            DLOG(@"[SERVERLIST-HEX] NO PARSING - leaving data untouched for analysis");
+            // Patch server list: replace port 12003 (0x2EE3) with 58158 (0xE34E)
+            // Server list format: 4 bytes IP + 2 bytes port (big-endian) per entry
+            if (ret >= 12) {
+                unsigned char *b = (unsigned char *)buf;
+                int patched = 0;
+                for (ssize_t i = 12; i <= ret - 6; i++) {
+                    int b1 = b[i], b4 = b[i+3];
+                    int port = (b[i+4] << 8) | b[i+5];
+                    // Valid IP: b1 in 1-223 (not 127), b4 in 1-223
+                    if (b1 >= 1 && b1 <= 223 && b1 != 127 && b4 >= 1 && b4 <= 223 && port == 12003) {
+                        DLOG(@"[SERVERLIST-PATCH] Found IP %d.%d.%d.%d:12003 at offset %zd -> 58158",
+                             b1, b[i+1], b[i+2], b4, i);
+                        b[i+4] = 0xE3; // 58158 high byte
+                        b[i+5] = 0x4E; // 58158 low byte
+                        patched++;
+                    }
+                }
+                if (patched > 0) {
+                    DLOG(@"[SERVERLIST-PATCH] Patched %d server entries from port 12003 to 58158", patched);
+                }
+            }
+            
+            // Update global game server info from response
+            parseServerListResponse((const unsigned char *)buf, ret);
             
             // Also try to decode as JSON
             NSString *jsonStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
