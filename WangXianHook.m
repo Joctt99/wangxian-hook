@@ -1,11 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.39 - Revert login server redirect, keep game server fix
- * FIX: REVERTED login server redirect (keep 5678 for login - it works)
- * FIX: KEEP game server port rewrite 12003 -> 58158
- * FIX: KEEP non-blocking + select() with 5s timeout
- * FIX: KEEP server list port patch in 0x802EE113 response
- * WHY: Login on 5678 was working fine; only game server connection was failing
+ * WangXianHook v36.40 - Remove port rewrite, add ServerInfoForClient stub
+ * FIX: REMOVED game server port rewrite (12003 -> 58158)
+ * FIX: REMOVED server list port patch in 0x802EE113 response
+ * FIX: ADDED ServerInfoForClient stub class creation when real class not found
+ * FIX: Default game server port changed to 12003 (original server port)
+ * WHY: Port rewrite caused connection timeout; original port 12003 should be used
+ * 
+ * PREVIOUS (v36.39):
+ * FIX: Revert login server redirect, keep game server fix with 5s timeout
  * 
  * PREVIOUS (v36.38):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
@@ -156,7 +159,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.39 loaded ===");
+        _log(@"=== WangXianHook v36.40 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -335,7 +338,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.39 诊断面板";
+            lbl.text = @"WXHook v36.40 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -929,6 +932,144 @@ static id msi_init_hook(id self, SEL _cmd) {
     return ret;
 }
 
+// ============================================================
+// ServerInfoForClient Stub Class Implementation
+// ============================================================
+
+static NSMutableDictionary *g_msiStubData = nil;
+
+static id msiStub_init(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient init] called");
+    if (!g_msiStubData) {
+        g_msiStubData = [[NSMutableDictionary alloc] init];
+        [g_msiStubData setObject:@1 forKey:@"status"];
+        [g_msiStubData setObject:@1 forKey:@"serverType"];
+        [g_msiStubData setObject:@1 forKey:@"serverid"];
+        [g_msiStubData setObject:@1 forKey:@"clientid"];
+        [g_msiStubData setObject:@"一区" forKey:@"category"];
+        [g_msiStubData setObject:@"运行" forKey:@"description"];
+        [g_msiStubData setObject:g_gameServerIP forKey:@"ip"];
+        [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
+        DLOG(@"[MSI-STUB] Initialized with ip=%@ port=%d", g_gameServerIP, g_gameServerPort);
+    }
+    return self;
+}
+
+static id msiStub_initWithDict(id self, SEL _cmd, NSDictionary *dict) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient initWithDictionary:] called");
+    if (!g_msiStubData) {
+        g_msiStubData = [[NSMutableDictionary alloc] init];
+    }
+    
+    if (dict) {
+        // Use provided dictionary but override critical fields
+        [g_msiStubData setDictionary:dict];
+    }
+    
+    // Ensure critical fields are set
+    [g_msiStubData setObject:@1 forKey:@"status"];
+    [g_msiStubData setObject:@1 forKey:@"serverType"];
+    [g_msiStubData setObject:@"一区" forKey:@"category"];
+    [g_msiStubData setObject:@"运行" forKey:@"description"];
+    
+    // Override IP and port with our game server
+    [g_msiStubData setObject:g_gameServerIP forKey:@"ip"];
+    [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
+    
+    // Log all properties
+    @try {
+        for (NSString *key in g_msiStubData) {
+            DLOG(@"[MSI-STUB]   %@ = %@", key, g_msiStubData[key]);
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[MSI-STUB] Exception logging: %@", e.reason);
+    }
+    
+    return self;
+}
+
+static NSNumber *msiStub_status(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient status] -> 1");
+    return @1;
+}
+
+static NSString *msiStub_ip(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient ip] -> %s", g_gameServerIP);
+    return [NSString stringWithUTF8String:g_gameServerIP];
+}
+
+static NSString *msiStub_category(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient category] -> 一区");
+    return @"一区";
+}
+
+static NSNumber *msiStub_serverType(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient serverType] -> 1");
+    return @1;
+}
+
+static NSInteger msiStub_integer(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] integer method called -> 1");
+    return 1;
+}
+
+static NSString *msiStub_string(id self, SEL _cmd) {
+    DLOG(@"[MSI-STUB] string method called -> stub");
+    return @"stub";
+}
+
+static void createServerInfoForClientStub(void) {
+    @try {
+        // Check if class already exists
+        Class existingClass = NSClassFromString(@"ServerInfoForClient");
+        if (existingClass) {
+            DLOG(@"[MSI-STUB] ServerInfoForClient class already exists");
+            return;
+        }
+        
+        // Create stub class
+        Class stubClass = objc_allocateClassPair([NSObject class], "ServerInfoForClient", 0);
+        if (stubClass) {
+            // Add instance methods
+            class_addMethod(stubClass, @selector(init), (IMP)msiStub_init, "@@:");
+            class_addMethod(stubClass, @selector(initWithDictionary:), (IMP)msiStub_initWithDict, "@@:@");
+            class_addMethod(stubClass, @selector(status), (IMP)msiStub_status, "@@:");
+            class_addMethod(stubClass, @selector(statusValue), (IMP)msiStub_status, "@@:");
+            class_addMethod(stubClass, @selector(ip), (IMP)msiStub_ip, "@@:");
+            class_addMethod(stubClass, @selector(port), (IMP)msiStub_serverType, "@@:");
+            class_addMethod(stubClass, @selector(category), (IMP)msiStub_category, "@@:");
+            class_addMethod(stubClass, @selector(serverType), (IMP)msiStub_serverType, "@@:");
+            class_addMethod(stubClass, @selector(serverid), (IMP)msiStub_integer, "l@:");
+            class_addMethod(stubClass, @selector(clientid), (IMP)msiStub_integer, "l@:");
+            class_addMethod(stubClass, @selector(description), (IMP)msiStub_string, "@@:");
+            class_addMethod(stubClass, @selector(objectForKey:), (IMP)msiStub_string, "@@:@");
+            
+            // Register the class
+            objc_registerClassPair(stubClass);
+            DLOG(@"[MSI-STUB] Created ServerInfoForClient stub class successfully");
+            
+            // Verify class exists
+            Class verifyClass = NSClassFromString(@"ServerInfoForClient");
+            if (verifyClass) {
+                DLOG(@"[MSI-STUB] Verified: ServerInfoForClient class is now available");
+                
+                // Log all methods
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(verifyClass, &mcount);
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    DLOG(@"[MSI-STUB]   Method: %@", NSStringFromSelector(sel));
+                }
+                if (methods) free(methods);
+            }
+        } else {
+            DLOG(@"[MSI-STUB] Failed to create ServerInfoForClient stub class");
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[MSI-STUB] Exception creating stub class: %@", e.reason);
+    }
+}
+
 static id msi_initWithDict_hook(id self, SEL _cmd, NSDictionary *dict) {
     NSMutableDictionary *mutDict = nil;
     if (dict) {
@@ -1197,6 +1338,31 @@ static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
         }
     } else {
         DLOG(@"[MSI-RETRY] ServerInfoForClient class not found at attempt #%d", attempt);
+        
+        if (attempt >= 2) {
+            // v36.40: After 2 retries, create stub class so UI can display server list
+            DLOG(@"[MSI-STUB] Attempt %d >= 2, creating ServerInfoForClient stub class...", attempt);
+            createServerInfoForClientStub();
+            
+            // Verify and hook the newly created stub class
+            Class stubCls = NSClassFromString(@"ServerInfoForClient");
+            if (stubCls) {
+                DLOG(@"[MSI-STUB] Stub class created and verified successfully");
+                
+                // Log all methods on stub
+                unsigned int smcount = 0;
+                Method *smethods = class_copyMethodList(stubCls, &smcount);
+                for (unsigned int i = 0; i < smcount; i++) {
+                    SEL sel = method_getName(smethods[i]);
+                    DLOG(@"[MSI-STUB]   Method: %@", NSStringFromSelector(sel));
+                }
+                if (smethods) free(smethods);
+            } else {
+                DLOG(@"[MSI-STUB] Failed to verify stub class after creation!");
+            }
+            return;
+        }
+        
         if (attempt < 3) {
             double delays[] = {2.0, 5.0, 10.0};
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1436,7 +1602,7 @@ static int g_trackedPorts[MAX_TRACKED_FDS];
 static int g_trackedCount = 0;
 static BOOL g_trackedActive[MAX_TRACKED_FDS];
 
-static int g_gameServerPort = 58158;
+static int g_gameServerPort = 12003;
 static char g_gameServerIP[64] = "47.100.14.198";
 static BOOL g_gameServerInfoUpdated = YES;
 
@@ -1642,99 +1808,22 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d host=%s port=%d", sockfd, sockFlags, isNonBlocking, host, port);
         
-        const struct sockaddr *finalAddr = addr;
-        struct sockaddr_in newAddr;
-        BOOL isGameServer = NO;
-        
-        // ONLY: Game server port rewrite 12003 -> 58158
-        // Login on 5678 works fine - DO NOT redirect it
-        if (port == 12003) {
-            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, g_gameServerIP);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_gameServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons(58158);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_gameServerIP, 63);
-            port = 58158;
-            isGameServer = YES;
-            
-            // KEY: Set non-blocking mode so connect returns immediately
-            if (!isNonBlocking) {
-                int newFlags = sockFlags | O_NONBLOCK;
-                fcntl(sockfd, F_SETFL, newFlags);
-                isNonBlocking = YES;
-                DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode for game server", sockfd);
-            }
-        }
-        
+        // DISABLED port rewrite for v36.40 - let game connect directly
+        // Only track connection info for logging
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d game_server=%d", sockfd, host, port, isNonBlocking, isGameServer);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (NO REWRITE)", sockfd, host, port, isNonBlocking);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
-        
-        // KEY FIX: If connect returns EINPROGRESS (non-blocking), wait with select()
-        if (result != 0 && errno == EINPROGRESS && isGameServer) {
-            DLOG(@"[CONNECT-WAIT] EINPROGRESS - waiting for connection with select()...");
-            
-            fd_set writeSet;
-            FD_ZERO(&writeSet);
-            FD_SET(sockfd, &writeSet);
-            
-            struct timeval waitTime;
-            waitTime.tv_sec = 5;
-            waitTime.tv_usec = 0;
-            
-            int selectResult = select(sockfd + 1, NULL, &writeSet, NULL, &waitTime);
-            DLOG(@"[CONNECT-WAIT] select() returned=%d errno=%d(%s)", selectResult, errno, strerror(errno));
-            
-            if (selectResult > 0) {
-                int sockErr = 0;
-                socklen_t errLen = sizeof(sockErr);
-                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen);
-                
-                if (sockErr == 0) {
-                    DLOG(@"[CONNECT-WAIT] Connection SUCCESS after select!");
-                    result = 0;
-                } else {
-                    DLOG(@"[CONNECT-WAIT] Connection FAILED after select: errno=%d(%s)", sockErr, strerror(sockErr));
-                    errno = sockErr;
-                    result = -1;
-                }
-            } else if (selectResult == 0) {
-                DLOG(@"[CONNECT-WAIT] Connection TIMED OUT after 5s");
-                errno = ETIMEDOUT;
-                result = -1;
-            } else {
-                DLOG(@"[CONNECT-WAIT] select() error: errno=%d(%s)", errno, strerror(errno));
-                result = -1;
-            }
-            
-            // Restore blocking mode for game
-            int origFlags = fcntl(sockfd, F_GETFL, 0);
-            if (origFlags & O_NONBLOCK) {
-                fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
-                DLOG(@"[CONNECT-WAIT] Restored blocking mode");
-            }
-        } else if (result == 0 && isGameServer) {
-            // Restore blocking mode after successful connect
-            int origFlags = fcntl(sockfd, F_GETFL, 0);
-            if (origFlags & O_NONBLOCK) {
-                fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
-                DLOG(@"[SOCK] Restored blocking mode after successful connect");
-            }
-        }
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d game_server=%d", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking, isGameServer);
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
         
         return result;
     } else if (addr->sa_family == AF_INET6) {
@@ -2167,27 +2256,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[SERVERLIST-HEX]   %zd: %@", i, line);
             }
             
-            // Patch server list: replace port 12003 (0x2EE3) with 58158 (0xE34E)
+            // v36.40: DISABLED port rewriting - use original port 12003 as-is
             // Server list format: 4 bytes IP + 2 bytes port (big-endian) per entry
-            if (ret >= 12) {
-                unsigned char *b = (unsigned char *)buf;
-                int patched = 0;
-                for (ssize_t i = 12; i <= ret - 6; i++) {
-                    int b1 = b[i], b4 = b[i+3];
-                    int port = (b[i+4] << 8) | b[i+5];
-                    // Valid IP: b1 in 1-223 (not 127), b4 in 1-223
-                    if (b1 >= 1 && b1 <= 223 && b1 != 127 && b4 >= 1 && b4 <= 223 && port == 12003) {
-                        DLOG(@"[SERVERLIST-PATCH] Found IP %d.%d.%d.%d:12003 at offset %zd -> 58158",
-                             b1, b[i+1], b[i+2], b4, i);
-                        b[i+4] = 0xE3; // 58158 high byte
-                        b[i+5] = 0x4E; // 58158 low byte
-                        patched++;
-                    }
-                }
-                if (patched > 0) {
-                    DLOG(@"[SERVERLIST-PATCH] Patched %d server entries from port 12003 to 58158", patched);
-                }
-            }
+            DLOG(@"[SERVERLIST-PATCH] Port rewriting DISABLED - using original ports from server list");
             
             // Update global game server info from response
             parseServerListResponse((const unsigned char *)buf, ret);
