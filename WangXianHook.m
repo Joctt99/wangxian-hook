@@ -1,13 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.57 - Server rotation, alert crash fix, full game server logging
+ * WangXianHook v36.58 - Port rewrite 12003->58158, simple direct connect
  * MODE: FULL - All hooks enabled including game server analysis
  * 
- * v36.57 CRITICAL FIXES:
- * - Implement server list rotation/retry (tryNextServer)
- * - Fix hook_alertControllerPresent SIGSEGV crash (NULL checks, main thread)
- * - Enhanced game server response logging (all ports and commands)
- * - MINIMAL_MODE=0: Enable ALL hooks including crypto and game server analysis
+ * v36.58 CRITICAL FIXES:
+ * - Re-enable port rewrite 12003->58158 (normal client uses 58158)
+ * - Remove O_NONBLOCK + select - use simple direct connect
+ * - Unified hook_connect for all modes (no MINIMAL_MODE branch)
  * 
  * v36.55 CRITICAL FIXES:
  * - SIMPLE direct connect: NO port rewrite, NO non-blocking, NO select
@@ -206,7 +205,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.57 loaded ===");
+        _log(@"=== WangXianHook v36.58 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -385,7 +384,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.57 诊断面板";
+            lbl.text = @"WXHook v36.58 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1946,19 +1945,40 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
-        int sockFlags = fcntl(sockfd, F_GETFL, 0);
-        BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
+        // v36.58: Port rewrite 12003 -> 58158 (normal client uses 58158)
+        BOOL isGameServer = (port == 12003 || port == 58158);
+        BOOL needRewrite = (port == 12003);
         
-#if MINIMAL_MODE
-        // v36.55: SIMPLE direct connect - NO port rewrite, NO non-blocking, NO select
-        // Just pass through to original connect
+        // Save original address for logging
+        char origHost[64];
+        int origPort = port;
+        strncpy(origHost, host, 63);
+        origHost[63] = '\0';
+        
+        struct sockaddr_in newAddr = *in;
+        
+        if (needRewrite) {
+            // Rewrite port 12003 -> 58158
+            newAddr.sin_port = htons(58158);
+            port = 58158;
+            strncpy(host, g_gameServerIP, 63);
+            host[63] = '\0';
+            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", origHost, host);
+        }
+        
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d (v36.55 SIMPLE)", sockfd, host, port);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d (v36.58 SIMPLE%s)", sockfd, host, port, needRewrite ? " PORT REWRITE 12003->58158" : "");
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        // Use rewritten address if needed
+        int result;
+        if (needRewrite) {
+            result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
+        } else {
+            result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        }
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
@@ -1967,75 +1987,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs", 
              sockfd, host, port, result, errno, strerror(errno), elapsed);
         
-        return result;
-#else
-        // v36.45: DISABLE port rewrite - use original port directly
-        // Try connecting with original port (12003) to verify if port rewrite caused issues
-        BOOL isGameServer = (port == 58158 || port == 12003);
-        
-        if (isGameServer && !isNonBlocking) {
-            int flags = fcntl(sockfd, F_GETFL, 0);
-            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-            isNonBlocking = YES;
-            DLOG(@"[SOCK] Set O_NONBLOCK for game server %s:%d", host, port);
-        }
-        
-        trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (NO PORT REWRITE)", sockfd, host, port, isNonBlocking);
-        
-        struct timeval startTV;
-        gettimeofday(&startTV, NULL);
-        
-        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
-        
-        if (isGameServer && isNonBlocking && result == -1 && errno == EINPROGRESS) {
-            DLOG(@"[SOCK] connect returned EINPROGRESS, waiting with select...");
-            
-            fd_set writefds;
-            FD_ZERO(&writefds);
-            FD_SET(sockfd, &writefds);
-            
-            struct timeval timeout;
-            timeout.tv_sec = 5;
-            timeout.tv_usec = 0;
-            
-            int selResult = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
-            
-            if (selResult > 0) {
-                int sockErr = 0;
-                socklen_t errLen = sizeof(sockErr);
-                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen);
-                
-                if (sockErr == 0) {
-                    result = 0;
-                    DLOG(@"[SOCK] select returned success, SO_ERROR=0");
-                } else {
-                    result = -1;
-                    errno = sockErr;
-                    DLOG(@"[SOCK] select returned but SO_ERROR=%d (%s)", sockErr, strerror(sockErr));
-                }
-            } else if (selResult == 0) {
-                result = -1;
-                errno = ETIMEDOUT;
-                DLOG(@"[SOCK] select timeout after 5 seconds");
-            } else {
-                result = -1;
-                DLOG(@"[SOCK] select error: %d (%s)", errno, strerror(errno));
-            }
-            
-            int origFlags = fcntl(sockfd, F_GETFL, 0);
-            fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
-            DLOG(@"[SOCK] Restored blocking mode");
-        }
-        
-        struct timeval endTV;
-        gettimeofday(&endTV, NULL);
-        double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
-        
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
-        
-        // v36.57: If connection failed on game server, try next server for retry
+        // If connection failed on game server, try next server for rotation
         if (isGameServer && result != 0) {
             DLOG(@"[SOCK] Game server %s:%d connection failed, attempting rotation...", host, port);
             @try {
@@ -2049,7 +2001,6 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         }
         
         return result;
-#endif
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
@@ -3643,7 +3594,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.57 - Server rotation, alert crash fix, full game server logging");
+    DLOG(@"[VERSION] WangXianHook v36.58 - Port rewrite 12003->58158, simple direct connect");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
