@@ -1,20 +1,27 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.49 - FIXED: KEEP full response, don't truncate ret
- * MODE: FIXED - Always patch login response, crypto hooks disabled
+ * WangXianHook v36.50 - CRITICAL FIX: Remove data corruption in read hook
+ * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
  * 
- * v36.49 Critical Fixes:
- * - FIX: Don't truncate ret to 13 bytes! Game needs full 94-byte response with sessionId
- * - KEEP: 0x802EE121 patch logic ALWAYS enabled (status byte only)
- * - KEEP: Crypto hooks disabled
+ * v36.50 CRITICAL FIXES:
+ * - FIX: Remove ret=13 truncation in hook_read() - it was destroying 0x802EE121 responses!
+ * - FIX: Limit '版本过低' clearing to ONLY port=5678 (login server), NOT port=12003 (game server)
+ * - FIX: Add port check (5678) to 0x802EE121 patch in both recv and read hooks
+ * - FIX: Remove '版本过低'/'当前版本' clearing from read hook entirely
+ * - FIX: Rewrite hook_alertControllerPresent with better error handling to prevent SIGSEGV
  * 
- * v36.48 Critical Fixes:
+ * PROBLEM ANALYSIS:
+ * The game uses both recv() and read() for socket I/O. 
+ * When read() was used for 0x802EE121, it truncated the 94-byte response to 13 bytes,
+ * removing sessionId and other critical data. This caused the "stuck at login" issue.
+ * 
+ * v36.49 Fixes:
+ * - FIX: Don't truncate ret to 13 bytes in hook_recv
+ * 
+ * v36.48 Fixes:
  * - FIX: 0x802EE121 patch logic ALWAYS enabled (was disabled by MINIMAL_MODE)
  * - FIX: Clear '版本过低' messages ALWAYS enabled
- * - KEEP: Crypto hooks disabled (v36.47 fix - avoid corrupting encryption data)
- * 
- * PREVIOUS (v36.47):
- * EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks
+ * - KEEP: Crypto hooks disabled
  * 
  * PREVIOUS (v36.46):
  * MINIMAL MODE - Only 0x802EE121 patch
@@ -1457,12 +1464,20 @@ static void hook_alertViewShow(id self, SEL _cmd) {
 
 static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
 static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
-    if (!orig_alertControllerPresent) {
-        DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL, calling original directly");
-        return;
-    }
-    
     @try {
+        // v36.50: Add NULL checks and type validation before any operation
+        if (!orig_alertControllerPresent) {
+            DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL");
+            // Can't call original, just return
+            return;
+        }
+        
+        // Validate function pointer is not NULL
+        if ((void *)orig_alertControllerPresent == NULL) {
+            DLOG(@"[DIAG-ALERT] orig_alertControllerPresent function pointer is NULL");
+            return;
+        }
+        
         if (self && [self isKindOfClass:[UIAlertController class]]) {
             NSString *title = [self title];
             NSString *msg = [self message];
@@ -1479,16 +1494,14 @@ static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispat
                 }
             }
         }
+        
+        // Call original
+        orig_alertControllerPresent(self, _cmd, animated, completion);
     } @catch (NSException *e) {
         DLOG(@"[DIAG-ALERT] Exception in alert hook: %@", e.reason);
     }
-    
-    @try {
-        if (orig_alertControllerPresent) {
-            orig_alertControllerPresent(self, _cmd, animated, completion);
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[DIAG-ALERT] Exception in original present: %@", e.reason);
+    @catch (...) {
+        DLOG(@"[DIAG-ALERT] Unknown exception in alert hook");
     }
 }
 
@@ -2433,19 +2446,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
     }
     
-    // v36.48: ALWAYS clear '版本过低' messages - critical for login
-    {
+    // v36.50: ONLY clear '版本过低'/'当前版本' on login server (port 5678) - NOT on game server!
+    // Running on port 12003 binary data could corrupt protocol data
+    if (port == 5678) {
         static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
         for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
             if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                DLOG(@"[PATCH-R] Cleared '版本过低' at offset %zd", i);
+                DLOG(@"[PATCH-R] Cleared '版本过低' at offset %zd (port=5678 only)", i);
                 memset((unsigned char *)buf + i, ' ', sizeof(verLow));
             }
         }
         static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
         for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
             if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd", i);
+                DLOG(@"[PATCH-R] Cleared '当前版本' at offset %zd (port=5678 only)", i);
                 memset((unsigned char *)buf + i, ' ', sizeof(curVer));
             }
         }
@@ -2556,55 +2570,21 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                 DLOG(@"[SERVERLIST-JSON2] JSON response: %@", jsonStr);
             }
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+            DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
-            if (cmd == 0x802EE121 && ret >= 90) {
-                const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
-                BOOL hasError = NO;
-                for (ssize_t i = 0; i <= ret - 12; i++) {
-                    if (memcmp(p + i, errMsg, 12) == 0) {
-                        hasError = YES;
-                        break;
-                    }
-                }
-                if (hasError) {
-                    DLOG(@"[PROTO-R-PATCH] 0x802EE121 has error message, replacing with success response (preserving seq#)");
-                    unsigned char *b = (unsigned char *)buf;
-                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) | ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    b[0] = 0x00; b[1] = 0x00; b[2] = 0x00; b[3] = 0x0D;
-                    b[4] = 0x80; b[5] = 0x2E; b[6] = 0xE1; b[7] = 0x21;
-                    b[8] = (origSeq >> 24) & 0xFF; b[9] = (origSeq >> 16) & 0xFF;
-                    b[10] = (origSeq >> 8) & 0xFF; b[11] = origSeq & 0xFF;
-                    b[12] = 0x00;
-                    ret = 13;
-                    DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
-                }
-            } else {
-#if !MINIMAL_MODE
-                if (ret >= 13 && p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq#)", p[12]);
+            // v36.50: ONLY patch on login server (port=5678), and NEVER truncate!
+            if (cmd == 0x802EE121 && ret >= 13 && port == 5678) {
+                if (p[12] != 0) {
+                    DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (read hook, keeping %zd bytes)", p[12], ret);
                     ((unsigned char *)buf)[12] = 0;
+                    // v36.50: Do NOT truncate! Game needs full response with sessionId
                 }
-#endif
             }
         }
     }
     
-#if !MINIMAL_MODE
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-R] Detected '版本过低' in response at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-        }
-    }
-    static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
-        if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-            DLOG(@"[PATCH-R] Detected '当前版本' in response at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(curVer));
-        }
-    }
-#endif
+    // v36.50: Remove '版本过低' clearing from read hook - it's handled in recv hook only
+    // read hook should NOT modify any data to avoid double-patching issues
     
     return ret;
 }
@@ -3448,7 +3428,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.49 - FIXED: KEEP full response, don't truncate ret");
+    DLOG(@"[VERSION] WangXianHook v36.50 - CRITICAL FIX: Remove data corruption in read hook");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
