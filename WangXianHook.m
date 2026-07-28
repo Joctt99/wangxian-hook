@@ -1,11 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.32 - Re-enable port rewriting (12003 -> 58158)
- * FIX: Re-enabled game server port rewriting: 12003 -> 58158
- * FIX: Set correct game server IP: 47.100.14.198
- * WHY: Normal client uses port 58158 for game server
+ * WangXianHook v36.33 - Fix binary parsing overwriting correct IP
+ * FIX: Set g_gameServerInfoUpdated = YES to prevent binary parsing from overwriting
+ * FIX: Improved IP validation in binary parsing (b1 1-223, exclude 127)
+ * FIX: Added log when skipping update in binary parsing
+ * WHY: Binary parsing incorrectly set wrong game server IP (47.230.160.150)
  * 
- * PREVIOUS (v36.31):
+ * PREVIOUS (v36.32):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -154,7 +155,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.32 loaded ===");
+        _log(@"=== WangXianHook v36.33 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -333,7 +334,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.32 诊断面板";
+            lbl.text = @"WXHook v36.33 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1434,7 +1435,7 @@ static BOOL g_trackedActive[MAX_TRACKED_FDS];
 
 static int g_gameServerPort = 58158;
 static char g_gameServerIP[64] = "47.100.14.198";
-static BOOL g_gameServerInfoUpdated = NO;
+static BOOL g_gameServerInfoUpdated = YES;
 
 static void clearTrackedFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
@@ -1570,7 +1571,9 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                 int b3 = body[offset+2];
                 int b4 = body[offset+3];
                 
-                if (b1 == 47 && b4 >= 1 && b4 <= 223) {
+                // More strict IP validation: b1 must be 1-223 (valid public IP range)
+                // Exclude 0 (invalid), 127 (loopback), 224-255 (multicast/reserved)
+                if (b1 >= 1 && b1 <= 223 && b1 != 127 && b4 >= 1 && b4 <= 223) {
                     char ipStr[64];
                     snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", b1, b2, b3, b4);
                     
@@ -1584,6 +1587,8 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                                 g_gameServerPort = port;
                                 g_gameServerInfoUpdated = YES;
                                 DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
+                            } else {
+                                DLOG(@"[SERVERLIST-PARSE] Skipping update, game server already set: %s:%d", g_gameServerIP, g_gameServerPort);
                             }
                             serverCount++;
                         }
