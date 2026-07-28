@@ -1,6 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.27 - Fixed game server port detection (58158)
+ * WangXianHook v36.28 - Fixed login server IP rewriting
+ * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
+ * FIX: Added game server IP rewriting logic
+ * FIX: Added global variables g_loginServerIP and g_loginServerPort
+ * WHY: Game hardcodes wrong login server IP (47.100.222.229), need to redirect to correct IP
+ * 
+ * PREVIOUS (v36.27):
  * FIX: Changed default game server port from 12003 to 58158 (matching normal client)
  * FIX: Added parseServerListResponse() to dynamically extract IP and port from server list response
  * FIX: Updated close hook to use dynamic game server port instead of hardcoded 12003
@@ -143,7 +149,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.27 loaded ===");
+        _log(@"=== WangXianHook v36.28 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -322,7 +328,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.27 诊断面板";
+            lbl.text = @"WXHook v36.28 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1411,6 +1417,9 @@ static int g_gameServerPort = 58158;
 static char g_gameServerIP[64] = {0};
 static BOOL g_gameServerInfoUpdated = NO;
 
+static char g_loginServerIP[64] = "47.100.14.198";
+static int g_loginServerPort = 5678;
+
 static void clearTrackedFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd) {
@@ -1587,21 +1596,53 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
-        trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
         
-        // Game server port (12003) may be down, try anyway
-        // If connection fails, we need special handling in recv
+        const struct sockaddr *finalAddr = addr;
+        struct sockaddr_in newAddr;
+        
+        // Rewrite login server IP: 47.100.222.229 -> 47.100.14.198
+        if (port == g_loginServerPort && strcmp(host, "47.100.222.229") == 0) {
+            DLOG(@"[CONNECT] Rewriting login server %s:%d -> %s:%d", host, port, g_loginServerIP, g_loginServerPort);
+            memset(&newAddr, 0, sizeof(newAddr));
+            newAddr.sin_family = AF_INET;
+            inet_aton(g_loginServerIP, &newAddr.sin_addr);
+            newAddr.sin_port = htons((uint16_t)g_loginServerPort);
+            finalAddr = (const struct sockaddr *)&newAddr;
+            addrlen = sizeof(newAddr);
+            strncpy(host, g_loginServerIP, 63);
+        }
+        
+        // Rewrite game server IP: any IP -> game server IP (if known)
+        if (port == g_gameServerPort && g_gameServerIP[0] != '\0' && strcmp(host, g_gameServerIP) != 0) {
+            DLOG(@"[CONNECT] Rewriting game server %s:%d -> %s:%d", host, port, g_gameServerIP, g_gameServerPort);
+            memset(&newAddr, 0, sizeof(newAddr));
+            newAddr.sin_family = AF_INET;
+            inet_aton(g_gameServerIP, &newAddr.sin_addr);
+            newAddr.sin_port = htons((uint16_t)g_gameServerPort);
+            finalAddr = (const struct sockaddr *)&newAddr;
+            addrlen = sizeof(newAddr);
+            strncpy(host, g_gameServerIP, 63);
+        }
+        
+        trackFd(sockfd, host, port);
+        DLOG(@"[SOCK] connect fd=%d %s:%d (original: port=%d)", sockfd, host, port, port);
+        
+        int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
+        DLOG(@"[SOCK] connect result=%d errno=%d", result, errno);
+        return result;
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
         port = ntohs(in6->sin6_port);
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect6 fd=%d [%s]:%d", sockfd, host, port);
+        
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        DLOG(@"[SOCK] connect6 result=%d errno=%d", result, errno);
+        return result;
     }
     
     int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
-    
     return result;
 }
 
