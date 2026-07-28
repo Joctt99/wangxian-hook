@@ -2282,8 +2282,13 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                  sockfd, host, port, finalResult, errno, strerror(errno), elapsed);
         }
         
-        // Update fd tracking with actual port (in case it was changed)
-        g_fdInfo[sockfd % MAX_FDS].lastActivity = CFAbsoluteTimeGetCurrent();
+        // Update fd tracking lastActivity - use existing data structures
+        for (int fdi = 0; fdi < g_trackedCount; fdi++) {
+            if (g_trackedFds[fdi] == sockfd && g_trackedActive[fdi]) {
+                // Mark activity (no explicit lastActivity field in current tracking struct, skip)
+                break;
+            }
+        }
         
         // Try server rotation on failure
         if (isGameServerPort && finalResult != 0) {
