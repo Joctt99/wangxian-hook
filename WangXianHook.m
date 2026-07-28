@@ -1,13 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.34 - Add detailed connect/packet logging
- * FIX: Added non-blocking socket detection in hook_connect
- * FIX: Added connection timing logs (elapsed time)
- * FIX: Added detailed 0x0000F013 packet TLV parsing
- * FIX: Added EINPROGRESS detection for non-blocking connects
- * WHY: Need to understand why 58158 connection times out
+ * WangXianHook v36.35 - Disable port rewrite, add timeout, dump server list
+ * FIX: DISABLED port rewrite (12003->58158) - let game connect natively
+ * FIX: Added SO_SNDTIMEO=10s timeout to prevent infinite blocking
+ * FIX: Set non-blocking mode for game server connections
+ * FIX: DISABLED parseServerListResponse - don't modify server list data
+ * FIX: Added detailed hex dump of 0x802EE113 server list response
+ * WHY: Need to understand why 58158 connection hangs in blocking mode
  * 
- * PREVIOUS (v36.33):
+ * PREVIOUS (v36.34):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -156,7 +157,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.34 loaded ===");
+        _log(@"=== WangXianHook v36.35 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -335,7 +336,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.34 诊断面板";
+            lbl.text = @"WXHook v36.35 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1640,21 +1641,34 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         int sockFlags = fcntl(sockfd, F_GETFL, 0);
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
-        DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d", sockfd, sockFlags, isNonBlocking);
+        DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d host=%s port=%d", sockfd, sockFlags, isNonBlocking, host, port);
+        
+        // Set 10-second send timeout to prevent infinite blocking
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        DLOG(@"[CONNECT-TIMEOUT] fd=%d set SO_SNDTIMEO=10s", sockfd);
+        
+        // Make non-blocking for game server connections (port 12003)
+        // This prevents blocking indefinitely if server is slow/unreachable
+        BOOL shouldSetNonBlocking = (port == 12003);
+        if (shouldSetNonBlocking && !isNonBlocking) {
+            int newFlags = sockFlags | O_NONBLOCK;
+            fcntl(sockfd, F_SETFL, newFlags);
+            isNonBlocking = YES;
+            DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode (was blocking)", sockfd);
+        }
         
         const struct sockaddr *finalAddr = addr;
         struct sockaddr_in newAddr;
         
+        // DISABLED port rewrite for v36.35 - let game connect to native port
+        // The game uses 12003, let it try that first
+        // If 12003 doesn't work, we'll investigate further
         if (port == 12003) {
-            DLOG(@"[CONNECT] Rewriting game server %s:12003 -> %s:58158", host, g_gameServerIP);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_gameServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons(58158);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_gameServerIP, 63);
-            port = 58158;
+            DLOG(@"[CONNECT-NATIVE] Game server %s:12003 (no rewrite, connecting natively)", host);
+            // NO REWRITE - connect to original IP:12003
         }
         
         trackFd(sockfd, host, port);
@@ -1674,6 +1688,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         if (result != 0 && errno == EINPROGRESS) {
             DLOG(@"[SOCK] connect EINPROGRESS - connection in progress (non-blocking mode)");
+        } else if (result != 0) {
+            DLOG(@"[SOCK] connect FAILED - will retry or report error");
         }
         
         return result;
@@ -2096,7 +2112,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            parseServerListResponse(p, ret);
+            
+            // DETAILED HEX DUMP of server list response for comparison with normal client
+            DLOG(@"[SERVERLIST-HEX] Full response hex (%zd bytes):", ret);
+            for (ssize_t i = 0; i < ret; i += 32) {
+                NSMutableString *line = [NSMutableString string];
+                for (ssize_t j = i; j < MIN(i + 32, ret); j++) {
+                    [line appendFormat:@"%02X ", p[j]];
+                }
+                DLOG(@"[SERVERLIST-HEX]   %zd: %@", i, line);
+            }
+            
+            // DISABLED parseServerListResponse for v36.35 - don't modify server list data
+            DLOG(@"[SERVERLIST-HEX] NO PARSING - leaving data untouched for analysis");
+            
+            // Also try to decode as JSON
+            NSString *jsonStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+            if (jsonStr && jsonStr.length > 0 && [jsonStr hasPrefix:@"{"]) {
+                DLOG(@"[SERVERLIST-JSON] JSON response: %@", jsonStr);
+            }
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
@@ -2184,9 +2218,25 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         
         if (cmd == 0x802EE113) {
             DLOG(@"[PROTO-R] Server list response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
-            parseServerListResponse(p, ret);
+            
+            // DETAILED HEX DUMP of server list response
+            DLOG(@"[SERVERLIST-HEX2] Full response hex (%zd bytes):", ret);
+            for (ssize_t i = 0; i < ret; i += 32) {
+                NSMutableString *line = [NSMutableString string];
+                for (ssize_t j = i; j < MIN(i + 32, ret); j++) {
+                    [line appendFormat:@"%02X ", p[j]];
+                }
+                DLOG(@"[SERVERLIST-HEX2]   %zd: %@", i, line);
+            }
+            
+            // DISABLED parseServerListResponse for v36.35
+            DLOG(@"[SERVERLIST-HEX2] NO PARSING - leaving data untouched");
+            
+            NSString *jsonStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+            if (jsonStr && jsonStr.length > 0 && [jsonStr hasPrefix:@"{"]) {
+                DLOG(@"[SERVERLIST-JSON2] JSON response: %@", jsonStr);
+            }
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
-            DLOG(@"[PROTO-R] Version check response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
             if (cmd == 0x802EE121 && ret >= 90) {
                 const unsigned char *errMsg = (const unsigned char *)"\xE5\xBD\x93\xE5\x89\x8D\xE7\x89\x88\xE6\x9C\xAC\xE8\xBF\x87\xE4\xBD\x8E";
