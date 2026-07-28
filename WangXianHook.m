@@ -1,12 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.30 - Fixed game server port rewriting
- * FIX: Added game server port rewriting: 12003 -> 58158
- * FIX: Set default game server IP to 47.100.14.198 (from normal client log)
- * FIX: Added g_gameServerIP global variable with default value
- * WHY: Game uses port 12003 in injected mode, but correct port is 58158
+ * WangXianHook v36.31 - Reverted port rewriting, added binary parsing
+ * FIX: Reverted game server port to 12003 (keep original port)
+ * FIX: Added binary format parsing for server list response
+ * FIX: Improved hook_alertControllerPresent stability
+ * WHY: Port rewriting broke game server connection
  * 
- * PREVIOUS (v36.29):
+ * PREVIOUS (v36.30):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -155,7 +155,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.30 loaded ===");
+        _log(@"=== WangXianHook v36.31 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -334,7 +334,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.30 诊断面板";
+            lbl.text = @"WXHook v36.31 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1259,26 +1259,39 @@ static void hook_alertViewShow(id self, SEL _cmd) {
 
 static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
 static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
+    if (!orig_alertControllerPresent) {
+        DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL, skipping");
+        return;
+    }
+    
     @try {
-        NSString *title = [self respondsToSelector:@selector(title)] ? [self title] : nil;
-        NSString *msg = [self respondsToSelector:@selector(message)] ? [self message] : nil;
-        DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
-        
-        if (title || msg) {
-            NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
-            NSString *lowerTitle = title ? [title lowercaseString] : @"";
-            if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
-                [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
-                [lowerMsg containsString:@"升级"]) {
-                DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
-                return;
+        if (self && [self isKindOfClass:[UIAlertController class]]) {
+            NSString *title = [self title];
+            NSString *msg = [self message];
+            DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
+            
+            if (title || msg) {
+                NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
+                NSString *lowerTitle = title ? [title lowercaseString] : @"";
+                if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
+                    [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+                    [lowerMsg containsString:@"升级"]) {
+                    DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
+                    return;
+                }
             }
+        } else {
+            DLOG(@"[DIAG-ALERT] Presenting non-UIAlertController class: %@", NSStringFromClass([self class]));
         }
     } @catch (NSException *e) {
         DLOG(@"[DIAG-ALERT] Exception in alert hook: %@", e.reason);
     }
     
-    orig_alertControllerPresent(self, _cmd, animated, completion);
+    @try {
+        orig_alertControllerPresent(self, _cmd, animated, completion);
+    } @catch (NSException *e) {
+        DLOG(@"[DIAG-ALERT] Exception in original present: %@", e.reason);
+    }
 }
 
 // ============================================================
@@ -1501,70 +1514,87 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
     
     @try {
         NSString *bodyStr = [[NSString alloc] initWithBytes:data+12 length:(NSUInteger)(len-12) encoding:NSUTF8StringEncoding];
-        if (!bodyStr || bodyStr.length == 0) {
-            DLOG(@"[SERVERLIST-PARSE] Failed to decode response body as UTF8");
-            return;
-        }
-        
-        DLOG(@"[SERVERLIST-PARSE] Response body length: %lu", (unsigned long)bodyStr.length);
-        
-        NSRegularExpression *ipRegex = [NSRegularExpression regularExpressionWithPattern:@"\"ip\"\\s*:\\s*\"([^\"]+)\"" options:0 error:nil];
-        NSArray *ipMatches = [ipRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-        NSMutableArray *ips = [NSMutableArray array];
-        for (NSTextCheckingResult *match in ipMatches) {
-            NSString *ipStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
-            [ips addObject:ipStr];
-            DLOG(@"[SERVERLIST-PARSE] Found IP: %@", ipStr);
-        }
-        
-        NSRegularExpression *portRegex = [NSRegularExpression regularExpressionWithPattern:@"\"port\"\\s*:\\s*(\\d+)" options:0 error:nil];
-        NSArray *portMatches = [portRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-        NSMutableArray *ports = [NSMutableArray array];
-        for (NSTextCheckingResult *match in portMatches) {
-            NSString *portStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
-            int portInt = [portStr intValue];
-            [ports addObject:portStr];
-            DLOG(@"[SERVERLIST-PARSE] Found port: %@ (int=%d)", portStr, portInt);
-        }
-        
-        if (ips.count > 0 && ports.count > 0) {
-            for (NSUInteger i = 0; i < MIN(ips.count, ports.count); i++) {
-                int portInt = [ports[i] intValue];
-                if (portInt > 0 && portInt < 65536) {
-                    NSString *ipStr = ips[i];
-                    DLOG(@"[SERVERLIST-PARSE] Server %lu: %@:%d", (unsigned long)i, ipStr, portInt);
-                    
-                    if (!g_gameServerInfoUpdated) {
-                        strncpy(g_gameServerIP, [ipStr UTF8String], 63);
-                        g_gameServerPort = portInt;
-                        g_gameServerInfoUpdated = YES;
-                        DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
+        if (bodyStr && bodyStr.length > 0) {
+            DLOG(@"[SERVERLIST-PARSE] Response body length: %lu", (unsigned long)bodyStr.length);
+            
+            NSRegularExpression *ipRegex = [NSRegularExpression regularExpressionWithPattern:@"\"ip\"\\s*:\\s*\"([^\"]+)\"" options:0 error:nil];
+            NSArray *ipMatches = [ipRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+            NSMutableArray *ips = [NSMutableArray array];
+            for (NSTextCheckingResult *match in ipMatches) {
+                NSString *ipStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                [ips addObject:ipStr];
+                DLOG(@"[SERVERLIST-PARSE] Found IP: %@", ipStr);
+            }
+            
+            NSRegularExpression *portRegex = [NSRegularExpression regularExpressionWithPattern:@"\"port\"\\s*:\\s*(\\d+)" options:0 error:nil];
+            NSArray *portMatches = [portRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
+            NSMutableArray *ports = [NSMutableArray array];
+            for (NSTextCheckingResult *match in portMatches) {
+                NSString *portStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
+                int portInt = [portStr intValue];
+                [ports addObject:portStr];
+                DLOG(@"[SERVERLIST-PARSE] Found port: %@ (int=%d)", portStr, portInt);
+            }
+            
+            if (ips.count > 0 && ports.count > 0) {
+                for (NSUInteger i = 0; i < MIN(ips.count, ports.count); i++) {
+                    int portInt = [ports[i] intValue];
+                    if (portInt > 0 && portInt < 65536) {
+                        NSString *ipStr = ips[i];
+                        DLOG(@"[SERVERLIST-PARSE] Server %lu: %@:%d", (unsigned long)i, ipStr, portInt);
+                        
+                        if (!g_gameServerInfoUpdated) {
+                            strncpy(g_gameServerIP, [ipStr UTF8String], 63);
+                            g_gameServerPort = portInt;
+                            g_gameServerInfoUpdated = YES;
+                            DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
+                        }
                     }
                 }
             }
-        } else if (ips.count > 0) {
-            DLOG(@"[SERVERLIST-PARSE] No port found, using default port %d", g_gameServerPort);
-            if (!g_gameServerInfoUpdated) {
-                strncpy(g_gameServerIP, [ips[0] UTF8String], 63);
-                g_gameServerInfoUpdated = YES;
-                DLOG(@"[SERVERLIST-PARSE] Updated game server IP: %s (port: %d)", g_gameServerIP, g_gameServerPort);
-            }
         } else {
-            DLOG(@"[SERVERLIST-PARSE] No IP or port found in response");
-        }
-        
-        NSRegularExpression *statusRegex = [NSRegularExpression regularExpressionWithPattern:@"\"status\"\\s*:\\s*(\\d+)" options:0 error:nil];
-        NSArray *statusMatches = [statusRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-        for (NSTextCheckingResult *match in statusMatches) {
-            NSString *statusStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
-            DLOG(@"[SERVERLIST-PARSE] Found status: %@", statusStr);
-        }
-        
-        NSRegularExpression *typeRegex = [NSRegularExpression regularExpressionWithPattern:@"\"serverType\"\\s*:\\s*(\\d+)" options:0 error:nil];
-        NSArray *typeMatches = [typeRegex matchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length)];
-        for (NSTextCheckingResult *match in typeMatches) {
-            NSString *typeStr = [bodyStr substringWithRange:[match rangeAtIndex:1]];
-            DLOG(@"[SERVERLIST-PARSE] Found serverType: %@", typeStr);
+            DLOG(@"[SERVERLIST-PARSE] Binary response, trying binary parsing...");
+            DLOG(@"[SERVERLIST-PARSE] First 64 bytes hex:");
+            for (int i = 0; i < MIN(64, len-12); i++) {
+                printf("%02x ", data[12+i]);
+                if ((i+1) % 16 == 0) printf("\n");
+            }
+            printf("\n");
+            
+            const unsigned char *body = data + 12;
+            ssize_t bodyLen = len - 12;
+            
+            int serverCount = 0;
+            for (ssize_t offset = 0; offset < bodyLen - 6 && serverCount < 20; offset++) {
+                int b1 = body[offset];
+                int b2 = body[offset+1];
+                int b3 = body[offset+2];
+                int b4 = body[offset+3];
+                
+                if (b1 == 47 && b4 >= 1 && b4 <= 223) {
+                    char ipStr[64];
+                    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", b1, b2, b3, b4);
+                    
+                    if (offset + 6 < bodyLen) {
+                        int port = (body[offset+5] << 8) | body[offset+6];
+                        if (port > 0 && port < 65536) {
+                            DLOG(@"[SERVERLIST-PARSE] Binary found server %d: %s:%d", serverCount, ipStr, port);
+                            
+                            if (!g_gameServerInfoUpdated) {
+                                strncpy(g_gameServerIP, ipStr, 63);
+                                g_gameServerPort = port;
+                                g_gameServerInfoUpdated = YES;
+                                DLOG(@"[SERVERLIST-PARSE] Updated game server: %s:%d", g_gameServerIP, g_gameServerPort);
+                            }
+                            serverCount++;
+                        }
+                    }
+                }
+            }
+            
+            if (serverCount == 0) {
+                DLOG(@"[SERVERLIST-PARSE] No servers found in binary response");
+            }
         }
     } @catch (NSException *e) {
         DLOG(@"[SERVERLIST-PARSE] Exception: %@", e.reason);
@@ -1600,28 +1630,14 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
-        
-        const struct sockaddr *finalAddr = addr;
-        struct sockaddr_in newAddr;
-        
-        // Rewrite game server: port 12003 -> 58158
-        // Game uses port 12003 in injected mode, but correct port is 58158
-        if (port == 12003) {
-            DLOG(@"[CONNECT] Rewriting game server %s:12003 -> %s:%d", host, g_gameServerIP, g_gameServerPort);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_gameServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons((uint16_t)g_gameServerPort);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_gameServerIP, 63);
-            port = g_gameServerPort;
-        }
-        
         trackFd(sockfd, host, port);
         DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
         
-        int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
+        if (port == 12003) {
+            DLOG(@"[GAME-SERVER] Connecting to game server %s:12003", host);
+        }
+        
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
         DLOG(@"[SOCK] connect result=%d errno=%d", result, errno);
         return result;
     } else if (addr->sa_family == AF_INET6) {
