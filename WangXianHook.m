@@ -1407,6 +1407,8 @@ static unsigned char *gzipCompress(const unsigned char *data, size_t len, size_t
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <execinfo.h>
+#include <sys/time.h>
+#include <fcntl.h>
 
 // === Socket hook functions ===
 typedef int (*ConnectFunc)(int, const struct sockaddr *, socklen_t);
