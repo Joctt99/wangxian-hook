@@ -1,7 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.54 - Non-blocking + select 30s wait, restore blocking
+ * WangXianHook v36.55 - SIMPLE direct connect, NO rewrite
  * MODE: FIXED - Only modify login server responses (port=5678), game server untouched
+ * 
+ * v36.55 CRITICAL FIXES:
+ * - SIMPLE direct connect: NO port rewrite, NO non-blocking, NO select
+ * - Just pass through to original connect with logging
+ * - All port rewrite attempts (12003->58158) failed - 58158 unreachable
  * 
  * v36.54 CRITICAL FIXES:
  * - Non-blocking connect + select wait 30s (restore blocking after)
@@ -1852,80 +1857,22 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
 #if MINIMAL_MODE
-        // v36.54: Non-blocking connect + select wait 30s (restore blocking after)
-        // Game expects connect() to complete, not EINPROGRESS
-        BOOL needRewrite = (port == 12003);
-        BOOL isGameServer = (port == 58158 || port == 12003);
-        
-        if (isGameServer && !isNonBlocking) {
-            int flags = fcntl(sockfd, F_GETFL, 0);
-            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-            isNonBlocking = YES;
-            DLOG(@"[SOCK] Set O_NONBLOCK for game server %s:%d", host, port);
-        }
-        
-        struct sockaddr_in connectAddr = *(struct sockaddr_in *)addr;
-        if (needRewrite) {
-            connectAddr.sin_port = htons(58158);
-            port = 58158;
-            DLOG(@"[REWRITE] Game server 12003 -> 58158");
-        }
-        
+        // v36.55: SIMPLE direct connect - NO port rewrite, NO non-blocking, NO select
+        // Just pass through to original connect
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (v36.54 WAIT 30s)", sockfd, host, port, isNonBlocking);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d (v36.55 SIMPLE)", sockfd, host, port);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        int result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&connectAddr, sizeof(connectAddr)) : -1;
-        
-        if (isGameServer && isNonBlocking && result == -1 && errno == EINPROGRESS) {
-            DLOG(@"[SOCK] connect returned EINPROGRESS, waiting up to 30s...");
-            
-            fd_set writefds;
-            FD_ZERO(&writefds);
-            FD_SET(sockfd, &writefds);
-            
-            struct timeval timeout;
-            timeout.tv_sec = 30;
-            timeout.tv_usec = 0;
-            
-            int selResult = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
-            
-            if (selResult > 0) {
-                int sockErr = 0;
-                socklen_t errLen = sizeof(sockErr);
-                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen);
-                
-                if (sockErr == 0) {
-                    result = 0;
-                    DLOG(@"[SOCK] select success, SO_ERROR=0");
-                } else {
-                    result = -1;
-                    errno = sockErr;
-                    DLOG(@"[SOCK] select success but SO_ERROR=%d (%s)", sockErr, strerror(sockErr));
-                }
-            } else if (selResult == 0) {
-                result = -1;
-                errno = ETIMEDOUT;
-                DLOG(@"[SOCK] select timeout after 30 seconds");
-            } else {
-                result = -1;
-                DLOG(@"[SOCK] select error: %d (%s)", errno, strerror(errno));
-            }
-            
-            // Restore blocking mode
-            int origFlags = fcntl(sockfd, F_GETFL, 0);
-            fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
-            DLOG(@"[SOCK] Restored blocking mode");
-        }
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
-             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed);
         
         return result;
 #else
@@ -3489,7 +3436,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.54 - Non-blocking + select 30s wait, restore blocking");
+    DLOG(@"[VERSION] WangXianHook v36.55 - SIMPLE direct connect, NO rewrite");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
