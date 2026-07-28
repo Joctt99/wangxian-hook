@@ -1530,13 +1530,13 @@ static void hook_alertControllerPresent(id self, SEL _cmd, id viewControllerToPr
         }
         
         // v36.59: Check self (presenting VC)
-        if (!self || (void *)self == NULL) {
+        if (!self) {
             DLOG(@"[DIAG-ALERT] self (presenting VC) is nil/NULL");
             return;
         }
         
         // v36.59: Check viewControllerToPresent (the one being presented, could be UIAlertController)
-        if (!viewControllerToPresent || (void *)viewControllerToPresent == NULL) {
+        if (!viewControllerToPresent) {
             DLOG(@"[DIAG-ALERT] viewControllerToPresent is nil/NULL");
             return;
         }
