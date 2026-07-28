@@ -936,6 +936,11 @@ static id msi_init_hook(id self, SEL _cmd) {
 // ServerInfoForClient Stub Class Implementation
 // ============================================================
 
+// Game server config variables (defined early for stub class access)
+static int g_gameServerPort = 12003;
+static char g_gameServerIP[64] = "47.100.14.198";
+static BOOL g_gameServerInfoUpdated = YES;
+
 static NSMutableDictionary *g_msiStubData = nil;
 
 static id msiStub_init(id self, SEL _cmd) {
@@ -1602,9 +1607,7 @@ static int g_trackedPorts[MAX_TRACKED_FDS];
 static int g_trackedCount = 0;
 static BOOL g_trackedActive[MAX_TRACKED_FDS];
 
-static int g_gameServerPort = 12003;
-static char g_gameServerIP[64] = "47.100.14.198";
-static BOOL g_gameServerInfoUpdated = YES;
+// Note: g_gameServerPort, g_gameServerIP, g_gameServerInfoUpdated defined earlier for stub class access
 
 static void clearTrackedFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
