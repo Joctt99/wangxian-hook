@@ -953,9 +953,9 @@ static id msiStub_init(id self, SEL _cmd) {
         [g_msiStubData setObject:@1 forKey:@"clientid"];
         [g_msiStubData setObject:@"一区" forKey:@"category"];
         [g_msiStubData setObject:@"运行" forKey:@"description"];
-        [g_msiStubData setObject:g_gameServerIP forKey:@"ip"];
+        [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
         [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
-        DLOG(@"[MSI-STUB] Initialized with ip=%@ port=%d", g_gameServerIP, g_gameServerPort);
+        DLOG(@"[MSI-STUB] Initialized with ip=%s port=%d", g_gameServerIP, g_gameServerPort);
     }
     return self;
 }
@@ -978,7 +978,7 @@ static id msiStub_initWithDict(id self, SEL _cmd, NSDictionary *dict) {
     [g_msiStubData setObject:@"运行" forKey:@"description"];
     
     // Override IP and port with our game server
-    [g_msiStubData setObject:g_gameServerIP forKey:@"ip"];
+    [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
     [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
     
     // Log all properties
