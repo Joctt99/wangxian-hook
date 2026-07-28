@@ -1,12 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.38 - Login server redirect + server list port patch
- * FIX: Redirect backup login server (47.100.222.229:5678) to primary (47.100.14.198:58158)
- * FIX: Patch server list response (0x802EE113) port 12003 -> 58158
- * FIX: Re-enabled parseServerListResponse to update global game server info
- * WHY: Game detects injection and switches to backup server with wrong port
+ * WangXianHook v36.39 - Revert login server redirect, keep game server fix
+ * FIX: REVERTED login server redirect (keep 5678 for login - it works)
+ * FIX: KEEP game server port rewrite 12003 -> 58158
+ * FIX: KEEP non-blocking + select() with 5s timeout
+ * FIX: KEEP server list port patch in 0x802EE113 response
+ * WHY: Login on 5678 was working fine; only game server connection was failing
  * 
- * PREVIOUS (v36.37):
+ * PREVIOUS (v36.38):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -155,7 +156,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.38 loaded ===");
+        _log(@"=== WangXianHook v36.39 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -334,7 +335,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.38 诊断面板";
+            lbl.text = @"WXHook v36.39 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1645,23 +1646,8 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in newAddr;
         BOOL isGameServer = NO;
         
-        // RE-ENABLED: Login server rewrite backup -> primary
-        // Normal client connects to 47.100.14.198:58158 for BOTH login and game
-        // Injected client is detected and switched to backup server 47.100.222.229:5678
-        // Rewrite backup login to primary server
-        if (strcmp(host, "47.100.222.229") == 0 && port == 5678) {
-            DLOG(@"[REWRITE] Login backup %s:5678 -> %s:58158", host, g_gameServerIP);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_gameServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons(58158);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_gameServerIP, 63);
-            port = 58158;
-        }
-        
-        // RE-ENABLED: Game server port rewrite 12003 -> 58158
+        // ONLY: Game server port rewrite 12003 -> 58158
+        // Login on 5678 works fine - DO NOT redirect it
         if (port == 12003) {
             DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, g_gameServerIP);
             memset(&newAddr, 0, sizeof(newAddr));
@@ -1700,7 +1686,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             FD_SET(sockfd, &writeSet);
             
             struct timeval waitTime;
-            waitTime.tv_sec = 15;
+            waitTime.tv_sec = 5;
             waitTime.tv_usec = 0;
             
             int selectResult = select(sockfd + 1, NULL, &writeSet, NULL, &waitTime);
@@ -1720,7 +1706,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                     result = -1;
                 }
             } else if (selectResult == 0) {
-                DLOG(@"[CONNECT-WAIT] Connection TIMED OUT after 15s");
+                DLOG(@"[CONNECT-WAIT] Connection TIMED OUT after 5s");
                 errno = ETIMEDOUT;
                 result = -1;
             } else {
