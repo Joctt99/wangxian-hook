@@ -1,15 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.36 - Re-enable port rewrite + non-blocking connect
- * FIX: RE-ENABLED port rewrite (12003 -> 58158) 
- * FIX: Set non-blocking mode BEFORE connect to prevent hanging
- * FIX: Added proper EINPROGRESS handling
- * FIX: Restore blocking mode after successful connect
- * FIX: Keep SO_SNDTIMEO=10s timeout
- * WHY: v36.35 proved 12003 doesn't work; v36.34 proved 58158 blocks forever
- * Solution: 58158 + non-blocking = game can poll with select()
+ * WangXianHook v36.37 - Non-blocking connect + select() wait
+ * FIX: Set non-blocking mode on game server socket BEFORE connect
+ * FIX: After connect returns EINPROGRESS, use select() to wait up to 15s
+ * FIX: Restore blocking mode after connection completes
+ * FIX: Game sees synchronous connect result (0 or -1), not EINPROGRESS
+ * WHY: Game does NOT support non-blocking connect - expects synchronous result
  * 
- * PREVIOUS (v36.35):
+ * PREVIOUS (v36.36):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -158,7 +156,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.36 loaded ===");
+        _log(@"=== WangXianHook v36.37 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -337,7 +335,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.36 诊断面板";
+            lbl.text = @"WXHook v36.37 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1644,31 +1642,12 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         DLOG(@"[CONNECT-DBG] fd=%d sock_flags=0x%X non_blocking=%d host=%s port=%d", sockfd, sockFlags, isNonBlocking, host, port);
         
-        // Set 10-second send timeout to prevent infinite blocking
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        DLOG(@"[CONNECT-TIMEOUT] fd=%d set SO_SNDTIMEO=10s", sockfd);
-        
-        // CRITICAL: Set non-blocking BEFORE port rewrite and connect
-        // This prevents blocking indefinitely if server is slow/unreachable
-        // The game will get EINPROGRESS and can poll with select()
-        BOOL shouldSetNonBlocking = (port == 12003);
-        if (shouldSetNonBlocking && !isNonBlocking) {
-            int newFlags = sockFlags | O_NONBLOCK;
-            fcntl(sockfd, F_SETFL, newFlags);
-            isNonBlocking = YES;
-            DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode BEFORE connect", sockfd);
-        }
-        
         const struct sockaddr *finalAddr = addr;
         struct sockaddr_in newAddr;
         
-        // RE-ENABLED port rewrite for v36.36
-        // Game tries 12003, but server only accepts 58158
+        // RE-ENABLED port rewrite for game server
         if (port == 12003) {
-            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158 (non-blocking=%d)", host, g_gameServerIP, isNonBlocking);
+            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", host, g_gameServerIP);
             memset(&newAddr, 0, sizeof(newAddr));
             newAddr.sin_family = AF_INET;
             inet_aton(g_gameServerIP, &newAddr.sin_addr);
@@ -1677,6 +1656,15 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             addrlen = sizeof(newAddr);
             strncpy(host, g_gameServerIP, 63);
             port = 58158;
+            
+            // KEY: Set non-blocking mode so connect returns immediately
+            // Then we'll use select() to wait for connection
+            if (!isNonBlocking) {
+                int newFlags = sockFlags | O_NONBLOCK;
+                fcntl(sockfd, F_SETFL, newFlags);
+                isNonBlocking = YES;
+                DLOG(@"[CONNECT-NONBLOCK] fd=%d set to non-blocking mode for game server", sockfd);
+            }
         }
         
         trackFd(sockfd, host, port);
@@ -1687,34 +1675,64 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
         
+        // KEY FIX: If connect returns EINPROGRESS (non-blocking), wait with select()
+        if (result != 0 && errno == EINPROGRESS && port == 58158) {
+            DLOG(@"[CONNECT-WAIT] EINPROGRESS - waiting for connection with select()...");
+            
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(sockfd, &writeSet);
+            
+            struct timeval waitTime;
+            waitTime.tv_sec = 15;
+            waitTime.tv_usec = 0;
+            
+            int selectResult = select(sockfd + 1, NULL, &writeSet, NULL, &waitTime);
+            DLOG(@"[CONNECT-WAIT] select() returned=%d", selectResult);
+            
+            if (selectResult > 0) {
+                int sockErr = 0;
+                socklen_t errLen = sizeof(sockErr);
+                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockErr, &errLen);
+                
+                if (sockErr == 0) {
+                    DLOG(@"[CONNECT-WAIT] Connection SUCCESS after select!");
+                    result = 0;
+                } else {
+                    DLOG(@"[CONNECT-WAIT] Connection FAILED after select: errno=%d(%s)", sockErr, strerror(sockErr));
+                    errno = sockErr;
+                    result = -1;
+                }
+            } else if (selectResult == 0) {
+                DLOG(@"[CONNECT-WAIT] Connection TIMED OUT after 15s");
+                errno = ETIMEDOUT;
+                result = -1;
+            } else {
+                DLOG(@"[CONNECT-WAIT] select() error: errno=%d(%s)", errno, strerror(errno));
+                result = -1;
+            }
+            
+            // Restore blocking mode for game
+            int origFlags = fcntl(sockfd, F_GETFL, 0);
+            if (origFlags & O_NONBLOCK) {
+                fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
+                DLOG(@"[CONNECT-WAIT] Restored blocking mode");
+            }
+        } else if (result == 0) {
+            // Restore blocking mode if we had temporarily set non-blocking
+            int origFlags = fcntl(sockfd, F_GETFL, 0);
+            if ((origFlags & O_NONBLOCK) && port == 58158) {
+                fcntl(sockfd, F_SETFL, origFlags & ~O_NONBLOCK);
+                DLOG(@"[SOCK] Restored blocking mode after successful connect");
+            }
+        }
+        
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
         DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
              sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
-        
-        // IMPORTANT: After connect returns, handle the result
-        if (result == 0) {
-            DLOG(@"[SOCK] connect SUCCESS - connection established immediately");
-            // Restore blocking mode if we set non-blocking
-            if (shouldSetNonBlocking && !isNonBlocking) {
-                fcntl(sockfd, F_SETFL, sockFlags);
-                DLOG(@"[SOCK] Restored blocking mode after successful connect");
-            }
-        } else if (errno == EINPROGRESS) {
-            DLOG(@"[SOCK] connect EINPROGRESS - connection in progress (normal for non-blocking)");
-            // Game should use select/poll to wait for connection
-            // Do NOT restore blocking mode yet - let game handle it
-        } else if (errno == EINTR) {
-            DLOG(@"[SOCK] connect EINTR - interrupted system call");
-        } else {
-            DLOG(@"[SOCK] connect FAILED errno=%d(%s) - unrecoverable error", errno, strerror(errno));
-            // Restore blocking mode on failure
-            if (shouldSetNonBlocking) {
-                fcntl(sockfd, F_SETFL, sockFlags);
-            }
-        }
         
         return result;
     } else if (addr->sa_family == AF_INET6) {
