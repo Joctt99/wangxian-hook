@@ -1,6 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.28 - Fixed login server IP rewriting
+ * WangXianHook v36.29 - Fixed UIAlertController crash, removed IP rewriting
+ * FIX: Removed broken login server IP rewriting (47.100.222.229 is correct login server)
+ * FIX: Fixed UIAlertController crash by adding @try/@catch and respondsToSelector checks
+ * FIX: Reverted hook_connect to pass-through mode (no IP rewriting)
+ * WHY: IP rewriting broke the login connection completely
+ * 
+ * PREVIOUS (v36.28):
  * FIX: Added login server IP rewriting: 47.100.222.229 -> 47.100.14.198
  * FIX: Added game server IP rewriting logic
  * FIX: Added global variables g_loginServerIP and g_loginServerPort
@@ -149,7 +155,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.28 loaded ===");
+        _log(@"=== WangXianHook v36.29 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -328,7 +334,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.28 诊断面板";
+            lbl.text = @"WXHook v36.29 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1253,22 +1259,23 @@ static void hook_alertViewShow(id self, SEL _cmd) {
 
 static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
 static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
-    NSString *title = [self performSelector:@selector(title)];
-    NSString *msg = [self performSelector:@selector(message)];
-    DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
-    
-    NSArray *stack = [NSThread callStackSymbols];
-    for (NSUInteger i = 0; i < [stack count] && i < 20; i++) {
-        DLOG(@"[DIAG-ALERT-STACK] %@", stack[i]);
-    }
-    
-    NSString *lowerMsg = [msg lowercaseString];
-    NSString *lowerTitle = [title lowercaseString];
-    if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
-        [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
-        [lowerMsg containsString:@"升级"]) {
-        DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
-        return;
+    @try {
+        NSString *title = [self respondsToSelector:@selector(title)] ? [self title] : nil;
+        NSString *msg = [self respondsToSelector:@selector(message)] ? [self message] : nil;
+        DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", title, msg);
+        
+        if (title || msg) {
+            NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
+            NSString *lowerTitle = title ? [title lowercaseString] : @"";
+            if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
+                [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+                [lowerMsg containsString:@"升级"]) {
+                DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", title, msg);
+                return;
+            }
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[DIAG-ALERT] Exception in alert hook: %@", e.reason);
     }
     
     orig_alertControllerPresent(self, _cmd, animated, completion);
@@ -1416,9 +1423,6 @@ static BOOL g_trackedActive[MAX_TRACKED_FDS];
 static int g_gameServerPort = 58158;
 static char g_gameServerIP[64] = {0};
 static BOOL g_gameServerInfoUpdated = NO;
-
-static char g_loginServerIP[64] = "47.100.14.198";
-static int g_loginServerPort = 5678;
 
 static void clearTrackedFd(int fd) {
     for (int i = 0; i < g_trackedCount; i++) {
@@ -1596,38 +1600,10 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
-        
-        const struct sockaddr *finalAddr = addr;
-        struct sockaddr_in newAddr;
-        
-        // Rewrite login server IP: 47.100.222.229 -> 47.100.14.198
-        if (port == g_loginServerPort && strcmp(host, "47.100.222.229") == 0) {
-            DLOG(@"[CONNECT] Rewriting login server %s:%d -> %s:%d", host, port, g_loginServerIP, g_loginServerPort);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_loginServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons((uint16_t)g_loginServerPort);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_loginServerIP, 63);
-        }
-        
-        // Rewrite game server IP: any IP -> game server IP (if known)
-        if (port == g_gameServerPort && g_gameServerIP[0] != '\0' && strcmp(host, g_gameServerIP) != 0) {
-            DLOG(@"[CONNECT] Rewriting game server %s:%d -> %s:%d", host, port, g_gameServerIP, g_gameServerPort);
-            memset(&newAddr, 0, sizeof(newAddr));
-            newAddr.sin_family = AF_INET;
-            inet_aton(g_gameServerIP, &newAddr.sin_addr);
-            newAddr.sin_port = htons((uint16_t)g_gameServerPort);
-            finalAddr = (const struct sockaddr *)&newAddr;
-            addrlen = sizeof(newAddr);
-            strncpy(host, g_gameServerIP, 63);
-        }
-        
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect fd=%d %s:%d (original: port=%d)", sockfd, host, port, port);
+        DLOG(@"[SOCK] connect fd=%d %s:%d", sockfd, host, port);
         
-        int result = orig_connect ? orig_connect(sockfd, finalAddr, addrlen) : -1;
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
         DLOG(@"[SOCK] connect result=%d errno=%d", result, errno);
         return result;
     } else if (addr->sa_family == AF_INET6) {
