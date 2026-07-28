@@ -1,14 +1,22 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.45 - DISABLE port rewrite, test direct 12003 connection
- * FIX: DISABLED port rewrite in both server list patch and connect hook
- * FIX: Set O_NONBLOCK for game server with select() wait
- * WHY: Test if port rewrite caused connection timeout; try original port 12003
+ * WangXianHook v36.47 - EXTREME MINIMAL MODE
+ * MODE: EXTREME MINIMAL - Only 0x802EE121 patch, NO crypto hooks, NO socket modifications
+ * 
+ * v36.47 Critical Fixes:
+ * - DISABLE all crypto function hooks (SecKeyCreateEncryptedData etc.) that corrupt encryption data
+ * - DISABLE all socket modifications (port rewrite, non-blocking, etc.)
+ * - FIX hook_alertControllerPresent SIGSEGV crash
+ * - Only keep 0x802EE121 login response patch
+ * 
+ * PREVIOUS (v36.46):
+ * MINIMAL MODE - Only 0x802EE121 patch
+ * 
+ * PREVIOUS (v36.45):
+ * DISABLE port rewrite, test direct 12003 connection
  * 
  * PREVIOUS (v36.44):
- * FIX: Patched port 12003->58158 in server list response (0x802EE113)
- * FIX: ADDED non-blocking mode + 10s timeout for game server connect (12003/58158)
- * WHY: hook_connect port rewrite caused blocking hang; patching response data avoids this
+ * Non-blocking connect with select wait
  * 
  * PREVIOUS (v36.39):
  * FIX: Revert login server redirect, keep game server fix with 5s timeout
@@ -72,6 +80,14 @@
 #import <Security/Security.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+
+// v36.47: EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks, NO socket modifications
+// v36.47: Critical fix - Disable all crypto function hooks that corrupt encryption data
+// v36.47: Critical fix - Fix hook_alertControllerPresent SIGSEGV crash
+#define MINIMAL_MODE 1
+#define DISABLE_CRYPTO_HOOKS 1
+#define DISABLE_SOCKET_MODS 1
+#define DISABLE_UI_HOOKS 0
 
 static NSString *g_logPath = nil;
 static BOOL g_logEnabled = YES; // logging toggle
@@ -1435,7 +1451,7 @@ static void hook_alertViewShow(id self, SEL _cmd) {
 static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
 static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
     if (!orig_alertControllerPresent) {
-        DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL, skipping");
+        DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL, calling original directly");
         return;
     }
     
@@ -1455,15 +1471,15 @@ static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispat
                     return;
                 }
             }
-        } else {
-            DLOG(@"[DIAG-ALERT] Presenting non-UIAlertController class: %@", NSStringFromClass([self class]));
         }
     } @catch (NSException *e) {
         DLOG(@"[DIAG-ALERT] Exception in alert hook: %@", e.reason);
     }
     
     @try {
-        orig_alertControllerPresent(self, _cmd, animated, completion);
+        if (orig_alertControllerPresent) {
+            orig_alertControllerPresent(self, _cmd, animated, completion);
+        }
     } @catch (NSException *e) {
         DLOG(@"[DIAG-ALERT] Exception in original present: %@", e.reason);
     }
@@ -1813,6 +1829,25 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         int sockFlags = fcntl(sockfd, F_GETFL, 0);
         BOOL isNonBlocking = (sockFlags & O_NONBLOCK) != 0;
         
+#if MINIMAL_MODE
+        // v36.47: EXTREME MINIMAL MODE - No connect modifications, just log
+        trackFd(sockfd, host, port);
+        DLOG(@"[SOCK] connect START fd=%d %s:%d non_blocking=%d (v36.47 NO MODS)", sockfd, host, port, isNonBlocking);
+        
+        struct timeval startTV;
+        gettimeofday(&startTV, NULL);
+        
+        int result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
+        
+        struct timeval endTV;
+        gettimeofday(&endTV, NULL);
+        double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
+        
+        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs non_blocking=%d", 
+             sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
+        
+        return result;
+#else
         // v36.45: DISABLE port rewrite - use original port directly
         // Try connecting with original port (12003) to verify if port rewrite caused issues
         BOOL isGameServer = (port == 58158 || port == 12003);
@@ -1880,6 +1915,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
              sockfd, host, port, result, errno, strerror(errno), elapsed, isNonBlocking);
         
         return result;
+#endif
     } else if (addr->sa_family == AF_INET6) {
         struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
@@ -2381,14 +2417,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
+#if !MINIMAL_MODE
             // Patch status byte to 0 for error responses (injection detection causes non-zero status)
             if (ret >= 13 && p[12] != 0) {
                 DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (injection detection response)", p[12]);
                 ((unsigned char *)buf)[12] = 0;
             }
+#endif
         }
     }
     
+#if !MINIMAL_MODE
     // RESTORED: Clear '版本过低' messages from responses (injection detection causes these)
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
     for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
@@ -2428,6 +2467,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[GAME-RECV] Exception: %@", e.reason);
         }
     }
+#endif
     
     return ret;
 }
@@ -2531,14 +2571,17 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     DLOG(@"[PROTO-R-PATCH] Preserved seq# = 0x%08X", origSeq);
                 }
             } else {
+#if !MINIMAL_MODE
                 if (ret >= 13 && p[12] != 0) {
                     DLOG(@"[PROTO-R-PATCH] Version check 1-byte status at offset 12: %u -> 0 (preserving seq#)", p[12]);
                     ((unsigned char *)buf)[12] = 0;
                 }
+#endif
             }
         }
     }
     
+#if !MINIMAL_MODE
     static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
     for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
         if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
@@ -2553,6 +2596,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             memset((unsigned char *)buf + i, ' ', sizeof(curVer));
         }
     }
+#endif
     
     return ret;
 }
@@ -3136,6 +3180,7 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
+#if !DISABLE_CRYPTO_HOOKS
     // Hook CCCrypt for AES encryption logging
     orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
     if (orig_CCCrypt) {
@@ -3171,6 +3216,9 @@ static void installSecurityHooks(void) {
         int r5 = rebindSymbol("_SecKeyCreateEncryptedData", (void *)hook_SecKeyCreateEncryptedData, (void **)&orig_SecKeyCreateEncryptedData);
         DLOG(@"[SEC] SecKeyCreateEncryptedData hook: rebind=%d addr=%p", r5, orig_SecKeyCreateEncryptedData);
     }
+#else
+    DLOG(@"[SEC] Crypto hooks DISABLED (v36.47 fix - avoid corrupting encryption data)");
+#endif
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
 }
@@ -3392,10 +3440,12 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.45 - DISABLE port rewrite, test direct 12003 connection");
+    DLOG(@"[VERSION] WangXianHook v36.47 - EXTREME MINIMAL MODE: Only 0x802EE121 patch, NO crypto hooks");
     DLOG(@"[ACT] Installing all hooks...");
     
+#if !DISABLE_CRYPTO_HOOKS
     installSecurityHooks();
+#endif
     installKeyboardProtection();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
