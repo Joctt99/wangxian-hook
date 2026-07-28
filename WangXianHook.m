@@ -1,13 +1,17 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.48 - FIXED: 0x802EE121 patch always enabled
+ * WangXianHook v36.49 - FIXED: KEEP full response, don't truncate ret
  * MODE: FIXED - Always patch login response, crypto hooks disabled
+ * 
+ * v36.49 Critical Fixes:
+ * - FIX: Don't truncate ret to 13 bytes! Game needs full 94-byte response with sessionId
+ * - KEEP: 0x802EE121 patch logic ALWAYS enabled (status byte only)
+ * - KEEP: Crypto hooks disabled
  * 
  * v36.48 Critical Fixes:
  * - FIX: 0x802EE121 patch logic ALWAYS enabled (was disabled by MINIMAL_MODE)
  * - FIX: Clear '版本过低' messages ALWAYS enabled
  * - KEEP: Crypto hooks disabled (v36.47 fix - avoid corrupting encryption data)
- * - KEEP: hook_alertControllerPresent SIGSEGV fix
  * 
  * PREVIOUS (v36.47):
  * EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks
@@ -2420,11 +2424,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
-            // v36.48: ALWAYS patch status byte for 0x802EE121 - critical for login
+            // v36.49: ALWAYS patch status byte for 0x802EE121 - KEEP original ret (don't truncate!)
             if (cmd == 0x802EE121 && ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (critical login patch)", p[12]);
+                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (critical login patch, keeping %zd bytes)", p[12], ret);
                 ((unsigned char *)buf)[12] = 0;
-                ret = 13;
+                // v36.49: Do NOT truncate ret! Game needs full response including sessionId etc.
             }
         }
     }
@@ -3444,7 +3448,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.48 - FIX: 0x802EE121 patch always enabled, crypto hooks disabled");
+    DLOG(@"[VERSION] WangXianHook v36.49 - FIXED: KEEP full response, don't truncate ret");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
