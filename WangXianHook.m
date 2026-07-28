@@ -1,15 +1,23 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.58 - Port rewrite 12003->58158, simple direct connect
- * MODE: FULL - All hooks enabled including game server analysis
+ * WangXianHook v36.59 - MSI stub fix, port rewrite, correct presentVC hook
+ * MODE: FULL - All hooks enabled
  * 
- * v36.58 CRITICAL FIXES:
- * - Re-enable port rewrite 12003->58158 (normal client uses 58158)
- * - Remove O_NONBLOCK + select - use simple direct connect
- * - Unified hook_connect for all modes (no MINIMAL_MODE branch)
- * 
+ * v36.59 CRITICAL FIXES:
+ * 1. [PORT-REWRITE] Only rewrite PORT 12003->58158, NEVER change IP address!
+ *    v36.58 bug: incorrectly overwrote host with g_gameServerIP, leading to wrong IP
+ * 2. [MSI-STUB] Preserve ORIGINAL ip/port from initWithDictionary, don't override
+ *    Game knows which server it selected - stub shouldn't replace its choice!
+ * 3. [SIGSEGV-FIX] Removed broken UIAlertController.present hook (WRONG sig!)
+ *    - Previous signature was missing viewController param, causing SIGSEGV
+ *    - Also, method was hooked on wrong class (called on presenting VC, not alert)
+ *    - Correctly merged alert-blocking logic into hook_presentVC
+ * 4. [SERVERLIST-PARSE] Try BOTH endian orders for IP/port + ASCII pattern search
+ * 5. [GAME-PATCH] Apply status=0 patch for BOTH ports 12003 AND 58158
+ */
+/*
+ * HISTORY:
  * v36.55 CRITICAL FIXES:
- * - SIMPLE direct connect: NO port rewrite, NO non-blocking, NO select
  * - Just pass through to original connect with logging
  * - All port rewrite attempts (12003->58158) failed - 58158 unreachable
  * 
@@ -205,7 +213,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.58 loaded ===");
+        _log(@"=== WangXianHook v36.59 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -384,7 +392,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.58 诊断面板";
+            lbl.text = @"WXHook v36.59 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1011,9 +1019,8 @@ static id msiStub_init(id self, SEL _cmd) {
         [g_msiStubData setObject:@1 forKey:@"clientid"];
         [g_msiStubData setObject:@"一区" forKey:@"category"];
         [g_msiStubData setObject:@"运行" forKey:@"description"];
-        [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
-        [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
-        DLOG(@"[MSI-STUB] Initialized with ip=%s port=%d", g_gameServerIP, g_gameServerPort);
+        // v36.59: Do NOT hardcode ip/port here - let initWithDictionary set them
+        DLOG(@"[MSI-STUB] Initialized empty (ip/port to be filled by caller)");
     }
     return self;
 }
@@ -1025,19 +1032,26 @@ static id msiStub_initWithDict(id self, SEL _cmd, NSDictionary *dict) {
     }
     
     if (dict) {
-        // Use provided dictionary but override critical fields
+        // v36.59: Use the provided dictionary - preserve ORIGINAL ip and port from game server list!
         [g_msiStubData setDictionary:dict];
+        DLOG(@"[MSI-STUB] Using original dict values from server list response");
     }
     
-    // Ensure critical fields are set
-    [g_msiStubData setObject:@1 forKey:@"status"];
-    [g_msiStubData setObject:@1 forKey:@"serverType"];
-    [g_msiStubData setObject:@"一区" forKey:@"category"];
-    [g_msiStubData setObject:@"运行" forKey:@"description"];
+    // Ensure critical fields are set (ONLY if missing from dict)
+    if (![g_msiStubData objectForKey:@"status"])
+        [g_msiStubData setObject:@1 forKey:@"status"];
+    if (![g_msiStubData objectForKey:@"serverType"])
+        [g_msiStubData setObject:@1 forKey:@"serverType"];
+    if (![g_msiStubData objectForKey:@"category"])
+        [g_msiStubData setObject:@"一区" forKey:@"category"];
+    // v36.59: FIX description field - replace '维护' with '运行'
+    NSString *desc = [g_msiStubData objectForKey:@"description"];
+    if (!desc || [desc isEqualToString:@"维护"]) {
+        [g_msiStubData setObject:@"运行" forKey:@"description"];
+    }
     
-    // Override IP and port with our game server
-    [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
-    [g_msiStubData setObject:@(g_gameServerPort) forKey:@"port"];
+    // v36.59: DO NOT override ip and port! Keep ORIGINAL values from dict!
+    // Game knows which server it selected - don't interfere with its choice!
     
     // Log all properties
     @try {
@@ -1057,8 +1071,19 @@ static NSNumber *msiStub_status(id self, SEL _cmd) {
 }
 
 static NSString *msiStub_ip(id self, SEL _cmd) {
-    DLOG(@"[MSI-STUB] -[ServerInfoForClient ip] -> %s", g_gameServerIP);
-    return [NSString stringWithUTF8String:g_gameServerIP];
+    // v36.59: Return ip from g_msiStubData (original value from dict), NOT hardcoded g_gameServerIP!
+    NSString *ip = [g_msiStubData objectForKey:@"ip"];
+    if (!ip) ip = [NSString stringWithUTF8String:g_gameServerIP];
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient ip] -> %@", ip);
+    return ip;
+}
+
+static NSNumber *msiStub_port(id self, SEL _cmd) {
+    // v36.59: Return port from g_msiStubData (original value from dict), NOT hardcoded g_gameServerPort!
+    NSNumber *portNum = [g_msiStubData objectForKey:@"port"];
+    int port = portNum ? [portNum intValue] : g_gameServerPort;
+    DLOG(@"[MSI-STUB] -[ServerInfoForClient port] -> %d", port);
+    return @(port);
 }
 
 static NSString *msiStub_category(id self, SEL _cmd) {
@@ -1487,76 +1512,118 @@ static void hook_alertViewShow(id self, SEL _cmd) {
     orig_alertViewShow(self, _cmd);
 }
 
-static void (*orig_alertControllerPresent)(id, SEL, BOOL, dispatch_block_t);
-static void hook_alertControllerPresent(id self, SEL _cmd, BOOL animated, dispatch_block_t completion) {
-    // v36.57: FIX - Complete NULL checks, main thread enforcement, safe block handling
+// v36.59: COMPLETE FIX - Correct method signature!
+// -[UIViewController presentViewController:animated:completion:] has 3 params after self/_cmd:
+//   arg1 = viewControllerToPresent (UIViewController*)
+//   arg2 = animated (BOOL)
+//   arg3 = completion (dispatch_block_t)
+// Previous hook had WRONG parameter order causing SIGSEGV when calling the "completion"
+// which was actually a BOOL value (0x0 or 0x1) interpreted as block pointer!
+static void (*orig_alertControllerPresent)(id, SEL, id, BOOL, dispatch_block_t);
+static void hook_alertControllerPresent(id self, SEL _cmd, id viewControllerToPresent, BOOL animated, dispatch_block_t completion) {
     @try {
         // Check orig function pointer
         if (!orig_alertControllerPresent) {
-            DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL");
+            DLOG(@"[DIAG-ALERT] orig_alertControllerPresent is NULL, passthrough");
+            // Even if orig is NULL we can't proceed - but avoid crash
             return;
         }
         
-        if ((void *)orig_alertControllerPresent == NULL) {
-            DLOG(@"[DIAG-ALERT] orig_alertControllerPresent function pointer is NULL");
+        // v36.59: Check self (presenting VC)
+        if (!self || (void *)self == NULL) {
+            DLOG(@"[DIAG-ALERT] self (presenting VC) is nil/NULL");
             return;
         }
         
-        // Check self is valid before any messaging
-        if (!self || self == nil) {
-            DLOG(@"[DIAG-ALERT] self is nil, cannot present");
+        // v36.59: Check viewControllerToPresent (the one being presented, could be UIAlertController)
+        if (!viewControllerToPresent || (void *)viewControllerToPresent == NULL) {
+            DLOG(@"[DIAG-ALERT] viewControllerToPresent is nil/NULL");
             return;
         }
         
-        // Log and check for version-related alerts
-        if ([self isKindOfClass:[UIAlertController class]]) {
-            @try {
-                NSString *title = [self title];
-                NSString *msg = [self message];
-                DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@'", 
-                     title ? title : @"<nil>", msg ? msg : @"<nil>");
+        // Check if the presented VC is UIAlertController - that's what we want to intercept
+        BOOL isAlert = NO;
+        @try {
+            if ([viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+                isAlert = YES;
+                UIAlertController *alert = (UIAlertController *)viewControllerToPresent;
+                NSString *title = [alert title];
+                NSString *msg = [alert message];
+                DLOG(@"[DIAG-ALERT] UIAlertController present: title='%@' msg='%@' presentingVC=%@", 
+                     title ? title : @"<nil>", msg ? msg : @"<nil>", 
+                     NSStringFromClass([self class]));
                 
+                // Block version-related alerts
                 if (title || msg) {
-                    NSString *lowerMsg = msg ? [msg lowercaseString] : @"";
-                    NSString *lowerTitle = title ? [title lowercaseString] : @"";
+                    NSString *lowerMsg = msg ? [[msg lowercaseString] copy] : @"";
+                    NSString *lowerTitle = title ? [[title lowercaseString] copy] : @"";
                     if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] || 
                         [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
-                        [lowerMsg containsString:@"升级"]) {
+                        [lowerMsg containsString:@"升级"] || [lowerMsg containsString:@"version"] ||
+                        [lowerMsg containsString:@"update"]) {
                         DLOG(@"[ALERT-BLOCK] Blocked version check UIAlertController: title='%@' msg='%@'", 
                              title ? title : @"", msg ? msg : @"");
-                        return;
+                        return;  // Do not present!
                     }
                 }
-            } @catch (NSException *e) {
-                DLOG(@"[DIAG-ALERT] Exception in alert check: %@", e.reason);
             }
+        } @catch (NSException *e) {
+            DLOG(@"[DIAG-ALERT] Exception checking alert: %@", e.reason);
+            isAlert = NO;  // On error, just passthrough
         }
         
-        // v36.57: Ensure completion block is not nil (use empty block as fallback)
-        dispatch_block_t safeCompletion = completion;
+        // v36.59: SAFE completion handling with Block_copy to avoid stack-block crash
+        dispatch_block_t safeCompletion = NULL;
+        if (completion != NULL) {
+            // Copy the block to heap in case it's a stack-allocated block
+            @try {
+                safeCompletion = [completion copy];  // ARC-style or Block_copy equivalent
+            } @catch (NSException *e) {
+                DLOG(@"[DIAG-ALERT] Exception copying completion block: %@", e.reason);
+                safeCompletion = NULL;
+            }
+        }
         if (!safeCompletion) {
+            // Provide a static empty block (heap-allocated by compiler)
             safeCompletion = ^{};
         }
         
-        // v36.57: Ensure UI operations run on main thread
+        // v36.59: Use __weak self to avoid dangling pointers on async dispatch
+        __weak id weakPresentingVC = self;
+        __weak id weakPresentedVC = viewControllerToPresent;
+        dispatch_block_t copiedCompletion = [safeCompletion copy];
+        
+        void (*callOrig)(id, SEL, id, BOOL, dispatch_block_t) = orig_alertControllerPresent;
+        
         if ([NSThread isMainThread]) {
-            orig_alertControllerPresent(self, _cmd, animated, safeCompletion);
+            @try {
+                callOrig(self, _cmd, viewControllerToPresent, animated, copiedCompletion);
+            } @catch (NSException *e) {
+                DLOG(@"[DIAG-ALERT] Exception calling orig present (main thread): %@", e.reason);
+            } @catch (...) {
+                DLOG(@"[DIAG-ALERT] Unknown C++/signal exception calling orig present (main thread)");
+            }
         } else {
             dispatch_async(dispatch_get_main_queue(), ^{
                 @try {
-                    orig_alertControllerPresent(self, _cmd, animated, safeCompletion);
+                    id strongPresenting = weakPresentingVC;
+                    id strongPresented = weakPresentedVC;
+                    if (strongPresenting && strongPresented) {
+                        callOrig(strongPresenting, _cmd, strongPresented, animated, copiedCompletion);
+                    } else {
+                        DLOG(@"[DIAG-ALERT] Async present aborted: presentingVC or presentedVC deallocated");
+                    }
                 } @catch (NSException *e) {
-                    DLOG(@"[DIAG-ALERT] Exception in main thread present: %@", e.reason);
+                    DLOG(@"[DIAG-ALERT] Exception calling orig present (async main thread): %@", e.reason);
                 } @catch (...) {
-                    DLOG(@"[DIAG-ALERT] Unknown exception in main thread present");
+                    DLOG(@"[DIAG-ALERT] Unknown exception calling orig present (async main thread)");
                 }
             });
         }
     } @catch (NSException *e) {
-        DLOG(@"[DIAG-ALERT] Exception in alert hook outer: %@", e.reason);
-    }
-    @catch (...) {
-        DLOG(@"[DIAG-ALERT] Unknown exception in alert hook outer");
+        DLOG(@"[DIAG-ALERT] Exception in alert hook OUTER: %@", e.reason);
+    } @catch (...) {
+        DLOG(@"[DIAG-ALERT] Unknown C++/foreign exception in alert hook OUTER");
     }
 }
 
@@ -1839,35 +1906,77 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
             const unsigned char *body = data + 12;
             ssize_t bodyLen = len - 12;
             
-            // v36.57: Reset server list before binary parsing
+            // v36.59: Reset server list before binary parsing
             g_serverCount = 0;
             
+            // v36.59: Parse servers using TLV format first (type-length-value)
+            // Look for patterns like: ip(4 bytes BE) + port(2 bytes BE) + serverid(2-4 bytes)
+            // Also try little-endian for IP and port as game may use host byte order
+            
+            NSMutableArray *foundServers = [NSMutableArray array];
+            
             for (ssize_t offset = 0; offset < bodyLen - 6 && g_serverCount < MAX_SERVERS; offset++) {
+                // Try BIG ENDIAN first: IP bytes in order b1.b2.b3.b4
                 int b1 = body[offset];
                 int b2 = body[offset+1];
                 int b3 = body[offset+2];
                 int b4 = body[offset+3];
                 
-                // More strict IP validation: b1 must be 1-223 (valid public IP range)
-                // Exclude 0 (invalid), 127 (loopback), 224-255 (multicast/reserved)
                 if (b1 >= 1 && b1 <= 223 && b1 != 127 && b4 >= 1 && b4 <= 223) {
-                    char ipStr[64];
-                    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", b1, b2, b3, b4);
+                    // Valid-looking IP bytes - try both byte orders
+                    char ipBE[64], ipLE[64];
+                    snprintf(ipBE, sizeof(ipBE), "%d.%d.%d.%d", b1, b2, b3, b4);
+                    snprintf(ipLE, sizeof(ipLE), "%d.%d.%d.%d", b4, b3, b2, b1);
                     
-                    if (offset + 6 < bodyLen) {
-                        int port = (body[offset+5] << 8) | body[offset+6];
-                        if (port > 0 && port < 65536) {
-                            // v36.57: Store in server list
-                            strncpy(g_serverList[g_serverCount].ip, ipStr, 63);
-                            g_serverList[g_serverCount].port = port;
-                            DLOG(@"[SERVERLIST-PARSE] Binary found server %d: %s:%d", g_serverCount, ipStr, port);
+                    // Big-endian port
+                    int portBE = (body[offset+4] << 8) | body[offset+5];
+                    // Little-endian port
+                    int portLE = (body[offset+5] << 8) | body[offset+4];
+                    
+                    // Try all combinations - valid port range is 1024-65535 for game servers
+                    char *selectedIP = NULL;
+                    int selectedPort = 0;
+                    
+                    if (portBE >= 1024 && portBE < 65536) {
+                        selectedIP = ipBE;
+                        selectedPort = portBE;
+                        DLOG(@"[SERVERLIST-PARSE] Candidate BE: %s:%d (raw: %02x %02x %02x %02x %02x %02x)",
+                             selectedIP, selectedPort,
+                             b1, b2, b3, b4, body[offset+4], body[offset+5]);
+                    }
+                    if (portLE >= 1024 && portLE < 65536) {
+                        if (!selectedIP || (portLE == 12003 || portLE == 58158)) {
+                            selectedIP = ipLE;
+                            selectedPort = portLE;
+                            DLOG(@"[SERVERLIST-PARSE] Candidate LE: %s:%d (raw: %02x %02x %02x %02x %02x %02x)",
+                                 selectedIP, selectedPort,
+                                 b1, b2, b3, b4, body[offset+4], body[offset+5]);
+                        }
+                    }
+                    
+                    if (selectedIP && selectedPort > 0) {
+                        // Avoid duplicates
+                        NSString *key = [NSString stringWithFormat:@"%s:%d", selectedIP, selectedPort];
+                        BOOL duplicate = NO;
+                        for (NSString *s in foundServers) {
+                            if ([s isEqualToString:key]) { duplicate = YES; break; }
+                        }
+                        if (!duplicate) {
+                            [foundServers addObject:key];
+                            
+                            // Store in server list
+                            strncpy(g_serverList[g_serverCount].ip, selectedIP, 63);
+                            g_serverList[g_serverCount].port = selectedPort;
+                            DLOG(@"[SERVERLIST-PARSE] Binary server %d: %s:%d", 
+                                 g_serverCount, g_serverList[g_serverCount].ip, g_serverList[g_serverCount].port);
                             
                             // Set first valid server as default
                             if (g_serverCount == 0) {
-                                strncpy(g_gameServerIP, ipStr, 63);
-                                g_gameServerPort = port;
+                                strncpy(g_gameServerIP, selectedIP, 63);
+                                g_gameServerPort = selectedPort;
                                 g_currentServerIndex = 0;
-                                DLOG(@"[SERVERLIST-PARSE] Set default game server: %s:%d", g_gameServerIP, g_gameServerPort);
+                                DLOG(@"[SERVERLIST-PARSE] Set default game server: %s:%d", 
+                                     g_gameServerIP, g_gameServerPort);
                             }
                             g_serverCount++;
                         }
@@ -1875,8 +1984,72 @@ static void parseServerListResponse(const unsigned char *data, ssize_t len) {
                 }
             }
             
+            // v36.59: Also check for ASCII-encoded IPs with preceding/surrounding data
+            // Pattern: 47.100.14.198 as individual ASCII digits, not binary
+            DLOG(@"[SERVERLIST-PARSE] Searching for ASCII IP patterns...");
+            for (ssize_t offset = 0; offset < bodyLen - 12; offset++) {
+                if (body[offset] >= '1' && body[offset] <= '9') {
+                    // Try to find ASCII IP: digits.digits.digits.digits:digits
+                    // Example: "47.100.14.198" then port value nearby
+                    char candidate[128];
+                    ssize_t i = 0;
+                    ssize_t start = offset;
+                    while (offset < bodyLen && i < 63 && 
+                           ((body[offset] >= '0' && body[offset] <= '9') || body[offset] == '.')) {
+                        candidate[i++] = (char)body[offset++];
+                    }
+                    candidate[i] = '\0';
+                    
+                    // Check if looks like IP
+                    int dots = 0;
+                    for (ssize_t j = 0; candidate[j]; j++) {
+                        if (candidate[j] == '.') dots++;
+                    }
+                    
+                    if (dots == 3 && i > 6) {
+                        DLOG(@"[SERVERLIST-PARSE] Found ASCII IP pattern at %zd: '%s'", start, candidate);
+                        // Look for port following this IP (usually within 4-20 bytes)
+                        for (ssize_t pOffset = offset; pOffset < offset + 30 && pOffset < bodyLen - 2; pOffset++) {
+                            int portA = (body[pOffset] << 8) | body[pOffset+1];
+                            int portB = (body[pOffset+1] << 8) | body[pOffset];
+                            int fport = 0;
+                            if (portA >= 1024 && portA < 65536) fport = portA;
+                            else if (portB >= 1024 && portB < 65536) fport = portB;
+                            
+                            if (fport > 0) {
+                                NSString *key = [NSString stringWithFormat:@"%s:%d", candidate, fport];
+                                BOOL duplicate = NO;
+                                for (NSString *s in foundServers) {
+                                    if ([s isEqualToString:key]) { duplicate = YES; break; }
+                                }
+                                if (!duplicate && g_serverCount < MAX_SERVERS) {
+                                    [foundServers addObject:key];
+                                    strncpy(g_serverList[g_serverCount].ip, candidate, 63);
+                                    g_serverList[g_serverCount].port = fport;
+                                    DLOG(@"[SERVERLIST-PARSE] ASCII server %d: %s:%d",
+                                         g_serverCount, candidate, fport);
+                                    
+                                    if (g_serverCount == 0) {
+                                        strncpy(g_gameServerIP, candidate, 63);
+                                        g_gameServerPort = fport;
+                                        g_currentServerIndex = 0;
+                                        DLOG(@"[SERVERLIST-PARSE] Set default: %s:%d", g_gameServerIP, g_gameServerPort);
+                                    }
+                                    g_serverCount++;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
             if (g_serverCount > 0) {
                 DLOG(@"[SERVERLIST-PARSE] Stored %d servers for rotation", g_serverCount);
+                for (int i = 0; i < g_serverCount; i++) {
+                    DLOG(@"[SERVERLIST-PARSE]   [%d] %s:%d", i, 
+                         g_serverList[i].ip, g_serverList[i].port);
+                }
             } else {
                 DLOG(@"[SERVERLIST-PARSE] No servers found in binary response");
             }
@@ -1945,9 +2118,10 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
-        // v36.58: Port rewrite 12003 -> 58158 (normal client uses 58158)
-        BOOL isGameServer = (port == 12003 || port == 58158);
-        BOOL needRewrite = (port == 12003);
+        // v36.59: Port rewrite - ONLY rewrite PORT 12003 -> 58158
+        // NEVER change the IP address! Keep original IP from game logic
+        BOOL isGameServerPort = (port == 12003 || port == 58158);
+        BOOL needPortRewrite = (port == 12003);
         
         // Save original address for logging
         char origHost[64];
@@ -1957,24 +2131,26 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         
         struct sockaddr_in newAddr = *in;
         
-        if (needRewrite) {
-            // Rewrite port 12003 -> 58158
+        if (needPortRewrite) {
+            // v36.59 FIX: Only rewrite PORT, keep original IP address!
             newAddr.sin_port = htons(58158);
             port = 58158;
-            strncpy(host, g_gameServerIP, 63);
-            host[63] = '\0';
-            DLOG(@"[REWRITE] Game server %s:12003 -> %s:58158", origHost, host);
+            // DO NOT change host variable! Keep original IP for logging and tracking
+            DLOG(@"[REWRITE-PORT] Game server %s:%d -> %s:%d (PORT ONLY, IP preserved)", 
+                 origHost, origPort, origHost, port);
         }
         
+        // v36.59: Detailed connection logging
         trackFd(sockfd, host, port);
-        DLOG(@"[SOCK] connect START fd=%d %s:%d (v36.58 SIMPLE%s)", sockfd, host, port, needRewrite ? " PORT REWRITE 12003->58158" : "");
+        DLOG(@"[SOCK] connect START fd=%d host=%s port=%d origPort=%d rewrite=%d", 
+             sockfd, host, port, origPort, needPortRewrite ? 1 : 0);
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        // Use rewritten address if needed
+        // Use rewritten address if port rewrite needed (IP unchanged, port changed)
         int result;
-        if (needRewrite) {
+        if (needPortRewrite) {
             result = orig_connect ? orig_connect(sockfd, (struct sockaddr *)&newAddr, sizeof(newAddr)) : -1;
         } else {
             result = orig_connect ? orig_connect(sockfd, addr, addrlen) : -1;
@@ -1984,16 +2160,17 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        DLOG(@"[SOCK] connect END fd=%d %s:%d result=%d errno=%d(%s) elapsed=%.3fs", 
+        DLOG(@"[SOCK] connect END fd=%d host=%s port=%d result=%d errno=%d(%s) elapsed=%.3fs", 
              sockfd, host, port, result, errno, strerror(errno), elapsed);
         
-        // If connection failed on game server, try next server for rotation
-        if (isGameServer && result != 0) {
-            DLOG(@"[SOCK] Game server %s:%d connection failed, attempting rotation...", host, port);
+        // If connection failed on game server port, try next server for rotation
+        if (isGameServerPort && result != 0) {
+            DLOG(@"[SOCK] Game server connection failed, attempting rotation...");
             @try {
                 BOOL rotated = tryNextServer();
                 if (rotated) {
-                    DLOG(@"[SOCK] Rotated to %s:%d for retry", g_gameServerIP, g_gameServerPort);
+                    DLOG(@"[SOCK] Next server available: %s:%d (game will use its own connection logic)", 
+                         g_gameServerIP, g_gameServerPort);
                 }
             } @catch (NSException *e) {
                 DLOG(@"[SOCK] Exception during rotation: %@", e.reason);
@@ -2594,11 +2771,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.57: Patch game server error responses for port 12003
-                    if (port == 12003) {
-                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=12003)", status);
+                    // v36.59: Patch game server error responses for BOTH 12003 AND 58158
+                    if (port == 12003 || port == 58158) {
+                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=%d host=%s)", status, port, host);
                         ((unsigned char *)buf)[12] = 0;
-                        [detail appendFormat:@"  [PATCH] Status patched to 0\n"];
+                        [detail appendFormat:@"  [PATCH] Status patched to 0 (port=%d)\n", port];
                     }
                 }
             }
@@ -2611,20 +2788,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     if ([payloadStr containsString:@"版本过低"] || [payloadStr containsString:@"当前版本"] || 
                         [payloadStr containsString:@"版本太旧"]) {
                         [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
-                        DLOG(@"[GAME-PATCH] Error text found: %@", payloadStr);
-                        // Clear error text for 12003 port
-                        if (port == 12003) {
+                        DLOG(@"[GAME-PATCH] Error text found in game server response: %@ (port=%d)", payloadStr, port);
+                        // Clear error text for BOTH ports
+                        if (port == 12003 || port == 58158) {
                             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
                             static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
                             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
                                 if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-                                    DLOG(@"[GAME-PATCH] Cleared '版本过低' at offset %zd", i);
+                                    DLOG(@"[GAME-PATCH] Cleared '版本过低' at offset %zd (port=%d)", i, port);
                                     memset((unsigned char *)buf + i, ' ', sizeof(verLow));
                                 }
                             }
                             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(curVer); i++) {
                                 if (memcmp(p + i, curVer, sizeof(curVer)) == 0) {
-                                    DLOG(@"[GAME-PATCH] Cleared '当前版本' at offset %zd", i);
+                                    DLOG(@"[GAME-PATCH] Cleared '当前版本' at offset %zd (port=%d)", i, port);
                                     memset((unsigned char *)buf + i, ' ', sizeof(curVer));
                                 }
                             }
@@ -3558,18 +3735,65 @@ static NSData *hook_sync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **r
     return nil;
 }
 
-// UIViewController.presentViewController - observe only
+// UIViewController.presentViewController - OBSERVE + VERSION ALERT BLOCKING
+// NOTE: presentViewController:animated:completion: is called ON THE PRESENTING VC,
+// NOT on the presented VC. So we must hook UIViewController's version, not UIAlertController's!
+// The previous hook on UIAlertController was NEVER triggered, and had WRONG param order causing SIGSEGV.
 typedef void (*PresentVC_IMP)(id, SEL, UIViewController *, BOOL, void (^)(void));
 static PresentVC_IMP orig_presentVC = NULL;
 static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
-    NSString *vcClass = NSStringFromClass([vc class]);
-    NSString *title = @"";
-    if ([vc isKindOfClass:[UIAlertController class]]) {
-        UIAlertController *alert = (UIAlertController *)vc;
-        title = [NSString stringWithFormat:@" title='%@' msg='%@'", alert.title ?: @"", alert.message ?: @""];
+    @try {
+        // Check if presented VC is UIAlertController - block version-related alerts HERE
+        if (vc && [vc isKindOfClass:[UIAlertController class]]) {
+            @try {
+                UIAlertController *alert = (UIAlertController *)vc;
+                NSString *title = [alert title];
+                NSString *msg = [alert message];
+                NSString *presenterClass = NSStringFromClass([self class]);
+                DLOG(@"[UI] presentVC: UIAlertController title='%@' msg='%@' presenter=%@",
+                     title ? title : @"<nil>", msg ? msg : @"<nil>", presenterClass);
+                
+                if (title || msg) {
+                    NSString *lowerMsg = msg ? [[msg lowercaseString] copy] : @"";
+                    NSString *lowerTitle = title ? [[title lowercaseString] copy] : @"";
+                    if ([lowerMsg containsString:@"版本过低"] || [lowerMsg containsString:@"版本太旧"] ||
+                        [lowerMsg containsString:@"更新"] || [lowerTitle containsString:@"版本"] ||
+                        [lowerMsg containsString:@"升级"] || [lowerMsg containsString:@"version"] ||
+                        [lowerMsg containsString:@"update"]) {
+                        DLOG(@"[ALERT-BLOCK] Blocked version alert in hook_presentVC: title='%@' msg='%@'",
+                             title ? title : @"", msg ? msg : @"");
+                        return;  // Do NOT present!
+                    }
+                }
+            } @catch (NSException *e) {
+                DLOG(@"[UI] Exception checking alert: %@", e.reason);
+                // Passthrough on error - don't lose the alert completely
+            }
+        } else {
+            NSString *vcClass = vc ? NSStringFromClass([vc class]) : @"<nil>";
+            DLOG(@"[UI] presentVC: %@ presenter=%@", vcClass, NSStringFromClass([self class]));
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[UI] Outer exception in hook_presentVC: %@", e.reason);
     }
-    DLOG(@"[UI] presentVC: %@%@", vcClass, title);
-    if (orig_presentVC) orig_presentVC(self, _cmd, vc, animated, completion);
+    
+    // Always call original (unless we returned early for blocked alerts)
+    // Safe completion: copy to heap, fallback to empty block
+    void (^safeCompletion)(void) = NULL;
+    if (completion) {
+        @try {
+            safeCompletion = [completion copy];
+        } @catch (...) {
+            safeCompletion = NULL;
+        }
+    }
+    if (!safeCompletion) {
+        safeCompletion = ^{};
+    }
+    
+    if (orig_presentVC) {
+        orig_presentVC(self, _cmd, vc, animated, safeCompletion);
+    }
 }
 
 // ============================================================
@@ -3594,7 +3818,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.58 - Port rewrite 12003->58158, simple direct connect");
+    DLOG(@"[VERSION] WangXianHook v36.59 - MSI stub fix, port rewrite, correct presentVC hook");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -3657,11 +3881,18 @@ static void installAllHooks(void) {
     }
     
     // === DIAGNOSTIC: UIAlertController hook ===
-    Class alertCtrlCls = [UIAlertController class];
-    if (alertCtrlCls) {
-        Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
-        if (m) { orig_alertControllerPresent = (void (*)(id, SEL, BOOL, dispatch_block_t))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertControllerPresent); _log(@"[INIT] UIAlertController.present: hook"); }
-    }
+    // v36.59: REMOVED the UIAlertController.presentViewController hook!
+    // REASON: presentViewController:animated:completion: is called ON THE PRESENTING VC,
+    //         not on the UIAlertController itself. So this method was NEVER triggered.
+    //         Worse, the function signature was WRONG (missing viewController param) which
+    //         caused SIGSEGV when the IMP was called.
+    //         The version alert blocking is NOW correctly done in hook_presentVC (UIViewController).
+    // Class alertCtrlCls = [UIAlertController class];
+    // if (alertCtrlCls) {
+    //     Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
+    //     if (m) { orig_alertControllerPresent = ...; ... }
+    // }
+    _log(@"[INIT] UIAlertController: using correct hook_presentVC from UIViewController (blocked old sigfault hook)");
     
     // === DIAGNOSTIC: NSDictionary hooks ===
     Class dictCls = [NSDictionary class];
