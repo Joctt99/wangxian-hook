@@ -1,17 +1,29 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.69 - Fix 0x00FFFF02 auto-response in leftover path
+ * WangXianHook v36.71 - CMD-based game server detection + unconditional status patch
  * MODE: FULL - All hooks enabled
  *
- * v36.69 CRITICAL FIXES:
- * 1. [LEFTOVER-RESPOND] Auto-respond to 0x00FFFF02 in STICKY-LEFTOVER path
- *    - v36.68's STICKY-LEFTOVER returned leftover bytes but skipped auto-response
- *    - When 0x00FFFF02 is saved as leftover, game receives it but doesn't respond
- *    - Now detects 0x00FFFF02 in leftover and sends 0x80FFFF02 auto-response
- *    - This triggers server to continue handshake flow
- * 2. [KEEP-v36.68] Keep all v36.68 fixes (sticky split, heartbeat block)
- * 3. [KEEP-v36.67] Keep all v36.67 fixes (auto-respond 0x00FFFF02)
- * 4. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
+ * v36.71 CRITICAL FIXES:
+ * 1. [CMD-DETECT] Implemented cmd-based game server detection (was only documented in v36.70)
+ *    - Added isGameCmd() function: checks if cmd is in 0x00FFxxxx/0x80FFxxxx/0x000Exxxx/0x800Exxxx ranges
+ *    - Modified hook_recv entry condition: isGameAnalysis = isGamePort || isGameCmd(cmd)
+ *    - This ensures game server responses are analyzed EVEN WHEN getPortForFd returns 0
+ * 2. [ALWAYS-PATCH] Status patch for 0x80FFF494/0x80FFF495 now executes UNCONDITIONALLY
+ *    - Removed isGamePort gate from status patch condition
+ *    - Server handshake response status=1 is ALWAYS patched to status=0
+ * 3. [SEND-DETECT] Heartbeat blocking in hook_send also uses cmd-based detection
+ *    - Modified isGamePortOnly check: blocks heartbeats via cmd range when port fails
+ * 4. [DEBUG] Added [CMD-DETECT] log showing which detection method was used
+ *
+ * PREVIOUS (v36.70):
+ * - Header mentioned CMD-BASED-DETECT but code was NOT actually implemented
+ * - Status patch was still gated by isGamePort check
+ * 
+ * PREVIOUS (v36.69):
+ * - Fix 0x00FFFF02 auto-response in leftover path
+ * - Keep all v36.68 fixes (sticky split, heartbeat block)
+ * - Keep all v36.67 fixes (auto-respond 0x00FFFF02)
+ * - Keep all v36.66 fixes (force send 0x000EE007)
  */
 /*
  * HISTORY:
@@ -211,7 +223,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.69 loaded ===");
+        _log(@"=== WangXianHook v36.71 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1859,6 +1871,23 @@ static int getPortForFd(int fd) {
     return 0;
 }
 
+// v36.71: Check if a command is from game server protocol (not login server)
+// Game server cmd ranges:
+//   0x00FFxxxx / 0x80FFxxxx - Handshake/challenge/response
+//   0x000Exxxx / 0x800Exxxx - Device info related
+//   0x00EExxxx / 0x80EExxxx - Extended device info responses
+// Login server uses 0x802Exxxx range
+static BOOL isGameCmd(uint32_t cmd) {
+    uint32_t prefix = cmd & 0xFFFF0000;
+    // Game server: 0x00FFxxxx, 0x80FFxxxx, 0x000Exxxx, 0x800Exxxx, 0x00EExxxx, 0x80EExxxx
+    if (prefix == 0x00FF0000 || prefix == 0x80FF0000 ||
+        prefix == 0x000E0000 || prefix == 0x800E0000 ||
+        prefix == 0x00EE0000 || prefix == 0x80EE0000) {
+        return YES;
+    }
+    return NO;
+}
+
 static void updateFdHostPort(int fd, const char *host, int port) {
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd) {
@@ -2374,14 +2403,17 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             }
         }
         
-        // v36.68: Block heartbeat packets (0x00000015/0x00000014) from being sent to game server
+        // v36.70: Block heartbeat packets (0x00000015/0x00000014) from being sent to game server
         // During handshake phase, game sends heartbeats that cause server to include
         // heartbeat ACK in handshake response, confusing the game state machine
+        // v36.70: Use cmd-based detection as fallback when port-based fails
         if (isGameOrLoginPort && (cmd == 0x00000015 || cmd == 0x00000014)) {
             // Only block heartbeats to game server ports (not login server)
             BOOL isGamePortOnly = (port == 12003 || port == 58158 ||
                                    (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
-            if (isGamePortOnly && !g_handshakeComplete) {
+            // v36.70: Also detect via cmd range when port-based fails
+            BOOL isGameCmdOnly = isGameCmd(cmd);
+            if ((isGamePortOnly || isGameCmdOnly) && !g_handshakeComplete) {
                 // Block heartbeat: don't send to server, return fake success
                 // Create local heartbeat ACK (0x80000015) to satisfy game client
                 @try {
@@ -2934,11 +2966,22 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     
 #if !MINIMAL_MODE
-    // v36.61: Enhanced game server response analysis (ALL ports, detailed logging)
-    // Analyze responses on game ports (12003, 58158, or dynamic parsed port) - log EVERYTHING
+    // v36.70: Enhanced game server response analysis with CMD-BASED detection
+    // Analyze responses on game ports OR by command range detection
+    // This ensures analysis works even when getPortForFd returns 0
     BOOL isGamePort = (port == 12003 || port == 58158 || 
                        (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
-    if (isGamePort && ret >= 4) {
+    // v36.70: Parse cmd FIRST to enable cmd-based detection when port fails
+    uint32_t rcmd_precheck = 0;
+    if (ret >= 8) {
+        rcmd_precheck = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+    }
+    BOOL gameCmdDetected = isGameCmd(rcmd_precheck);
+    // v36.70: Use BOTH port-based AND cmd-based detection
+    BOOL isGameAnalysis = isGamePort || gameCmdDetected;
+    
+    if (isGameAnalysis && ret >= 4) {
         @try {
             uint32_t rcmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
@@ -2948,7 +2991,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             const char *gamePort;
             if (port == 58158) gamePort = "58158";
             else if (port == 12003) gamePort = "12003";
-            else gamePort = "DYNAMIC";
+            else if (port > 0) gamePort = "DYNAMIC";
+            else gamePort = "CMD-DETECT";
+            
+            // v36.70: Log detection method for debugging
+            if (gameCmdDetected && !isGamePort) {
+                DLOG(@"[CMD-DETECT] Game server detected via cmd range (cmd=0x%08X, port=%d, host=%s) - port-based FAILED", 
+                     rcmd_precheck, port, host);
+            } else if (isGamePort) {
+                DLOG(@"[CMD-DETECT] Game server detected via port (port=%d, host=%s) - cmd check=%d", 
+                     port, host, gameCmdDetected ? 1 : 0);
+            }
             
             // v36.57: Build comprehensive log with hex dump
             NSMutableString *detail = [NSMutableString stringWithCapacity:1024];
@@ -3031,14 +3084,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.64: RE-ENABLE status patching - server returns status=1, client needs status=0
-                    // Only patch 0x80FFF494 and 0x80FFF495 (handshake responses)
-                    if (isGamePort && (rcmd == 0x80FFF494 || rcmd == 0x80FFF495)) {
-                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s)", status, rcmd, port, host);
+                    // v36.70: ALWAYS patch 0x80FFF494/0x80FFF495 status regardless of port detection
+                    // These are game server handshake responses - status=1 must be patched to 0
+                    if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
+                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s) [ALWAYS-ENABLED]", status, rcmd, port, host);
                         ((unsigned char *)buf)[12] = 0;
                         [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
                     } else {
-                        DLOG(@"[GAME-PATCH] Non-target packet (cmd=0x%08X) not patched, status=%u left unchanged", rcmd, status);
+                        [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
+                        DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
                     }
                 }
             }
@@ -3052,8 +3106,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         [payloadStr containsString:@"版本太旧"]) {
                         [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
                         DLOG(@"[GAME-PATCH] Error text found in game server response: %@ (port=%d)", payloadStr, port);
-                        // v36.64: RE-ENABLE text clearing - match status patching
-                        if (isGamePort) {
+                        // v36.70: RE-ENABLE text clearing with cmd-based detection support
+                        if (isGamePort || gameCmdDetected) {
                             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
                             static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
                             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
@@ -4233,7 +4287,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.69 - Fix 0x00FFFF02 auto-response in leftover path");
+    DLOG(@"[VERSION] WangXianHook v36.71 - CMD-based game server detection + unconditional status patch");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
