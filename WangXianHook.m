@@ -3425,14 +3425,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // We replace this ACK with handshake complete to trigger client to send 0x000EE007
             if (rcmd == 0x80000015 && g_challengeResponded && g_challengeFd == fd) {
                 DLOG(@"[ACK-REPLACE] Replacing 0x80000015 heartbeat ACK with 0x80FFF495 handshake complete");
-                // Replace command from 0x80000015 to 0x80FFF495
-                p[4] = 0x80; p[5] = 0xFF; p[6] = 0xF4; p[7] = 0x95;
+                // Replace command from 0x80000015 to 0x80FFF495 - use buf directly (not const p)
+                unsigned char *wbuf = (unsigned char *)buf;
+                wbuf[4] = 0x80; wbuf[5] = 0xFF; wbuf[6] = 0xF4; wbuf[7] = 0x95;
                 rcmd = 0x80FFF495;
                 pktLen = 13;  // Minimum packet length
                 // Update length field
-                p[0] = 0x00; p[1] = 0x00; p[2] = 0x00; p[3] = 0x0D;
+                wbuf[0] = 0x00; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x0D;
                 // Ensure status byte is 0
-                if (ret > 12) p[12] = 0x00;
+                if (ret > 12) wbuf[12] = 0x00;
                 // Reset challenge state
                 g_challengeResponded = NO;
                 DLOG(@"[ACK-REPLACE] Successfully replaced with 0x80FFF495");
