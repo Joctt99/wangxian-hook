@@ -1,20 +1,19 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.82 - Fix critical SecKeyCreateEncryptedData hook bug
+ * WangXianHook v36.84 - Fix challenge response format + force handshake complete
  * MODE: FULL - All hooks enabled
  *
- * v36.82 CRITICAL FIXES:
- * 1. [SEC-FIX] Fix SecKeyCreateEncryptedData hook signature
- *    - CORRECT signature returns CFDataRef, not OSStatus
- *    - Previous code incorrectly treated encrypted data pointer as integer
- *    - This was the ROOT CAUSE of RSA encryption failure
- * 2. [SEC-FIX] Fix SecKeyCreateDecryptedData hook signature
- *    - Same issue: function returns CFDataRef, not OSStatus
- *    - Updated both hooks to use correct function signatures
- * 3. [LOGGING] Use proper NSLog/DLOG logging for success/failure
- *    - Log cipher length on success
- *    - Log error description on failure
+ * v36.84 CRITICAL FIXES:
+ * 1. [RESPONSE-FORMAT] Add STATUS byte to 0x80FFFF02 challenge response
+ *    - Previous: [LENGTH][CMD][SEQ][DATA] 
+ *    - Correct: [LENGTH][CMD][SEQ][STATUS=0][DATA]
+ * 2. [FORCE-HANDSHAKE] Force 0x80FFF495 when client sends heartbeat after challenge
+ *    - If server doesn't return 0x80FFF495, we send it to client ourselves
+ *    - This triggers client to send 0x000EE007 device info
+ * 3. [HEARTBEAT-BLOCK] Extended blocking to post-challenge state
  *
+ * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
+ * v36.82: Fix critical SecKeyCreateEncryptedData/DecryptedData hook signature bug
  * v36.81: Manual Base64 decode with robust error handling
  * v36.79-v36.80: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
  * v36.78: Remove EncryptUtils hooking (fix SIGSEGV crash)
@@ -218,7 +217,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.82 loaded ===");
+        _log(@"=== WangXianHook v36.84 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1042,6 +1041,15 @@ static BOOL g_pubKeyCaptured = NO;
 // v36.79: Track if we already auto-responded to 0x00FFFF02
 static BOOL g_challengeResponded = NO;
 static int g_challengeFd = -1;
+
+// v36.83: Force handshake complete packet buffer
+// When client sends heartbeat after challenge response (server didn't send 0x80FFF495),
+// we prepare a fake 0x80FFF495 handshake complete response
+#define MAX_FORCE_HS_BUF 256
+static BOOL g_forceHandshakeComplete = NO;
+static int g_forceHandshakeFd = -1;
+static uint8_t g_forceHandshakeBuf[MAX_FORCE_HS_BUF];
+static uint32_t g_forceHandshakeLen = 0;
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -2427,12 +2435,17 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                    (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
             // v36.70: Also detect via cmd range when port-based fails
             BOOL isGameCmdOnly = isGameCmd(cmd);
-            if ((isGamePortOnly || isGameCmdOnly) && !g_handshakeComplete) {
+            // v36.83: Also block heartbeats after challenge response (g_challengeResponded)
+            // If client sends heartbeat after our challenge response, it means server
+            // didn't send 0x80FFF495 handshake complete. We need to force-send it.
+            BOOL blockAfterChallenge = (g_challengeResponded && g_challengeFd == fd && 
+                                       (cmd == 0x00000015 || cmd == 0x00000014));
+            
+            if ((isGamePortOnly || isGameCmdOnly) && (!g_handshakeComplete || blockAfterChallenge)) {
                 // Block heartbeat: don't send to server, return fake success
-                // Create local heartbeat ACK (0x80000015) to satisfy game client
                 @try {
                     uint8_t ackBuf[22];
-                    memcpy(ackBuf, buf, 22);  // Copy original heartbeat
+                    memcpy(ackBuf, buf, 22);
                     ackBuf[4] = 0x80;  // Change command from 0x00000015 to 0x80000015
                     
                     // Buffer the local ACK for next recv call
@@ -2441,6 +2454,30 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         g_localHeartbeatAckFd = fd;
                         memcpy(g_localHeartbeatAckBuf, ackBuf, 22);
                         DLOG(@"[HEARTBEAT-BLOCK] Blocked heartbeat (cmd=0x%08X) to game server port=%d. Local ACK buffered.", cmd, port);
+                    }
+                    
+                    // v36.83: If blocking after challenge response, also force-send 0x80FFF495
+                    // This tells client handshake is complete, so it should send 0x000EE007
+                    if (blockAfterChallenge) {
+                        DLOG(@"[HEARTBEAT-BLOCK] After challenge response, forcing 0x80FFF495 handshake complete...");
+                        
+                        // Construct 0x80FFF495 response packet
+                        // Structure: [4 bytes length][4 bytes cmd][4 bytes seq][1 byte status]
+                        uint8_t hsBuf[16] = {0};
+                        uint32_t hsLen = 13;  // 4+4+4+1 = 13
+                        hsBuf[0] = 0x00; hsBuf[1] = 0x00; hsBuf[2] = 0x00; hsBuf[3] = 0x0D;
+                        hsBuf[4] = 0x80; hsBuf[5] = 0xFF; hsBuf[6] = 0xF4; hsBuf[7] = 0x95;
+                        // seq from heartbeat
+                        memcpy(hsBuf + 8, (const unsigned char *)buf + 8, 4);
+                        hsBuf[12] = 0x00;  // status = success
+                        
+                        // Buffer for hook_recv to deliver
+                        g_forceHandshakeComplete = YES;
+                        g_forceHandshakeFd = fd;
+                        memcpy(g_forceHandshakeBuf, hsBuf, hsLen);
+                        g_forceHandshakeLen = hsLen;
+                        
+                        DLOG(@"[HEARTBEAT-BLOCK] 0x80FFF495 handshake complete packet prepared for fd=%d", fd);
                     }
                 } @catch (NSException *e) {
                     DLOG(@"[HEARTBEAT-BLOCK] Exception: %@", e.reason);
@@ -2893,19 +2930,20 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
         return NO;
     }
     
-    // Construct 0x80FFFF02 response packet:
-    // 4 bytes: total packet length (4 + 4 + 4 + encryptedLen)
+    // Construct 0x80FFFF02 response packet (with STATUS byte):
+    // 4 bytes: total packet length (4 + 4 + 4 + 1 + encryptedLen)
     // 4 bytes: cmd = 0x80FFFF02
     // 4 bytes: seq (same as challenge, bytes[8-11])
+    // 1 byte:  status = 0 (success)
     // encryptedLen bytes: encrypted challenge data
-    uint32_t totalLen = (uint32_t)(4 + 4 + 4 + encryptedLen);
-    uint8_t responseBuf[300]; // Max 4+4+4+256 = 264
+    uint32_t totalLen = (uint32_t)(4 + 4 + 4 + 1 + encryptedLen);
+    uint8_t responseBuf[300]; // Max 4+4+4+1+256 = 269
     if (totalLen > sizeof(responseBuf)) {
         DLOG(@"[CHALLENGE-AUTO] Response too large: %u bytes", totalLen);
         return NO;
     }
     
-    // Build packet
+    // Build packet with STATUS byte at offset 12
     responseBuf[0] = (totalLen >> 24) & 0xFF;
     responseBuf[1] = (totalLen >> 16) & 0xFF;
     responseBuf[2] = (totalLen >> 8) & 0xFF;
@@ -2916,11 +2954,14 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
     // Copy seq from challenge (bytes[8-11])
     memcpy(responseBuf + 8, pktBuf + 8, 4);
     
-    // Copy encrypted data
-    memcpy(responseBuf + 12, encryptedData, encryptedLen);
+    // STATUS byte = 0 (success)
+    responseBuf[12] = 0x00;
+    
+    // Copy encrypted data starting at offset 13 (after STATUS)
+    memcpy(responseBuf + 13, encryptedData, encryptedLen);
     
     // Send the response
-    DLOG(@"[CHALLENGE-AUTO] Sending 0x80FFFF02 response: %u bytes to fd=%d (encrypted %zd bytes)", totalLen, fd, encryptedLen);
+    DLOG(@"[CHALLENGE-AUTO] Sending 0x80FFFF02 response: %u bytes to fd=%d (encrypted %zd bytes, WITH status byte)", totalLen, fd, encryptedLen);
     ssize_t sent = orig_send ? orig_send(fd, responseBuf, totalLen, 0) : -1;
     if (sent > 0) {
         g_challengeResponded = YES;
@@ -3148,6 +3189,28 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
+    
+    // v36.83: Check for force handshake complete packet first
+    // After we send fake heartbeat ACK, we also send 0x80FFF495 handshake complete
+    if (g_forceHandshakeComplete && g_forceHandshakeFd == fd && g_forceHandshakeLen > 0) {
+        uint32_t hsLen = g_forceHandshakeLen;
+        if (hsLen > len) hsLen = (uint32_t)len;
+        memcpy(buf, g_forceHandshakeBuf, hsLen);
+        DLOG(@"[FORCE-HS] Returning %u bytes 0x80FFF495 handshake complete (fd=%d)", hsLen, fd);
+        DLOG(@"[FORCE-HS] HEX: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+             g_forceHandshakeBuf[0], g_forceHandshakeBuf[1], g_forceHandshakeBuf[2], g_forceHandshakeBuf[3],
+             g_forceHandshakeBuf[4], g_forceHandshakeBuf[5], g_forceHandshakeBuf[6], g_forceHandshakeBuf[7],
+             g_forceHandshakeBuf[8], g_forceHandshakeBuf[9], g_forceHandshakeBuf[10], g_forceHandshakeBuf[11],
+             g_forceHandshakeBuf[12]);
+        g_forceHandshakeComplete = NO;
+        g_forceHandshakeFd = -1;
+        g_forceHandshakeLen = 0;
+        
+        // Reset challenge state so client can send 0x000EE007
+        g_challengeResponded = NO;
+        DLOG(@"[FORCE-HS] Challenge state reset, client should now send 0x000EE007 device info");
+        return hsLen;
+    }
     
     // v36.68: Check for local heartbeat ACK first (blocked heartbeat responses)
     if (g_localHeartbeatAckLen > 0 && g_localHeartbeatAckFd == fd) {
@@ -3715,6 +3778,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 g_localHeartbeatAckLen = 0;
                 g_localHeartbeatAckFd = -1;
                 g_deviceInfoSentToGame = NO;
+                // v36.84: Clear force handshake state
+                g_forceHandshakeComplete = NO;
+                g_forceHandshakeFd = -1;
+                g_forceHandshakeLen = 0;
                 DLOG(@"[GAME-FLOW] Connection closed, resetting handshake state");
             }
             
