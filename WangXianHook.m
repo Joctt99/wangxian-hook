@@ -1,29 +1,27 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.75 - Patch byte[11] + EncryptUtils hook + init packet logging
+ * WangXianHook v36.76 - Revert byte[11] patch + Hook ALL EncryptUtils methods
  * MODE: FULL - All hooks enabled
  *
- * v36.75 CRITICAL FIXES:
- * 1. [BYTE11-PATCH] Also patch byte[11] (0x1A -> 0x00) in 0x80FFF494/0x80FFF495
- *    - byte[11] = 0x1A (26) may be a secondary status/error field
- *    - byte[12] = 0x01 was already patched to 0
- *    - Client may check multiple fields before proceeding to 0x00FFFF02 processing
- * 2. [ENCRYPT-HOOK] Hook EncryptUtils class to detect certificate parsing attempts
- *    - Hooks RSA-related methods: rsaEncrypt, rsaDecrypt, certificate, publicKey
- *    - Also searches for alternative classes: RSAUtils, CryptoUtils, SecurityUtils
- *    - Will reveal if client attempts to parse cert from 0x80FFF494
- * 3. [INIT-LOG] Log game server initial connection packets (len < 12)
- *    - These are sent right after connecting to game server
- *    - May contain handshake initialization data
+ * v36.76 CRITICAL FIXES:
+ * 1. [REVERT-BYTE11] Reverted byte[11] patch (was corrupting certificate data)
+ *    - byte[11] changes between connections (0x19 -> 0x1A), it's NOT a status field
+ *    - It's likely a sequence number or length indicator
+ *    - Patching it corrupts the Base64-encoded certificate data
+ * 2. [HOOK-ALL] Hook ALL EncryptUtils methods (not just RSA-related ones)
+ *    - Previous version only hooked methods matching specific strings (rsa, certificate, etc.)
+ *    - Now hooks ALL methods and logs every call with return type
+ *    - Will definitively determine if client attempts certificate parsing
+ * 3. [LIST-METHODS] List ALL methods of EncryptUtils for analysis
+ *    - Shows method names to understand the class structure
  *
+ * PREVIOUS (v36.75):
+ * - Added byte[11] patch (turned out to be WRONG - corrupted cert data)
+ * - Added EncryptUtils hook (but missed methods due to name filtering)
+ * 
  * PREVIOUS (v36.74):
  * - COMPLETELY removed ALL 0x00FFFF02 auto-response code
  * - Let client handle 0x00FFFF02 challenge naturally
- * 
- * PREVIOUS (v36.73):
- * - Claimed to disable auto-response and force-send (but code still existed!)
- * - Added protocol tracing to monitor client behavior
- * - Keep all v36.66 fixes (force send 0x000EE007)
  */
 /*
  * HISTORY:
@@ -223,7 +221,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.75 loaded ===");
+        _log(@"=== WangXianHook v36.76 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3125,12 +3123,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
                         DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s) [ALWAYS-ENABLED]", status, rcmd, port, host);
                         ((unsigned char *)buf)[12] = 0;
-                        // v36.75: Also patch byte[11] (0x1A -> 0x00) - may be secondary status field
-                        uint8_t byte11 = ((unsigned char *)buf)[11];
-                        if (byte11 != 0) {
-                            DLOG(@"[GAME-PATCH] Also patching byte[11] from %u (0x%02X) to 0 for cmd=0x%08X", byte11, byte11, rcmd);
-                            ((unsigned char *)buf)[11] = 0;
-                        }
+                        // v36.76: NOT patching byte[11] - it's a sequence/length field, not status
+                        // byte[11] changed from 0x19 to 0x1A between connections, indicating it's not status
+                        // Patching it corrupts the certificate data and prevents client from parsing it
                         [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -3285,15 +3280,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             DLOG(@"[STICKY-PACKET] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd", 
                                  subStatus, subCmd, offset);
                             ((unsigned char *)buf)[offset + 12] = 0;
-                            // v36.75: Also patch byte[11] in sub-packet
-                            if (remaining >= 12) {
-                                uint8_t subByte11 = p[offset + 11];
-                                if (subByte11 != 0) {
-                                    DLOG(@"[STICKY-PACKET] Also patching sub-packet byte[11] from %u (0x%02X) to 0 at offset %zd", 
-                                         subByte11, subByte11, offset);
-                                    ((unsigned char *)buf)[offset + 11] = 0;
-                                }
-                            }
+                            // v36.76: NOT patching byte[11] in sub-packet - same reason as above
                         }
                     }
                     
@@ -4307,7 +4294,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.75 - Patch byte[11] + EncryptUtils hook + init packet logging");
+    DLOG(@"[VERSION] WangXianHook v36.76 - Revert byte[11] patch + Hook ALL EncryptUtils methods");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -4951,34 +4938,48 @@ static void installAllHooks(void) {
                 
                 unsigned int mcount = 0;
                 Method *methods = class_copyMethodList(encryptUtilsCls, &mcount);
+                DLOG(@"[ENCRYPT-UTILS] Total methods in EncryptUtils: %u", mcount);
+                
+                // List ALL methods for debugging
+                NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] ALL methods:"];
                 for (unsigned int i = 0; i < mcount; i++) {
                     SEL sel = method_getName(methods[i]);
                     NSString *selName = NSStringFromSelector(sel);
-                    // Hook RSA-related methods
-                    if ([selName containsString:@"rsaEncrypt"] || 
-                        [selName containsString:@"rsaDecrypt"] ||
-                        [selName containsString:@"RSA"] ||
-                        [selName containsString:@"certificate"] ||
-                        [selName containsString:@"Certificate"] ||
-                        [selName containsString:@"publicKey"] ||
-                        [selName containsString:@"PublicKey"]) {
-                        DLOG(@"[ENCRYPT-UTILS] Found RSA-related method: +[%@ %@]", NSStringFromClass(encryptUtilsCls), selName);
-                        
+                    [allMethods appendFormat:@"\n  [%u] %@", i, selName];
+                    
+                    // v36.76: Hook ALL methods to track any RSA/crypto operations
+                    // Previous version only hooked methods matching specific strings
+                    // Now we hook ALL methods to catch any call
+                    @try {
                         IMP orig = method_getImplementation(methods[i]);
+                        __block NSString *methodName = selName;
                         IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
-                            DLOG(@"[ENCRYPT-UTILS] +[%@ %@] CALLED", NSStringFromClass([self class]), selName);
+                            DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] CALLED", NSStringFromClass([self class]), methodName);
                             va_list args;
                             va_start(args, _cmd);
                             id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
                             va_end(args);
-                            DLOG(@"[ENCRYPT-UTILS] +[%@ %@] returned: %@", NSStringFromClass([self class]), selName, result ?: @"nil");
+                            // Log result type
+                            if ([result isKindOfClass:[NSData class]]) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned NSData (len=%lu)", 
+                                     NSStringFromClass([self class]), methodName, (unsigned long)[(NSData *)result length]);
+                            } else if ([result isKindOfClass:[NSString class]]) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned NSString: %@", 
+                                     NSStringFromClass([self class]), methodName, result);
+                            } else if (result == nil) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned nil", 
+                                     NSStringFromClass([self class]), methodName);
+                            }
                             return result;
                         });
                         method_setImplementation(methods[i], new_impl);
-                        DLOG(@"[ENCRYPT-UTILS] Hooked: %@", selName);
+                    } @catch (NSException *e) {
+                        // Silently ignore hooking failures for individual methods
                     }
                 }
+                DLOG(@"%@", allMethods);
                 if (methods) free(methods);
+                DLOG(@"[ENCRYPT-UTILS] Hooked all %u methods in EncryptUtils", mcount);
             } else {
                 DLOG(@"[ENCRYPT-UTILS] EncryptUtils class NOT found! Searching for alternatives...");
                 // Try alternative class names
@@ -4989,13 +4990,11 @@ static void installAllHooks(void) {
                         DLOG(@"[ENCRYPT-UTILS] Found alternative class: %@", altName);
                         unsigned int altMcount = 0;
                         Method *altMethods = class_copyMethodList(altCls, &altMcount);
+                        DLOG(@"[ENCRYPT-UTILS] %@ has %u methods:", altName, altMcount);
                         for (unsigned int i = 0; i < altMcount; i++) {
                             SEL sel = method_getName(altMethods[i]);
                             NSString *selName = NSStringFromSelector(sel);
-                            if ([selName containsString:@"rsa"] || [selName containsString:@"RSA"] ||
-                                [selName containsString:@"encrypt"] || [selName containsString:@"decrypt"]) {
-                                DLOG(@"[ENCRYPT-UTILS] Alternative method: +[%@ %@]", altName, selName);
-                            }
+                            DLOG(@"[ENCRYPT-UTILS]   [%u] %@", i, selName);
                         }
                         if (altMethods) free(altMethods);
                     }
