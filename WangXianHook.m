@@ -1,21 +1,20 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.78 - Remove EncryptUtils hooking (fix SIGSEGV crash)
+ * WangXianHook v36.79 - Auto-respond to 0x00FFFF02 with RSA-encrypted 0x80FFFF02
  * MODE: FULL - All hooks enabled
  *
- * v36.78 CRITICAL FIXES:
- * 1. [NO-HOOK] REMOVED ALL EncryptUtils method hooking (imp_implementationWithBlock)
- *    - v36.77 crash: SIGSEGV in +[EncryptUtils getPublicKeyFromBase64:] 
- *    - Root cause: va_list forwarding in block-based IMP corrupts Obj-C calling convention
- *    - Game IS calling EncryptUtils correctly (confirmed in v36.77 logs)
- *    - No need to hook - just let game process 0x00FFFF02 naturally
- * 2. [KEEP-FIX] Keep v36.77 sticky packet NO-SPLIT fix
- *    - This WORKS: client now receives 0x00FFFF02 after 0x80FFF494
- *    - Game successfully calls rsaVerifyData and getPublicKeyFromBase64
- * 3. [KEEP-SCAN] Keep crypto class scanning for future reference
+ * v36.79 CRITICAL FIXES:
+ * 1. [AUTO-RESPONSE] Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
+ *    - Client fails to parse RSA cert from 0x80FFF494 and never sends 0x80FFFF02
+ *    - We extract Base64 cert from 0x80FFF494 response, encrypt challenge data with RSA key
+ *    - Construct and send 0x80FFFF02 response automatically
+ * 2. [CERT-EXTRACT] Extract RSA public key certificate from 0x80FFF494 response
+ *    - cert starts at byte[14] (after length+cmd+field+status+type)
+ *    - Base64 decode and parse with Security framework
+ * 3. [KEEP-FIX] Keep v36.77 sticky packet NO-SPLIT fix
  *
+ * v36.78: Remove EncryptUtils hooking (fix SIGSEGV crash)
  * v36.77: Fix sticky packet splitting + metaclass crypto detection
- * v36.76: Revert byte[11] patch + Hook ALL EncryptUtils methods
  */
 /*
  * HISTORY:
@@ -215,7 +214,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.78 loaded ===");
+        _log(@"=== WangXianHook v36.79 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1028,6 +1027,17 @@ static int g_localHeartbeatAckFd = -1;
 // v36.68: Global handshake state tracking (moved from hook_recv for cross-function access)
 static BOOL g_handshakeComplete = NO;
 static int g_heartbeatCount = 0;
+
+// v36.79: Store game server public key for RSA encrypt
+// Extracted from 0x80FFF494 response (Base64-encoded DER public key)
+#define MAX_PUBKEY_BASE64 1024
+static char g_pubKeyBase64[MAX_PUBKEY_BASE64];
+static size_t g_pubKeyBase64Len = 0;
+static BOOL g_pubKeyCaptured = NO;
+
+// v36.79: Track if we already auto-responded to 0x00FFFF02
+static BOOL g_challengeResponded = NO;
+static int g_challengeFd = -1;
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -2590,6 +2600,232 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     return ret;
 }
 
+// v36.79: RSA encrypt challenge data using server's public key certificate
+// Returns encrypted data length, or -1 on failure
+static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
+                                    uint8_t *cipherBuf, size_t cipherBufSize) {
+    if (!g_pubKeyCaptured || g_pubKeyBase64Len == 0) {
+        DLOG(@"[RSA-ENCRYPT] No public key captured, cannot encrypt");
+        return -1;
+    }
+    
+    @try {
+        // Step 1: Base64 decode the certificate
+        NSData *certBase64Data = [NSData dataWithBytes:g_pubKeyBase64 length:g_pubKeyBase64Len];
+        if (!certBase64Data) {
+            DLOG(@"[RSA-ENCRYPT] Failed to create NSData from Base64 cert");
+            return -1;
+        }
+        
+        NSData *certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:0];
+        if (!certDER || certDER.length == 0) {
+            DLOG(@"[RSA-ENCRYPT] Base64 decode failed, trying alternate approach...");
+            // Try with line-breaking options
+            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:NSBase64DecodingIgnoreUnknownCharacters];
+            if (!certDER || certDER.length == 0) {
+                DLOG(@"[RSA-ENCRYPT] Base64 decode failed completely");
+                return -1;
+            }
+        }
+        DLOG(@"[RSA-ENCRYPT] Base64 decoded cert: %lu bytes (from %lu bytes Base64)",
+             (unsigned long)certDER.length, (unsigned long)g_pubKeyBase64Len);
+        
+        // Step 2: Create SecCertificate from DER data
+        SecCertificateRef certRef = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)certDER);
+        if (!certRef) {
+            DLOG(@"[RSA-ENCRYPT] SecCertificateCreateWithData failed - cert may not be valid X.509");
+            
+            // Try to extract public key directly from DER (in case it's a bare public key, not cert)
+            // Check if DER starts with a known RSA public key sequence
+            if (certDER.length > 16) {
+                const uint8_t *derBytes = (const uint8_t *)certDER.bytes;
+                DLOG(@"[RSA-ENCRYPT] DER header: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     derBytes[0], derBytes[1], derBytes[2], derBytes[3],
+                     derBytes[4], derBytes[5], derBytes[6], derBytes[7]);
+                
+                // Try as SecKey directly using kSecAttrKeyTypeRSA
+                NSDictionary *keyAttrs = @{
+                    (__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeRSA,
+                    (__bridge id)kSecAttrKeyClass: (__bridge id)kSecAttrKeyClassPublic,
+                    (__bridge id)kSecAttrKeySizeInBits: @2048
+                };
+                SecKeyRef directKey = SecKeyCreateWithData((__bridge CFDataRef)certDER,
+                                                           (__bridge CFDictionaryRef)keyAttrs, NULL);
+                if (directKey) {
+                    DLOG(@"[RSA-ENCRYPT] Created SecKey directly from DER data");
+                    
+                    // Step 3: Encrypt with RSA
+                    CFErrorRef encryptErr = NULL;
+                    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionWithSHA256;
+                    CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
+                    CFDataRef cipherCFData = SecKeyCreateEncryptedData(directKey, algo,
+                                                                       plainCFData, &encryptErr);
+                    CFRelease(plainCFData);
+                    
+                    if (cipherCFData) {
+                        size_t cipherLen = CFDataGetLength(cipherCFData);
+                        if (cipherLen <= cipherBufSize) {
+                            CFDataGetBytes(cipherCFData, CFRangeMake(0, cipherLen), cipherBuf);
+                            CFRelease(cipherCFData);
+                            CFRelease(directKey);
+                            DLOG(@"[RSA-ENCRYPT] Success: encrypted %lu bytes -> %lu bytes RSA cipher",
+                                 (unsigned long)plainLen, (unsigned long)cipherLen);
+                            return (ssize_t)cipherLen;
+                        }
+                        CFRelease(cipherCFData);
+                    } else {
+                        DLOG(@"[RSA-ENCRYPT] SecKeyCreateEncryptedData failed: %@",
+                             encryptErr ? CFBridgingRelease(CFErrorCopyDescription(encryptErr)) : @"unknown");
+                        if (encryptErr) CFRelease(encryptErr);
+                    }
+                    CFRelease(directKey);
+                } else {
+                    DLOG(@"[RSA-ENCRYPT] SecKeyCreateWithData also failed");
+                }
+            }
+            return -1;
+        }
+        
+        // Step 3: Extract public key from certificate
+        SecKeyRef pubKeyRef = SecCertificateCopyPublicKey(certRef);
+        CFRelease(certRef);
+        
+        if (!pubKeyRef) {
+            DLOG(@"[RSA-ENCRYPT] SecCertificateCopyPublicKey failed");
+            return -1;
+        }
+        DLOG(@"[RSA-ENCRYPT] Got public key from certificate");
+        
+        // Step 4: Encrypt with RSA using SecKeyCreateEncryptedData (iOS 10+)
+        CFErrorRef encryptErr = NULL;
+        SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionWithSHA256;
+        
+        // Check if the algorithm is supported
+        if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+            DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
+            algo = kSecKeyAlgorithmRSAEncryptionWithSHA1;
+            if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+                DLOG(@"[RSA-ENCRYPT] SHA1 not supported either, trying PKCS1...");
+                algo = kSecKeyAlgorithmRSAEncryptionPKCS1;
+                if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+                    DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
+                    CFRelease(pubKeyRef);
+                    return -1;
+                }
+            }
+        }
+        
+        CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
+        CFDataRef cipherCFData = SecKeyCreateEncryptedData(pubKeyRef, algo,
+                                                           plainCFData, &encryptErr);
+        CFRelease(plainCFData);
+        CFRelease(pubKeyRef);
+        
+        if (cipherCFData) {
+            size_t cipherLen = CFDataGetLength(cipherCFData);
+            if (cipherLen <= cipherBufSize) {
+                CFDataGetBytes(cipherCFData, CFRangeMake(0, cipherLen), cipherBuf);
+                CFRelease(cipherCFData);
+                DLOG(@"[RSA-ENCRYPT] Success: encrypted %lu bytes -> %lu bytes RSA cipher (algo=%s)",
+                     (unsigned long)plainLen, (unsigned long)cipherLen,
+                     algo == kSecKeyAlgorithmRSAEncryptionWithSHA256 ? "SHA256" :
+                     algo == kSecKeyAlgorithmRSAEncryptionWithSHA1 ? "SHA1" : "PKCS1");
+                return (ssize_t)cipherLen;
+            }
+            CFRelease(cipherCFData);
+            DLOG(@"[RSA-ENCRYPT] Cipher buffer too small: need %lu, have %lu",
+                 (unsigned long)cipherLen, (unsigned long)cipherBufSize);
+            return -1;
+        } else {
+            DLOG(@"[RSA-ENCRYPT] SecKeyCreateEncryptedData failed: %@",
+                 encryptErr ? CFBridgingRelease(CFErrorCopyDescription(encryptErr)) : @"unknown");
+            if (encryptErr) CFRelease(encryptErr);
+            return -1;
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[RSA-ENCRYPT] Exception: %@", e.reason);
+        return -1;
+    }
+}
+
+// v36.79: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
+// Returns YES if response was sent
+static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t pktLen,
+                                    uint32_t cmd) {
+    if (cmd != 0x00FFFF02 || pktLen < 12) return NO;
+    if (g_challengeResponded && g_challengeFd == fd) {
+        DLOG(@"[CHALLENGE-AUTO] Already responded to 0x00FFFF02 for fd=%d, skipping", fd);
+        return NO;
+    }
+    if (!g_pubKeyCaptured) {
+        DLOG(@"[CHALLENGE-AUTO] No public key available, cannot auto-respond");
+        return NO;
+    }
+    
+    // Extract challenge payload (bytes[12..end])
+    size_t payloadLen = pktLen - 12;
+    const uint8_t *payloadData = pktBuf + 12;
+    
+    DLOG(@"[CHALLENGE-AUTO] Auto-responding to 0x00FFFF02: payload=%zu bytes, fd=%d", payloadLen, fd);
+    
+    // Encrypt the challenge data with RSA public key
+    uint8_t encryptedData[256]; // RSA 2048-bit = 256 bytes max
+    ssize_t encryptedLen = rsaEncryptChallenge(payloadData, payloadLen, encryptedData, sizeof(encryptedData));
+    if (encryptedLen <= 0) {
+        DLOG(@"[CHALLENGE-AUTO] RSA encryption failed, cannot auto-respond");
+        return NO;
+    }
+    
+    // Construct 0x80FFFF02 response packet:
+    // 4 bytes: total packet length (4 + 4 + 4 + encryptedLen)
+    // 4 bytes: cmd = 0x80FFFF02
+    // 4 bytes: seq (same as challenge, bytes[8-11])
+    // encryptedLen bytes: encrypted challenge data
+    uint32_t totalLen = (uint32_t)(4 + 4 + 4 + encryptedLen);
+    uint8_t responseBuf[300]; // Max 4+4+4+256 = 264
+    if (totalLen > sizeof(responseBuf)) {
+        DLOG(@"[CHALLENGE-AUTO] Response too large: %u bytes", totalLen);
+        return NO;
+    }
+    
+    // Build packet
+    responseBuf[0] = (totalLen >> 24) & 0xFF;
+    responseBuf[1] = (totalLen >> 16) & 0xFF;
+    responseBuf[2] = (totalLen >> 8) & 0xFF;
+    responseBuf[3] = totalLen & 0xFF;
+    
+    responseBuf[4] = 0x80; responseBuf[5] = 0xFF; responseBuf[6] = 0xFF; responseBuf[7] = 0x02;
+    
+    // Copy seq from challenge (bytes[8-11])
+    memcpy(responseBuf + 8, pktBuf + 8, 4);
+    
+    // Copy encrypted data
+    memcpy(responseBuf + 12, encryptedData, encryptedLen);
+    
+    // Send the response
+    DLOG(@"[CHALLENGE-AUTO] Sending 0x80FFFF02 response: %u bytes to fd=%d", totalLen, fd);
+    ssize_t sent = orig_send ? orig_send(fd, responseBuf, totalLen, 0) : -1;
+    if (sent > 0) {
+        g_challengeResponded = YES;
+        g_challengeFd = fd;
+        DLOG(@"[CHALLENGE-AUTO] Sent 0x80FFFF02 response: %zd bytes (encrypted %zu -> %zd)",
+             sent, payloadLen, encryptedLen);
+        
+        // Log response hex
+        NSMutableString *hexStr = [NSMutableString stringWithString:@"  Response HEX: "];
+        for (uint32_t i = 0; i < totalLen && i < 64; i++) {
+            [hexStr appendFormat:@"%02X ", responseBuf[i]];
+        }
+        if (totalLen > 64) [hexStr appendFormat:@"..."];
+        DLOG(@"%@", hexStr);
+        
+        return YES;
+    } else {
+        DLOG(@"[CHALLENGE-AUTO] Send failed: %zd", sent);
+        return NO;
+    }
+}
+
 static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
     if (!payload || payloadLen == 0) return;
     
@@ -2917,13 +3153,21 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // v36.74: DISABLE auto-response and force-send - let client handle protocol naturally
-            // Client already handles 0x00FFFF01 by sending 0x80FFFF01 - should also handle 0x00FFFF02
-            // Force-sending plaintext 0x000EE007 is rejected by server (needs encryption with RSA key)
+            // v36.79: Auto-respond to 0x00FFFF02 with RSA-encrypted 0x80FFFF02
+            // Client fails to parse RSA cert from 0x80FFF494 - we handle it
+            // 0x00FFFF01 is handled by client natively (no RSA needed)
             if (cmd == 0x00FFFF02 && ret >= 28) {
-                [challengeDetail appendFormat:@"  [V36.74] NOT auto-responding - client must handle 0x00FFFF02 naturally\n"];
-                [challengeDetail appendFormat:@"  [V36.74] Client needs to: 1) parse RSA cert from 0x80FFF494, 2) derive session key, 3) send encrypted 0x000EE007\n"];
-                [challengeDetail appendFormat:@"  [V36.74] Monitoring client response to 0x00FFFF02...\n"];
+                [challengeDetail appendFormat:@"  [V36.79] AUTO-RESPONDING to 0x00FFFF02 with RSA-encrypted 0x80FFFF02\n"];
+                [challengeDetail appendFormat:@"  [V36.79] Using stored public key from 0x80FFF494 response\n"];
+                
+                // v36.79: Actually auto-respond here
+                BOOL responded = autoRespondToChallenge(fd, p, ret, cmd);
+                if (responded) {
+                    [challengeDetail appendFormat:@"  [V36.79] Successfully sent 0x80FFFF02 response!\n"];
+                } else {
+                    [challengeDetail appendFormat:@"  [V36.79] Auto-response failed - client may handle naturally\n"];
+                    [challengeDetail appendFormat:@"  [V36.79] Client needs to: 1) parse RSA cert, 2) derive session key, 3) send encrypted 0x000EE007\n"];
+                }
             } else if (cmd == 0x00FFFF01) {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -3121,6 +3365,27 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         // byte[11] changed from 0x19 to 0x1A between connections, indicating it's not status
                         // Patching it corrupts the certificate data and prevents client from parsing it
                         [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
+                        
+                        // v36.79: Extract RSA public key certificate from 0x80FFF494 response
+                        // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
+                        // byte[13] = cert format type (0x88 = X.509 cert)
+                        // bytes[14..end] = Base64-encoded DER certificate data
+                        if (rcmd == 0x80FFF494 && ret > 14 && !g_pubKeyCaptured) {
+                            ssize_t certOffset = 14;
+                            ssize_t certLen = ret - certOffset;
+                            if (certLen > 0 && certLen < MAX_PUBKEY_BASE64) {
+                                memcpy(g_pubKeyBase64, p + certOffset, certLen);
+                                g_pubKeyBase64Len = certLen;
+                                g_pubKeyCaptured = YES;
+                                g_challengeResponded = NO; // Reset challenge response flag
+                                DLOG(@"[PUBKEY-EXTRACT] Extracted RSA cert: %zd bytes Base64 (offset=%zd)", certLen, certOffset);
+                                // Log first 80 chars of cert
+                                NSString *certPreview = [[NSString alloc] initWithBytes:p+certOffset length:MIN((NSUInteger)certLen, 80) encoding:NSASCIIStringEncoding];
+                                if (certPreview) {
+                                    DLOG(@"[PUBKEY-EXTRACT] Cert starts: %@...", certPreview);
+                                }
+                            }
+                        }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
@@ -3186,9 +3451,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     // v36.68: Clear local heartbeat ACK buffer when handshake completes
                     g_localHeartbeatAckLen = 0;
                     g_localHeartbeatAckFd = -1;
-                    DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Waiting for client to handle 0x00FFFF02 and send encrypted 0x000EE007...", rcmd);
-                    DLOG(@"[GAME-FLOW] v36.74: NOT auto-responding to challenges - letting client handle protocol naturally");
-                    DLOG(@"[GAME-FLOW] Client should: 1) parse cert, 2) derive session key, 3) send encrypted device info");
+                    DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Waiting for 0x00FFFF02 challenge...", rcmd);
+                    DLOG(@"[GAME-FLOW] v36.79: Auto-responding to 0x00FFFF02 with RSA-encrypted 0x80FFFF02");
+                    DLOG(@"[GAME-FLOW] After challenge response, client should send encrypted 0x000EE007 (device info)");
                 }
             } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
                 // Count server responses after handshake - these are likely responses to client heartbeats
@@ -3256,6 +3521,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[STICKY-SCAN] Sub-packet at offset %zd: cmd=0x%08X len=%u status=%u",
                      scanOffset, scanCmd, scanPktLen, p[scanOffset + 12]);
                 
+                // v36.79: Auto-respond to 0x00FFFF02 in sticky scan path
+                if (scanCmd == 0x00FFFF02 && scanRemaining >= 28) {
+                    DLOG(@"[STICKY-SCAN] Auto-responding to 0x00FFFF02 sub-packet at offset %zd", scanOffset);
+                    autoRespondToChallenge(fd, p + scanOffset, (size_t)scanPktLen, scanCmd);
+                }
+                
                 scanOffset += scanPktLen;
             }
             if (patchedExtra) {
@@ -3298,10 +3569,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         }
                     }
                     
-                    // v36.74: DISABLED auto-response to 0x00FFFF02 in sticky-packet path
-                    // Let client handle challenge naturally - it needs to construct proper RSA-encrypted response
-                    // Previously: auto-responded with fake 0x80FFFF02 by copying bytes and flipping cmd,
-                    // which server rejected because it expects RSA-encrypted data using certificate from 0x80FFF494
+                    // v36.79: Auto-respond to 0x00FFFF02 in sticky-packet path too
+                    if (subCmd == 0x00FFFF02 && remaining >= 28) {
+                        DLOG(@"[STICKY-AUTO] Auto-responding to 0x00FFFF02 sub-packet at offset %zd", offset);
+                        autoRespondToChallenge(fd, p + offset, (size_t)subPktLen, subCmd);
+                    }
+                    // v36.74: DISABLED auto-response to 0x00FFFF02 in sticky-packet path (now handled above)
                 }
                 
                 // Move to next packet
@@ -4308,7 +4581,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.78 - Remove EncryptUtils hooking (fix SIGSEGV crash)");
+    DLOG(@"[VERSION] WangXianHook v36.79 - Auto-respond 0x00FFFF02 with RSA-encrypted 0x80FFFF02");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
