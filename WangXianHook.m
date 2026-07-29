@@ -1,19 +1,23 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.87 - Inject UUID into device info + force-send enhanced packet
+ * WangXianHook v36.88 - Inject proper-sized 0x80FFF495 packet, let client send encrypted device info
  * MODE: FULL - All hooks enabled
  *
- * v36.87 CRITICAL FIXES:
- * 1. [UUID-INJECT] Inject 36-byte UUID TLV into 0x000EE007 for game server
- *    - Login server (5678) sends 143-byte packet (no UUID)
- *    - Game server (12003) expects 179-byte packet (with UUID TLV)
- *    - UUID inserted after first TLV field (account/ticket)
- * 2. [ENHANCED-PACKET] Use enhanced 179-byte packet when force-sending
- *    - Priority: ENHANCED > ORIGINAL
- *    - If injection fails, fallback to original 143 bytes
+ * v36.88 CRITICAL FIXES:
+ * 1. [ROOT-CAUSE FOUND] Why plaintext 0x000EE007 force-send is IGNORED:
+ *    - After 0x80FFF494 + 0x00FFFF02 + 0x80FFFF02, protocol enters ENCRYPTED mode
+ *    - Game server 12003 port expects AES-encrypted 0x000EE007 (179 bytes)
+ *    - Our plaintext 143/217 bytes are silently dropped = only heartbeats returned
+ * 2. [FORCE-HS-PACKET] Construct REAL-SIZED (200-byte) 0x80FFF495 into recv(), NOT:
+ *    - NOT v36.85 style: hack 22-byte heartbeat ACK cmd = causes SIGSEGV
+ *    - NOT v36.86/87 style: force-send plaintext 0x000EE007 = server ignores
+ * 3. [CLIENT-DRIVEN] After injected 0x80FFF495 is consumed by client:
+ *    - handle_CHOOSE_WOOD_BOX_RES handler receives valid 200-byte buffer = no SIGSEGV
+ *    - Client state advances to ENCRYPTED channel
+ *    - Client sends PROPER AES-encrypted 0x000EE007 (179 bytes) to server itself
  *
+ * v36.87: Inject UUID into device info + force-send enhanced 179-byte packet
  * v36.86: Fix SIGSEGV crash + force-send device info after challenge
- * v36.85: Remove heartbeat block after challenge + adjust RSA algorithm
  *
  * v36.84: Fix challenge response format (add STATUS byte)
  * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
@@ -3052,35 +3056,72 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
         if (totalLen > 64) [hexStr appendFormat:@"..."];
         DLOG(@"%@", hexStr);
         
-        // v36.87: Force-send 0x000EE007 device info immediately after challenge response
-        // Server doesn't send 0x80FFF495, so client state machine doesn't advance.
-        // Use ENHANCED packet (with UUID injected) instead of 143-byte login server version.
-        if (!g_deviceInfoSentToGame) {
-            const uint8_t *sendBuf = NULL;
-            ssize_t sendLen = 0;
-            const char *sendType = "";
+        // v36.88: Construct 0x80FFF495 handshake complete PACKET (not fake 22-byte ACK)
+        // Challenge response was sent. Server may not send 0x80FFF495, so client state
+        // machine is stuck on heartbeats. We inject a REAL-SIZED 0x80FFF495 packet into recv.
+        // Key: must be LARGE enough to avoid SIGSEGV in handle_CHOOSE_WOOD_BOX_RES handler,
+        // which reads significant payload. We build ~200 byte packet with proper header + padding.
+        {
+            uint32_t hsPktSize = 200;  // Large enough to avoid out-of-bounds read
+            if (hsPktSize > MAX_FORCE_HS_BUF) hsPktSize = MAX_FORCE_HS_BUF;
             
-            if (g_deviceInfoEnhancedReady && g_deviceInfoEnhancedLen > 0) {
-                sendBuf = g_deviceInfoEnhanced;
-                sendLen = g_deviceInfoEnhancedLen;
-                sendType = "ENHANCED (UUID injected)";
-            } else if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0) {
-                sendBuf = g_deviceInfoPacket;
-                sendLen = g_deviceInfoPacketLen;
-                sendType = "ORIGINAL (no UUID)";
-            }
+            memset(g_forceHandshakeBuf, 0, hsPktSize);
             
-            if (sendBuf && sendLen > 0) {
-                g_deviceInfoSentToGame = YES;
-                DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 device info [%s] (%zd bytes) to game server fd=%d after challenge response",
-                     sendType, sendLen, fd);
-                ssize_t devSent = orig_send ? orig_send(fd, sendBuf, sendLen, 0) : -1;
-                DLOG(@"[GAME-FORCE-SEND] Device info send result: %zd bytes", devSent);
-            } else {
-                DLOG(@"[GAME-FORCE-SEND] WARNING: No device info packet available! captured=%d enhanced=%d",
-                     g_deviceInfoCaptured, g_deviceInfoEnhancedReady);
-            }
+            // Byte[0-3]: Total packet length (big-endian)
+            g_forceHandshakeBuf[0] = (hsPktSize >> 24) & 0xFF;
+            g_forceHandshakeBuf[1] = (hsPktSize >> 16) & 0xFF;
+            g_forceHandshakeBuf[2] = (hsPktSize >> 8) & 0xFF;
+            g_forceHandshakeBuf[3] = hsPktSize & 0xFF;
+            
+            // Byte[4-7]: cmd = 0x80FFF495 (handshake complete, response to challenge)
+            g_forceHandshakeBuf[4] = 0x80;
+            g_forceHandshakeBuf[5] = 0xFF;
+            g_forceHandshakeBuf[6] = 0xF4;
+            g_forceHandshakeBuf[7] = 0x95;
+            
+            // Byte[8-11]: seq number, use same base as challenge response
+            g_forceHandshakeBuf[8]  = responseBuf[8];
+            g_forceHandshakeBuf[9]  = responseBuf[9];
+            g_forceHandshakeBuf[10] = responseBuf[10];
+            g_forceHandshakeBuf[11] = responseBuf[11];
+            
+            // Byte[12]: STATUS = 0 (SUCCESS)
+            g_forceHandshakeBuf[12] = 0x00;
+            
+            // Byte[13]: format flags (copy from 0x80FFF494 style = 0x88)
+            g_forceHandshakeBuf[13] = 0x88;
+            
+            // Byte[14...]: SAFETY PADDING - fill with recognizable Base64-like content
+            // This prevents SIGSEGV when handler parses the payload.
+            const char *padding = 
+                "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzOJwUMBZ0a1FZkot1lJ"
+                "+LB4rodylyGvUbq7sOO6nHgBqeqT2bp/mCShyDsVKdGGruFM8TY1cKlrHHhukEHV"
+                "vr2+5zTL7Pg+ywmn+53vB4azfuaetHwVctLFmTyqrENWsTiL0uyl5w4k52TSvX7sC"
+                "tuMx2grh6f1Hhb0/LqsFNjPobudwS00ypDtBG0Ung3T32DO2eFQ4JI0hXKkbCp0cyBT";
+            size_t padLen = strlen(padding);
+            size_t copyLen = padLen;
+            if (copyLen > hsPktSize - 14) copyLen = hsPktSize - 14;
+            memcpy(g_forceHandshakeBuf + 14, padding, copyLen);
+            
+            g_forceHandshakeLen = hsPktSize;
+            g_forceHandshakeFd = fd;
+            g_forceHandshakeComplete = YES;
+            
+            DLOG(@"[FORCE-HS-PREP] Prepared 0x80FFF495 packet size=%u bytes (fd=%d)",
+                 hsPktSize, fd);
+            DLOG(@"[FORCE-HS-PREP] Header: len=%u cmd=0x%02X%02X%02X%02X seq=0x%02X%02X%02X%02X status=%u",
+                 hsPktSize,
+                 g_forceHandshakeBuf[4], g_forceHandshakeBuf[5], g_forceHandshakeBuf[6], g_forceHandshakeBuf[7],
+                 g_forceHandshakeBuf[8], g_forceHandshakeBuf[9], g_forceHandshakeBuf[10], g_forceHandshakeBuf[11],
+                 g_forceHandshakeBuf[12]);
         }
+        
+        // v36.88: REMOVED immediate plaintext 0x000EE007 force-send.
+        // Game server expects ENCRYPTED device info after handshake.
+        // Force-sending plaintext (143/181/217 bytes) is silently discarded.
+        // Instead, the injected 0x80FFF495 above will cause client state machine
+        // to advance and send proper AES-encrypted 0x000EE007 (179 bytes) itself.
+        DLOG(@"[GAME-FLOW] Waiting for FORCE-HS 0x80FFF495 injection -> client will send encrypted device info");
         
         return YES;
     } else {
