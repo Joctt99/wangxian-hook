@@ -1,19 +1,20 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.65 - TCP sticky packet detection, auto-respond to 0x00FFFF02 challenges
+ * WangXianHook v36.66 - Force send 0x000EE007 to game server after handshake
  * MODE: FULL - All hooks enabled
  *
- * v36.65 CRITICAL FIXES:
- * 1. [STICKY-DETECT] Added TCP sticky packet detection in hook_recv
- *    - 0x80FFF494 and 0x00FFFF02 arrive in same TCP buffer (sticky packet)
- *    - Previous code only processed first packet, missed 0x00FFFF02 challenge
- *    - Now loops through all sub-packets and processes each one
- * 2. [AUTO-RESPOND] Auto-respond to 0x00FFFF02 challenge packets
- *    - Constructs 0x80FFFF02 response (copies challenge data, changes command)
- *    - Sends response via orig_send to advance game state machine
- * 3. [SUB-PATCH] Apply status patching to sub-packets in sticky packets
- *    - Same patching logic for 0x80FFF494/0x80FFF495 sub-packets
- * 4. [KEEP-v36.64] Keep all v36.64 fixes (status patching, text clearing, port 12003)
+ * v36.66 CRITICAL FIXES:
+ * 1. [CAPTURE-DEVICE] Capture 0x000EE007 packet in send hook
+ *    - When 0x000EE007 is sent to login server (port 5678), capture it to global buffer
+ *    - Store packet data and length for later forced send
+ * 2. [FORCE-SEND] Force send 0x000EE007 to game server fd after handshake
+ *    - After receiving 0x80FFF494 response (handshake complete)
+ *    - Force-send the captured device info packet to game server via orig_send
+ *    - Bypasses client state machine that's stuck on heartbeat loop
+ * 3. [STICKY-DEBUG] Added debug logging for sticky packet detection
+ *    - Logs [STICKY-DETECT] even when no sticky packets found
+ *    - Confirms detection code is executing
+ * 4. [KEEP-v36.65] Keep all v36.65 fixes (sticky detection, auto-respond)
  */
 /*
  * HISTORY:
@@ -213,7 +214,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.65 loaded ===");
+        _log(@"=== WangXianHook v36.66 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -999,6 +1000,13 @@ static BOOL g_gameServerInfoUpdated = YES;
 static BOOL g_gameServerConnected = NO;  // Whether game server handshake completed
 static int g_gameServerFd = -1;  // Track which fd is connected to game server
 static NSTimeInterval g_gameConnectTime = 0;  // Time of game server connection
+
+// v36.66: Store 0x000EE007 device info packet for forced send to game server
+#define MAX_DEVICE_INFO_SIZE 512
+static uint8_t g_deviceInfoPacket[MAX_DEVICE_INFO_SIZE];
+static ssize_t g_deviceInfoPacketLen = 0;
+static BOOL g_deviceInfoCaptured = NO;
+static BOOL g_deviceInfoSentToGame = NO;
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -2334,6 +2342,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 }
                 
                 DLOG(@"[DEVICE-INFO] ===== END DEVICE INFO =====");
+                
+                // v36.66: Capture 0x000EE007 packet for forced send to game server
+                if (len > 0 && len <= MAX_DEVICE_INFO_SIZE) {
+                    memcpy(g_deviceInfoPacket, buf, len);
+                    g_deviceInfoPacketLen = len;
+                    g_deviceInfoCaptured = YES;
+                    g_deviceInfoSentToGame = NO;  // Reset flag for new capture
+                    DLOG(@"[DEVICE-INFO] CAPTURED %zd bytes for forced game server send", len);
+                }
             } @catch (NSException *e) {
                 // Silently ignore any errors in packet analysis
                 DLOG(@"[DEVICE-INFO] Analysis skipped due to exception: %@", e.reason);
@@ -2978,6 +2995,31 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     g_handshakeComplete = YES;
                     g_heartbeatCount = 0;
                     DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Client should now send 0x000EE007...", rcmd);
+                    
+                    // v36.66: FORCE send captured 0x000EE007 to game server fd
+                    if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0 && fd >= 0 && !g_deviceInfoSentToGame) {
+                        @try {
+                            g_deviceInfoSentToGame = YES;
+                            DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 packet (%zd bytes) to game server fd=%d", 
+                                 g_deviceInfoPacketLen, fd);
+                            ssize_t sent = orig_send ? orig_send(fd, g_deviceInfoPacket, g_deviceInfoPacketLen, 0) : -1;
+                            DLOG(@"[GAME-FORCE-SEND] Force-send result: %zd bytes sent", sent);
+                            if (sent > 0) {
+                                // Hex dump of sent packet
+                                NSMutableString *hex = [NSMutableString string];
+                                for (ssize_t i = 0; i < g_deviceInfoPacketLen && i < 64; i++) {
+                                    [hex appendFormat:@"%02X ", g_deviceInfoPacket[i]];
+                                }
+                                DLOG(@"[GAME-FORCE-SEND] Sent packet HEX (first 64 bytes): %@", hex);
+                            }
+                        } @catch (NSException *e) {
+                            DLOG(@"[GAME-FORCE-SEND] Exception during force-send: %@", e.reason);
+                            g_deviceInfoSentToGame = NO;  // Reset for retry
+                        }
+                    } else {
+                        DLOG(@"[GAME-FORCE-SEND] Skipping force-send: captured=%d len=%zd fd=%d sent=%d", 
+                             g_deviceInfoCaptured ? 1 : 0, g_deviceInfoPacketLen, fd, g_deviceInfoSentToGame ? 1 : 0);
+                    }
                 }
             } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
                 // Count server responses after handshake - these are likely responses to client heartbeats
@@ -3004,11 +3046,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             DLOG(@"%@", detail);
             
-            // v36.65: TCP STICKY PACKET DETECTION - Check for multiple packets in one recv
-            // After processing first packet, check if remaining data contains more packets
-            // This handles cases like 0x80FFF494 + 0x00FFFF02 arriving together
+            // v36.66: TCP STICKY PACKET DETECTION - Check for multiple packets in one recv
+            DLOG(@"[STICKY-DETECT] Starting sticky packet detection: ret=%zd firstPktLen=%u firstCmd=0x%08X", 
+                 ret, pktLen, rcmd);
+            
             ssize_t offset = 0;
             int subPacketCount = 0;
+            BOOL foundSticky = NO;
             while (offset < ret) {
                 ssize_t remaining = ret - offset;
                 if (remaining < 8) break; // Need at least header
@@ -3023,6 +3067,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 
                 subPacketCount++;
                 if (subPacketCount > 1) {
+                    foundSticky = YES;
                     DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
                          subPacketCount, offset, subCmd, subPktLen, remaining);
                     
@@ -3059,8 +3104,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
                 offset += subPktLen;
             }
-            if (subPacketCount > 1) {
+            if (foundSticky) {
                 DLOG(@"[STICKY-PACKET] Processed %d sub-packets in one recv (total %zd bytes)", subPacketCount, ret);
+            } else {
+                DLOG(@"[STICKY-DETECT] No sticky packets found (single packet: cmd=0x%08X len=%u)", rcmd, pktLen);
             }
         } @catch (NSException *e) {
             DLOG(@"[GAME-RECV] Exception during analysis: %@", e.reason);
@@ -4052,7 +4099,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.65 - TCP sticky packet detection, auto-respond to 0x00FFFF02 challenges");
+    DLOG(@"[VERSION] WangXianHook v36.66 - Force send 0x000EE007 to game server after handshake");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
