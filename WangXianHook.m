@@ -1,18 +1,18 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.85 - Remove heartbeat block after challenge + adjust RSA algorithm
+ * WangXianHook v36.86 - Fix SIGSEGV crash + force-send device info after challenge
  * MODE: FULL - All hooks enabled
  *
- * v36.85 CRITICAL FIXES:
- * 1. [HEARTBEAT-PASS] Allow heartbeat packets to pass after challenge response
- *    - Only block heartbeats BEFORE challenge response (initial handshake)
- *    - After challenge responded, let heartbeats go to server
- * 2. [ACK-REPLACE] Replace server's heartbeat ACK (0x80000015) with 0x80FFF495
- *    - When server returns heartbeat ACK after our challenge response
- *    - Replace it with 0x80FFF495 to trigger client to send 0x000EE007
- * 3. [RSA-ALGO] Change RSA algorithm priority: Raw -> PKCS1 -> SHA256
- *    - Try Raw encryption first (matching server expectation)
- *    - Fall back to PKCS1, then SHA256/SHA1
+ * v36.86 CRITICAL FIXES:
+ * 1. [CRASH-FIX] Remove ACK-REPLACE logic that caused SIGSEGV
+ *    - 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES in game client
+ *    - Faking this packet caused wrong handler call -> crash
+ * 2. [FORCE-DEVICE-INFO] Force-send 0x000EE007 immediately after challenge response
+ *    - Server doesn't send 0x80FFF495, so client state machine doesn't advance
+ *    - Instead of faking 0x80FFF495, directly send device info packet
+ * 3. [RSA-ALGO] Change to PKCS1 first (Raw requires plaintext=key size, doesn't fit 16 bytes)
+ *
+ * v36.85: Remove heartbeat block after challenge + adjust RSA algorithm
  *
  * v36.84: Fix challenge response format (add STATUS byte)
  * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
@@ -220,7 +220,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.85 loaded ===");
+        _log(@"=== WangXianHook v36.86 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2820,20 +2820,20 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
     DLOG(@"[RSA-ENCRYPT] Got public key reference, proceeding to encryption");
     
     // Step 3: Encrypt with RSA using SecKeyCreateEncryptedData
-    // v36.85: Try Raw first (matching server expectation), then PKCS1, then SHA256
+    // v36.86: Try PKCS1 first (most common for challenge-response), then OAEP, then Raw
     CFErrorRef encryptErr = NULL;
-    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionRaw;
+    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionPKCS1;
     
     // Check if the algorithm is supported
     if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-        DLOG(@"[RSA-ENCRYPT] Raw not supported, trying PKCS1...");
-        algo = kSecKeyAlgorithmRSAEncryptionPKCS1;
+        DLOG(@"[RSA-ENCRYPT] PKCS1 not supported, trying SHA256...");
+        algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
         if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-            DLOG(@"[RSA-ENCRYPT] PKCS1 not supported, trying SHA256...");
-            algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
+            DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
+            algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
             if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-                DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
-                algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
+                DLOG(@"[RSA-ENCRYPT] SHA1 not supported, trying Raw...");
+                algo = kSecKeyAlgorithmRSAEncryptionRaw;
                 if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
                     DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
                     CFRelease(pubKeyRef);
@@ -2844,9 +2844,9 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
     }
     
     DLOG(@"[RSA-ENCRYPT] Using encryption algorithm: %s",
-          algo == kSecKeyAlgorithmRSAEncryptionRaw ? "Raw" :
           algo == kSecKeyAlgorithmRSAEncryptionPKCS1 ? "PKCS1" :
-          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" : "SHA1");
+          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" :
+          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA1 ? "SHA1" : "Raw");
     
     CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
     CFErrorRef *encryptErrPtr = NULL;
@@ -2951,6 +2951,17 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
         }
         if (totalLen > 64) [hexStr appendFormat:@"..."];
         DLOG(@"%@", hexStr);
+        
+        // v36.86: Force-send 0x000EE007 device info immediately after challenge response
+        // Server doesn't send 0x80FFF495, so we can't rely on client state machine.
+        // Instead, directly send the device info packet captured from login server.
+        if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0 && !g_deviceInfoSentToGame) {
+            g_deviceInfoSentToGame = YES;
+            DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 device info (%zd bytes) to game server fd=%d after challenge response",
+                 g_deviceInfoPacketLen, fd);
+            ssize_t devSent = orig_send ? orig_send(fd, g_deviceInfoPacket, g_deviceInfoPacketLen, 0) : -1;
+            DLOG(@"[GAME-FORCE-SEND] Device info send result: %zd bytes", devSent);
+        }
         
         return YES;
     } else {
@@ -3420,24 +3431,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                              ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
             
-            // v36.85: Replace server's heartbeat ACK (0x80000015) with 0x80FFF495
-            // When client sends heartbeat after our challenge response, server returns ACK
-            // We replace this ACK with handshake complete to trigger client to send 0x000EE007
-            if (rcmd == 0x80000015 && g_challengeResponded && g_challengeFd == fd) {
-                DLOG(@"[ACK-REPLACE] Replacing 0x80000015 heartbeat ACK with 0x80FFF495 handshake complete");
-                // Replace command from 0x80000015 to 0x80FFF495 - use buf directly (not const p)
-                unsigned char *wbuf = (unsigned char *)buf;
-                wbuf[4] = 0x80; wbuf[5] = 0xFF; wbuf[6] = 0xF4; wbuf[7] = 0x95;
-                rcmd = 0x80FFF495;
-                pktLen = 13;  // Minimum packet length
-                // Update length field
-                wbuf[0] = 0x00; wbuf[1] = 0x00; wbuf[2] = 0x00; wbuf[3] = 0x0D;
-                // Ensure status byte is 0
-                if (ret > 12) wbuf[12] = 0x00;
-                // Reset challenge state
-                g_challengeResponded = NO;
-                DLOG(@"[ACK-REPLACE] Successfully replaced with 0x80FFF495");
-            }
+            // v36.86: REMOVED ACK-REPLACE logic - it causes SIGSEGV crash!
+            // 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES in the game client.
+            // Faking this packet causes the client to call the wrong handler -> crash.
+            // Instead: force-send 0x000EE007 device info directly after challenge response.
             
             const char *gamePort;
             if (port == 58158) gamePort = "58158";
@@ -4896,7 +4893,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.85 - Remove heartbeat block after challenge");
+    DLOG(@"[VERSION] WangXianHook v36.86 - Fix SIGSEGV crash + force-send device info");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
