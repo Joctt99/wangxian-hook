@@ -1,17 +1,20 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.84 - Fix challenge response format + force handshake complete
+ * WangXianHook v36.85 - Remove heartbeat block after challenge + adjust RSA algorithm
  * MODE: FULL - All hooks enabled
  *
- * v36.84 CRITICAL FIXES:
- * 1. [RESPONSE-FORMAT] Add STATUS byte to 0x80FFFF02 challenge response
- *    - Previous: [LENGTH][CMD][SEQ][DATA] 
- *    - Correct: [LENGTH][CMD][SEQ][STATUS=0][DATA]
- * 2. [FORCE-HANDSHAKE] Force 0x80FFF495 when client sends heartbeat after challenge
- *    - If server doesn't return 0x80FFF495, we send it to client ourselves
- *    - This triggers client to send 0x000EE007 device info
- * 3. [HEARTBEAT-BLOCK] Extended blocking to post-challenge state
+ * v36.85 CRITICAL FIXES:
+ * 1. [HEARTBEAT-PASS] Allow heartbeat packets to pass after challenge response
+ *    - Only block heartbeats BEFORE challenge response (initial handshake)
+ *    - After challenge responded, let heartbeats go to server
+ * 2. [ACK-REPLACE] Replace server's heartbeat ACK (0x80000015) with 0x80FFF495
+ *    - When server returns heartbeat ACK after our challenge response
+ *    - Replace it with 0x80FFF495 to trigger client to send 0x000EE007
+ * 3. [RSA-ALGO] Change RSA algorithm priority: Raw -> PKCS1 -> SHA256
+ *    - Try Raw encryption first (matching server expectation)
+ *    - Fall back to PKCS1, then SHA256/SHA1
  *
+ * v36.84: Fix challenge response format (add STATUS byte)
  * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
  * v36.82: Fix critical SecKeyCreateEncryptedData/DecryptedData hook signature bug
  * v36.81: Manual Base64 decode with robust error handling
@@ -217,7 +220,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.84 loaded ===");
+        _log(@"=== WangXianHook v36.85 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2425,64 +2428,30 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             }
         }
         
-        // v36.70: Block heartbeat packets (0x00000015/0x00000014) from being sent to game server
-        // During handshake phase, game sends heartbeats that cause server to include
-        // heartbeat ACK in handshake response, confusing the game state machine
-        // v36.70: Use cmd-based detection as fallback when port-based fails
+        // v36.85: Only block heartbeats during initial handshake (BEFORE challenge response)
+        // After challenge response (g_challengeResponded=YES), let heartbeats go to server
+        // so we can intercept the server's heartbeat ACK and replace it with 0x80FFF495
         if (isGameOrLoginPort && (cmd == 0x00000015 || cmd == 0x00000014)) {
-            // Only block heartbeats to game server ports (not login server)
             BOOL isGamePortOnly = (port == 12003 || port == 58158 ||
                                    (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
-            // v36.70: Also detect via cmd range when port-based fails
             BOOL isGameCmdOnly = isGameCmd(cmd);
-            // v36.83: Also block heartbeats after challenge response (g_challengeResponded)
-            // If client sends heartbeat after our challenge response, it means server
-            // didn't send 0x80FFF495 handshake complete. We need to force-send it.
-            BOOL blockAfterChallenge = (g_challengeResponded && g_challengeFd == fd && 
-                                       (cmd == 0x00000015 || cmd == 0x00000014));
             
-            if ((isGamePortOnly || isGameCmdOnly) && (!g_handshakeComplete || blockAfterChallenge)) {
-                // Block heartbeat: don't send to server, return fake success
+            // v36.85: Only block heartbeats BEFORE challenge response (NOT after)
+            if ((isGamePortOnly || isGameCmdOnly) && !g_handshakeComplete && !g_challengeResponded) {
                 @try {
                     uint8_t ackBuf[22];
                     memcpy(ackBuf, buf, 22);
                     ackBuf[4] = 0x80;  // Change command from 0x00000015 to 0x80000015
                     
-                    // Buffer the local ACK for next recv call
                     if (g_localHeartbeatAckLen == 0 || g_localHeartbeatAckFd != fd) {
                         g_localHeartbeatAckLen = 22;
                         g_localHeartbeatAckFd = fd;
                         memcpy(g_localHeartbeatAckBuf, ackBuf, 22);
-                        DLOG(@"[HEARTBEAT-BLOCK] Blocked heartbeat (cmd=0x%08X) to game server port=%d. Local ACK buffered.", cmd, port);
-                    }
-                    
-                    // v36.83: If blocking after challenge response, also force-send 0x80FFF495
-                    // This tells client handshake is complete, so it should send 0x000EE007
-                    if (blockAfterChallenge) {
-                        DLOG(@"[HEARTBEAT-BLOCK] After challenge response, forcing 0x80FFF495 handshake complete...");
-                        
-                        // Construct 0x80FFF495 response packet
-                        // Structure: [4 bytes length][4 bytes cmd][4 bytes seq][1 byte status]
-                        uint8_t hsBuf[16] = {0};
-                        uint32_t hsLen = 13;  // 4+4+4+1 = 13
-                        hsBuf[0] = 0x00; hsBuf[1] = 0x00; hsBuf[2] = 0x00; hsBuf[3] = 0x0D;
-                        hsBuf[4] = 0x80; hsBuf[5] = 0xFF; hsBuf[6] = 0xF4; hsBuf[7] = 0x95;
-                        // seq from heartbeat
-                        memcpy(hsBuf + 8, (const unsigned char *)buf + 8, 4);
-                        hsBuf[12] = 0x00;  // status = success
-                        
-                        // Buffer for hook_recv to deliver
-                        g_forceHandshakeComplete = YES;
-                        g_forceHandshakeFd = fd;
-                        memcpy(g_forceHandshakeBuf, hsBuf, hsLen);
-                        g_forceHandshakeLen = hsLen;
-                        
-                        DLOG(@"[HEARTBEAT-BLOCK] 0x80FFF495 handshake complete packet prepared for fd=%d", fd);
+                        DLOG(@"[HEARTBEAT-BLOCK] Blocked heartbeat during handshake (cmd=0x%08X) to port=%d", cmd, port);
                     }
                 } @catch (NSException *e) {
                     DLOG(@"[HEARTBEAT-BLOCK] Exception: %@", e.reason);
                 }
-                // Return fake success - game thinks heartbeat was sent
                 return len;
             }
         }
@@ -2851,27 +2820,33 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
     DLOG(@"[RSA-ENCRYPT] Got public key reference, proceeding to encryption");
     
     // Step 3: Encrypt with RSA using SecKeyCreateEncryptedData
+    // v36.85: Try Raw first (matching server expectation), then PKCS1, then SHA256
     CFErrorRef encryptErr = NULL;
-    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
+    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionRaw;
     
     // Check if the algorithm is supported
     if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-        DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
-        algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
+        DLOG(@"[RSA-ENCRYPT] Raw not supported, trying PKCS1...");
+        algo = kSecKeyAlgorithmRSAEncryptionPKCS1;
         if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-            DLOG(@"[RSA-ENCRYPT] SHA1 not supported either, trying PKCS1...");
-            algo = kSecKeyAlgorithmRSAEncryptionRaw;
+            DLOG(@"[RSA-ENCRYPT] PKCS1 not supported, trying SHA256...");
+            algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
             if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-                DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
-                CFRelease(pubKeyRef);
-                return -1;
+                DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
+                algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
+                if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+                    DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
+                    CFRelease(pubKeyRef);
+                    return -1;
+                }
             }
         }
     }
     
     DLOG(@"[RSA-ENCRYPT] Using encryption algorithm: %s",
-          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" :
-          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA1 ? "SHA1" : "PKCS1");
+          algo == kSecKeyAlgorithmRSAEncryptionRaw ? "Raw" :
+          algo == kSecKeyAlgorithmRSAEncryptionPKCS1 ? "PKCS1" :
+          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" : "SHA1");
     
     CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
     CFErrorRef *encryptErrPtr = NULL;
@@ -3190,6 +3165,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
+    // v36.84: Debug log to track recv calls
+    DLOG(@"[RECV-ENTRY] fd=%d len=%zu forceHS=%d forceFd=%d forceLen=%lu hbAck=%zd hbFd=%d",
+         fd, len, g_forceHandshakeComplete, g_forceHandshakeFd, (unsigned long)g_forceHandshakeLen,
+         g_localHeartbeatAckLen, g_localHeartbeatAckFd);
+    
     // v36.83: Check for force handshake complete packet first
     // After we send fake heartbeat ACK, we also send 0x80FFF495 handshake complete
     if (g_forceHandshakeComplete && g_forceHandshakeFd == fd && g_forceHandshakeLen > 0) {
@@ -3439,6 +3419,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
             uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                              ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+            
+            // v36.85: Replace server's heartbeat ACK (0x80000015) with 0x80FFF495
+            // When client sends heartbeat after our challenge response, server returns ACK
+            // We replace this ACK with handshake complete to trigger client to send 0x000EE007
+            if (rcmd == 0x80000015 && g_challengeResponded && g_challengeFd == fd) {
+                DLOG(@"[ACK-REPLACE] Replacing 0x80000015 heartbeat ACK with 0x80FFF495 handshake complete");
+                // Replace command from 0x80000015 to 0x80FFF495
+                p[4] = 0x80; p[5] = 0xFF; p[6] = 0xF4; p[7] = 0x95;
+                rcmd = 0x80FFF495;
+                pktLen = 13;  // Minimum packet length
+                // Update length field
+                p[0] = 0x00; p[1] = 0x00; p[2] = 0x00; p[3] = 0x0D;
+                // Ensure status byte is 0
+                if (ret > 12) p[12] = 0x00;
+                // Reset challenge state
+                g_challengeResponded = NO;
+                DLOG(@"[ACK-REPLACE] Successfully replaced with 0x80FFF495");
+            }
             
             const char *gamePort;
             if (port == 58158) gamePort = "58158";
@@ -4897,7 +4895,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.80 - Debug RSA Base64 decoding failure");
+    DLOG(@"[VERSION] WangXianHook v36.85 - Remove heartbeat block after challenge");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
