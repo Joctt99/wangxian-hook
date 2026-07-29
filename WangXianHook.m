@@ -1,19 +1,19 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.62 - Force port 58158, disable binary port parsing, simple blocking connect
+ * WangXianHook v36.63 - REVERT to port 12003, disable status patching, add timeout safety net
  * MODE: FULL - All hooks enabled
  *
- * v36.62 CRITICAL FIXES:
- * 1. [FORCE-PORT] ALL game server connections use port 58158 regardless of parsed port!
- *    - Server list parsing of 11776 was a misparse of 0x2E00 (low byte of 0xE32E = 58158)
- *    - Always override game server ports to 58158, the confirmed correct port from normal client
- * 2. [SIMPLE-CONNECT] Removed O_NONBLOCK + select timeout logic!
- *    - Non-blocking connect with select was causing game to see EINPROGRESS and close socket
- *    - Now uses simple blocking connect, letting game's own timeout logic handle failures
- * 3. [DISABLE-BINARY-PARSE] Disabled binary port parsing in parseServerListResponse!
- *    - Binary port parsing was producing false positives (11776 from 0x2E00)
- *    - Now only parses IP addresses, always assigns port 58158
- * 4. [ROTATE-IP-ONLY] tryNextServer only rotates IP, port stays 58158
+ * v36.63 CRITICAL FIXES:
+ * 1. [REVERT-12003] REVERTED from 58158 to 12003 (ONLY confirmed working port)
+ *    - Port 58158 is unreachable - ALL tests since v36.51 showed timeout/hang
+ *    - If game uses non-standard port (like 11776), rewrite to 12003
+ * 2. [TIMEOUT-SAFETY] Added SO_SNDTIMEO 10s timeout as safety net for blocking connect
+ *    - Prevents hanging forever on unreachable ports
+ *    - Timeout is cleared after connect completes
+ * 3. [DISABLE-PATCH] DISABLED 0x80FFF494 status patching to test
+ *    - Status patching was corrupting handshake response
+ *    - Leaving status unchanged allows game state machine to progress
+ * 4. [ROTATE-12003] tryNextServer rotates IP only, port always 12003
  */
 /*
  * HISTORY:
@@ -213,7 +213,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.62 loaded ===");
+        _log(@"=== WangXianHook v36.63 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2096,17 +2096,17 @@ static BOOL tryNextServer(void) {
     g_connectionFailCount++;
     g_currentServerIndex = (g_currentServerIndex + 1) % g_serverCount;
     
-    // v36.62: Override port to 58158 regardless of what was parsed
+    // v36.63: Override port to 12003 (the only confirmed working port)
     strncpy(g_gameServerIP, g_serverList[g_currentServerIndex].ip, 63);
-    g_gameServerPort = 58158;  // Always use 58158, the confirmed correct port
+    g_gameServerPort = 12003;  // Always use 12003, the only confirmed working port
     
-    DLOG(@"[SERVER-ROTATE] Switching to server %d/%d: %s:58158 (forced port, parsed was %d, fail count=%d)", 
+    DLOG(@"[SERVER-ROTATE] Switching to server %d/%d: %s:12003 (forced port, parsed was %d, fail count=%d)", 
          g_currentServerIndex + 1, g_serverCount, g_gameServerIP, g_serverList[g_currentServerIndex].port, g_connectionFailCount);
     
     // Update stub data
     if (g_msiStubData) {
         [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
-        [g_msiStubData setObject:@(58158) forKey:@"port"];  // Force 58158 in stub too
+        [g_msiStubData setObject:@(12003) forKey:@"port"];  // Force 12003 in stub too
     }
     
     return YES;
@@ -2148,12 +2148,12 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
-        // v36.62: FORCE all game server connections to port 58158
-        // Server list parsing (11776) is a misparse of 0x2E00 (low byte of 0xE32E = 58158)
-        // Always override game server ports to 58158, the confirmed correct port
+        // v36.63: REVERT to port 12003 (the only port confirmed to connect and complete handshake)
+        // Port 58158 is unreachable - ALL tests since v36.51 showed timeout/hang
+        // If game uses non-standard port (like 11776), rewrite to 12003
         BOOL isGameServerPort = (port == 12003 || port == 58158 || 
                                  (port >= 10000 && port <= 65535 && port != 5678));
-        BOOL needPortRewrite = (port != 5678 && port != 58158);  // Rewrite any non-login, non-58158 port
+        BOOL needPortRewrite = (port != 5678 && port != 12003);  // Rewrite any non-login, non-12003 port to 12003
         
         int origPort = port;
         char origHost[64];
@@ -2163,14 +2163,14 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in newAddr = *in;
         
         if (needPortRewrite && isGameServerPort) {
-            // v36.62: Force rewrite to 58158 for ALL game server connections
-            newAddr.sin_port = htons(58158);
-            port = 58158;
-            DLOG(@"[REWRITE-PORT] FORCE game server %s:%d -> %s:58158 (normal client uses 58158)", 
+            // v36.63: Force rewrite non-standard game ports (like 11776) to 12003
+            newAddr.sin_port = htons(12003);
+            port = 12003;
+            DLOG(@"[REWRITE-PORT] FORCE game server %s:%d -> %s:12003 (only confirmed working port)", 
                  origHost, origPort, origHost);
         }
         
-        // v36.62: Track fd BEFORE connect with target port
+        // v36.63: Track fd BEFORE connect with target port
         trackFd(sockfd, host, port);
         
         DLOG(@"[SOCK] connect START fd=%d target=%s:%d origPort=%d rewrite=%d isGamePort=%d",
@@ -2182,8 +2182,14 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             return -1;
         }
         
-        // v36.62: SIMPLE blocking connect - let game's own timeout handle failures
-        // O_NONBLOCK + select approach was causing game to see EINPROGRESS and close socket
+        // v36.63: Set SO_SNDTIMEO 10s timeout as safety net for blocking connect
+        // Prevents hanging forever on unreachable ports
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        // v36.63: SIMPLE blocking connect with timeout protection
         const struct sockaddr *actualAddr = needPortRewrite ? (struct sockaddr *)&newAddr : addr;
         socklen_t actualAddrLen = needPortRewrite ? sizeof(newAddr) : addrlen;
         
@@ -2193,18 +2199,24 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         int result = orig_connect(sockfd, actualAddr, actualAddrLen);
         int connectErrno = errno;
         
+        // v36.63: Clear the timeout after connect
+        struct timeval tvZero;
+        tvZero.tv_sec = 0;
+        tvZero.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tvZero, sizeof(tvZero));
+        
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
         if (result == 0) {
-            // v36.62: Track game server connection state
+            // v36.63: Track game server connection state
             if (isGameServerPort) {
                 g_gameServerConnected = YES;
                 g_gameServerFd = sockfd;
                 g_gameConnectTime = [[NSDate date] timeIntervalSince1970];
-                DLOG(@"[GAME-CONNECT] Game server connected fd=%d target=%s:58158 (forced port)", 
-                     sockfd, host);
+                DLOG(@"[GAME-CONNECT] Game server connected fd=%d target=%s:%d (confirmed working port)", 
+                     sockfd, host, port);
             }
             DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d origPort=%d elapsed=%.3fs",
                  sockfd, host, port, origPort, elapsed);
@@ -2212,13 +2224,13 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             DLOG(@"[SOCK] connect END fd=%d FAILED target=%s:%d origPort=%d errno=%d(%s) elapsed=%.3fs",
                  sockfd, host, port, origPort, connectErrno, strerror(connectErrno), elapsed);
             
-            // v36.62: Game server failed: try rotation (IP rotation, port stays 58158)
+            // v36.63: Game server failed: try IP rotation (port stays 12003)
             if (isGameServerPort) {
-                DLOG(@"[SOCK] Game server %s:58158 FAILED -> attempting IP rotation...", host);
+                DLOG(@"[SOCK] Game server %s:%d FAILED -> attempting IP rotation...", host, port);
                 @try {
                     BOOL rotated = tryNextServer();
                     if (rotated) {
-                        DLOG(@"[SOCK] Rotation succeeded: %s:58158 (index %d/%d, port forced)",
+                        DLOG(@"[SOCK] Rotation succeeded: %s:12003 (index %d/%d)",
                              g_gameServerIP, g_currentServerIndex + 1, g_serverCount);
                     } else {
                         DLOG(@"[SOCK] Rotation unavailable (servers=%d)", g_serverCount);
@@ -2896,12 +2908,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
+                    // v36.63: DISABLE status patching to test if unpatched response allows game state machine to progress
+                    // Status patching was corrupting the handshake and preventing 0x000EE007 from being sent
+                    DLOG(@"[GAME-PATCH] DISABLED status patching (v36.63 test) - leaving status=%u unchanged", status);
+                    /*
                     // v36.61: Patch game server error responses for ALL game ports (dynamic detection)
                     if (isGamePort) {
                         DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=%d host=%s)", status, port, host);
                         ((unsigned char *)buf)[12] = 0;
                         [detail appendFormat:@"  [PATCH] Status patched to 0 (port=%d)\n", port];
                     }
+                    */
                 }
             }
             
@@ -3978,7 +3995,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.62 - Force port 58158, disable binary port parsing, simple blocking connect");
+    DLOG(@"[VERSION] WangXianHook v36.63 - REVERT to port 12003, disable status patching, add timeout safety net");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
