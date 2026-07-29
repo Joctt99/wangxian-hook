@@ -1,20 +1,21 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.81 - Fix RSA Base64 decode with manual decoder
+ * WangXianHook v36.82 - Fix critical SecKeyCreateEncryptedData hook bug
  * MODE: FULL - All hooks enabled
  *
- * v36.81 CRITICAL FIXES:
- * 1. [RSA-DECODE] Implement manual Base64 decode with robust error handling
- *    - Standard NSData Base64 decode fails due to invalid chars in protocol data
- *    - Manual decoder skips whitespace/newlines and recovers from invalid chars
- *    - Added comprehensive NSLog logging for every step
- * 2. [RSA-KEY-EXTRACT] Try both X.509 certificate and direct public key extraction
- *    - SecCertificateCreateWithData for certificate format
- *    - SecKeyCreateWithData for direct RSA public key format
- * 3. [LOGGING] Use NSLog instead of DLOG for critical RSA operations
- *    - Ensures all debug logs are visible in system log
- *    - Detailed error messages for each failure point
+ * v36.82 CRITICAL FIXES:
+ * 1. [SEC-FIX] Fix SecKeyCreateEncryptedData hook signature
+ *    - CORRECT signature returns CFDataRef, not OSStatus
+ *    - Previous code incorrectly treated encrypted data pointer as integer
+ *    - This was the ROOT CAUSE of RSA encryption failure
+ * 2. [SEC-FIX] Fix SecKeyCreateDecryptedData hook signature
+ *    - Same issue: function returns CFDataRef, not OSStatus
+ *    - Updated both hooks to use correct function signatures
+ * 3. [LOGGING] Use proper NSLog/DLOG logging for success/failure
+ *    - Log cipher length on success
+ *    - Log error description on failure
  *
+ * v36.81: Manual Base64 decode with robust error handling
  * v36.79-v36.80: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
  * v36.78: Remove EncryptUtils hooking (fix SIGSEGV crash)
  * v36.77: Fix sticky packet splitting + metaclass crypto detection
@@ -217,7 +218,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.81 loaded ===");
+        _log(@"=== WangXianHook v36.82 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -4448,34 +4449,49 @@ static OSStatus hook_SecKeyDecrypt(SecKeyRef key, SecPadding padding, const uint
 }
 
 // SecKeyCreateDecryptedData hook (iOS 10+)
-typedef OSStatus (*SecKeyCreateDecryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFDataRef *plaintext);
+// CORRECT signature: CFDataRef SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFErrorRef *error);
+typedef CFDataRef (*SecKeyCreateDecryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFErrorRef *error);
 static SecKeyCreateDecryptedDataFunc orig_SecKeyCreateDecryptedData = NULL;
 
-static OSStatus hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFDataRef *plaintext) {
+static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef ciphertext, CFErrorRef *error) {
     if (!orig_SecKeyCreateDecryptedData) {
         orig_SecKeyCreateDecryptedData = (SecKeyCreateDecryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateDecryptedData");
     }
-    if (!orig_SecKeyCreateDecryptedData) return errSecParam;
-    OSStatus ret = orig_SecKeyCreateDecryptedData(key, algorithm, ciphertext, plaintext);
-    DLOG(@"[SEC] SecKeyCreateDecryptedData cipherLen=%lu ret=%d", ciphertext ? CFDataGetLength(ciphertext) : 0, (int)ret);
-    if (plaintext && *plaintext) {
-        DLOG(@"[SEC] SecKeyCreateDecryptedData plainLen=%lu", CFDataGetLength(*plaintext));
+    if (!orig_SecKeyCreateDecryptedData) return NULL;
+    CFErrorRef *errPtr = NULL;
+    CFDataRef result = orig_SecKeyCreateDecryptedData(key, algorithm, ciphertext, errPtr);
+    if (errPtr && *errPtr) {
+        DLOG(@"[SEC] SecKeyCreateDecryptedData FAILED: %@", CFBridgingRelease(CFErrorCopyDescription(*errPtr)));
+    } else if (result) {
+        DLOG(@"[SEC] SecKeyCreateDecryptedData SUCCESS: cipherLen=%lu plainLen=%lu", 
+             ciphertext ? CFDataGetLength(ciphertext) : 0, CFDataGetLength(result));
+    } else {
+        DLOG(@"[SEC] SecKeyCreateDecryptedData returned NULL");
     }
-    return ret;
+    return result;
 }
 
 // SecKeyCreateEncryptedData hook (iOS 10+)
-typedef OSStatus (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFDataRef *ciphertext);
+// CORRECT signature: CFDataRef SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFErrorRef *error);
+typedef CFDataRef (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFErrorRef *error);
 static SecKeyCreateEncryptedDataFunc orig_SecKeyCreateEncryptedData = NULL;
 
-static OSStatus hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFDataRef *ciphertext) {
+static CFDataRef hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFErrorRef *error) {
     if (!orig_SecKeyCreateEncryptedData) {
         orig_SecKeyCreateEncryptedData = (SecKeyCreateEncryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateEncryptedData");
     }
-    if (!orig_SecKeyCreateEncryptedData) return errSecParam;
-    OSStatus ret = orig_SecKeyCreateEncryptedData(key, algorithm, plaintext, ciphertext);
-    DLOG(@"[SEC] SecKeyCreateEncryptedData plainLen=%lu ret=%d", plaintext ? CFDataGetLength(plaintext) : 0, (int)ret);
-    return ret;
+    if (!orig_SecKeyCreateEncryptedData) return NULL;
+    CFErrorRef *errPtr = NULL;
+    CFDataRef result = orig_SecKeyCreateEncryptedData(key, algorithm, plaintext, errPtr);
+    if (errPtr && *errPtr) {
+        DLOG(@"[SEC] SecKeyCreateEncryptedData FAILED: %@", CFBridgingRelease(CFErrorCopyDescription(*errPtr)));
+    } else if (result) {
+        DLOG(@"[SEC] SecKeyCreateEncryptedData SUCCESS: plainLen=%lu cipherLen=%lu", 
+             plaintext ? CFDataGetLength(plaintext) : 0, CFDataGetLength(result));
+    } else {
+        DLOG(@"[SEC] SecKeyCreateEncryptedData returned NULL");
+    }
+    return result;
 }
 
 static void installSecurityHooks(void) {
