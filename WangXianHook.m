@@ -2446,11 +2446,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         // Monitor what client sends in response to 0x00FFFF02 challenge
         if (g_handshakeComplete && isGameOrLoginPort && len >= 12) {
             @try {
+                const unsigned char *tp = (const unsigned char *)buf;
                 NSMutableString *protoTrace = [NSMutableString stringWithCapacity:256];
-                uint32_t trackCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                                   ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-                uint32_t trackPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                      ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+                uint32_t trackCmd = ((uint32_t)tp[4] << 24) | ((uint32_t)tp[5] << 16) |
+                                   ((uint32_t)tp[6] << 8)  | (uint32_t)tp[7];
+                uint32_t trackPktLen = ((uint32_t)tp[0] << 24) | ((uint32_t)tp[1] << 16) |
+                                      ((uint32_t)tp[2] << 8)  | (uint32_t)tp[3];
                 
                 [protoTrace appendFormat:@"[PROTO-TRACE] Client send after handshake: cmd=0x%08X pktLen=%u port=%d\n", trackCmd, trackPktLen, port];
                 
@@ -2476,7 +2477,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // Hex dump first 32 bytes
                 [protoTrace appendFormat:@"  HEX(32): "];
                 for (size_t i = 0; i < MIN((size_t)32, len); i++) {
-                    [protoTrace appendFormat:@"%02X ", p[i]];
+                    [protoTrace appendFormat:@"%02X ", tp[i]];
                 }
                 [protoTrace appendFormat:@"\n"];
                 
