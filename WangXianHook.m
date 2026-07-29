@@ -2440,7 +2440,6 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 return len;
             }
         }
-        }
         
         // v36.73: Track client protocol behavior after handshake completion
         // Monitor what client sends in response to 0x00FFFF02 challenge
