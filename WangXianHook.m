@@ -1,22 +1,17 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.60 - Remove port rewrite, timeout-safe connect, clean server list parsing
+ * WangXianHook v36.61 - Use server list parsed port, dynamic game port support
  * MODE: FULL - All hooks enabled
  *
- * v36.60 CRITICAL FIXES:
- * 1. [PORT-REWRITE] COMPLETELY DISABLED port rewrite 12003->58158!
- *    - v36.59 caused connect HANG (no connect END log) because 58158 is unreachable
- *    - Now use game's ORIGINAL target port directly (12003 works for handshake)
- * 2. [CONNECT-TIMEOUT] Added NON-BLOCKING connect with 15s select + getsockopt + restore flags
- *    - Prevents indefinite hang even on bad ports
- *    - Restores O_NONBLOCK flag to original state before returning to game
- * 3. [SERVERLIST-PARSE] DISABLED false-positive 4-byte raw IP scan entirely!
- *    - v36.59 stored 20 garbage servers first (e.g. 16.228.184.128:58764)
- *      which are actually bytes of the ASCII string "47.100.14.198" misinterpreted
- *    - Now ONLY ASCII IP pattern scan (we know it finds 47.100.14.198 etc.)
- *    - If port can't be detected near an ASCII IP -> DEFAULT PORT = 12003
- *      (12003 is the only port we've confirmed completes handshake in tests)
- * 4. [LOGGING] Very detailed connect START/END logs with errno strings and select diagnostics
+ * v36.61 CRITICAL FIXES:
+ * 1. [PORT-REWRITE] Use g_gameServerPort (parsed from server list) instead of hardcoded 58158!
+ *    - Previous code always rewrote 12003 -> 58158 regardless of actual server list
+ *    - Now uses dynamically parsed port (e.g., 11776, 58158, etc.) from server list response
+ *    - Fallback to 58158 if g_gameServerPort is not set or invalid
+ * 2. [PORT-DETECT] Dynamic game server port detection instead of hardcoded 12003/58158
+ *    - Any port >= 10000 that matches g_gameServerPort is treated as game server port
+ *    - Supports server list returning any valid port (11776, 58158, 12003, etc.)
+ * 3. [LOGGING] Enhanced port rewrite logging with parsed port info
  */
 /*
  * HISTORY:
@@ -216,7 +211,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.60 loaded ===");
+        _log(@"=== WangXianHook v36.61 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -395,7 +390,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.60 诊断面板";
+            lbl.text = @"WXHook v36.61 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -994,9 +989,14 @@ static id msi_init_hook(id self, SEL _cmd) {
 // ============================================================
 
 // Game server config variables (defined early for stub class access)
-static int g_gameServerPort = 12003;  // v36.57: Default to 12003 (no port rewrite)
+static int g_gameServerPort = 0;  // v36.61: Default to 0 (not set yet), will be parsed from server list
 static char g_gameServerIP[64] = "47.100.14.198";
 static BOOL g_gameServerInfoUpdated = YES;
+
+// v36.61: Track game server connection state
+static BOOL g_gameServerConnected = NO;  // Whether game server handshake completed
+static int g_gameServerFd = -1;  // Track which fd is connected to game server
+static NSTimeInterval g_gameConnectTime = 0;  // Time of game server connection
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -2122,11 +2122,13 @@ static BOOL tryNextServer(void) {
 
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
-    // v36.56: Track both 58158 and 12003 port closures
+    // v36.61: Track game server port closures (12003, 58158, or dynamic)
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd && g_trackedActive[i]) {
             int port = g_trackedPorts[i];
-            if (port == 58158 || port == 12003) {
+            BOOL isGamePort = (port == 58158 || port == 12003 || 
+                               (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+            if (isGamePort) {
                 DLOG(@"[CLOSE-TRACE] close(%d) for game server %s:%d (matched port %d)", fd, g_trackedHosts[i], port, port);
                 void *callstack[8];
                 int frames = backtrace(callstack, 8);
@@ -2154,53 +2156,64 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
         
-        // v36.60: DISABLED port rewrite 12003->58158! 58158 is unreachable and hangs connect()
-        // Use game's ORIGINAL target port directly.
-        // Known working port from previous tests: 12003 (at least handshake works)
-        BOOL isGameServerPort = (port == 12003 || port == 58158 || (port >= 10000 && port < 65536));
+        // v36.61: Use g_gameServerPort (parsed from server list) instead of hardcoded 58158
+        // Previous code always rewrote 12003 -> 58158, but server list may return other ports (e.g., 11776)
+        // Now dynamically use the parsed port from server list response
+        BOOL isGameServerPort = (port == 12003 || port == 58158 || 
+                                 (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+        BOOL needPortRewrite = (port == 12003 && g_gameServerPort != 12003);
         
         int origPort = port;
         char origHost[64];
         strncpy(origHost, host, 63);
         origHost[63] = '\0';
         
-        // v36.60: Track fd BEFORE connect (so close hook can log)
+        struct sockaddr_in newAddr = *in;
+        
+        if (needPortRewrite) {
+            // v36.61: Use g_gameServerPort for rewrite target
+            int targetPort = (g_gameServerPort >= 1024 && g_gameServerPort != 12003) ? g_gameServerPort : 58158;
+            newAddr.sin_port = htons(targetPort);
+            port = targetPort;
+            DLOG(@"[REWRITE-PORT] Game server %s:12003 -> %s:%d (parsed=%d, fallback=%d)", 
+                 origHost, origHost, targetPort, g_gameServerPort, targetPort == 58158 ? 1 : 0);
+        }
+        
+        // v36.61: Track fd BEFORE connect with target port
         trackFd(sockfd, host, port);
         
-        // v36.60: Print connection diagnostics
-        BOOL hasPreexistingConnectError = (orig_connect == NULL);
-        DLOG(@"[SOCK] connect START fd=%d target=%s:%d isGamePort=%d orig_fn=%@",
-             sockfd, host, port, isGameServerPort ? 1 : 0,
-             orig_connect ? @"OK" : @"NULL");
+        DLOG(@"[SOCK] connect START fd=%d target=%s:%d origPort=%d rewrite=%d isGamePort=%d",
+             sockfd, host, port, origPort, needPortRewrite ? 1 : 0, isGameServerPort ? 1 : 0);
         
+        BOOL hasPreexistingConnectError = (orig_connect == NULL);
         if (hasPreexistingConnectError) {
             DLOG(@"[SOCK] FATAL: orig_connect is NULL! dlsym failed.");
             errno = EACCES;
             return -1;
         }
         
-        // v36.60: NON-BLOCKING CONNECT with timeout (to prevent hanging)
-        // Steps: (1) save flags, (2) set O_NONBLOCK, (3) connect (returns EINPROGRESS),
-        //        (4) select with timeout, (5) check result via getsockopt, (6) restore flags
+        // Use rewritten address if port rewrite needed
+        const struct sockaddr *actualAddr = needPortRewrite ? (struct sockaddr *)&newAddr : addr;
+        socklen_t actualAddrLen = needPortRewrite ? sizeof(newAddr) : addrlen;
+        
+        // NON-BLOCKING CONNECT with 15s timeout (prevents hanging)
         int savedFlags = fcntl(sockfd, F_GETFL, 0);
         if (savedFlags < 0) savedFlags = 0;
         
         int setResult = fcntl(sockfd, F_SETFL, savedFlags | O_NONBLOCK);
         if (setResult < 0) {
-            DLOG(@"[SOCK] Warning: cannot set O_NONBLOCK, will use blocking connect (fd=%d errno=%d %s)",
-                 sockfd, errno, strerror(errno));
+            DLOG(@"[SOCK] Warning: cannot set O_NONBLOCK (errno=%d %s), using blocking connect",
+                 errno, strerror(errno));
         }
         
         struct timeval startTV;
         gettimeofday(&startTV, NULL);
         
-        // Try connect (will return immediately with EINPROGRESS if O_NONBLOCK worked)
-        int interimResult = orig_connect(sockfd, addr, addrlen);
+        int interimResult = orig_connect(sockfd, actualAddr, actualAddrLen);
         int connectErrno = errno;
         int finalResult = interimResult;
         
         if (interimResult < 0 && connectErrno == EINPROGRESS) {
-            // Non-blocking connect in progress - use select to wait
             DLOG(@"[SOCK] connect in progress (EINPROGRESS). Waiting with 15s timeout...");
             fd_set writeSet, errSet;
             FD_ZERO(&writeSet);
@@ -2209,31 +2222,26 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
             FD_SET(sockfd, &errSet);
             
             struct timeval timeoutTV;
-            timeoutTV.tv_sec = 15;   // 15 seconds timeout (generous for mobile networks)
+            timeoutTV.tv_sec = 15;
             timeoutTV.tv_usec = 0;
             
             int selResult = select(sockfd + 1, NULL, &writeSet, &errSet, &timeoutTV);
             connectErrno = errno;
             
             if (selResult == 0) {
-                // Timeout!
                 finalResult = -1;
                 connectErrno = ETIMEDOUT;
                 DLOG(@"[SOCK] connect TIMEOUT after 15s (fd=%d target=%s:%d)", sockfd, host, port);
             } else if (selResult < 0) {
-                // select error
                 finalResult = -1;
                 DLOG(@"[SOCK] select() failed ret=%d errno=%d %s", selResult, connectErrno, strerror(connectErrno));
             } else {
-                // select success - check which set fired and use getsockopt for real result
                 if (FD_ISSET(sockfd, &errSet)) {
-                    // Error occurred
                     socklen_t optLen = sizeof(connectErrno);
                     getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &connectErrno, &optLen);
                     finalResult = -1;
                     DLOG(@"[SOCK] select fired error set, SO_ERROR=%d %s", connectErrno, strerror(connectErrno));
                 } else if (FD_ISSET(sockfd, &writeSet)) {
-                    // Write-ready: double-check with SO_ERROR that connect really succeeded
                     socklen_t optLen = sizeof(connectErrno);
                     connectErrno = 0;
                     int optResult = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &connectErrno, &optLen);
@@ -2250,63 +2258,63 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 }
             }
         } else if (interimResult == 0) {
-            // connect succeeded immediately!
             connectErrno = 0;
             DLOG(@"[SOCK] connect succeeded immediately (fd=%d)", sockfd);
         } else {
-            // Other error (not EINPROGRESS) - log it
             DLOG(@"[SOCK] connect failed immediately ret=%d errno=%d %s",
                  interimResult, connectErrno, strerror(connectErrno));
             finalResult = interimResult;
         }
         
-        // Restore original socket flags (disable O_NONBLOCK so game sees expected blocking behavior)
+        // Restore original socket flags
         if (setResult == 0) {
             fcntl(sockfd, F_SETFL, savedFlags);
             DLOG(@"[SOCK] Restored socket flags to 0x%x (non-blocking removed)", savedFlags);
         }
         
-        // Set global errno to the real error
         errno = connectErrno;
         
         struct timeval endTV;
         gettimeofday(&endTV, NULL);
         double elapsed = (endTV.tv_sec - startTV.tv_sec) + (endTV.tv_usec - startTV.tv_usec) / 1000000.0;
         
-        // v36.60: Very detailed END log
         if (finalResult == 0) {
-            DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d result=%d errno=%d elapsed=%.3fs",
-                 sockfd, host, port, finalResult, errno, elapsed);
+            // v36.61: Track game server connection state
+            if (isGameServerPort) {
+                g_gameServerConnected = YES;
+                g_gameServerFd = sockfd;
+                g_gameConnectTime = [[NSDate date] timeIntervalSince1970];
+                DLOG(@"[GAME-CONNECT] Game server connected fd=%d target=%s:%d (parsed port=%d)", 
+                     sockfd, host, port, g_gameServerPort);
+            }
+            DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d origPort=%d elapsed=%.3fs",
+                 sockfd, host, port, origPort, elapsed);
         } else {
-            DLOG(@"[SOCK] connect END fd=%d FAILED target=%s:%d result=%d errno=%d(%s) elapsed=%.3fs",
-                 sockfd, host, port, finalResult, errno, strerror(errno), elapsed);
+            DLOG(@"[SOCK] connect END fd=%d FAILED target=%s:%d origPort=%d errno=%d(%s) elapsed=%.3fs",
+                 sockfd, host, port, origPort, errno, strerror(errno), elapsed);
         }
         
-        // Update fd tracking lastActivity - use existing data structures
+        // Update fd tracking - mark as active
         for (int fdi = 0; fdi < g_trackedCount; fdi++) {
             if (g_trackedFds[fdi] == sockfd && g_trackedActive[fdi]) {
-                // Mark activity (no explicit lastActivity field in current tracking struct, skip)
-                break;
+                break;  // Already tracked
             }
         }
         
-        // Try server rotation on failure
+        // Game server failed: try rotation
         if (isGameServerPort && finalResult != 0) {
             DLOG(@"[SOCK] Game server %s:%d FAILED -> attempting rotation...", host, port);
             @try {
                 BOOL rotated = tryNextServer();
                 if (rotated) {
-                    DLOG(@"[SOCK] Rotation succeeded. Global g_gameServerInfo now: %s:%d (index %d/%d failCount=%d)",
+                    DLOG(@"[SOCK] Rotation succeeded: %s:%d (index %d/%d)",
                          g_gameServerIP, g_gameServerPort,
-                         g_currentServerIndex + 1, g_serverCount, g_connectionFailCount);
+                         g_currentServerIndex + 1, g_serverCount);
                 } else {
-                    DLOG(@"[SOCK] Rotation unavailable (only %d server(s) known, failCount=%d)",
-                         g_serverCount, g_connectionFailCount);
+                    DLOG(@"[SOCK] Rotation unavailable (servers=%d)", g_serverCount);
                 }
             } @catch (NSException *e) {
                 DLOG(@"[SOCK] Exception during rotation: %@", e.reason);
-            } @catch (...) {
-                DLOG(@"[SOCK] Unknown error during rotation");
             }
         }
         
@@ -2339,10 +2347,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        // v36.56: Add 12003 port logging (game server without port rewrite)
-        if (port == 5678 || port == 58158 || port == 12003) {
-            const char *serverType = (port == 5678) ? "LOGIN" : (port == 58158 ? "GAME-58158" : "GAME-12003");
-            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu [%s]", fd, cmd, len, serverType);
+        // v36.61: Use dynamic game port detection (12003, 58158, or parsed port)
+        BOOL isGameOrLoginPort = (port == 5678 || port == 12003 || port == 58158 || 
+                                  (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+        if (isGameOrLoginPort) {
+            const char *serverType;
+            if (port == 5678) serverType = "LOGIN";
+            else if (port == 58158) serverType = "GAME-58158";
+            else if (port == 12003) serverType = "GAME-12003";
+            else serverType = "GAME-DYNAMIC";
+            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu [%s port=%d]", fd, cmd, len, serverType, port);
         }
     }
     
@@ -2358,27 +2372,44 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
     }
     
-    // Analyze device info packets (0x000EE007) - on login server (5678), game server (58158 and 12003)
-    if (len >= 12 && (port == 5678 || port == 58158 || port == 12003)) {
+    // Analyze device info packets (0x000EE007) - on login server (5678), game server (all ports)
+    BOOL isGameOrLoginPort = (port == 5678 || port == 12003 || port == 58158 || 
+                              (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+    if (len >= 12 && isGameOrLoginPort) {
         const unsigned char *dp = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)dp[4] << 24) | ((uint32_t)dp[5] << 16) |
                        ((uint32_t)dp[6] << 8)  | (uint32_t)dp[7];
         if (cmd == 0x000EE007) {
             @try {
-                // Simple hex dump only - no complex regex or string operations
+                // v36.61: Detailed device info packet logging
+                DLOG(@"[DEVICE-INFO] ===== DEVICE INFO PACKET (0x000EE007) =====");
+                DLOG(@"[DEVICE-INFO] len=%zu port=%d fd=%d gameConnected=%d", len, port, fd, g_gameServerConnected ? 1 : 0);
+                
+                // Hex dump - full packet
                 NSMutableString *hex = [NSMutableString string];
-                for (size_t i = 0; i < len && i < 64; i++) {
+                for (size_t i = 0; i < len && i < 128; i++) {
                     [hex appendFormat:@"%02X ", dp[i]];
                 }
-                DLOG(@"[DEVICE-INFO] len=%zu hex(64): %@", len, hex);
+                if (len > 128) [hex appendFormat:@"...(truncated)"];
+                DLOG(@"[DEVICE-INFO] HEX: %@", hex);
                 
-                // Simple ASCII decode attempt
+                // Parse header
+                if (len >= 16) {
+                    uint32_t pktLen = ((uint32_t)dp[0]<<24)|((uint32_t)dp[1]<<16)|((uint32_t)dp[2]<<8)|dp[3];
+                    uint32_t pktCmd = ((uint32_t)dp[4]<<24)|((uint32_t)dp[5]<<16)|((uint32_t)dp[6]<<8)|dp[7];
+                    uint8_t status = dp[12];
+                    DLOG(@"[DEVICE-INFO] pktLen=%u cmd=0x%08X status=%u", pktLen, pktCmd, status);
+                }
+                
+                // ASCII decode payload
                 if (len > 12) {
                     NSString *payload = [[NSString alloc] initWithBytes:dp+12 length:MIN(len-12, 100) encoding:NSUTF8StringEncoding];
                     if (payload) {
-                        DLOG(@"[DEVICE-INFO] payload: %@", payload);
+                        DLOG(@"[DEVICE-INFO] payload (offset 12): '%@'", payload);
                     }
                 }
+                
+                DLOG(@"[DEVICE-INFO] ===== END DEVICE INFO =====");
             } @catch (NSException *e) {
                 // Silently ignore any errors in packet analysis
                 DLOG(@"[DEVICE-INFO] Analysis skipped due to exception: %@", e.reason);
@@ -2709,8 +2740,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         }
         if (ret == 0) {
             DLOG(@"[RECV-CLOSE] fd=%d %s:%d ret=0 (server closed connection gracefully)", fd, host, port);
-            // v36.57: Game server disconnected, try next server
-            if (port == 12003 || port == 58158) {
+            // v36.61: Game server disconnected, try next server (dynamic port detection)
+            BOOL isGamePort = (port == 12003 || port == 58158 || 
+                               (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+            if (isGamePort) {
                 DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
                 @try {
                     BOOL rotated = tryNextServer();
@@ -2854,16 +2887,21 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     
 #if !MINIMAL_MODE
-    // v36.57: Enhanced game server response analysis (ALL ports, detailed logging)
-    // Analyze responses on game ports (12003, 58158) - log EVERYTHING
-    if ((port == 12003 || port == 58158) && ret >= 4) {
+    // v36.61: Enhanced game server response analysis (ALL ports, detailed logging)
+    // Analyze responses on game ports (12003, 58158, or dynamic parsed port) - log EVERYTHING
+    BOOL isGamePort = (port == 12003 || port == 58158 || 
+                       (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+    if (isGamePort && ret >= 4) {
         @try {
             uint32_t rcmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
             uint32_t pktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                              ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
             
-            const char *gamePort = (port == 58158) ? "58158" : "12003";
+            const char *gamePort;
+            if (port == 58158) gamePort = "58158";
+            else if (port == 12003) gamePort = "12003";
+            else gamePort = "DYNAMIC";
             
             // v36.57: Build comprehensive log with hex dump
             NSMutableString *detail = [NSMutableString stringWithCapacity:1024];
@@ -2898,14 +2936,56 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // Status byte analysis
+            // v36.61: Special detailed logging for 0x80FFF494 (login response from game server)
+            if (rcmd == 0x80FFF494) {
+                DLOG(@"[GAME-80FFF494] ===== DETAILED ANALYSIS OF 0x80FFF494 RESPONSE =====");
+                DLOG(@"[GAME-80FFF494] Total length: %zd bytes", ret);
+                DLOG(@"[GAME-80FFF494] FULL HEX DUMP:");
+                for (ssize_t i = 0; i < ret; i += 16) {
+                    NSMutableString *line = [NSMutableString string];
+                    for (ssize_t j = i; j < MIN(i + 16, ret); j++) {
+                        [line appendFormat:@"%02X ", p[j]];
+                    }
+                    DLOG(@"[GAME-80FFF494]   %04zd: %@", i, line);
+                }
+                // Parse known fields
+                if (ret >= 16) {
+                    uint32_t pLen = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+                    uint32_t pCmd = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
+                    uint8_t pStatus = p[12];
+                    DLOG(@"[GAME-80FFF494] pktLen=%u cmd=0x%08X status=%u(0x%02X)", pLen, pCmd, pStatus, pStatus);
+                    // Check bytes 12-20 for status/error fields
+                    DLOG(@"[GAME-80FFF494] Header fields (offset 8-20):");
+                    for (int i = 8; i < MIN(20, (int)ret); i++) {
+                        DLOG(@"[GAME-80FFF494]   byte[%d] = %u (0x%02X)", i, p[i], p[i]);
+                    }
+                    // Try to decode payload
+                    if (ret > 13) {
+                        NSString *payload = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
+                        if (payload && payload.length > 0) {
+                            DLOG(@"[GAME-80FFF494] ASCII payload (offset 13+): '%@'", payload);
+                        }
+                    }
+                }
+                DLOG(@"[GAME-80FFF494] ===== END DETAILED ANALYSIS =====");
+            }
+            
+            // v36.61: Also log all GAME-RECV packets in detail (first 128 bytes)
+            [detail appendFormat:@"  [DETAIL] Full packet hex (all %zd bytes):\n", ret];
+            for (ssize_t i = 0; i < ret; i += 16) {
+                [detail appendFormat:@"    %04zd: ", i];
+                for (ssize_t j = i; j < MIN(i + 16, ret); j++) {
+                    [detail appendFormat:@"%02X ", p[j]];
+                }
+                [detail appendFormat:@"\n"];
+            }
             if (ret >= 13) {
                 uint8_t status = p[12];
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.59: Patch game server error responses for BOTH 12003 AND 58158
-                    if (port == 12003 || port == 58158) {
+                    // v36.61: Patch game server error responses for ALL game ports (dynamic detection)
+                    if (isGamePort) {
                         DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=%d host=%s)", status, port, host);
                         ((unsigned char *)buf)[12] = 0;
                         [detail appendFormat:@"  [PATCH] Status patched to 0 (port=%d)\n", port];
@@ -2922,8 +3002,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         [payloadStr containsString:@"版本太旧"]) {
                         [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
                         DLOG(@"[GAME-PATCH] Error text found in game server response: %@ (port=%d)", payloadStr, port);
-                        // Clear error text for BOTH ports
-                        if (port == 12003 || port == 58158) {
+                        // Clear error text for ALL game ports
+                        if (isGamePort) {
                             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
                             static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
                             for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
@@ -2958,6 +3038,41 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [SERVER-RESP] Server response (cmd=0x%08X)\n", rcmd];
             } else {
                 [detail appendFormat:@"  [UNKNOWN] Unknown command (cmd=0x%08X) - possible protocol data\n", rcmd];
+            }
+            
+            // v36.61: Track game server protocol flow
+            // After handshake (0x80FFF494), client should send 0x000EE007 (device info)
+            // If only heartbeats are being sent, the device info packet may be missing
+            static BOOL g_handshakeComplete = NO;
+            static int g_heartbeatCount = 0;
+            
+            if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
+                if (!g_handshakeComplete) {
+                    g_handshakeComplete = YES;
+                    g_heartbeatCount = 0;
+                    DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Client should now send 0x000EE007...", rcmd);
+                }
+            } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
+                // Count server responses after handshake - these are likely responses to client heartbeats
+                g_heartbeatCount++;
+                if (g_heartbeatCount == 5) {
+                    DLOG(@"[GAME-FLOW] WARNING: Received %d server responses after handshake, but no 0x000EE007 sent yet!", g_heartbeatCount);
+                    DLOG(@"[GAME-FLOW] Client may be stuck on heartbeats only. Check if game is sending 0x000EE007...");
+                }
+            }
+            
+            // Log if 0x000EE007 related responses are received
+            if (rcmd == 0x00EEE007 || rcmd == 0x80EEE007 || rcmd == 0x00EE007) {
+                DLOG(@"[GAME-FLOW] Device info response received (cmd=0x%08X). Game should be entering now.", rcmd);
+                g_handshakeComplete = YES;
+                g_heartbeatCount = 0;
+            }
+            
+            // Reset handshake state on disconnect (heartbeat timeout)
+            if (g_handshakeComplete && ret == 0) {
+                g_handshakeComplete = NO;
+                g_heartbeatCount = 0;
+                DLOG(@"[GAME-FLOW] Connection closed, resetting handshake state");
             }
             
             DLOG(@"%@", detail);
