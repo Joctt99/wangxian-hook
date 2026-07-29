@@ -3978,7 +3978,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.60 - Remove port rewrite, timeout-safe connect, clean server list parse");
+    DLOG(@"[VERSION] WangXianHook v36.62 - Force port 58158, disable binary port parsing, simple blocking connect");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
