@@ -1,23 +1,30 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.88 - Inject proper-sized 0x80FFF495 packet, let client send encrypted device info
- * MODE: FULL - All hooks enabled
+ * WangXianHook v36.89 - OBSERVATION MODE: Stop all game server protocol intervention
+ * MODE: FULL - All hooks enabled (but game server patches DISABLED for observation)
  *
- * v36.88 CRITICAL FIXES:
- * 1. [ROOT-CAUSE FOUND] Why plaintext 0x000EE007 force-send is IGNORED:
- *    - After 0x80FFF494 + 0x00FFFF02 + 0x80FFFF02, protocol enters ENCRYPTED mode
- *    - Game server 12003 port expects AES-encrypted 0x000EE007 (179 bytes)
- *    - Our plaintext 143/217 bytes are silently dropped = only heartbeats returned
- * 2. [FORCE-HS-PACKET] Construct REAL-SIZED (200-byte) 0x80FFF495 into recv(), NOT:
- *    - NOT v36.85 style: hack 22-byte heartbeat ACK cmd = causes SIGSEGV
- *    - NOT v36.86/87 style: force-send plaintext 0x000EE007 = server ignores
- * 3. [CLIENT-DRIVEN] After injected 0x80FFF495 is consumed by client:
- *    - handle_CHOOSE_WOOD_BOX_RES handler receives valid 200-byte buffer = no SIGSEGV
- *    - Client state advances to ENCRYPTED channel
- *    - Client sends PROPER AES-encrypted 0x000EE007 (179 bytes) to server itself
+ * v36.89 CRITICAL STRATEGY CHANGE:
+ * After 80+ versions of status patching + auto-respond + packet injection all failing,
+ * we now DISABLE ALL game server protocol intervention to observe what the client does
+ * NATURALLY when left alone:
  *
- * v36.87: Inject UUID into device info + force-send enhanced 179-byte packet
- * v36.86: Fix SIGSEGV crash + force-send device info after challenge
+ * 1. [NO STATUS PATCH] Do NOT patch 0x80FFF494/0x80FFF495 status byte[12]
+ *    - Previous: status=1 -> patched to 0 (may corrupt "challenge required" signal)
+ *    - Now: let status=1 through, client decides what to do
+ *
+ * 2. [NO AUTO-RESPOND] Do NOT auto-respond to 0x00FFFF02 challenge
+ *    - Previous: hook sends 0x80FFFF02 before client can (server may reject format)
+ *    - Now: let client process challenge and send its own 0x80FFFF02
+ *
+ * 3. [NO INJECTION] Do NOT inject fake 0x80FFF495 into recv
+ *    - Previous: 200-byte fake packet (client ignored it, kept heartbeating)
+ *    - Now: no injection, see if server sends real 0x80FFF495 after client's own response
+ *
+ * GOAL: Determine if client can complete handshake on its own.
+ * If yes -> our intervention was the problem all along.
+ * If no -> we see exactly where client fails and can target that.
+ *
+ * v36.88: Inject proper-sized 0x80FFF495 packet, let client send encrypted device info
  *
  * v36.84: Fix challenge response format (add STATUS byte)
  * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
@@ -3692,15 +3699,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.70: ALWAYS patch 0x80FFF494/0x80FFF495 status regardless of port detection
-                    // These are game server handshake responses - status=1 must be patched to 0
+                    // v36.89: OBSERVATION MODE - DO NOT PATCH status!
+                    // Previous versions patched status 1->0 for 0x80FFF494/0x80FFF495.
+                    // But this may CORRUPT the packet: byte[12]=1 might mean "challenge required"
+                    // not "error". Patching it to 0 tells client "handshake complete, no challenge
+                    // needed", so client skips challenge response -> server never sends 0x80FFF495
+                    // -> client stuck on heartbeats forever.
+                    // NOW: Let status=1 through unchanged. Observe what client does naturally.
                     if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
-                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s) [ALWAYS-ENABLED]", status, rcmd, port, host);
-                        ((unsigned char *)buf)[12] = 0;
-                        // v36.76: NOT patching byte[11] - it's a sequence/length field, not status
-                        // byte[11] changed from 0x19 to 0x1A between connections, indicating it's not status
-                        // Patching it corrupts the certificate data and prevents client from parsing it
-                        [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
+                        DLOG(@"[GAME-PATCH] v36.89 OBSERVATION MODE: NOT patching status %u for cmd=0x%08X (letting client handle naturally)", status, rcmd);
+                        [detail appendFormat:@"  [OBSERVE] v36.89: Status NOT patched (observation mode)\n"];
                         
                         // v36.79: Extract RSA public key certificate from 0x80FFF494 response
                         // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
@@ -3978,10 +3986,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[STICKY-SCAN] Sub-packet at offset %zd: cmd=0x%08X len=%u status=%u",
                      scanOffset, scanCmd, scanPktLen, p[scanOffset + 12]);
                 
-                // v36.79: Auto-respond to 0x00FFFF02 in sticky scan path
+                // v36.89: OBSERVATION MODE - DO NOT auto-respond to 0x00FFFF02!
+                // Let the CLIENT handle the challenge itself. Our auto-response was
+                // sending 0x80FFFF02 BEFORE the client could, and the server may have
+                // rejected our format (extra status byte, wrong seq, etc.).
+                // Now: just log the challenge, let client process it naturally.
                 if (scanCmd == 0x00FFFF02 && scanRemaining >= 28) {
-                    DLOG(@"[STICKY-SCAN] Auto-responding to 0x00FFFF02 sub-packet at offset %zd", scanOffset);
-                    autoRespondToChallenge(fd, p + scanOffset, (size_t)scanPktLen, scanCmd);
+                    DLOG(@"[STICKY-SCAN] v36.89 OBSERVATION: NOT auto-responding to 0x00FFFF02 (letting client handle)");
+                    DLOG(@"[STICKY-SCAN] Challenge data at offset %zd: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                         scanOffset,
+                         p[scanOffset+12], p[scanOffset+13], p[scanOffset+14], p[scanOffset+15],
+                         p[scanOffset+16], p[scanOffset+17], p[scanOffset+18], p[scanOffset+19],
+                         p[scanOffset+20], p[scanOffset+21], p[scanOffset+22], p[scanOffset+23],
+                         p[scanOffset+24], p[scanOffset+25], p[scanOffset+26], p[scanOffset+27]);
                 }
                 
                 scanOffset += scanPktLen;
@@ -4015,23 +4032,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
                          subPacketCount, offset, subCmd, subPktLen, remaining);
                     
-                    // Process sub-packet status patching (same logic as above)
+                    // v36.89: OBSERVATION MODE - DO NOT patch sub-packet status
                     if (remaining >= 13) {
                         uint8_t subStatus = p[offset + 12];
                         if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
-                            DLOG(@"[STICKY-PACKET] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd", 
+                            DLOG(@"[STICKY-PACKET] v36.89 OBSERVATION: NOT patching sub-packet status %u for cmd=0x%08X at offset %zd",
                                  subStatus, subCmd, offset);
-                            ((unsigned char *)buf)[offset + 12] = 0;
-                            // v36.76: NOT patching byte[11] in sub-packet - same reason as above
                         }
                     }
-                    
-                    // v36.79: Auto-respond to 0x00FFFF02 in sticky-packet path too
-                    if (subCmd == 0x00FFFF02 && remaining >= 28) {
-                        DLOG(@"[STICKY-AUTO] Auto-responding to 0x00FFFF02 sub-packet at offset %zd", offset);
-                        autoRespondToChallenge(fd, p + offset, (size_t)subPktLen, subCmd);
-                    }
-                    // v36.74: DISABLED auto-response to 0x00FFFF02 in sticky-packet path (now handled above)
+                }
+                
+                // v36.89: OBSERVATION MODE - DO NOT auto-respond to 0x00FFFF02!
+                if (subCmd == 0x00FFFF02 && remaining >= 28) {
+                    DLOG(@"[STICKY-AUTO] v36.89 OBSERVATION: NOT auto-responding to 0x00FFFF02 (letting client handle)");
                 }
                 
                 // Move to next packet
