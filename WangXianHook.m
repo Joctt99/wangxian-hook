@@ -1,6 +1,6 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.79 - Auto-respond to 0x00FFFF02 with RSA-encrypted 0x80FFFF02
+ * WangXianHook v36.80 - Debug RSA Base64 decoding failure
  * MODE: FULL - All hooks enabled
  *
  * v36.79 CRITICAL FIXES:
@@ -214,7 +214,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.79 loaded ===");
+        _log(@"=== WangXianHook v36.80 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2610,6 +2610,36 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
     }
     
     @try {
+        // Debug: Log cert data details
+        DLOG(@"[RSA-DEBUG] Base64 cert length: %lu bytes", (unsigned long)g_pubKeyBase64Len);
+        
+        // Check for invalid Base64 characters
+        BOOL hasInvalidChars = NO;
+        int invalidCharCount = 0;
+        int validChars = 0;
+        for (size_t i = 0; i < g_pubKeyBase64Len; i++) {
+            unsigned char c = g_pubKeyBase64[i];
+            // Valid Base64: A-Z, a-z, 0-9, +, /, =
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
+                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '\n' || c == '\r') {
+                validChars++;
+            } else {
+                invalidCharCount++;
+                if (!hasInvalidChars) {
+                    DLOG(@"[RSA-DEBUG] Invalid char found at offset %zu: 0x%02X (%c)", i, c, c >= 32 ? c : '.');
+                    hasInvalidChars = YES;
+                }
+            }
+        }
+        DLOG(@"[RSA-DEBUG] Valid chars: %d, Invalid chars: %d", validChars, invalidCharCount);
+        
+        // Debug: Log first and last characters
+        NSString *certStr = [[NSString alloc] initWithBytes:g_pubKeyBase64 length:g_pubKeyBase64Len encoding:NSASCIIStringEncoding];
+        if (certStr) {
+            DLOG(@"[RSA-DEBUG] Cert string (first 100): %@", [certStr substringToIndex:MIN(100, certStr.length)]);
+            DLOG(@"[RSA-DEBUG] Cert string (last 50): %@", [certStr substringFromIndex:MAX(0, (NSInteger)certStr.length - 50)]);
+        }
+        
         // Step 1: Base64 decode the certificate
         NSData *certBase64Data = [NSData dataWithBytes:g_pubKeyBase64 length:g_pubKeyBase64Len];
         if (!certBase64Data) {
@@ -2617,13 +2647,56 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
             return -1;
         }
         
-        NSData *certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:0];
+        // Try method 1: decode using NSString
+        NSData *certDER = nil;
+        if (certStr) {
+            certDER = [[NSData alloc] initWithBase64EncodedString:certStr options:0];
+            DLOG(@"[RSA-DEBUG] Method 1 (NSString decode with options=0): %lu bytes", 
+                 certDER ? (unsigned long)certDER.length : 0);
+        }
+        
+        // Try method 2: decode using NSData
         if (!certDER || certDER.length == 0) {
-            DLOG(@"[RSA-ENCRYPT] Base64 decode failed, trying alternate approach...");
-            // Try with line-breaking options
+            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:0];
+            DLOG(@"[RSA-DEBUG] Method 2 (NSData decode with options=0): %lu bytes", 
+                 certDER ? (unsigned long)certDER.length : 0);
+        }
+        
+        // Try method 3: decode with IgnoreUnknownCharacters
+        if (!certDER || certDER.length == 0) {
             certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            DLOG(@"[RSA-DEBUG] Method 3 (NSData decode with IgnoreUnknown): %lu bytes", 
+                 certDER ? (unsigned long)certDER.length : 0);
+        }
+        
+        if (!certDER || certDER.length == 0) {
+            DLOG(@"[RSA-ENCRYPT] ALL Base64 decode methods failed");
+            
+            // Try manual Base64 decode with padding fix
+            // Remove non-Base64 chars (like newlines) and fix padding
+            NSMutableString *cleanStr = [NSMutableString string];
+            for (size_t i = 0; i < g_pubKeyBase64Len; i++) {
+                unsigned char c = g_pubKeyBase64[i];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
+                    (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
+                    [cleanStr appendFormat:@"%c", c];
+                }
+            }
+            
+            // Fix padding
+            while (cleanStr.length % 4 != 0) {
+                [cleanStr appendString:@"="];
+            }
+            DLOG(@"[RSA-DEBUG] Cleaned Base64 length: %lu (original: %lu)", 
+                 (unsigned long)cleanStr.length, (unsigned long)g_pubKeyBase64Len);
+            DLOG(@"[RSA-DEBUG] Cleaned string (first 100): %@", [cleanStr substringToIndex:MIN(100, cleanStr.length)]);
+            
+            certDER = [[NSData alloc] initWithBase64EncodedString:cleanStr options:0];
+            DLOG(@"[RSA-DEBUG] Method 4 (cleaned + padded): %lu bytes", 
+                 certDER ? (unsigned long)certDER.length : 0);
+            
             if (!certDER || certDER.length == 0) {
-                DLOG(@"[RSA-ENCRYPT] Base64 decode failed completely");
+                DLOG(@"[RSA-ENCRYPT] ALL decode methods failed");
                 return -1;
             }
         }
@@ -3371,6 +3444,53 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         // byte[13] = cert format type (0x88 = X.509 cert)
                         // bytes[14..end] = Base64-encoded DER certificate data
                         if (rcmd == 0x80FFF494 && ret > 14 && !g_pubKeyCaptured) {
+                            // Debug: Log full packet structure
+                            DLOG(@"[PUBKEY-DEBUG] Full 0x80FFF494 packet: ret=%zd bytes", ret);
+                            DLOG(@"[PUBKEY-DEBUG] Bytes 0-15 hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                                 p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+                            DLOG(@"[PUBKEY-DEBUG] Packet header analysis:");
+                            DLOG(@"[PUBKEY-DEBUG]   pktLen=%u (bytes 0-3)", ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]);
+                            DLOG(@"[PUBKEY-DEBUG]   cmd=0x%08X (bytes 4-7)", ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7]);
+                            DLOG(@"[PUBKEY-DEBUG]   seq=0x%08X (bytes 8-11)", ((uint32_t)p[8]<<24)|((uint32_t)p[9]<<16)|((uint32_t)p[10]<<8)|p[11]);
+                            DLOG(@"[PUBKEY-DEBUG]   status=%u (byte 12)", p[12]);
+                            DLOG(@"[PUBKEY-DEBUG]   format=%u (byte 13)", p[13]);
+                            
+                            // Try multiple offset values
+                            NSArray *offsetAttempts = @[@14, @13, @12, @15, @16];
+                            for (NSNumber *offsetNum in offsetAttempts) {
+                                ssize_t certOffset = offsetNum.integerValue;
+                                if (certOffset >= ret) continue;
+                                ssize_t certLen = ret - certOffset;
+                                if (certLen > 0 && certLen < MAX_PUBKEY_BASE64) {
+                                    NSString *certStrTest = [[NSString alloc] initWithBytes:p+certOffset length:(NSUInteger)certLen encoding:NSASCIIStringEncoding];
+                                    if (certStrTest) {
+                                        // Count valid Base64 chars
+                                        int validB64 = 0;
+                                        int invalidB64 = 0;
+                                        for (ssize_t i = 0; i < certLen; i++) {
+                                            unsigned char c = p[certOffset + i];
+                                            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
+                                                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '\n') {
+                                                validB64++;
+                                            } else {
+                                                invalidB64++;
+                                            }
+                                        }
+                                        
+                                        DLOG(@"[PUBKEY-DEBUG] Offset %zd: len=%zd, validB64=%d, invalidB64=%d, starts: %@",
+                                             certOffset, certLen, validB64, invalidB64,
+                                             [certStrTest substringToIndex:MIN(60, certStrTest.length)]);
+                                        
+                                        // If most chars are valid Base64, this is likely the correct offset
+                                        if (validB64 > invalidB64 * 2 && certLen > 100) {
+                                            DLOG(@"[PUBKEY-DEBUG] Offset %zd looks promising (valid/invalid ratio)", certOffset);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Use offset 14 as primary, but also try to decode to verify
                             ssize_t certOffset = 14;
                             ssize_t certLen = ret - certOffset;
                             if (certLen > 0 && certLen < MAX_PUBKEY_BASE64) {
@@ -3383,6 +3503,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                 NSString *certPreview = [[NSString alloc] initWithBytes:p+certOffset length:MIN((NSUInteger)certLen, 80) encoding:NSASCIIStringEncoding];
                                 if (certPreview) {
                                     DLOG(@"[PUBKEY-EXTRACT] Cert starts: %@...", certPreview);
+                                }
+                                // Log last 30 chars
+                                if (certLen > 30) {
+                                    NSString *certEnd = [[NSString alloc] initWithBytes:p+certOffset+certLen-30 length:30 encoding:NSASCIIStringEncoding];
+                                    if (certEnd) {
+                                        DLOG(@"[PUBKEY-EXTRACT] Cert ends: ...%@", certEnd);
+                                    }
                                 }
                             }
                         }
@@ -4581,7 +4708,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.79 - Auto-respond 0x00FFFF02 with RSA-encrypted 0x80FFFF02");
+    DLOG(@"[VERSION] WangXianHook v36.80 - Debug RSA Base64 decoding failure");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
