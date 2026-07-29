@@ -2621,7 +2621,7 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
         if (!certDER || certDER.length == 0) {
             DLOG(@"[RSA-ENCRYPT] Base64 decode failed, trying alternate approach...");
             // Try with line-breaking options
-            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:NSBase64DecodingIgnoreUnknownCharacters];
+            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:NSDataBase64DecodingIgnoreUnknownCharacters];
             if (!certDER || certDER.length == 0) {
                 DLOG(@"[RSA-ENCRYPT] Base64 decode failed completely");
                 return -1;
@@ -2656,7 +2656,7 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
                     
                     // Step 3: Encrypt with RSA
                     CFErrorRef encryptErr = NULL;
-                    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionWithSHA256;
+                    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
                     CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
                     CFDataRef cipherCFData = SecKeyCreateEncryptedData(directKey, algo,
                                                                        plainCFData, &encryptErr);
@@ -2687,26 +2687,26 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
         }
         
         // Step 3: Extract public key from certificate
-        SecKeyRef pubKeyRef = SecCertificateCopyPublicKey(certRef);
+        SecKeyRef pubKeyRef = SecCertificateCopyKey(certRef);
         CFRelease(certRef);
         
         if (!pubKeyRef) {
-            DLOG(@"[RSA-ENCRYPT] SecCertificateCopyPublicKey failed");
+            DLOG(@"[RSA-ENCRYPT] SecCertificateCopyKey failed");
             return -1;
         }
         DLOG(@"[RSA-ENCRYPT] Got public key from certificate");
         
         // Step 4: Encrypt with RSA using SecKeyCreateEncryptedData (iOS 10+)
         CFErrorRef encryptErr = NULL;
-        SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionWithSHA256;
+        SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
         
         // Check if the algorithm is supported
         if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
             DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
-            algo = kSecKeyAlgorithmRSAEncryptionWithSHA1;
+            algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
             if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
                 DLOG(@"[RSA-ENCRYPT] SHA1 not supported either, trying PKCS1...");
-                algo = kSecKeyAlgorithmRSAEncryptionPKCS1;
+                algo = kSecKeyAlgorithmRSAEncryptionRaw;
                 if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
                     DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
                     CFRelease(pubKeyRef);
@@ -2728,8 +2728,8 @@ static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
                 CFRelease(cipherCFData);
                 DLOG(@"[RSA-ENCRYPT] Success: encrypted %lu bytes -> %lu bytes RSA cipher (algo=%s)",
                      (unsigned long)plainLen, (unsigned long)cipherLen,
-                     algo == kSecKeyAlgorithmRSAEncryptionWithSHA256 ? "SHA256" :
-                     algo == kSecKeyAlgorithmRSAEncryptionWithSHA1 ? "SHA1" : "PKCS1");
+                     algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" :
+                     algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA1 ? "SHA1" : "PKCS1");
                 return (ssize_t)cipherLen;
             }
             CFRelease(cipherCFData);
