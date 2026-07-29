@@ -1,19 +1,16 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.63 - REVERT to port 12003, disable status patching, add timeout safety net
+ * WangXianHook v36.64 - Re-enable status patching for 0x80FFF494/0x80FFF495, restore text clearing
  * MODE: FULL - All hooks enabled
  *
- * v36.63 CRITICAL FIXES:
- * 1. [REVERT-12003] REVERTED from 58158 to 12003 (ONLY confirmed working port)
- *    - Port 58158 is unreachable - ALL tests since v36.51 showed timeout/hang
- *    - If game uses non-standard port (like 11776), rewrite to 12003
- * 2. [TIMEOUT-SAFETY] Added SO_SNDTIMEO 10s timeout as safety net for blocking connect
- *    - Prevents hanging forever on unreachable ports
- *    - Timeout is cleared after connect completes
- * 3. [DISABLE-PATCH] DISABLED 0x80FFF494 status patching to test
- *    - Status patching was corrupting handshake response
- *    - Leaving status unchanged allows game state machine to progress
- * 4. [ROTATE-12003] tryNextServer rotates IP only, port always 12003
+ * v36.64 CRITICAL FIXES:
+ * 1. [REENABLE-PATCH] Re-enabled status patching for 0x80FFF494 and 0x80FFF495
+ *    - Test showed server returns status=1, client needs status=0 to proceed
+ *    - Only patch handshake responses (0x80FFF494, 0x80FFF495), not all game packets
+ * 2. [RESTORE-TEXT] Restored text clearing logic for "版本过低" etc.
+ *    - Matches status patching to keep response consistent
+ * 3. [KEEP-12003] Keep port 12003 (confirmed working), add SO_SNDTIMEO timeout
+ * 4. [TARGETED] Status patching only for handshake commands, not all game traffic
  */
 /*
  * HISTORY:
@@ -213,7 +210,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.63 loaded ===");
+        _log(@"=== WangXianHook v36.64 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2908,17 +2905,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.63: DISABLE status patching to test if unpatched response allows game state machine to progress
-                    // Status patching was corrupting the handshake and preventing 0x000EE007 from being sent
-                    DLOG(@"[GAME-PATCH] DISABLED status patching (v36.63 test) - leaving status=%u unchanged", status);
-                    /*
-                    // v36.61: Patch game server error responses for ALL game ports (dynamic detection)
-                    if (isGamePort) {
-                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 (port=%d host=%s)", status, port, host);
+                    // v36.64: RE-ENABLE status patching - server returns status=1, client needs status=0
+                    // Only patch 0x80FFF494 and 0x80FFF495 (handshake responses)
+                    if (isGamePort && (rcmd == 0x80FFF494 || rcmd == 0x80FFF495)) {
+                        DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s)", status, rcmd, port, host);
                         ((unsigned char *)buf)[12] = 0;
-                        [detail appendFormat:@"  [PATCH] Status patched to 0 (port=%d)\n", port];
+                        [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
+                    } else {
+                        DLOG(@"[GAME-PATCH] Non-target packet (cmd=0x%08X) not patched, status=%u left unchanged", rcmd, status);
                     }
-                    */
                 }
             }
             
@@ -2931,11 +2926,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         [payloadStr containsString:@"版本太旧"]) {
                         [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
                         DLOG(@"[GAME-PATCH] Error text found in game server response: %@ (port=%d)", payloadStr, port);
-                        // v36.63: DISABLED text clearing too for clean test
-                        // Inconsistent state: status not patched but text erased
-                        DLOG(@"[GAME-PATCH] DISABLED text clearing (v36.63 test) - leaving text unchanged");
-                        /*
-                        // Clear error text for ALL game ports
+                        // v36.64: RE-ENABLE text clearing - match status patching
                         if (isGamePort) {
                             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
                             static const unsigned char curVer[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
@@ -2952,7 +2943,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                 }
                             }
                         }
-                        */
                     }
                 }
             }
@@ -4000,7 +3990,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.63 - REVERT to port 12003, disable status patching, add timeout safety net");
+    DLOG(@"[VERSION] WangXianHook v36.64 - Re-enable status patching for 0x80FFF494/0x80FFF495, restore text clearing");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
