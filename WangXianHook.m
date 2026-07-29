@@ -1,24 +1,21 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.77 - Fix sticky packet splitting + metaclass crypto detection
+ * WangXianHook v36.78 - Remove EncryptUtils hooking (fix SIGSEGV crash)
  * MODE: FULL - All hooks enabled
  *
- * v36.77 CRITICAL FIXES:
- * 1. [NO-SPLIT] REMOVED sticky packet splitting - return full buffer to client
- *    - Previously: split 0x80FFF494 + 0x00FFFF02 into separate recv calls
- *    - BROKE protocol: client needs 0x00FFFF02 IMMEDIATELY after 0x80FFF494
- *    - Now: patch ALL sub-packets in buffer, return ENTIRE buffer to client
- *    - Client's own parser extracts individual packets sequentially
- * 2. [METACLASS] Check EncryptUtils metaclass for class methods (+ methods)
- *    - v36.76 only checked instance methods (- methods) - found 0
- *    - Now also checks object_getClass(cls) for class methods
- * 3. [CRYPTO-SCAN] Scan ALL game classes for crypto-related methods
- *    - Search for classes with keywords: Encrypt, Crypto, RSA, Cert, Key, etc.
- *    - List all instance and class methods for each found class
- *    - Identify the actual game crypto handler (not WeChat's EncryptUtils)
+ * v36.78 CRITICAL FIXES:
+ * 1. [NO-HOOK] REMOVED ALL EncryptUtils method hooking (imp_implementationWithBlock)
+ *    - v36.77 crash: SIGSEGV in +[EncryptUtils getPublicKeyFromBase64:] 
+ *    - Root cause: va_list forwarding in block-based IMP corrupts Obj-C calling convention
+ *    - Game IS calling EncryptUtils correctly (confirmed in v36.77 logs)
+ *    - No need to hook - just let game process 0x00FFFF02 naturally
+ * 2. [KEEP-FIX] Keep v36.77 sticky packet NO-SPLIT fix
+ *    - This WORKS: client now receives 0x00FFFF02 after 0x80FFF494
+ *    - Game successfully calls rsaVerifyData and getPublicKeyFromBase64
+ * 3. [KEEP-SCAN] Keep crypto class scanning for future reference
  *
- * v36.76: Reverted byte[11] patch + Hook ALL EncryptUtils methods
- * v36.75: Patch byte[11] + EncryptUtils hook + init packet logging
+ * v36.77: Fix sticky packet splitting + metaclass crypto detection
+ * v36.76: Revert byte[11] patch + Hook ALL EncryptUtils methods
  */
 /*
  * HISTORY:
@@ -218,7 +215,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.77 loaded ===");
+        _log(@"=== WangXianHook v36.78 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -4311,7 +4308,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.77 - Fix sticky packet splitting + metaclass crypto detection");
+    DLOG(@"[VERSION] WangXianHook v36.78 - Remove EncryptUtils hooking (fix SIGSEGV crash)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -5060,54 +5057,10 @@ static void installAllHooks(void) {
                 }
                 DLOG(@"%@", clsMethodList);
                 
-                // Hook ALL methods (both inst and cls)
-                for (unsigned int i = 0; i < instCount; i++) {
-                    @try {
-                        IMP orig = method_getImplementation(instMethods[i]);
-                        __block NSString *methodName = NSStringFromSelector(method_getName(instMethods[i]));
-                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
-                            DLOG(@"[ENCRYPT-UTILS-CALL] -[%@ %@] CALLED", NSStringFromClass([self class]), methodName);
-                            va_list args;
-                            va_start(args, _cmd);
-                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
-                            va_end(args);
-                            if ([result isKindOfClass:[NSData class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSData len=%lu", (unsigned long)[(NSData *)result length]);
-                            } else if ([result isKindOfClass:[NSString class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSString: %@", result);
-                            } else if (!result) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned nil");
-                            }
-                            return result;
-                        });
-                        method_setImplementation(instMethods[i], new_impl);
-                    } @catch (NSException *e) {}
-                }
-                
-                for (unsigned int i = 0; i < clsCount; i++) {
-                    @try {
-                        IMP orig = method_getImplementation(clsMethods[i]);
-                        __block NSString *methodName = NSStringFromSelector(method_getName(clsMethods[i]));
-                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
-                            DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] CALLED", NSStringFromClass([self class]), methodName);
-                            va_list args;
-                            va_start(args, _cmd);
-                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
-                            va_end(args);
-                            if ([result isKindOfClass:[NSData class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSData len=%lu", (unsigned long)[(NSData *)result length]);
-                            } else if ([result isKindOfClass:[NSString class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSString: %@", result);
-                            } else if (!result) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] returned nil");
-                            }
-                            return result;
-                        });
-                        method_setImplementation(clsMethods[i], new_impl);
-                    } @catch (NSException *e) {}
-                }
-                
-                DLOG(@"[ENCRYPT-UTILS] Hooked %u inst + %u cls methods", instCount, clsCount);
+                // v36.78: DO NOT hook EncryptUtils methods - va_list forwarding causes SIGSEGV
+                // The game IS calling EncryptUtils (confirmed in v36.77 logs)
+                // We just log the method names for reference, no hooking needed
+                DLOG(@"[ENCRYPT-UTILS] %u inst + %u cls methods listed (no hooking - va_list crash risk)", instCount, clsCount);
                 if (instMethods) free(instMethods);
                 if (clsMethods) free(clsMethods);
             }
