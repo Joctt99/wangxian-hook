@@ -1,38 +1,42 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.91 - REMOVE ALL FORCE-INJECTION: Only patch REAL server 0x80FFF495 status
- * MODE: ULTRA-LIGHT - ONLY patch status byte, NO challenge auto-respond, NO force packet injection
+ * WangXianHook v36.92 - SELECTIVE patch + FORCE-SEND ENHANCED 0x000EE007 after 0x80FFF495
+ * MODE: TARGETED - Keep 0x80FFF495 status=1→0 patch + auto-send captured device info + UUID
  *
- * v36.91 CRITICAL FIX (learned from v36.90 FAILURE):
- * v36.90 still had TWO interference layers ACTIVE despite "selective patch" claim:
- *   1. FORCE-HS injection: Auto-inject 200B FAKE 0x80FFF495 BEFORE real server response!
- *      Log evidence: [FORCE-HS] Returning 200 bytes... then [RECV] ret=365 (real packet)
- *      → Client receives TWO 0x80FFF495 packets with DIFFERENT seq numbers!
- *        Fake: seq=0x3B7B1F3E (from FORCE-HS-PREP auto-response)
- *        Real: seq=0x0000001B (from actual server)
- *      → Client state machine CORRUPTED → never sends 0x000EE007/0x00FFF493 → stuck in heartbeat!
+ * v36.91 vs v36.92 CRITICAL DISCOVERY (PARADOX):
+ *   Scenario A (v36.89 OBSERVATION, status NOT patched):
+ *     - Server returns 0x80FFF495 status=1 (365B)
+ *     - Client DOES send 0x000EE007 (217B) + 0x00FFF493 (1697B/896B) ✅
+ *     - But THEN calls quitFromServer() -> "network interrupted" ❌
  *
- *   2. 0x00FFFF02 auto-respond (double response problem):
- *      Log evidence: [FORCE-HS-PREP] at 84643 BEFORE client's own [SEND-CMD] 0x00FFF495 at 84667
- *      → Hook sent 0x80FFFF02 response AND activated FORCE-HS
- *      → Client ALSO processed challenge and sent 0x00FFF495 (703B RSA response)
- *      → TWO responses to ONE challenge = protocol state corrupted!
+ *   Scenario B (v36.91, status 1→0 PATCHED):
+ *     - Hook patches 0x80FFF495 status 1→0
+ *     - Client does NOT call quitFromServer (connection stays alive) ✅
+ *     - But client STOPS at heartbeat only! NO 0x000EE007! NO 0x00FFF493! ❌
  *
- * ROOT CAUSE HIERARCHY (why v36.89 observation was closer to success):
- *   v36.89: No auto-respond = client handled challenge cleanly (only FORCE-HS was missing in obs mode)
- *   v36.90: Selective status patch GOOD, but FORCE-HS + auto-respond still ACTIVE = BAD
- *   v36.91: Minimal intervention = ONLY patch 0x80FFF495 status byte of REAL server packet
- *           DELETE: FORCE-HS injection mechanism entirely
- *           DELETE: 0x00FFFF02 auto-respond entirely
- *           KEEP: Selective status patch on 0x80FFF495 status=1→0 (0x80FFF494 untouched!)
+ * PARADOX EXPLANATION:
+ *   0x80FFF495 status byte has DUAL SEMANTICS:
+ *     status=1 → Client treats as "error" AND simultaneously triggers "send login data now" handler
+ *                 (calls quitFromServer in error branch AFTER enqueuing login packets)
+ *     status=0 → Client treats as "ACK only" (clean handshake, no further action needed,
+ *                 skips the login packet dispatch handler entirely!)
  *
- * EXPECTED FLOW (v36.91):
- *   1. Client → 0x00FFF494 (handshake init)
- *   2. Server → 0x80FFF494 status=1 (752B) + 0x00FFFF02 challenge (28B)
- *   3. Client (native, no hook) → 0x00FFF495 (703B, RSA encrypted)
- *   4. Server → 0x80FFF495 status=1 (365B) ← HOOK PATCHES status 1→0 HERE!
- *   5. Client → 0x000EE007 (179~217B device info) + 0x00FFF493 (login request)
- *   6. Server → Enter game! ✅
+ *   In v36.89 observation: Client first enqueues 0x000EE007+0x00FFF493, then checks status=1
+ *   in the error-check callback → quits.  Packets go out but the subsequent server
+ *   response is never processed due to disconnect.
+ *
+ * v36.92 RESOLUTION (COMPROMISE):
+ *   1. [PATCH] Still patch 0x80FFF495 status 1→0 to prevent quitFromServer/disconnect
+ *   2. [FORCE-SEND] RIGHT AFTER patching 0x80FFF495, inject 0x000EE007 (enhanced with UUID)
+ *      via orig_send() directly, to manually trigger what status=1 would have triggered.
+ *   3. [FALLBACK] If heartbeat count reaches 3 (still no 0x00FFF493 after force-send),
+ *      send again + mark g_deviceInfoSentToGame as complete.
+ *
+ *   This combines: "no disconnect" (status=0 effect) + "send login packets anyway" (status=1 effect).
+ *
+ * ALSO REMAINS from v36.91:
+ *   DELETE: FORCE-HS mechanism (no fake 0x80FFF495 injection)
+ *   DELETE: 0x00FFFF02 auto-respond (let client send native 0x00FFF495 703B)
  */
 /*
  * HISTORY:
@@ -232,7 +236,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.91 loaded ===");
+        _log(@"=== WangXianHook v36.92 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3473,15 +3477,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // v36.91: DISABLED auto-respond to 0x00FFFF02!
+            // v36.92: DISABLED auto-respond to 0x00FFFF02! (same as v36.91)
             // v36.90 analysis: Hook's auto-response (0x80FFFF02) + Client's native response (0x00FFF495)
             // cause DOUBLE response to single challenge, activating FORCE-HS and corrupting state machine.
             // v36.89 observation PROVED client can handle 0x00FFFF02 challenge natively.
             // Let client send 0x00FFF495 (703B RSA response) - this is the PROPER response format!
             if (cmd == 0x00FFFF02 && ret >= 28) {
-                [challengeDetail appendFormat:@"  [V36.91] SKIP AUTO-RESPOND: Let client handle 0x00FFFF02 challenge natively\n"];
-                [challengeDetail appendFormat:@"  [V36.91] Client will parse RSA cert from 0x80FFF494 and send 0x00FFF495 response\n"];
-                DLOG(@"[CHALLENGE] v36.91: Skipping auto-respond - let client send native 0x00FFF495 (703B RSA response)");
+                [challengeDetail appendFormat:@"  [V36.92] SKIP AUTO-RESPOND: Let client handle 0x00FFFF02 challenge natively\n"];
+                [challengeDetail appendFormat:@"  [V36.92] Client will parse RSA cert from 0x80FFF494 and send 0x00FFF495 response\n"];
+                DLOG(@"[CHALLENGE] v36.92: Skipping auto-respond - let client send native 0x00FFF495 (703B RSA response)");
             } else if (cmd == 0x00FFFF01) {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -3685,8 +3689,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     //       causing client to call quitFromServer() -> "network interrupted".
                     //       Patching 1->0 allows client to proceed to send 0x000EE007 + 0x00FFF493.
                     if (rcmd == 0x80FFF494) {
-                        DLOG(@"[GAME-PATCH] v36.90: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
-                        [detail appendFormat:@"  [OBSERVE] v36.90: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
+                        DLOG(@"[GAME-PATCH] v36.92: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
+                        [detail appendFormat:@"  [OBSERVE] v36.92: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
                         
                         // v36.79: Extract RSA public key certificate from 0x80FFF494 response
                         // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
@@ -3826,9 +3830,37 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        DLOG(@"[GAME-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status);
+                        DLOG(@"[GAME-PATCH] v36.92 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status);
                         ((unsigned char *)buf)[12] = 0;
                         [detail appendFormat:@"  [PATCH] 0x80FFF495 status patched to 0 (critical handshake fix)\n"];
+                        
+                        // v36.92: FORCE-SEND captured 0x000EE007 device info RIGHT AFTER patching 0x80FFF495
+                        // Status byte DUAL SEMANTICS DISCOVERY:
+                        //   status=1 -> triggers send-login-packets handler (then calls quit)
+                        //   status=0 -> prevents quit (but also skips login packet handler entirely!)
+                        // Compromise: patch to 0 (no quit) + MANUALLY send device info via orig_send
+                        if (g_deviceInfoCaptured && !g_deviceInfoSentToGame && orig_send) {
+                            const uint8_t *pktToSend = g_deviceInfoEnhancedReady ? g_deviceInfoEnhanced : g_deviceInfoPacket;
+                            ssize_t pktToLen = g_deviceInfoEnhancedReady ? g_deviceInfoEnhancedLen : g_deviceInfoPacketLen;
+                            DLOG(@"[GAME-FORCE-SEND] v36.92: Sending %@ 0x000EE007 (%zd bytes) to game fd=%d RIGHT AFTER 0x80FFF495 patch",
+                                 g_deviceInfoEnhancedReady ? @"ENHANCED" : @"CAPTURED",
+                                 pktToLen, fd);
+                            ssize_t fSent = orig_send(fd, pktToSend, pktToLen, 0);
+                            if (fSent > 0) {
+                                g_deviceInfoSentToGame = YES;
+                                DLOG(@"[GAME-FORCE-SEND] SUCCESS: Sent %zd bytes (expected %zd) to fd=%d",
+                                     fSent, pktToLen, fd);
+                                [detail appendFormat:@"  [FORCE-SEND] v36.92: Sent %s %zd bytes 0x000EE007 device info\n",
+                                 g_deviceInfoEnhancedReady ? "ENHANCED" : "CAPTURED",
+                                 pktToLen];
+                            } else {
+                                DLOG(@"[GAME-FORCE-SEND] FAILED: orig_send returned %zd (errno=%d)",
+                                     fSent, errno);
+                            }
+                        } else {
+                            DLOG(@"[GAME-FORCE-SEND] v36.92: SKIP send - captured=%d sent=%d orig_send=%p",
+                                 g_deviceInfoCaptured, g_deviceInfoSentToGame, orig_send);
+                        }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
@@ -3901,9 +3933,33 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
                 // Count server responses after handshake - these are likely responses to client heartbeats
                 g_heartbeatCount++;
-                if (g_heartbeatCount == 5) {
+                if (g_heartbeatCount == 3) {
                     DLOG(@"[GAME-FLOW] WARNING: Received %d server responses after handshake, but no 0x000EE007 sent yet!", g_heartbeatCount);
                     DLOG(@"[GAME-FLOW] Client may be stuck on heartbeats only. Check if game is sending 0x000EE007...");
+                    
+                    // v36.92 FALLBACK FORCE-SEND: If heartbeat reaches 3 (stuck detected) and we still
+                    // haven't sent device info, force-send now. Status patch 1->0 would have blocked
+                    // the native send handler, so we re-trigger here.
+                    if (g_deviceInfoCaptured && !g_deviceInfoSentToGame && orig_send) {
+                        const uint8_t *pktToSend = g_deviceInfoEnhancedReady ? g_deviceInfoEnhanced : g_deviceInfoPacket;
+                        ssize_t pktToLen = g_deviceInfoEnhancedReady ? g_deviceInfoEnhancedLen : g_deviceInfoPacketLen;
+                        DLOG(@"[GAME-FORCE-SEND] v36.92 FALLBACK (after %d heartbeats): Sending %@ 0x000EE007 (%zd bytes) to fd=%d",
+                             g_heartbeatCount,
+                             g_deviceInfoEnhancedReady ? @"ENHANCED" : @"CAPTURED",
+                             pktToLen, fd);
+                        ssize_t fSent = orig_send(fd, pktToSend, pktToLen, 0);
+                        if (fSent > 0) {
+                            g_deviceInfoSentToGame = YES;
+                            DLOG(@"[GAME-FORCE-SEND] FALLBACK SUCCESS: Sent %zd bytes (expected %zd) to fd=%d",
+                                 fSent, pktToLen, fd);
+                        } else {
+                            DLOG(@"[GAME-FORCE-SEND] FALLBACK FAILED: orig_send=%zd errno=%d", fSent, errno);
+                        }
+                    }
+                }
+                if (g_heartbeatCount == 10) {
+                    DLOG(@"[GAME-FLOW] CRITICAL WARNING: %d heartbeats after handshake! Game is stuck.", g_heartbeatCount);
+                    DLOG(@"[GAME-FLOW] This is likely because: 1) FORCE-SEND packet not recognized by server, or 2) next step requires 0x00FFF493");
                 }
             }
             
@@ -3953,16 +4009,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (scanPktLen < 8 || scanPktLen > 65535) break;
                 if (scanPktLen > (uint32_t)scanRemaining) break;
                 
-                // v36.90: SELECTIVE status patching for sticky sub-packets
+                // v36.92: SELECTIVE status patching for sticky sub-packets
                 // Same logic as main packet: only patch 0x80FFF495, not 0x80FFF494
                 if (scanRemaining >= 13) {
                     uint8_t scanStatus = p[scanOffset + 12];
                     if (scanStatus != 0 && (scanCmd == 0x80FFF494 || scanCmd == 0x80FFF495)) {
                         if (scanCmd == 0x80FFF494) {
-                            DLOG(@"[STICKY-PATCH] v36.90: NOT patching status %u for 0x80FFF494 sub-packet at offset %zd (preserve challenge signal)",
+                            DLOG(@"[STICKY-PATCH] v36.92: NOT patching status %u for 0x80FFF494 sub-packet at offset %zd (preserve challenge signal)",
                                  scanStatus, scanOffset);
                         } else if (scanCmd == 0x80FFF495) {
-                            DLOG(@"[STICKY-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
+                            DLOG(@"[STICKY-PATCH] v36.92 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
                                  scanStatus, scanOffset);
                             ((unsigned char *)buf)[scanOffset + 12] = 0;
                             patchedExtra = YES;
@@ -3974,13 +4030,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[STICKY-SCAN] Sub-packet at offset %zd: cmd=0x%08X len=%u status=%u",
                      scanOffset, scanCmd, scanPktLen, p[scanOffset + 12]);
                 
-                // v36.90: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
+                // v36.92: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
                 // Let the CLIENT handle the challenge itself. Our auto-response was
                 // sending 0x80FFFF02 BEFORE the client could, and the server may have
                 // rejected our format (extra status byte, wrong seq, etc.).
                 // v36.89 observation confirmed client handles challenge perfectly.
                 if (scanCmd == 0x00FFFF02 && scanRemaining >= 28) {
-                    DLOG(@"[STICKY-SCAN] v36.90: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
+                    DLOG(@"[STICKY-SCAN] v36.92: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                     DLOG(@"[STICKY-SCAN] Challenge data at offset %zd: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                          scanOffset,
                          p[scanOffset+12], p[scanOffset+13], p[scanOffset+14], p[scanOffset+15],
@@ -4020,15 +4076,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
                          subPacketCount, offset, subCmd, subPktLen, remaining);
                     
-                    // v36.90: SELECTIVE status patching for detected sticky sub-packets
+                    // v36.92: SELECTIVE status patching for detected sticky sub-packets
                     if (remaining >= 13) {
                         uint8_t subStatus = p[offset + 12];
                         if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
                             if (subCmd == 0x80FFF494) {
-                                DLOG(@"[STICKY-PACKET] v36.90: NOT patching 0x80FFF494 sub-packet status %u at offset %zd (preserve challenge signal)",
+                                DLOG(@"[STICKY-PACKET] v36.92: NOT patching 0x80FFF494 sub-packet status %u at offset %zd (preserve challenge signal)",
                                      subStatus, offset);
                             } else if (subCmd == 0x80FFF495) {
-                                DLOG(@"[STICKY-PACKET] v36.90 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
+                                DLOG(@"[STICKY-PACKET] v36.92 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
                                      subStatus, offset);
                                 ((unsigned char *)buf)[offset + 12] = 0;
                             }
@@ -4036,9 +4092,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 
-                // v36.90: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
+                // v36.92: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
                 if (subCmd == 0x00FFFF02 && remaining >= 28) {
-                    DLOG(@"[STICKY-AUTO] v36.90: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
+                    DLOG(@"[STICKY-AUTO] v36.92: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                 }
                 
                 // Move to next packet
@@ -5060,7 +5116,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.91 - REMOVE force-hs injection + auto-challenge, only patch real 0x80FFF495 status");
+    DLOG(@"[VERSION] WangXianHook v36.92 - Selective patch 0x80FFF495 + FORCE-SEND enhanced 0x000EE007 after handshake");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
