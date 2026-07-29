@@ -1,36 +1,28 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.74 - COMPLETE removal of auto-response + let client handle protocol
+ * WangXianHook v36.75 - Patch byte[11] + EncryptUtils hook + init packet logging
  * MODE: FULL - All hooks enabled
  *
- * v36.74 CRITICAL FIXES:
- * 1. [FULL-REMOVE] COMPLETELY removed ALL 0x00FFFF02 auto-response code
- *    - STICKY-LEFTOVER path: removed auto-response block
- *    - STICKY-PACKET path: removed auto-response block
- *    - v36.73 only claimed to disable auto-response but code still existed!
- * 2. [CLIENT-OWNERSHIP] Let client handle 0x00FFFF02 challenge naturally
- *    - Client needs to construct proper RSA-encrypted 0x80FFFF02 response
- *    - Server expects encrypted data using certificate from 0x80FFF494
- *    - Fake auto-response (copy+flip cmd) is REJECTED by server
- * 3. [TRACE] Protocol tracing still active to monitor client behavior
- *    - [PROTO-TRACE] log tracks every packet client sends after handshake
+ * v36.75 CRITICAL FIXES:
+ * 1. [BYTE11-PATCH] Also patch byte[11] (0x1A -> 0x00) in 0x80FFF494/0x80FFF495
+ *    - byte[11] = 0x1A (26) may be a secondary status/error field
+ *    - byte[12] = 0x01 was already patched to 0
+ *    - Client may check multiple fields before proceeding to 0x00FFFF02 processing
+ * 2. [ENCRYPT-HOOK] Hook EncryptUtils class to detect certificate parsing attempts
+ *    - Hooks RSA-related methods: rsaEncrypt, rsaDecrypt, certificate, publicKey
+ *    - Also searches for alternative classes: RSAUtils, CryptoUtils, SecurityUtils
+ *    - Will reveal if client attempts to parse cert from 0x80FFF494
+ * 3. [INIT-LOG] Log game server initial connection packets (len < 12)
+ *    - These are sent right after connecting to game server
+ *    - May contain handshake initialization data
  *
+ * PREVIOUS (v36.74):
+ * - COMPLETELY removed ALL 0x00FFFF02 auto-response code
+ * - Let client handle 0x00FFFF02 challenge naturally
+ * 
  * PREVIOUS (v36.73):
  * - Claimed to disable auto-response and force-send (but code still existed!)
  * - Added protocol tracing to monitor client behavior
- * 
- * PREVIOUS (v36.72):
- * - Fixed protocol order: force-send after challenge response
- * - Added 150ms delay between challenge response and force-send
- * 
- * PREVIOUS (v36.71):
- * - CMD-based game server detection (isGameCmd function)
- * - Unconditional status patch for 0x80FFF494/0x80FFF495
- * 
- * PREVIOUS (v36.69):
- * - Fix 0x00FFFF02 auto-response in leftover path
- * - Keep all v36.68 fixes (sticky split, heartbeat block)
- * - Keep all v36.67 fixes (auto-respond 0x00FFFF02)
  * - Keep all v36.66 fixes (force send 0x000EE007)
  */
 /*
@@ -231,7 +223,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.74 loaded ===");
+        _log(@"=== WangXianHook v36.75 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2356,6 +2348,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             [ascii appendFormat:@"%c", (p[i] >= 0x20 && p[i] < 0x7F) ? p[i] : '.'];
         }
         DLOG(@"[SEND] fd=%d %s:%d len=%zu\n  hex: %@\n  txt: %@", fd, host, port, sendLen, hex, ascii);
+        
+        // v36.75: Log game server initial connection packets (before handshake)
+        // These are packets sent right after connecting to game server
+        BOOL isGamePort = (port == 12003 || port == 58158 ||
+                          (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+        if (isGamePort && !g_handshakeComplete && len > 0 && len < 12) {
+            DLOG(@"[GAME-INIT] Small packet to game server: len=%zu hex=%@ (may be handshake init)", len, hex);
+        }
     }
     
     // Analyze device info packets (0x000EE007) - on login server (5678), game server (all ports)
@@ -3125,6 +3125,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
                         DLOG(@"[GAME-PATCH] Patching status %u -> 0 for cmd=0x%08X (port=%d host=%s) [ALWAYS-ENABLED]", status, rcmd, port, host);
                         ((unsigned char *)buf)[12] = 0;
+                        // v36.75: Also patch byte[11] (0x1A -> 0x00) - may be secondary status field
+                        uint8_t byte11 = ((unsigned char *)buf)[11];
+                        if (byte11 != 0) {
+                            DLOG(@"[GAME-PATCH] Also patching byte[11] from %u (0x%02X) to 0 for cmd=0x%08X", byte11, byte11, rcmd);
+                            ((unsigned char *)buf)[11] = 0;
+                        }
                         [detail appendFormat:@"  [PATCH] Status patched to 0 for cmd=0x%08X (port=%d)\n", rcmd, port];
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -3279,6 +3285,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             DLOG(@"[STICKY-PACKET] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd", 
                                  subStatus, subCmd, offset);
                             ((unsigned char *)buf)[offset + 12] = 0;
+                            // v36.75: Also patch byte[11] in sub-packet
+                            if (remaining >= 12) {
+                                uint8_t subByte11 = p[offset + 11];
+                                if (subByte11 != 0) {
+                                    DLOG(@"[STICKY-PACKET] Also patching sub-packet byte[11] from %u (0x%02X) to 0 at offset %zd", 
+                                         subByte11, subByte11, offset);
+                                    ((unsigned char *)buf)[offset + 11] = 0;
+                                }
+                            }
                         }
                     }
                     
@@ -4292,7 +4307,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.74 - COMPLETE removal of auto-response + let client handle protocol");
+    DLOG(@"[VERSION] WangXianHook v36.75 - Patch byte[11] + EncryptUtils hook + init packet logging");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -4924,6 +4939,70 @@ static void installAllHooks(void) {
             }
         } @catch (NSException *e) {
             DLOG(@"[CLOGIN] Exception: %@", e);
+        }
+    });
+    
+    // === DEFERRED: Hook EncryptUtils for RSA certificate operations tracing ===
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
+            if (encryptUtilsCls) {
+                DLOG(@"[ENCRYPT-UTILS] EncryptUtils class FOUND!");
+                
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(encryptUtilsCls, &mcount);
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    // Hook RSA-related methods
+                    if ([selName containsString:@"rsaEncrypt"] || 
+                        [selName containsString:@"rsaDecrypt"] ||
+                        [selName containsString:@"RSA"] ||
+                        [selName containsString:@"certificate"] ||
+                        [selName containsString:@"Certificate"] ||
+                        [selName containsString:@"publicKey"] ||
+                        [selName containsString:@"PublicKey"]) {
+                        DLOG(@"[ENCRYPT-UTILS] Found RSA-related method: +[%@ %@]", NSStringFromClass(encryptUtilsCls), selName);
+                        
+                        IMP orig = method_getImplementation(methods[i]);
+                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
+                            DLOG(@"[ENCRYPT-UTILS] +[%@ %@] CALLED", NSStringFromClass([self class]), selName);
+                            va_list args;
+                            va_start(args, _cmd);
+                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
+                            va_end(args);
+                            DLOG(@"[ENCRYPT-UTILS] +[%@ %@] returned: %@", NSStringFromClass([self class]), selName, result ?: @"nil");
+                            return result;
+                        });
+                        method_setImplementation(methods[i], new_impl);
+                        DLOG(@"[ENCRYPT-UTILS] Hooked: %@", selName);
+                    }
+                }
+                if (methods) free(methods);
+            } else {
+                DLOG(@"[ENCRYPT-UTILS] EncryptUtils class NOT found! Searching for alternatives...");
+                // Try alternative class names
+                NSArray *altNames = @[@"RSAUtils", @"CryptoUtils", @"SecurityUtils", @"GameCrypto"];
+                for (NSString *altName in altNames) {
+                    Class altCls = NSClassFromString(altName);
+                    if (altCls) {
+                        DLOG(@"[ENCRYPT-UTILS] Found alternative class: %@", altName);
+                        unsigned int altMcount = 0;
+                        Method *altMethods = class_copyMethodList(altCls, &altMcount);
+                        for (unsigned int i = 0; i < altMcount; i++) {
+                            SEL sel = method_getName(altMethods[i]);
+                            NSString *selName = NSStringFromSelector(sel);
+                            if ([selName containsString:@"rsa"] || [selName containsString:@"RSA"] ||
+                                [selName containsString:@"encrypt"] || [selName containsString:@"decrypt"]) {
+                                DLOG(@"[ENCRYPT-UTILS] Alternative method: +[%@ %@]", altName, selName);
+                            }
+                        }
+                        if (altMethods) free(altMethods);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            DLOG(@"[ENCRYPT-UTILS] Exception: %@", e);
         }
     });
 }
