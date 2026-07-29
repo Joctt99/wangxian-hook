@@ -1,27 +1,24 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.76 - Revert byte[11] patch + Hook ALL EncryptUtils methods
+ * WangXianHook v36.77 - Fix sticky packet splitting + metaclass crypto detection
  * MODE: FULL - All hooks enabled
  *
- * v36.76 CRITICAL FIXES:
- * 1. [REVERT-BYTE11] Reverted byte[11] patch (was corrupting certificate data)
- *    - byte[11] changes between connections (0x19 -> 0x1A), it's NOT a status field
- *    - It's likely a sequence number or length indicator
- *    - Patching it corrupts the Base64-encoded certificate data
- * 2. [HOOK-ALL] Hook ALL EncryptUtils methods (not just RSA-related ones)
- *    - Previous version only hooked methods matching specific strings (rsa, certificate, etc.)
- *    - Now hooks ALL methods and logs every call with return type
- *    - Will definitively determine if client attempts certificate parsing
- * 3. [LIST-METHODS] List ALL methods of EncryptUtils for analysis
- *    - Shows method names to understand the class structure
+ * v36.77 CRITICAL FIXES:
+ * 1. [NO-SPLIT] REMOVED sticky packet splitting - return full buffer to client
+ *    - Previously: split 0x80FFF494 + 0x00FFFF02 into separate recv calls
+ *    - BROKE protocol: client needs 0x00FFFF02 IMMEDIATELY after 0x80FFF494
+ *    - Now: patch ALL sub-packets in buffer, return ENTIRE buffer to client
+ *    - Client's own parser extracts individual packets sequentially
+ * 2. [METACLASS] Check EncryptUtils metaclass for class methods (+ methods)
+ *    - v36.76 only checked instance methods (- methods) - found 0
+ *    - Now also checks object_getClass(cls) for class methods
+ * 3. [CRYPTO-SCAN] Scan ALL game classes for crypto-related methods
+ *    - Search for classes with keywords: Encrypt, Crypto, RSA, Cert, Key, etc.
+ *    - List all instance and class methods for each found class
+ *    - Identify the actual game crypto handler (not WeChat's EncryptUtils)
  *
- * PREVIOUS (v36.75):
- * - Added byte[11] patch (turned out to be WRONG - corrupted cert data)
- * - Added EncryptUtils hook (but missed methods due to name filtering)
- * 
- * PREVIOUS (v36.74):
- * - COMPLETELY removed ALL 0x00FFFF02 auto-response code
- * - Let client handle 0x00FFFF02 challenge naturally
+ * v36.76: Reverted byte[11] patch + Hook ALL EncryptUtils methods
+ * v36.75: Patch byte[11] + EncryptUtils hook + init packet logging
  */
 /*
  * HISTORY:
@@ -221,7 +218,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.76 loaded ===");
+        _log(@"=== WangXianHook v36.77 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3227,25 +3224,45 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             DLOG(@"%@", detail);
             
-            // v36.68: STICKY PACKET SPLITTING - Critical fix for login flow
-            // When 0x80FFF494 (handshake) + 0x80000015 (heartbeat ACK) arrive in same buffer,
-            // the heartbeat ACK confuses the game state machine, causing it to enter heartbeat mode
-            // instead of proceeding to login. We split the sticky packet so game only sees handshake.
-            if ((rcmd == 0x80FFF494 || rcmd == 0x80FFF495) && pktLen < (uint32_t)ret) {
-                ssize_t extraLen = ret - (ssize_t)pktLen;
-                if (extraLen > 0 && extraLen < MAX_STICKY_LEFTOVER) {
-                    memcpy(g_stickyLeftoverBuf, p + pktLen, extraLen);
-                    g_stickyLeftoverLen = extraLen;
-                    g_stickyLeftoverFd = fd;
-                    DLOG(@"[STICKY-SPLIT] Splitting sticky packet: firstPkt=%u bytes (0x%08X), extra=%zd bytes saved for next recv",
-                         pktLen, rcmd, extraLen);
-                    DLOG(@"[STICKY-SPLIT] Extra bytes HEX: ");
-                    for (ssize_t i = 0; i < extraLen && i < 32; i++) {
-                        DLOG(@"[STICKY-SPLIT]   byte[%zd]=0x%02X", i, g_stickyLeftoverBuf[i]);
+            // v36.77: STICKY PACKET PATCHING (NO SPLITTING) - Return full buffer to client
+            // v36.68-36.76 split sticky packets and saved extra bytes for next recv.
+            // This BROKE the protocol because client needs to see 0x00FFFF02 
+            // challenge IMMEDIATELY after 0x80FFF494 (same recv buffer).
+            // Now: patch ALL sub-packets in buffer, return ENTIRE buffer to client.
+            // Client's own parser will extract individual packets correctly.
+            BOOL patchedExtra = NO;
+            ssize_t scanOffset = pktLen;
+            while (scanOffset < ret) {
+                ssize_t scanRemaining = ret - scanOffset;
+                if (scanRemaining < 8) break;
+                
+                uint32_t scanPktLen = ((uint32_t)p[scanOffset] << 24) | ((uint32_t)p[scanOffset+1] << 16) |
+                                      ((uint32_t)p[scanOffset+2] << 8)  | (uint32_t)p[scanOffset+3];
+                uint32_t scanCmd    = ((uint32_t)p[scanOffset+4] << 24) | ((uint32_t)p[scanOffset+5] << 16) |
+                                      ((uint32_t)p[scanOffset+6] << 8)  | (uint32_t)p[scanOffset+7];
+                
+                if (scanPktLen < 8 || scanPktLen > 65535) break;
+                if (scanPktLen > (uint32_t)scanRemaining) break;
+                
+                // Patch status for sub-packets that are handshake responses
+                if (scanRemaining >= 13) {
+                    uint8_t scanStatus = p[scanOffset + 12];
+                    if (scanStatus != 0 && (scanCmd == 0x80FFF494 || scanCmd == 0x80FFF495)) {
+                        DLOG(@"[STICKY-PATCH] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd",
+                             scanStatus, scanCmd, scanOffset);
+                        ((unsigned char *)buf)[scanOffset + 12] = 0;
+                        patchedExtra = YES;
                     }
-                    // Adjust return value to only include the first packet
-                    ret = pktLen;
                 }
+                
+                // Log the sub-packet
+                DLOG(@"[STICKY-SCAN] Sub-packet at offset %zd: cmd=0x%08X len=%u status=%u",
+                     scanOffset, scanCmd, scanPktLen, p[scanOffset + 12]);
+                
+                scanOffset += scanPktLen;
+            }
+            if (patchedExtra) {
+                DLOG(@"[STICKY-PATCH] Patched extra sub-packets in buffer (no splitting, returning full %zd bytes)", ret);
             }
             
             // v36.66: TCP STICKY PACKET DETECTION - Check for multiple packets in one recv
@@ -4294,7 +4311,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.76 - Revert byte[11] patch + Hook ALL EncryptUtils methods");
+    DLOG(@"[VERSION] WangXianHook v36.77 - Fix sticky packet splitting + metaclass crypto detection");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -4929,79 +4946,173 @@ static void installAllHooks(void) {
         }
     });
     
-    // === DEFERRED: Hook EncryptUtils for RSA certificate operations tracing ===
+    // === DEFERRED: Hook ALL crypto-related classes for RSA tracing ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try {
+            // v36.77: Search for ALL crypto-related classes in the game binary
+            // EncryptUtils is a WeChat class, not the game's crypto handler
+            NSArray *cryptoKeywords = @[@"Encrypt", @"Crypto", @"RSA", @"Cert", @"Key", 
+                                         @"Session", @"Token", @"Login", @"Handshake",
+                                         @"Protocol", @"Message", @"Network", @"Socket"];
+            
+            NSMutableArray *foundClasses = [NSMutableArray array];
+            unsigned int totalClassCount = 0;
+            Class *allClasses = objc_copyClassList(&totalClassCount);
+            
+            for (unsigned int i = 0; i < totalClassCount; i++) {
+                Class cls = allClasses[i];
+                NSString *clsName = NSStringFromClass(cls);
+                if (!clsName) continue;
+                
+                // Skip Apple system classes (NS, UI, CA, etc.)
+                if ([clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"UI"] || 
+                    [clsName hasPrefix:@"CA"] || [clsName hasPrefix:@"CF"] ||
+                    [clsName hasPrefix:@"CG"] || [clsName hasPrefix:@"AB"] ||
+                    [clsName hasPrefix:@"SK"] || [clsName hasPrefix:@"GK"] ||
+                    [clsName hasPrefix:@"PK"] || [clsName hasPrefix:@"LK"] ||
+                    [clsName hasPrefix:@"MK"] || [clsName hasPrefix:@"IK"] ||
+                    [clsName hasPrefix:@"NE"] || [clsName hasPrefix:@"CK"] ||
+                    [clsName hasPrefix:@"MS"] || [clsName hasPrefix:@"MC"] ||
+                    [clsName hasPrefix:@"CL"] || [clsName hasPrefix:@"AL"] ||
+                    [clsName hasPrefix:@"AV"] || [clsName hasPrefix:@"BE"] ||
+                    [clsName hasPrefix:@"BF"] || [clsName hasPrefix:@"AB"] ||
+                    [clsName hasPrefix:@"SP"] || [clsName hasPrefix:@"WK"] ||
+                    [clsName hasPrefix:@"TP"] || [clsName hasPrefix:@"TL"] ||
+                    [clsName hasPrefix:@"VM"] || [clsName hasPrefix:@"IM"] ||
+                    [clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"CF"] ||
+                    [clsName hasPrefix:@"UIV"] || [clsName hasPrefix:@"NSV"]) {
+                    continue;
+                }
+                
+                // Check if class name contains crypto-related keywords
+                BOOL isCryptoRelated = NO;
+                for (NSString *keyword in cryptoKeywords) {
+                    if ([clsName containsString:keyword]) {
+                        isCryptoRelated = YES;
+                        break;
+                    }
+                }
+                
+                if (isCryptoRelated) {
+                    // Get both instance AND class methods
+                    unsigned int instCount = 0;
+                    Method *instMethods = class_copyMethodList(cls, &instCount);
+                    
+                    Class metaCls = object_getClass(cls);
+                    unsigned int clsCount = 0;
+                    Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
+                    
+                    unsigned int totalMethods = instCount + clsCount;
+                    
+                    // Only log classes with methods (skip empty/placeholder classes)
+                    if (totalMethods > 0 && totalMethods < 200) {
+                        NSMutableString *methodList = [NSMutableString string];
+                        
+                        // List instance methods
+                        for (unsigned int j = 0; j < instCount; j++) {
+                            SEL sel = method_getName(instMethods[j]);
+                            NSString *selName = NSStringFromSelector(sel);
+                            [methodList appendFormat:@"\n    -%@", selName];
+                        }
+                        
+                        // List class methods
+                        for (unsigned int j = 0; j < clsCount; j++) {
+                            SEL sel = method_getName(clsMethods[j]);
+                            NSString *selName = NSStringFromSelector(sel);
+                            [methodList appendFormat:@"\n    +%@", selName];
+                        }
+                        
+                        DLOG(@"[CRYPTO-CLASS] %@ (%u methods total: %u inst, %u cls)%@", 
+                             clsName, totalMethods, instCount, clsCount, methodList);
+                        [foundClasses addObject:clsName];
+                    }
+                    
+                    if (instMethods) free(instMethods);
+                    if (clsMethods) free(clsMethods);
+                }
+            }
+            if (allClasses) free(allClasses);
+            
+            DLOG(@"[CRYPTO-CLASS] Found %lu crypto-related classes", (unsigned long)foundClasses.count);
+            
+            // v36.77: Also specifically check EncryptUtils with metaclass
             Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
             if (encryptUtilsCls) {
-                DLOG(@"[ENCRYPT-UTILS] EncryptUtils class FOUND!");
+                unsigned int instCount = 0;
+                Method *instMethods = class_copyMethodList(encryptUtilsCls, &instCount);
+                Class metaCls = object_getClass(encryptUtilsCls);
+                unsigned int clsCount = 0;
+                Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
                 
-                unsigned int mcount = 0;
-                Method *methods = class_copyMethodList(encryptUtilsCls, &mcount);
-                DLOG(@"[ENCRYPT-UTILS] Total methods in EncryptUtils: %u", mcount);
+                DLOG(@"[ENCRYPT-UTILS] EncryptUtils: %u inst methods, %u cls methods", instCount, clsCount);
                 
-                // List ALL methods for debugging
-                NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] ALL methods:"];
-                for (unsigned int i = 0; i < mcount; i++) {
-                    SEL sel = method_getName(methods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    [allMethods appendFormat:@"\n  [%u] %@", i, selName];
-                    
-                    // v36.76: Hook ALL methods to track any RSA/crypto operations
-                    // Previous version only hooked methods matching specific strings
-                    // Now we hook ALL methods to catch any call
+                NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Instance methods:"];
+                for (unsigned int i = 0; i < instCount; i++) {
+                    SEL sel = method_getName(instMethods[i]);
+                    [allMethods appendFormat:@"\n  -%@", NSStringFromSelector(sel)];
+                }
+                DLOG(@"%@", allMethods);
+                
+                NSMutableString *clsMethodList = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Class methods:"];
+                for (unsigned int i = 0; i < clsCount; i++) {
+                    SEL sel = method_getName(clsMethods[i]);
+                    [clsMethodList appendFormat:@"\n  +%@", NSStringFromSelector(sel)];
+                }
+                DLOG(@"%@", clsMethodList);
+                
+                // Hook ALL methods (both inst and cls)
+                for (unsigned int i = 0; i < instCount; i++) {
                     @try {
-                        IMP orig = method_getImplementation(methods[i]);
-                        __block NSString *methodName = selName;
+                        IMP orig = method_getImplementation(instMethods[i]);
+                        __block NSString *methodName = NSStringFromSelector(method_getName(instMethods[i]));
+                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
+                            DLOG(@"[ENCRYPT-UTILS-CALL] -[%@ %@] CALLED", NSStringFromClass([self class]), methodName);
+                            va_list args;
+                            va_start(args, _cmd);
+                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
+                            va_end(args);
+                            if ([result isKindOfClass:[NSData class]]) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSData len=%lu", (unsigned long)[(NSData *)result length]);
+                            } else if ([result isKindOfClass:[NSString class]]) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSString: %@", result);
+                            } else if (!result) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned nil");
+                            }
+                            return result;
+                        });
+                        method_setImplementation(instMethods[i], new_impl);
+                    } @catch (NSException *e) {}
+                }
+                
+                for (unsigned int i = 0; i < clsCount; i++) {
+                    @try {
+                        IMP orig = method_getImplementation(clsMethods[i]);
+                        __block NSString *methodName = NSStringFromSelector(method_getName(clsMethods[i]));
                         IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
                             DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] CALLED", NSStringFromClass([self class]), methodName);
                             va_list args;
                             va_start(args, _cmd);
                             id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
                             va_end(args);
-                            // Log result type
                             if ([result isKindOfClass:[NSData class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned NSData (len=%lu)", 
-                                     NSStringFromClass([self class]), methodName, (unsigned long)[(NSData *)result length]);
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSData len=%lu", (unsigned long)[(NSData *)result length]);
                             } else if ([result isKindOfClass:[NSString class]]) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned NSString: %@", 
-                                     NSStringFromClass([self class]), methodName, result);
-                            } else if (result == nil) {
-                                DLOG(@"[ENCRYPT-UTILS-CALL] +[%@ %@] returned nil", 
-                                     NSStringFromClass([self class]), methodName);
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned NSString: %@", result);
+                            } else if (!result) {
+                                DLOG(@"[ENCRYPT-UTILS-CALL] returned nil");
                             }
                             return result;
                         });
-                        method_setImplementation(methods[i], new_impl);
-                    } @catch (NSException *e) {
-                        // Silently ignore hooking failures for individual methods
-                    }
+                        method_setImplementation(clsMethods[i], new_impl);
+                    } @catch (NSException *e) {}
                 }
-                DLOG(@"%@", allMethods);
-                if (methods) free(methods);
-                DLOG(@"[ENCRYPT-UTILS] Hooked all %u methods in EncryptUtils", mcount);
-            } else {
-                DLOG(@"[ENCRYPT-UTILS] EncryptUtils class NOT found! Searching for alternatives...");
-                // Try alternative class names
-                NSArray *altNames = @[@"RSAUtils", @"CryptoUtils", @"SecurityUtils", @"GameCrypto"];
-                for (NSString *altName in altNames) {
-                    Class altCls = NSClassFromString(altName);
-                    if (altCls) {
-                        DLOG(@"[ENCRYPT-UTILS] Found alternative class: %@", altName);
-                        unsigned int altMcount = 0;
-                        Method *altMethods = class_copyMethodList(altCls, &altMcount);
-                        DLOG(@"[ENCRYPT-UTILS] %@ has %u methods:", altName, altMcount);
-                        for (unsigned int i = 0; i < altMcount; i++) {
-                            SEL sel = method_getName(altMethods[i]);
-                            NSString *selName = NSStringFromSelector(sel);
-                            DLOG(@"[ENCRYPT-UTILS]   [%u] %@", i, selName);
-                        }
-                        if (altMethods) free(altMethods);
-                    }
-                }
+                
+                DLOG(@"[ENCRYPT-UTILS] Hooked %u inst + %u cls methods", instCount, clsCount);
+                if (instMethods) free(instMethods);
+                if (clsMethods) free(clsMethods);
             }
         } @catch (NSException *e) {
-            DLOG(@"[ENCRYPT-UTILS] Exception: %@", e);
+            DLOG(@"[CRYPTO-CLASS] Exception: %@", e);
         }
     });
 }
