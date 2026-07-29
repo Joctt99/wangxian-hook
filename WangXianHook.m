@@ -1,39 +1,38 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.90 - SELECTIVE STATUS PATCH: Only patch 0x80FFF495 status=1->0
- * MODE: FULL - All hooks enabled, with TARGETED game server patches
+ * WangXianHook v36.91 - REMOVE ALL FORCE-INJECTION: Only patch REAL server 0x80FFF495 status
+ * MODE: ULTRA-LIGHT - ONLY patch status byte, NO challenge auto-respond, NO force packet injection
  *
- * v36.90 CRITICAL BREAKTHROUGH (based on v36.89 observation mode):
- * v36.89 OBSERVATION MODE confirmed the client CAN complete the handshake ON ITS OWN!
- * The NATURAL flow works perfectly:
- *   1. Client sends 0x00FFF494 (handshake init)
- *   2. Server returns 0x80FFF494 status=1 (752B) + 0x00FFFF02 challenge (28B) [sticky]
- *      -> status=1 here is NORMAL! It means "challenge required"
- *   3. Client processes challenge, sends 0x00FFF495 (703B, RSA-encrypted response)
- *   4. Server returns 0x80FFF495 status=1 (365B) <- PROBLEM! status=1 = ERROR HERE
- *   5. Client calls quitFromServer() -> "network interrupted"
- *   6. Client DID send 0x000EE007 (179B) + 0x00FFF493 (492B+896B) just before disconnect!
+ * v36.91 CRITICAL FIX (learned from v36.90 FAILURE):
+ * v36.90 still had TWO interference layers ACTIVE despite "selective patch" claim:
+ *   1. FORCE-HS injection: Auto-inject 200B FAKE 0x80FFF495 BEFORE real server response!
+ *      Log evidence: [FORCE-HS] Returning 200 bytes... then [RECV] ret=365 (real packet)
+ *      → Client receives TWO 0x80FFF495 packets with DIFFERENT seq numbers!
+ *        Fake: seq=0x3B7B1F3E (from FORCE-HS-PREP auto-response)
+ *        Real: seq=0x0000001B (from actual server)
+ *      → Client state machine CORRUPTED → never sends 0x000EE007/0x00FFF493 → stuck in heartbeat!
  *
- * ROOT CAUSE CONFIRMED:
- *   - 0x80FFF494 status=1 -> DO NOT PATCH! This is "challenge required" signal.
- *   - 0x80FFF495 status=1 -> MUST PATCH TO 0! This is handshake completion ACK,
- *     server incorrectly returns error status, causing client to disconnect right after
- *     it successfully sent device info + login request.
+ *   2. 0x00FFFF02 auto-respond (double response problem):
+ *      Log evidence: [FORCE-HS-PREP] at 84643 BEFORE client's own [SEND-CMD] 0x00FFF495 at 84667
+ *      → Hook sent 0x80FFFF02 response AND activated FORCE-HS
+ *      → Client ALSO processed challenge and sent 0x00FFF495 (703B RSA response)
+ *      → TWO responses to ONE challenge = protocol state corrupted!
  *
- * v36.90 STRATEGY:
- *   1. [SELECTIVE PATCH] Only patch 0x80FFF495 status=1->0 (handshake completion)
- *   2. [NO AUTO-RESPOND] Continue letting CLIENT handle 0x00FFFF02 challenge
- *   3. [NO STATUS PATCH on 0x80FFF494] Preserve "challenge required" signal
+ * ROOT CAUSE HIERARCHY (why v36.89 observation was closer to success):
+ *   v36.89: No auto-respond = client handled challenge cleanly (only FORCE-HS was missing in obs mode)
+ *   v36.90: Selective status patch GOOD, but FORCE-HS + auto-respond still ACTIVE = BAD
+ *   v36.91: Minimal intervention = ONLY patch 0x80FFF495 status byte of REAL server packet
+ *           DELETE: FORCE-HS injection mechanism entirely
+ *           DELETE: 0x00FFFF02 auto-respond entirely
+ *           KEEP: Selective status patch on 0x80FFF495 status=1→0 (0x80FFF494 untouched!)
  *
- * v36.89: OBSERVATION MODE - Disabled all intervention, confirmed client natural flow
- * v36.88: Inject proper-sized 0x80FFF495 packet, let client send encrypted device info
- * v36.84: Fix challenge response format (add STATUS byte)
- * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
- * v36.82: Fix critical SecKeyCreateEncryptedData/DecryptedData hook signature bug
- * v36.81: Manual Base64 decode with robust error handling
- * v36.79-v36.80: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
- * v36.78: Remove EncryptUtils hooking (fix SIGSEGV crash)
- * v36.77: Fix sticky packet splitting + metaclass crypto detection
+ * EXPECTED FLOW (v36.91):
+ *   1. Client → 0x00FFF494 (handshake init)
+ *   2. Server → 0x80FFF494 status=1 (752B) + 0x00FFFF02 challenge (28B)
+ *   3. Client (native, no hook) → 0x00FFF495 (703B, RSA encrypted)
+ *   4. Server → 0x80FFF495 status=1 (365B) ← HOOK PATCHES status 1→0 HERE!
+ *   5. Client → 0x000EE007 (179~217B device info) + 0x00FFF493 (login request)
+ *   6. Server → Enter game! ✅
  */
 /*
  * HISTORY:
@@ -233,7 +232,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.90 loaded ===");
+        _log(@"=== WangXianHook v36.91 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3344,32 +3343,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.84: Debug log to track recv calls
-    DLOG(@"[RECV-ENTRY] fd=%d len=%zu forceHS=%d forceFd=%d forceLen=%lu hbAck=%zd hbFd=%d",
-         fd, len, g_forceHandshakeComplete, g_forceHandshakeFd, (unsigned long)g_forceHandshakeLen,
-         g_localHeartbeatAckLen, g_localHeartbeatAckFd);
+    // v36.91: Debug log to track recv calls (FORCE-HS removed - no more fake packet injection!)
+    DLOG(@"[RECV-ENTRY] fd=%d len=%zu hbAck=%zd hbFd=%d",
+         fd, len, g_localHeartbeatAckLen, g_localHeartbeatAckFd);
     
-    // v36.83: Check for force handshake complete packet first
-    // After we send fake heartbeat ACK, we also send 0x80FFF495 handshake complete
-    if (g_forceHandshakeComplete && g_forceHandshakeFd == fd && g_forceHandshakeLen > 0) {
-        uint32_t hsLen = g_forceHandshakeLen;
-        if (hsLen > len) hsLen = (uint32_t)len;
-        memcpy(buf, g_forceHandshakeBuf, hsLen);
-        DLOG(@"[FORCE-HS] Returning %u bytes 0x80FFF495 handshake complete (fd=%d)", hsLen, fd);
-        DLOG(@"[FORCE-HS] HEX: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-             g_forceHandshakeBuf[0], g_forceHandshakeBuf[1], g_forceHandshakeBuf[2], g_forceHandshakeBuf[3],
-             g_forceHandshakeBuf[4], g_forceHandshakeBuf[5], g_forceHandshakeBuf[6], g_forceHandshakeBuf[7],
-             g_forceHandshakeBuf[8], g_forceHandshakeBuf[9], g_forceHandshakeBuf[10], g_forceHandshakeBuf[11],
-             g_forceHandshakeBuf[12]);
-        g_forceHandshakeComplete = NO;
-        g_forceHandshakeFd = -1;
-        g_forceHandshakeLen = 0;
-        
-        // Reset challenge state so client can send 0x000EE007
-        g_challengeResponded = NO;
-        DLOG(@"[FORCE-HS] Challenge state reset, client should now send 0x000EE007 device info");
-        return hsLen;
-    }
+    // v36.91: FORCE-HS MECHANISM COMPLETELY REMOVED!
+    // v36.90 proved: injecting fake 0x80FFF495 BEFORE real server packet = state machine corruption.
+    // Client receives TWO 0x80FFF495 (fake first, then real) with mismatched seq = handshake fails.
+    // Only patch the REAL server 0x80FFF495 status byte = minimum intervention approach.
     
     // v36.68: Check for local heartbeat ACK first (blocked heartbeat responses)
     if (g_localHeartbeatAckLen > 0 && g_localHeartbeatAckFd == fd) {
@@ -3492,21 +3473,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // v36.79: Auto-respond to 0x00FFFF02 with RSA-encrypted 0x80FFFF02
-            // Client fails to parse RSA cert from 0x80FFF494 - we handle it
-            // 0x00FFFF01 is handled by client natively (no RSA needed)
+            // v36.91: DISABLED auto-respond to 0x00FFFF02!
+            // v36.90 analysis: Hook's auto-response (0x80FFFF02) + Client's native response (0x00FFF495)
+            // cause DOUBLE response to single challenge, activating FORCE-HS and corrupting state machine.
+            // v36.89 observation PROVED client can handle 0x00FFFF02 challenge natively.
+            // Let client send 0x00FFF495 (703B RSA response) - this is the PROPER response format!
             if (cmd == 0x00FFFF02 && ret >= 28) {
-                [challengeDetail appendFormat:@"  [V36.79] AUTO-RESPONDING to 0x00FFFF02 with RSA-encrypted 0x80FFFF02\n"];
-                [challengeDetail appendFormat:@"  [V36.79] Using stored public key from 0x80FFF494 response\n"];
-                
-                // v36.79: Actually auto-respond here
-                BOOL responded = autoRespondToChallenge(fd, p, ret, cmd);
-                if (responded) {
-                    [challengeDetail appendFormat:@"  [V36.79] Successfully sent 0x80FFFF02 response!\n"];
-                } else {
-                    [challengeDetail appendFormat:@"  [V36.79] Auto-response failed - client may handle naturally\n"];
-                    [challengeDetail appendFormat:@"  [V36.79] Client needs to: 1) parse RSA cert, 2) derive session key, 3) send encrypted 0x000EE007\n"];
-                }
+                [challengeDetail appendFormat:@"  [V36.91] SKIP AUTO-RESPOND: Let client handle 0x00FFFF02 challenge natively\n"];
+                [challengeDetail appendFormat:@"  [V36.91] Client will parse RSA cert from 0x80FFF494 and send 0x00FFF495 response\n"];
+                DLOG(@"[CHALLENGE] v36.91: Skipping auto-respond - let client send native 0x00FFF495 (703B RSA response)");
             } else if (cmd == 0x00FFFF01) {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -5085,7 +5060,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.90 - Selective patch 0x80FFF495 status=1->0, preserve 0x80FFF494 status=1");
+    DLOG(@"[VERSION] WangXianHook v36.91 - REMOVE force-hs injection + auto-challenge, only patch real 0x80FFF495 status");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
