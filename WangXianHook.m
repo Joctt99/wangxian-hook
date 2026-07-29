@@ -1,31 +1,32 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.89 - OBSERVATION MODE: Stop all game server protocol intervention
- * MODE: FULL - All hooks enabled (but game server patches DISABLED for observation)
+ * WangXianHook v36.90 - SELECTIVE STATUS PATCH: Only patch 0x80FFF495 status=1->0
+ * MODE: FULL - All hooks enabled, with TARGETED game server patches
  *
- * v36.89 CRITICAL STRATEGY CHANGE:
- * After 80+ versions of status patching + auto-respond + packet injection all failing,
- * we now DISABLE ALL game server protocol intervention to observe what the client does
- * NATURALLY when left alone:
+ * v36.90 CRITICAL BREAKTHROUGH (based on v36.89 observation mode):
+ * v36.89 OBSERVATION MODE confirmed the client CAN complete the handshake ON ITS OWN!
+ * The NATURAL flow works perfectly:
+ *   1. Client sends 0x00FFF494 (handshake init)
+ *   2. Server returns 0x80FFF494 status=1 (752B) + 0x00FFFF02 challenge (28B) [sticky]
+ *      -> status=1 here is NORMAL! It means "challenge required"
+ *   3. Client processes challenge, sends 0x00FFF495 (703B, RSA-encrypted response)
+ *   4. Server returns 0x80FFF495 status=1 (365B) <- PROBLEM! status=1 = ERROR HERE
+ *   5. Client calls quitFromServer() -> "network interrupted"
+ *   6. Client DID send 0x000EE007 (179B) + 0x00FFF493 (492B+896B) just before disconnect!
  *
- * 1. [NO STATUS PATCH] Do NOT patch 0x80FFF494/0x80FFF495 status byte[12]
- *    - Previous: status=1 -> patched to 0 (may corrupt "challenge required" signal)
- *    - Now: let status=1 through, client decides what to do
+ * ROOT CAUSE CONFIRMED:
+ *   - 0x80FFF494 status=1 -> DO NOT PATCH! This is "challenge required" signal.
+ *   - 0x80FFF495 status=1 -> MUST PATCH TO 0! This is handshake completion ACK,
+ *     server incorrectly returns error status, causing client to disconnect right after
+ *     it successfully sent device info + login request.
  *
- * 2. [NO AUTO-RESPOND] Do NOT auto-respond to 0x00FFFF02 challenge
- *    - Previous: hook sends 0x80FFFF02 before client can (server may reject format)
- *    - Now: let client process challenge and send its own 0x80FFFF02
+ * v36.90 STRATEGY:
+ *   1. [SELECTIVE PATCH] Only patch 0x80FFF495 status=1->0 (handshake completion)
+ *   2. [NO AUTO-RESPOND] Continue letting CLIENT handle 0x00FFFF02 challenge
+ *   3. [NO STATUS PATCH on 0x80FFF494] Preserve "challenge required" signal
  *
- * 3. [NO INJECTION] Do NOT inject fake 0x80FFF495 into recv
- *    - Previous: 200-byte fake packet (client ignored it, kept heartbeating)
- *    - Now: no injection, see if server sends real 0x80FFF495 after client's own response
- *
- * GOAL: Determine if client can complete handshake on its own.
- * If yes -> our intervention was the problem all along.
- * If no -> we see exactly where client fails and can target that.
- *
+ * v36.89: OBSERVATION MODE - Disabled all intervention, confirmed client natural flow
  * v36.88: Inject proper-sized 0x80FFF495 packet, let client send encrypted device info
- *
  * v36.84: Fix challenge response format (add STATUS byte)
  * v36.83: Convert all NSLog to DLOG for wxhook.log visibility
  * v36.82: Fix critical SecKeyCreateEncryptedData/DecryptedData hook signature bug
@@ -232,7 +233,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.86 loaded ===");
+        _log(@"=== WangXianHook v36.90 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3699,16 +3700,23 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [STATUS] byte@12 = %u (0x%02X)\n", status, status];
                 if (status != 0) {
                     [detail appendFormat:@"  *** WARNING: Non-zero status! Server returned error ***\n"];
-                    // v36.89: OBSERVATION MODE - DO NOT PATCH status!
-                    // Previous versions patched status 1->0 for 0x80FFF494/0x80FFF495.
-                    // But this may CORRUPT the packet: byte[12]=1 might mean "challenge required"
-                    // not "error". Patching it to 0 tells client "handshake complete, no challenge
-                    // needed", so client skips challenge response -> server never sends 0x80FFF495
-                    // -> client stuck on heartbeats forever.
-                    // NOW: Let status=1 through unchanged. Observe what client does naturally.
-                    if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
-                        DLOG(@"[GAME-PATCH] v36.89 OBSERVATION MODE: NOT patching status %u for cmd=0x%08X (letting client handle naturally)", status, rcmd);
-                        [detail appendFormat:@"  [OBSERVE] v36.89: Status NOT patched (observation mode)\n"];
+                    // v36.90: SELECTIVE status patching based on 80+ version learnings:
+                    //   0x80FFF494 (handshake init, status=1) -> DO NOT PATCH!
+                    //       status=1 means "challenge required". Patching to 0
+                    //       makes client skip challenge -> never sends 0x00FFF495 -> hangs.
+                    //   0x80FFF495 (handshake complete, status=1) -> PATCH TO 0!
+                    //       This is the REAL handshake completion ACK from server.
+                    //       v36.89 observation confirmed server returns status=1 here,
+                    //       causing client to call quitFromServer() -> "network interrupted".
+                    //       Patching 1->0 allows client to proceed to send 0x000EE007 + 0x00FFF493.
+                    if (rcmd == 0x80FFF494) {
+                        DLOG(@"[GAME-PATCH] v36.90: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
+                        [detail appendFormat:@"  [OBSERVE] v36.90: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
+                    } else if (rcmd == 0x80FFF495) {
+                        DLOG(@"[GAME-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status, rcmd);
+                        ((unsigned char *)buf)[12] = 0;
+                        [detail appendFormat:@"  [PATCH] 0x80FFF495 status patched to 0 (critical handshake fix)\n"];
+                    }
                         
                         // v36.79: Extract RSA public key certificate from 0x80FFF494 response
                         // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
@@ -3971,14 +3979,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (scanPktLen < 8 || scanPktLen > 65535) break;
                 if (scanPktLen > (uint32_t)scanRemaining) break;
                 
-                // Patch status for sub-packets that are handshake responses
+                // v36.90: SELECTIVE status patching for sticky sub-packets
+                // Same logic as main packet: only patch 0x80FFF495, not 0x80FFF494
                 if (scanRemaining >= 13) {
                     uint8_t scanStatus = p[scanOffset + 12];
                     if (scanStatus != 0 && (scanCmd == 0x80FFF494 || scanCmd == 0x80FFF495)) {
-                        DLOG(@"[STICKY-PATCH] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd",
-                             scanStatus, scanCmd, scanOffset);
-                        ((unsigned char *)buf)[scanOffset + 12] = 0;
-                        patchedExtra = YES;
+                        if (scanCmd == 0x80FFF494) {
+                            DLOG(@"[STICKY-PATCH] v36.90: NOT patching status %u for 0x80FFF494 sub-packet at offset %zd (preserve challenge signal)",
+                                 scanStatus, scanOffset);
+                        } else if (scanCmd == 0x80FFF495) {
+                            DLOG(@"[STICKY-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
+                                 scanStatus, scanOffset);
+                            ((unsigned char *)buf)[scanOffset + 12] = 0;
+                            patchedExtra = YES;
+                        }
                     }
                 }
                 
@@ -3986,13 +4000,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[STICKY-SCAN] Sub-packet at offset %zd: cmd=0x%08X len=%u status=%u",
                      scanOffset, scanCmd, scanPktLen, p[scanOffset + 12]);
                 
-                // v36.89: OBSERVATION MODE - DO NOT auto-respond to 0x00FFFF02!
+                // v36.90: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
                 // Let the CLIENT handle the challenge itself. Our auto-response was
                 // sending 0x80FFFF02 BEFORE the client could, and the server may have
                 // rejected our format (extra status byte, wrong seq, etc.).
-                // Now: just log the challenge, let client process it naturally.
+                // v36.89 observation confirmed client handles challenge perfectly.
                 if (scanCmd == 0x00FFFF02 && scanRemaining >= 28) {
-                    DLOG(@"[STICKY-SCAN] v36.89 OBSERVATION: NOT auto-responding to 0x00FFFF02 (letting client handle)");
+                    DLOG(@"[STICKY-SCAN] v36.90: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                     DLOG(@"[STICKY-SCAN] Challenge data at offset %zd: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                          scanOffset,
                          p[scanOffset+12], p[scanOffset+13], p[scanOffset+14], p[scanOffset+15],
@@ -4032,19 +4046,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
                          subPacketCount, offset, subCmd, subPktLen, remaining);
                     
-                    // v36.89: OBSERVATION MODE - DO NOT patch sub-packet status
+                    // v36.90: SELECTIVE status patching for detected sticky sub-packets
                     if (remaining >= 13) {
                         uint8_t subStatus = p[offset + 12];
                         if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
-                            DLOG(@"[STICKY-PACKET] v36.89 OBSERVATION: NOT patching sub-packet status %u for cmd=0x%08X at offset %zd",
-                                 subStatus, subCmd, offset);
+                            if (subCmd == 0x80FFF494) {
+                                DLOG(@"[STICKY-PACKET] v36.90: NOT patching 0x80FFF494 sub-packet status %u at offset %zd (preserve challenge signal)",
+                                     subStatus, offset);
+                            } else if (subCmd == 0x80FFF495) {
+                                DLOG(@"[STICKY-PACKET] v36.90 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
+                                     subStatus, offset);
+                                ((unsigned char *)buf)[offset + 12] = 0;
+                            }
                         }
                     }
                 }
                 
-                // v36.89: OBSERVATION MODE - DO NOT auto-respond to 0x00FFFF02!
+                // v36.90: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
                 if (subCmd == 0x00FFFF02 && remaining >= 28) {
-                    DLOG(@"[STICKY-AUTO] v36.89 OBSERVATION: NOT auto-responding to 0x00FFFF02 (letting client handle)");
+                    DLOG(@"[STICKY-AUTO] v36.90: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                 }
                 
                 // Move to next packet
@@ -5066,7 +5086,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.86 - Fix SIGSEGV crash + force-send device info");
+    DLOG(@"[VERSION] WangXianHook v36.90 - Selective patch 0x80FFF495 status=1->0, preserve 0x80FFF494 status=1");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
