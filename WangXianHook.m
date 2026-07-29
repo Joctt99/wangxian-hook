@@ -1,24 +1,17 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.68 - Sticky packet splitting + heartbeat blocking
+ * WangXianHook v36.69 - Fix 0x00FFFF02 auto-response in leftover path
  * MODE: FULL - All hooks enabled
  *
- * v36.68 CRITICAL FIXES:
- * 1. [STICKY-SPLIT] Split sticky packets (0x80FFF494 + 0x80000015)
- *    - When handshake response + heartbeat ACK arrive in same TCP buffer
- *    - Split so game client only sees handshake response (752 bytes)
- *    - Heartbeat ACK (22 bytes) saved to leftover buffer for next recv
- *    - Prevents heartbeat ACK from confusing game state machine during login
- * 2. [HEARTBEAT-BLOCK] Block game heartbeats during handshake phase
- *    - Game sends 0x00000015 heartbeats while waiting for server response
- *    - These heartbeats cause server to include ACK in handshake response
- *    - Now blocked: return fake success, buffer local heartbeat ACK
- *    - Game receives local ACK instead of server ACK
- * 3. [LOCAL-HB-ACK] Local heartbeat ACK buffer
- *    - Returns local ACK to game on next recv call
- *    - Satisfies game's heartbeat watchdog without involving server
- * 4. [KEEP-v36.67] Keep all v36.67 fixes (auto-respond 0x00FFFF02)
- * 5. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
+ * v36.69 CRITICAL FIXES:
+ * 1. [LEFTOVER-RESPOND] Auto-respond to 0x00FFFF02 in STICKY-LEFTOVER path
+ *    - v36.68's STICKY-LEFTOVER returned leftover bytes but skipped auto-response
+ *    - When 0x00FFFF02 is saved as leftover, game receives it but doesn't respond
+ *    - Now detects 0x00FFFF02 in leftover and sends 0x80FFFF02 auto-response
+ *    - This triggers server to continue handshake flow
+ * 2. [KEEP-v36.68] Keep all v36.68 fixes (sticky split, heartbeat block)
+ * 3. [KEEP-v36.67] Keep all v36.67 fixes (auto-respond 0x00FFFF02)
+ * 4. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
  */
 /*
  * HISTORY:
@@ -218,7 +211,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.68 loaded ===");
+        _log(@"=== WangXianHook v36.69 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2744,6 +2737,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (leftoverLen > (ssize_t)len) leftoverLen = (ssize_t)len;
         memcpy(buf, g_stickyLeftoverBuf, leftoverLen);
         DLOG(@"[STICKY-LEFTOVER] Returning %zd leftover bytes from sticky packet split (fd=%d)", leftoverLen, fd);
+        
+        // v36.69: Auto-respond to 0x00FFFF02 in leftover path
+        // When 0x00FFFF02 is saved as leftover, we need to auto-respond before returning
+        if (leftoverLen >= 28) {
+            const unsigned char *lp = (const unsigned char *)buf;
+            uint32_t lcmd = ((uint32_t)lp[4] << 24) | ((uint32_t)lp[5] << 16) |
+                           ((uint32_t)lp[6] << 8)  | (uint32_t)lp[7];
+            if (lcmd == 0x00FFFF02) {
+                int lport = getPortForFd(fd);
+                DLOG(@"[STICKY-LEFTOVER] Detected 0x00FFFF02 in leftover buffer, auto-responding... (port=%d)", lport);
+                // Construct 0x80FFFF02 response (copy challenge data, change cmd)
+                uint8_t respBuf[28];
+                memcpy(respBuf, lp, 28);
+                respBuf[4] = 0x80;
+                ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
+                DLOG(@"[STICKY-LEFTOVER] Sent 0x80FFFF02 response: %zd bytes", respSent);
+            }
+        }
+        
         // Shift remaining leftover bytes
         if (leftoverLen < g_stickyLeftoverLen) {
             memmove(g_stickyLeftoverBuf, g_stickyLeftoverBuf + leftoverLen, g_stickyLeftoverLen - leftoverLen);
@@ -4221,7 +4233,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.68 - Sticky packet splitting + heartbeat blocking");
+    DLOG(@"[VERSION] WangXianHook v36.69 - Fix 0x00FFFF02 auto-response in leftover path");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
