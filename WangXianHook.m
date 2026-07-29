@@ -2931,6 +2931,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         [payloadStr containsString:@"版本太旧"]) {
                         [detail appendFormat:@"  *** ERROR TEXT DETECTED: %@ ***\n", payloadStr];
                         DLOG(@"[GAME-PATCH] Error text found in game server response: %@ (port=%d)", payloadStr, port);
+                        // v36.63: DISABLED text clearing too for clean test
+                        // Inconsistent state: status not patched but text erased
+                        DLOG(@"[GAME-PATCH] DISABLED text clearing (v36.63 test) - leaving text unchanged");
+                        /*
                         // Clear error text for ALL game ports
                         if (isGamePort) {
                             static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
@@ -2948,6 +2952,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                 }
                             }
                         }
+                        */
                     }
                 }
             }
