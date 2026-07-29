@@ -1,20 +1,16 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.66 - Force send 0x000EE007 to game server after handshake
+ * WangXianHook v36.67 - Auto-respond to 0x00FFFF02 challenge packets
  * MODE: FULL - All hooks enabled
  *
- * v36.66 CRITICAL FIXES:
- * 1. [CAPTURE-DEVICE] Capture 0x000EE007 packet in send hook
- *    - When 0x000EE007 is sent to login server (port 5678), capture it to global buffer
- *    - Store packet data and length for later forced send
- * 2. [FORCE-SEND] Force send 0x000EE007 to game server fd after handshake
- *    - After receiving 0x80FFF494 response (handshake complete)
- *    - Force-send the captured device info packet to game server via orig_send
- *    - Bypasses client state machine that's stuck on heartbeat loop
- * 3. [STICKY-DEBUG] Added debug logging for sticky packet detection
- *    - Logs [STICKY-DETECT] even when no sticky packets found
- *    - Confirms detection code is executing
- * 4. [KEEP-v36.65] Keep all v36.65 fixes (sticky detection, auto-respond)
+ * v36.67 CRITICAL FIXES:
+ * 1. [AUTO-RESPOND-02] Auto-respond to 0x00FFFF02 challenge packets
+ *    - Server sends 0x00FFFF02 after 0x80FFF494 handshake
+ *    - Client must respond with 0x80FFFF02 to continue handshake
+ *    - Without response, client falls into heartbeat loop (stuck at "正在进入...")
+ *    - Now auto-responds by copying challenge data and changing command byte
+ * 2. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
+ * 3. [KEEP-v36.65] Keep all v36.65 fixes (sticky detection, auto-respond 01)
  */
 /*
  * HISTORY:
@@ -214,7 +210,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.66 loaded ===");
+        _log(@"=== WangXianHook v36.67 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2723,10 +2719,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // Challenge packets (0x00FFFF01/0x00FFFF02) - LOG ONLY, DO NOT RESPOND
-        // Analysis: Normal client does NOT send responses to these packets
-        // They may be internal game protocol packets, not server verification
-        // Auto-responding causes server to disconnect immediately
+        // Challenge packets (0x00FFFF01/0x00FFFF02) - LOG AND RESPOND
+        // v36.67: Server requires response to 0x00FFFF02 to continue handshake
         if (cmd == 0x00FFFF01 || cmd == 0x00FFFF02) {
             NSMutableString *challengeDetail = [NSMutableString string];
             [challengeDetail appendFormat:@"[CHALLENGE-LOG] cmd=0x%08X len=%zd port=%d\n", cmd, (size_t)ret, port];
@@ -2761,7 +2755,22 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     [challengeDetail appendFormat:@"  Payload text: %@\n", payloadStr];
                 }
             }
-            [challengeDetail appendFormat:@"  NOTE: Not responding - let game handle this packet normally\n"];
+            
+            // v36.67: RESPOND to 0x00FFFF02 challenge - server requires this
+            if (cmd == 0x00FFFF02 && ret >= 28 && port == 12003) {
+                [challengeDetail appendFormat:@"  [RESPOND] Auto-responding to 0x00FFFF02 challenge...\n"];
+                // Construct 0x80FFFF02 response (copy challenge data, change cmd)
+                uint8_t respBuf[28];
+                memcpy(respBuf, p, 28);
+                // Change command from 0x00FFFF02 to 0x80FFFF02
+                respBuf[4] = 0x80;
+                // Keep challenge data (bytes 8-27) unchanged
+                ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
+                [challengeDetail appendFormat:@"  [RESPOND] Sent 0x80FFFF02 response: %zd bytes\n", respSent];
+            } else {
+                [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
+            }
+            
             DLOG(@"%@", challengeDetail);
         }
         
@@ -4099,7 +4108,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.66 - Force send 0x000EE007 to game server after handshake");
+    DLOG(@"[VERSION] WangXianHook v36.67 - Auto-respond to 0x00FFFF02 challenge packets");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
