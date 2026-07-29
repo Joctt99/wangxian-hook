@@ -1,20 +1,22 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.71 - CMD-based game server detection + unconditional status patch
+ * WangXianHook v36.72 - Fix protocol order: force-send AFTER challenge response
  * MODE: FULL - All hooks enabled
  *
- * v36.71 CRITICAL FIXES:
- * 1. [CMD-DETECT] Implemented cmd-based game server detection (was only documented in v36.70)
- *    - Added isGameCmd() function: checks if cmd is in 0x00FFxxxx/0x80FFxxxx/0x000Exxxx/0x800Exxxx ranges
- *    - Modified hook_recv entry condition: isGameAnalysis = isGamePort || isGameCmd(cmd)
- *    - This ensures game server responses are analyzed EVEN WHEN getPortForFd returns 0
- * 2. [ALWAYS-PATCH] Status patch for 0x80FFF494/0x80FFF495 now executes UNCONDITIONALLY
- *    - Removed isGamePort gate from status patch condition
- *    - Server handshake response status=1 is ALWAYS patched to status=0
- * 3. [SEND-DETECT] Heartbeat blocking in hook_send also uses cmd-based detection
- *    - Modified isGamePortOnly check: blocks heartbeats via cmd range when port fails
- * 4. [DEBUG] Added [CMD-DETECT] log showing which detection method was used
+ * v36.72 CRITICAL FIXES:
+ * 1. [PROTO-ORDER] Fix force-send timing: moved 0x000EE007 from AFTER 0x80FFF494 to AFTER 0x80FFFF02 response
+ *    - Previous: 0x80FFF494 → [force-send 0x000EE007] → 0x00FFFF02 → 0x80FFFF02 (WRONG ORDER)
+ *    - Fixed:    0x80FFF494 → 0x00FFFF02 → 0x80FFFF02 → [150ms delay] → 0x000EE007 (CORRECT ORDER)
+ *    - Server rejects 0x000EE007 if sent before challenge-response is complete
+ * 2. [DELAY] Added 150ms delay after 0x80FFFF02 response before force-sending
+ *    - Gives server time to process the challenge response
+ *    - Ensures proper protocol synchronization
  *
+ * PREVIOUS (v36.71):
+ * - CMD-based game server detection (isGameCmd function)
+ * - Unconditional status patch for 0x80FFF494/0x80FFF495
+ * - Enhanced send/recv hook logging
+ * 
  * PREVIOUS (v36.70):
  * - Header mentioned CMD-BASED-DETECT but code was NOT actually implemented
  * - Status patch was still gated by isGamePort check
@@ -223,7 +225,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.71 loaded ===");
+        _log(@"=== WangXianHook v36.72 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2896,6 +2898,36 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // Keep challenge data (bytes 8-27) unchanged
                 ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
                 [challengeDetail appendFormat:@"  [RESPOND] Sent 0x80FFFF02 response: %zd bytes\n", respSent];
+                
+                // v36.72: Force-send 0x000EE007 AFTER 0x00FFFF02 response (correct protocol order)
+                // Protocol: 0x80FFF494 → 0x00FFFF02 → 0x80FFFF02 → [wait] → 0x000EE007
+                if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0 && fd >= 0 && !g_deviceInfoSentToGame) {
+                    @try {
+                        // Add 150ms delay to let server process the 0x80FFFF02 response first
+                        [challengeDetail appendFormat:@"  [FORCE-SEND] Waiting 150ms after challenge response before sending 0x000EE007...\n"];
+                        // Use usleep for delay (POSIX)
+                        usleep(150000);  // 150ms = 150,000 microseconds
+                        
+                        g_deviceInfoSentToGame = YES;
+                        [challengeDetail appendFormat:@"  [FORCE-SEND] Sending 0x000EE007 packet (%zd bytes) to game server fd=%d\n", 
+                                                     g_deviceInfoPacketLen, fd];
+                        ssize_t sent = orig_send ? orig_send(fd, g_deviceInfoPacket, g_deviceInfoPacketLen, 0) : -1;
+                        [challengeDetail appendFormat:@"  [FORCE-SEND] Result: %zd bytes sent\n", sent];
+                        if (sent > 0) {
+                            NSMutableString *hex = [NSMutableString string];
+                            for (ssize_t i = 0; i < g_deviceInfoPacketLen && i < 64; i++) {
+                                [hex appendFormat:@"%02X ", g_deviceInfoPacket[i]];
+                            }
+                            [challengeDetail appendFormat:@"  [FORCE-SEND] Packet HEX (first 64 bytes): %@\n", hex];
+                        }
+                    } @catch (NSException *e) {
+                        [challengeDetail appendFormat:@"  [FORCE-SEND] Exception: %@\n", e.reason];
+                        g_deviceInfoSentToGame = NO;
+                    }
+                } else {
+                    [challengeDetail appendFormat:@"  [FORCE-SEND] Skipping: captured=%d len=%zd sent=%d\n", 
+                                                     g_deviceInfoCaptured ? 1 : 0, g_deviceInfoPacketLen, g_deviceInfoSentToGame ? 1 : 0];
+                }
             } else {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -3155,32 +3187,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     // v36.68: Clear local heartbeat ACK buffer when handshake completes
                     g_localHeartbeatAckLen = 0;
                     g_localHeartbeatAckFd = -1;
-                    DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Client should now send 0x000EE007...", rcmd);
+                    DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Waiting for 0x00FFFF02 challenge before sending 0x000EE007...", rcmd);
                     
-                    // v36.66: FORCE send captured 0x000EE007 to game server fd
-                    if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0 && fd >= 0 && !g_deviceInfoSentToGame) {
-                        @try {
-                            g_deviceInfoSentToGame = YES;
-                            DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 packet (%zd bytes) to game server fd=%d", 
-                                 g_deviceInfoPacketLen, fd);
-                            ssize_t sent = orig_send ? orig_send(fd, g_deviceInfoPacket, g_deviceInfoPacketLen, 0) : -1;
-                            DLOG(@"[GAME-FORCE-SEND] Force-send result: %zd bytes sent", sent);
-                            if (sent > 0) {
-                                // Hex dump of sent packet
-                                NSMutableString *hex = [NSMutableString string];
-                                for (ssize_t i = 0; i < g_deviceInfoPacketLen && i < 64; i++) {
-                                    [hex appendFormat:@"%02X ", g_deviceInfoPacket[i]];
-                                }
-                                DLOG(@"[GAME-FORCE-SEND] Sent packet HEX (first 64 bytes): %@", hex);
-                            }
-                        } @catch (NSException *e) {
-                            DLOG(@"[GAME-FORCE-SEND] Exception during force-send: %@", e.reason);
-                            g_deviceInfoSentToGame = NO;  // Reset for retry
-                        }
-                    } else {
-                        DLOG(@"[GAME-FORCE-SEND] Skipping force-send: captured=%d len=%zd fd=%d sent=%d", 
-                             g_deviceInfoCaptured ? 1 : 0, g_deviceInfoPacketLen, fd, g_deviceInfoSentToGame ? 1 : 0);
-                    }
+                    // v36.72: Do NOT force-send here - wait for 0x00FFFF02 response first
+                    // Protocol order must be: 0x80FFF494 → 0x00FFFF02 → 0x80FFFF02 → 0x000EE007
+                    // Sending 0x000EE007 too early causes server to reject it
                 }
             } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
                 // Count server responses after handshake - these are likely responses to client heartbeats
@@ -4287,7 +4298,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.71 - CMD-based game server detection + unconditional status patch");
+    DLOG(@"[VERSION] WangXianHook v36.72 - Fix protocol order: force-send AFTER challenge response");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
