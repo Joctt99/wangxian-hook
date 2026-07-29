@@ -1,21 +1,24 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.73 - Let client handle protocol naturally + trace client behavior
+ * WangXianHook v36.74 - COMPLETE removal of auto-response + let client handle protocol
  * MODE: FULL - All hooks enabled
  *
- * v36.73 CRITICAL FIXES:
- * 1. [NO-INTERFERE] DISABLED 0x00FFFF02 auto-response and 0x000EE007 force-send
- *    - Previous auto-response and force-send were WRONG:
- *      a) Client already handles 0x00FFFF01 (sends 0x80FFFF01)
- *      b) Client should also handle 0x00FFFF02 internally
- *      c) Force-sent plaintext 0x000EE007 is REJECTED by game server
- *    - Game server requires ENCRYPTED device info (RSA encryption from 0x80FFF494 cert)
- *    - Our plaintext force-send is ignored by server
- * 2. [TRACE] Added protocol tracing to monitor client behavior after handshake
- *    - New [PROTO-TRACE] log tracks every packet client sends after handshake
- *    - Categorizes commands: challenge responses, device info, heartbeats, encrypted data
- *    - This will reveal what client tries to do after receiving 0x00FFFF02
+ * v36.74 CRITICAL FIXES:
+ * 1. [FULL-REMOVE] COMPLETELY removed ALL 0x00FFFF02 auto-response code
+ *    - STICKY-LEFTOVER path: removed auto-response block
+ *    - STICKY-PACKET path: removed auto-response block
+ *    - v36.73 only claimed to disable auto-response but code still existed!
+ * 2. [CLIENT-OWNERSHIP] Let client handle 0x00FFFF02 challenge naturally
+ *    - Client needs to construct proper RSA-encrypted 0x80FFFF02 response
+ *    - Server expects encrypted data using certificate from 0x80FFF494
+ *    - Fake auto-response (copy+flip cmd) is REJECTED by server
+ * 3. [TRACE] Protocol tracing still active to monitor client behavior
+ *    - [PROTO-TRACE] log tracks every packet client sends after handshake
  *
+ * PREVIOUS (v36.73):
+ * - Claimed to disable auto-response and force-send (but code still existed!)
+ * - Added protocol tracing to monitor client behavior
+ * 
  * PREVIOUS (v36.72):
  * - Fixed protocol order: force-send after challenge response
  * - Added 150ms delay between challenge response and force-send
@@ -228,7 +231,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.73 loaded ===");
+        _log(@"=== WangXianHook v36.74 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2441,7 +2444,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             }
         }
         
-        // v36.73: Track client protocol behavior after handshake completion
+        // v36.74: Track client protocol behavior after handshake completion
         // Monitor what client sends in response to 0x00FFFF02 challenge
         if (g_handshakeComplete && isGameOrLoginPort && len >= 12) {
             @try {
@@ -2456,21 +2459,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 
                 // Categorize the command
                 if (trackCmd == 0x80FFFF02) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sent 0x80FFFF02 - responding to 0x00FFFF02 challenge!\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sent 0x80FFFF02 - responding to 0x00FFFF02 challenge!\n"];
                 } else if (trackCmd == 0x80FFFF01) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sent 0x80FFFF01 - responding to 0x00FFFF01 challenge\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sent 0x80FFFF01 - responding to 0x00FFFF01 challenge\n"];
                 } else if (trackCmd == 0x000EE007) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sending 0x000EE007 device info (plaintext)!\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sending 0x000EE007 device info (plaintext)!\n"];
                 } else if (trackCmd == 0x80EEE007 || trackCmd == 0x80EE0007) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sending encrypted device info!\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sending encrypted device info!\n"];
                 } else if (trackCmd == 0x00F493 || trackCmd == 0x80F493) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sending encrypted game data\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sending encrypted game data\n"];
                 } else if (trackCmd == 0x00000015) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sending heartbeat (may be stuck)\n"];
+                    [protoTrace appendFormat:@"  [V36.74] Client sending heartbeat (may be stuck)\n"];
                 } else if (trackCmd >= 0x80000000) {
-                    [protoTrace appendFormat:@"  [V36.73] Client sending server response (cmd=0x%08X)\n", trackCmd];
+                    [protoTrace appendFormat:@"  [V36.74] Client sending server response (cmd=0x%08X)\n", trackCmd];
                 } else {
-                    [protoTrace appendFormat:@"  [V36.73] Unknown command (cmd=0x%08X) - tracing...\n", trackCmd];
+                    [protoTrace appendFormat:@"  [V36.74] Unknown command (cmd=0x%08X) - tracing...\n", trackCmd];
                 }
                 
                 // Hex dump first 32 bytes
@@ -2820,23 +2823,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         memcpy(buf, g_stickyLeftoverBuf, leftoverLen);
         DLOG(@"[STICKY-LEFTOVER] Returning %zd leftover bytes from sticky packet split (fd=%d)", leftoverLen, fd);
         
-        // v36.69: Auto-respond to 0x00FFFF02 in leftover path
-        // When 0x00FFFF02 is saved as leftover, we need to auto-respond before returning
-        if (leftoverLen >= 28) {
-            const unsigned char *lp = (const unsigned char *)buf;
-            uint32_t lcmd = ((uint32_t)lp[4] << 24) | ((uint32_t)lp[5] << 16) |
-                           ((uint32_t)lp[6] << 8)  | (uint32_t)lp[7];
-            if (lcmd == 0x00FFFF02) {
-                int lport = getPortForFd(fd);
-                DLOG(@"[STICKY-LEFTOVER] Detected 0x00FFFF02 in leftover buffer, auto-responding... (port=%d)", lport);
-                // Construct 0x80FFFF02 response (copy challenge data, change cmd)
-                uint8_t respBuf[28];
-                memcpy(respBuf, lp, 28);
-                respBuf[4] = 0x80;
-                ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
-                DLOG(@"[STICKY-LEFTOVER] Sent 0x80FFFF02 response: %zd bytes", respSent);
-            }
-        }
+        // v36.74: DISABLED auto-response to 0x00FFFF02 in leftover path
+        // Let client handle challenge naturally - it needs to construct proper RSA-encrypted response
+        // Previously: auto-responded with fake 0x80FFFF02 by copying bytes and flipping cmd,
+        // which server rejected because it expects RSA-encrypted data using certificate from 0x80FFF494
         
         // Shift remaining leftover bytes
         if (leftoverLen < g_stickyLeftoverLen) {
@@ -2935,13 +2925,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // v36.73: DISABLE auto-response and force-send - let client handle protocol naturally
+            // v36.74: DISABLE auto-response and force-send - let client handle protocol naturally
             // Client already handles 0x00FFFF01 by sending 0x80FFFF01 - should also handle 0x00FFFF02
             // Force-sending plaintext 0x000EE007 is rejected by server (needs encryption with RSA key)
             if (cmd == 0x00FFFF02 && ret >= 28) {
-                [challengeDetail appendFormat:@"  [V36.73] NOT auto-responding - client must handle 0x00FFFF02 naturally\n"];
-                [challengeDetail appendFormat:@"  [V36.73] Client needs to: 1) parse RSA cert from 0x80FFF494, 2) derive session key, 3) send encrypted 0x000EE007\n"];
-                [challengeDetail appendFormat:@"  [V36.73] Monitoring client response to 0x00FFFF02...\n"];
+                [challengeDetail appendFormat:@"  [V36.74] NOT auto-responding - client must handle 0x00FFFF02 naturally\n"];
+                [challengeDetail appendFormat:@"  [V36.74] Client needs to: 1) parse RSA cert from 0x80FFF494, 2) derive session key, 3) send encrypted 0x000EE007\n"];
+                [challengeDetail appendFormat:@"  [V36.74] Monitoring client response to 0x00FFFF02...\n"];
             } else if (cmd == 0x00FFFF01) {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -3202,7 +3192,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     g_localHeartbeatAckLen = 0;
                     g_localHeartbeatAckFd = -1;
                     DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Waiting for client to handle 0x00FFFF02 and send encrypted 0x000EE007...", rcmd);
-                    DLOG(@"[GAME-FLOW] v36.73: NOT auto-responding to challenges - letting client handle protocol naturally");
+                    DLOG(@"[GAME-FLOW] v36.74: NOT auto-responding to challenges - letting client handle protocol naturally");
                     DLOG(@"[GAME-FLOW] Client should: 1) parse cert, 2) derive session key, 3) send encrypted device info");
                 }
             } else if (g_handshakeComplete && rcmd >= 0x80000000 && rcmd != 0x000EE007) {
@@ -3292,18 +3282,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         }
                     }
                     
-                    // v36.65: Auto-respond to 0x00FFFF02 challenge packets in sticky packets
-                    if (subCmd == 0x00FFFF02 && remaining >= 28) {
-                        DLOG(@"[STICKY-PACKET] Auto-responding to 0x00FFFF02 challenge (sub-packet #%d)", subPacketCount);
-                        // Construct 0x80FFFF02 response (copy challenge data, change cmd)
-                        uint8_t respBuf[28];
-                        memcpy(respBuf, p + offset, 28);
-                        // Change command from 0x00FFFF02 to 0x80FFFF02
-                        respBuf[4] = 0x80;
-                        // Keep challenge data (bytes 8-27) unchanged
-                        ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
-                        DLOG(@"[STICKY-PACKET] Sent 0x80FFFF02 response: %zd bytes", respSent);
-                    }
+                    // v36.74: DISABLED auto-response to 0x00FFFF02 in sticky-packet path
+                    // Let client handle challenge naturally - it needs to construct proper RSA-encrypted response
+                    // Previously: auto-responded with fake 0x80FFFF02 by copying bytes and flipping cmd,
+                    // which server rejected because it expects RSA-encrypted data using certificate from 0x80FFF494
                 }
                 
                 // Move to next packet
@@ -4310,7 +4292,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.73 - Let client handle protocol naturally + trace client behavior");
+    DLOG(@"[VERSION] WangXianHook v36.74 - COMPLETE removal of auto-response + let client handle protocol");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
