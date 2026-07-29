@@ -1,17 +1,18 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.86 - Fix SIGSEGV crash + force-send device info after challenge
+ * WangXianHook v36.87 - Inject UUID into device info + force-send enhanced packet
  * MODE: FULL - All hooks enabled
  *
- * v36.86 CRITICAL FIXES:
- * 1. [CRASH-FIX] Remove ACK-REPLACE logic that caused SIGSEGV
- *    - 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES in game client
- *    - Faking this packet caused wrong handler call -> crash
- * 2. [FORCE-DEVICE-INFO] Force-send 0x000EE007 immediately after challenge response
- *    - Server doesn't send 0x80FFF495, so client state machine doesn't advance
- *    - Instead of faking 0x80FFF495, directly send device info packet
- * 3. [RSA-ALGO] Change to PKCS1 first (Raw requires plaintext=key size, doesn't fit 16 bytes)
+ * v36.87 CRITICAL FIXES:
+ * 1. [UUID-INJECT] Inject 36-byte UUID TLV into 0x000EE007 for game server
+ *    - Login server (5678) sends 143-byte packet (no UUID)
+ *    - Game server (12003) expects 179-byte packet (with UUID TLV)
+ *    - UUID inserted after first TLV field (account/ticket)
+ * 2. [ENHANCED-PACKET] Use enhanced 179-byte packet when force-sending
+ *    - Priority: ENHANCED > ORIGINAL
+ *    - If injection fails, fallback to original 143 bytes
  *
+ * v36.86: Fix SIGSEGV crash + force-send device info after challenge
  * v36.85: Remove heartbeat block after challenge + adjust RSA algorithm
  *
  * v36.84: Fix challenge response format (add STATUS byte)
@@ -1014,6 +1015,13 @@ static ssize_t g_deviceInfoPacketLen = 0;
 static BOOL g_deviceInfoCaptured = NO;
 static BOOL g_deviceInfoSentToGame = NO;
 
+// v36.87: Enhanced device info packet (with UUID injected) for game server
+// Login server (5678) sends 143-byte version (no UUID)
+// Game server expects 179-byte version (with UUID field)
+static uint8_t g_deviceInfoEnhanced[MAX_DEVICE_INFO_SIZE];
+static ssize_t g_deviceInfoEnhancedLen = 0;
+static BOOL g_deviceInfoEnhancedReady = NO;
+
 // v36.68: Sticky packet leftover buffer - for splitting sticky packets
 // When 0x80FFF494 and heartbeat ACK arrive in same TCP buffer,
 // we split them so the game client only sees the handshake response
@@ -1888,6 +1896,81 @@ static int getPortForFd(int fd) {
     return 0;
 }
 
+// v36.87: Inject UUID into 0x000EE007 device info packet for game server
+// Login server (5678) sends 143-byte packet without UUID field
+// Game server expects 179-byte packet with 36-byte UUID TLV (len=0x0024 + 36 char UUID)
+// UUID field is inserted after first field (account/ticket: 0x0014 + 20 bytes) at offset 12+2+20 = 34
+static ssize_t injectUUIDIntoDeviceInfo(const uint8_t *src, size_t srcLen,
+                                         uint8_t *dst, size_t dstMaxLen) {
+    if (!src || srcLen < 36 || !dst || dstMaxLen < srcLen + 40) {
+        DLOG(@"[UUID-INJECT] Invalid params: srcLen=%zu dstMaxLen=%zu", srcLen, dstMaxLen);
+        return -1;
+    }
+    
+    // Generate a consistent fake UUID using NSUserDefaults or derive from UDID/IDFV
+    // Use a hardcoded UUID for reproducibility across sessions (server may bind UUID)
+    const char *fakeUUID = "00000000-0000-0000-0000-000000000001";
+    // Prefer device's IDFV if available
+    @try {
+        UIDevice *device = [UIDevice currentDevice];
+        if (device && [device respondsToSelector:@selector(identifierForVendor)]) {
+            NSUUID *idfv = [device identifierForVendor];
+            if (idfv) {
+                NSString *uuidStr = [idfv UUIDString];
+                if (uuidStr && uuidStr.length == 36) {
+                    fakeUUID = uuidStr.UTF8String;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    
+    size_t uuidStrLen = strlen(fakeUUID);
+    
+    // Find insertion point: header(12) + first TLV (2-byte len + N bytes)
+    // First field starts at offset 12 with 2-byte length prefix
+    if (srcLen < 14) return -1;
+    uint16_t firstFieldLen = ((uint16_t)src[12] << 8) | (uint16_t)src[13];
+    if (firstFieldLen > 200 || 14 + firstFieldLen > srcLen) {
+        DLOG(@"[UUID-INJECT] First field invalid: len=%u srcLen=%zu", firstFieldLen, srcLen);
+        return -1;
+    }
+    
+    size_t insertOffset = 12 + 2 + firstFieldLen;  // after header + first TLV
+    DLOG(@"[UUID-INJECT] Inserting UUID at offset %zu (firstFieldLen=%u, srcLen=%zu)",
+         insertOffset, firstFieldLen, srcLen);
+    
+    // Build new packet
+    size_t newPayloadSize = srcLen + 2 + uuidStrLen;  // +2 for TLV length prefix
+    if (newPayloadSize > dstMaxLen) {
+        DLOG(@"[UUID-INJECT] Output too large: need %zu max %zu", newPayloadSize, dstMaxLen);
+        return -1;
+    }
+    
+    // Copy bytes before insertion point
+    memcpy(dst, src, insertOffset);
+    
+    // Insert UUID TLV: length (2 bytes, big-endian) + UUID string
+    dst[insertOffset] = (uuidStrLen >> 8) & 0xFF;
+    dst[insertOffset + 1] = uuidStrLen & 0xFF;
+    memcpy(dst + insertOffset + 2, fakeUUID, uuidStrLen);
+    
+    // Copy remaining bytes after insertion point
+    size_t remaining = srcLen - insertOffset;
+    memcpy(dst + insertOffset + 2 + uuidStrLen, src + insertOffset, remaining);
+    
+    // Update total packet length in header (bytes 0-3, big-endian)
+    uint32_t newTotalLen = (uint32_t)newPayloadSize;
+    dst[0] = (newTotalLen >> 24) & 0xFF;
+    dst[1] = (newTotalLen >> 16) & 0xFF;
+    dst[2] = (newTotalLen >> 8) & 0xFF;
+    dst[3] = newTotalLen & 0xFF;
+    
+    DLOG(@"[UUID-INJECT] SUCCESS: %zu -> %u bytes (added UUID=%.*s)",
+         srcLen, newTotalLen, 8, fakeUUID);
+    
+    return (ssize_t)newTotalLen;
+}
+
 // v36.71: Check if a command is from game server protocol (not login server)
 // Game server cmd ranges:
 //   0x00FFxxxx / 0x80FFxxxx - Handshake/challenge/response
@@ -2420,7 +2503,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     g_deviceInfoPacketLen = len;
                     g_deviceInfoCaptured = YES;
                     g_deviceInfoSentToGame = NO;  // Reset flag for new capture
+                    g_deviceInfoEnhancedReady = NO;
                     DLOG(@"[DEVICE-INFO] CAPTURED %zd bytes for forced game server send", len);
+                    
+                    // v36.87: Immediately create enhanced version with UUID injected
+                    // Login server (5678) sends 143-byte without UUID
+                    // Game server (12003/58158) expects 179-byte with UUID
+                    ssize_t enhancedLen = injectUUIDIntoDeviceInfo(
+                        (const uint8_t *)buf, len,
+                        g_deviceInfoEnhanced, MAX_DEVICE_INFO_SIZE
+                    );
+                    if (enhancedLen > 0) {
+                        g_deviceInfoEnhancedLen = enhancedLen;
+                        g_deviceInfoEnhancedReady = YES;
+                        DLOG(@"[DEVICE-INFO] ENHANCED ready: %zd bytes (UUID injected)", enhancedLen);
+                    } else {
+                        // Fallback: use original if injection fails
+                        DLOG(@"[DEVICE-INFO] ENHANCED FAILED, will use original %zd bytes", len);
+                    }
                 }
             } @catch (NSException *e) {
                 // Silently ignore any errors in packet analysis
@@ -2952,15 +3052,34 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
         if (totalLen > 64) [hexStr appendFormat:@"..."];
         DLOG(@"%@", hexStr);
         
-        // v36.86: Force-send 0x000EE007 device info immediately after challenge response
-        // Server doesn't send 0x80FFF495, so we can't rely on client state machine.
-        // Instead, directly send the device info packet captured from login server.
-        if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0 && !g_deviceInfoSentToGame) {
-            g_deviceInfoSentToGame = YES;
-            DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 device info (%zd bytes) to game server fd=%d after challenge response",
-                 g_deviceInfoPacketLen, fd);
-            ssize_t devSent = orig_send ? orig_send(fd, g_deviceInfoPacket, g_deviceInfoPacketLen, 0) : -1;
-            DLOG(@"[GAME-FORCE-SEND] Device info send result: %zd bytes", devSent);
+        // v36.87: Force-send 0x000EE007 device info immediately after challenge response
+        // Server doesn't send 0x80FFF495, so client state machine doesn't advance.
+        // Use ENHANCED packet (with UUID injected) instead of 143-byte login server version.
+        if (!g_deviceInfoSentToGame) {
+            const uint8_t *sendBuf = NULL;
+            ssize_t sendLen = 0;
+            const char *sendType = "";
+            
+            if (g_deviceInfoEnhancedReady && g_deviceInfoEnhancedLen > 0) {
+                sendBuf = g_deviceInfoEnhanced;
+                sendLen = g_deviceInfoEnhancedLen;
+                sendType = "ENHANCED (UUID injected)";
+            } else if (g_deviceInfoCaptured && g_deviceInfoPacketLen > 0) {
+                sendBuf = g_deviceInfoPacket;
+                sendLen = g_deviceInfoPacketLen;
+                sendType = "ORIGINAL (no UUID)";
+            }
+            
+            if (sendBuf && sendLen > 0) {
+                g_deviceInfoSentToGame = YES;
+                DLOG(@"[GAME-FORCE-SEND] Force sending 0x000EE007 device info [%s] (%zd bytes) to game server fd=%d after challenge response",
+                     sendType, sendLen, fd);
+                ssize_t devSent = orig_send ? orig_send(fd, sendBuf, sendLen, 0) : -1;
+                DLOG(@"[GAME-FORCE-SEND] Device info send result: %zd bytes", devSent);
+            } else {
+                DLOG(@"[GAME-FORCE-SEND] WARNING: No device info packet available! captured=%d enhanced=%d",
+                     g_deviceInfoCaptured, g_deviceInfoEnhancedReady);
+            }
         }
         
         return YES;
