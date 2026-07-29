@@ -1,16 +1,19 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.64 - Re-enable status patching for 0x80FFF494/0x80FFF495, restore text clearing
+ * WangXianHook v36.65 - TCP sticky packet detection, auto-respond to 0x00FFFF02 challenges
  * MODE: FULL - All hooks enabled
  *
- * v36.64 CRITICAL FIXES:
- * 1. [REENABLE-PATCH] Re-enabled status patching for 0x80FFF494 and 0x80FFF495
- *    - Test showed server returns status=1, client needs status=0 to proceed
- *    - Only patch handshake responses (0x80FFF494, 0x80FFF495), not all game packets
- * 2. [RESTORE-TEXT] Restored text clearing logic for "版本过低" etc.
- *    - Matches status patching to keep response consistent
- * 3. [KEEP-12003] Keep port 12003 (confirmed working), add SO_SNDTIMEO timeout
- * 4. [TARGETED] Status patching only for handshake commands, not all game traffic
+ * v36.65 CRITICAL FIXES:
+ * 1. [STICKY-DETECT] Added TCP sticky packet detection in hook_recv
+ *    - 0x80FFF494 and 0x00FFFF02 arrive in same TCP buffer (sticky packet)
+ *    - Previous code only processed first packet, missed 0x00FFFF02 challenge
+ *    - Now loops through all sub-packets and processes each one
+ * 2. [AUTO-RESPOND] Auto-respond to 0x00FFFF02 challenge packets
+ *    - Constructs 0x80FFFF02 response (copies challenge data, changes command)
+ *    - Sends response via orig_send to advance game state machine
+ * 3. [SUB-PATCH] Apply status patching to sub-packets in sticky packets
+ *    - Same patching logic for 0x80FFF494/0x80FFF495 sub-packets
+ * 4. [KEEP-v36.64] Keep all v36.64 fixes (status patching, text clearing, port 12003)
  */
 /*
  * HISTORY:
@@ -210,7 +213,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.64 loaded ===");
+        _log(@"=== WangXianHook v36.65 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -3000,6 +3003,65 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             DLOG(@"%@", detail);
+            
+            // v36.65: TCP STICKY PACKET DETECTION - Check for multiple packets in one recv
+            // After processing first packet, check if remaining data contains more packets
+            // This handles cases like 0x80FFF494 + 0x00FFFF02 arriving together
+            ssize_t offset = 0;
+            int subPacketCount = 0;
+            while (offset < ret) {
+                ssize_t remaining = ret - offset;
+                if (remaining < 8) break; // Need at least header
+                
+                uint32_t subPktLen = ((uint32_t)p[offset] << 24) | ((uint32_t)p[offset+1] << 16) |
+                                     ((uint32_t)p[offset+2] << 8)  | (uint32_t)p[offset+3];
+                uint32_t subCmd    = ((uint32_t)p[offset+4] << 24) | ((uint32_t)p[offset+5] << 16) |
+                                     ((uint32_t)p[offset+6] << 8)  | (uint32_t)p[offset+7];
+                
+                // Validate packet length
+                if (subPktLen < 8 || subPktLen > 65535) break;
+                
+                subPacketCount++;
+                if (subPacketCount > 1) {
+                    DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
+                         subPacketCount, offset, subCmd, subPktLen, remaining);
+                    
+                    // Process sub-packet status patching (same logic as above)
+                    if (remaining >= 13) {
+                        uint8_t subStatus = p[offset + 12];
+                        if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
+                            DLOG(@"[STICKY-PACKET] Patching sub-packet status %u -> 0 for cmd=0x%08X at offset %zd", 
+                                 subStatus, subCmd, offset);
+                            ((unsigned char *)buf)[offset + 12] = 0;
+                        }
+                    }
+                    
+                    // v36.65: Auto-respond to 0x00FFFF02 challenge packets in sticky packets
+                    if (subCmd == 0x00FFFF02 && remaining >= 28) {
+                        DLOG(@"[STICKY-PACKET] Auto-responding to 0x00FFFF02 challenge (sub-packet #%d)", subPacketCount);
+                        // Construct 0x80FFFF02 response (copy challenge data, change cmd)
+                        uint8_t respBuf[28];
+                        memcpy(respBuf, p + offset, 28);
+                        // Change command from 0x00FFFF02 to 0x80FFFF02
+                        respBuf[4] = 0x80;
+                        // Keep challenge data (bytes 8-27) unchanged
+                        ssize_t respSent = orig_send ? orig_send(fd, respBuf, 28, 0) : -1;
+                        DLOG(@"[STICKY-PACKET] Sent 0x80FFFF02 response: %zd bytes", respSent);
+                    }
+                }
+                
+                // Move to next packet
+                if (subPktLen > (uint32_t)remaining) {
+                    // Packet extends beyond available data - incomplete packet
+                    DLOG(@"[STICKY-PACKET] Incomplete packet at offset %zd: pktLen=%u > remaining=%zd", 
+                         offset, subPktLen, remaining);
+                    break;
+                }
+                offset += subPktLen;
+            }
+            if (subPacketCount > 1) {
+                DLOG(@"[STICKY-PACKET] Processed %d sub-packets in one recv (total %zd bytes)", subPacketCount, ret);
+            }
         } @catch (NSException *e) {
             DLOG(@"[GAME-RECV] Exception during analysis: %@", e.reason);
         }
@@ -3990,7 +4052,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.64 - Re-enable status patching for 0x80FFF494/0x80FFF495, restore text clearing");
+    DLOG(@"[VERSION] WangXianHook v36.65 - TCP sticky packet detection, auto-respond to 0x00FFFF02 challenges");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
