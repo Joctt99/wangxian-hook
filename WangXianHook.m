@@ -1,16 +1,24 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.67 - Auto-respond to 0x00FFFF02 challenge packets
+ * WangXianHook v36.68 - Sticky packet splitting + heartbeat blocking
  * MODE: FULL - All hooks enabled
  *
- * v36.67 CRITICAL FIXES:
- * 1. [AUTO-RESPOND-02] Auto-respond to 0x00FFFF02 challenge packets
- *    - Server sends 0x00FFFF02 after 0x80FFF494 handshake
- *    - Client must respond with 0x80FFFF02 to continue handshake
- *    - Without response, client falls into heartbeat loop (stuck at "正在进入...")
- *    - Now auto-responds by copying challenge data and changing command byte
- * 2. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
- * 3. [KEEP-v36.65] Keep all v36.65 fixes (sticky detection, auto-respond 01)
+ * v36.68 CRITICAL FIXES:
+ * 1. [STICKY-SPLIT] Split sticky packets (0x80FFF494 + 0x80000015)
+ *    - When handshake response + heartbeat ACK arrive in same TCP buffer
+ *    - Split so game client only sees handshake response (752 bytes)
+ *    - Heartbeat ACK (22 bytes) saved to leftover buffer for next recv
+ *    - Prevents heartbeat ACK from confusing game state machine during login
+ * 2. [HEARTBEAT-BLOCK] Block game heartbeats during handshake phase
+ *    - Game sends 0x00000015 heartbeats while waiting for server response
+ *    - These heartbeats cause server to include ACK in handshake response
+ *    - Now blocked: return fake success, buffer local heartbeat ACK
+ *    - Game receives local ACK instead of server ACK
+ * 3. [LOCAL-HB-ACK] Local heartbeat ACK buffer
+ *    - Returns local ACK to game on next recv call
+ *    - Satisfies game's heartbeat watchdog without involving server
+ * 4. [KEEP-v36.67] Keep all v36.67 fixes (auto-respond 0x00FFFF02)
+ * 5. [KEEP-v36.66] Keep all v36.66 fixes (force send 0x000EE007)
  */
 /*
  * HISTORY:
@@ -210,7 +218,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.67 loaded ===");
+        _log(@"=== WangXianHook v36.68 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1003,6 +1011,22 @@ static uint8_t g_deviceInfoPacket[MAX_DEVICE_INFO_SIZE];
 static ssize_t g_deviceInfoPacketLen = 0;
 static BOOL g_deviceInfoCaptured = NO;
 static BOOL g_deviceInfoSentToGame = NO;
+
+// v36.68: Sticky packet leftover buffer - for splitting sticky packets
+// When 0x80FFF494 and heartbeat ACK arrive in same TCP buffer,
+// we split them so the game client only sees the handshake response
+#define MAX_STICKY_LEFTOVER 4096
+static uint8_t g_stickyLeftoverBuf[MAX_STICKY_LEFTOVER];
+static ssize_t g_stickyLeftoverLen = 0;
+static int g_stickyLeftoverFd = -1;
+
+// v36.68: Local heartbeat ACK buffer - for faking heartbeat responses
+// When game sends heartbeat to game server during handshake, we intercept
+// and return a local ACK to prevent server from including it in handshake response
+#define MAX_LOCAL_HEARTBEAT_ACK 256
+static uint8_t g_localHeartbeatAckBuf[MAX_LOCAL_HEARTBEAT_ACK];
+static ssize_t g_localHeartbeatAckLen = 0;
+static int g_localHeartbeatAckFd = -1;
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -2352,6 +2376,36 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[DEVICE-INFO] Analysis skipped due to exception: %@", e.reason);
             }
         }
+        
+        // v36.68: Block heartbeat packets (0x00000015/0x00000014) from being sent to game server
+        // During handshake phase, game sends heartbeats that cause server to include
+        // heartbeat ACK in handshake response, confusing the game state machine
+        if (isGameOrLoginPort && (cmd == 0x00000015 || cmd == 0x00000014)) {
+            // Only block heartbeats to game server ports (not login server)
+            BOOL isGamePortOnly = (port == 12003 || port == 58158 ||
+                                   (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+            if (isGamePortOnly && !g_handshakeComplete) {
+                // Block heartbeat: don't send to server, return fake success
+                // Create local heartbeat ACK (0x80000015) to satisfy game client
+                @try {
+                    uint8_t ackBuf[22];
+                    memcpy(ackBuf, buf, 22);  // Copy original heartbeat
+                    ackBuf[4] = 0x80;  // Change command from 0x00000015 to 0x80000015
+                    
+                    // Buffer the local ACK for next recv call
+                    if (g_localHeartbeatAckLen == 0 || g_localHeartbeatAckFd != fd) {
+                        g_localHeartbeatAckLen = 22;
+                        g_localHeartbeatAckFd = fd;
+                        memcpy(g_localHeartbeatAckBuf, ackBuf, 22);
+                        DLOG(@"[HEARTBEAT-BLOCK] Blocked heartbeat (cmd=0x%08X) to game server port=%d. Local ACK buffered.", cmd, port);
+                    }
+                } @catch (NSException *e) {
+                    DLOG(@"[HEARTBEAT-BLOCK] Exception: %@", e.reason);
+                }
+                // Return fake success - game thinks heartbeat was sent
+                return len;
+            }
+        }
     }
     
     // Analyze 0x0000F013 packet - select server / enter game
@@ -2667,6 +2721,33 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
+    
+    // v36.68: Check for local heartbeat ACK first (blocked heartbeat responses)
+    if (g_localHeartbeatAckLen > 0 && g_localHeartbeatAckFd == fd) {
+        ssize_t ackLen = g_localHeartbeatAckLen;
+        if (ackLen > (ssize_t)len) ackLen = (ssize_t)len;
+        memcpy(buf, g_localHeartbeatAckBuf, ackLen);
+        DLOG(@"[LOCAL-HB-ACK] Returning %zd bytes local heartbeat ACK (fd=%d)", ackLen, fd);
+        g_localHeartbeatAckLen = 0;
+        g_localHeartbeatAckFd = -1;
+        return ackLen;
+    }
+    
+    // v36.68: Check for leftover bytes from sticky packet split
+    // When 0x80FFF494 + heartbeat ACK arrive in same TCP buffer, we split them
+    if (g_stickyLeftoverLen > 0 && g_stickyLeftoverFd == fd) {
+        ssize_t leftoverLen = g_stickyLeftoverLen;
+        if (leftoverLen > (ssize_t)len) leftoverLen = (ssize_t)len;
+        memcpy(buf, g_stickyLeftoverBuf, leftoverLen);
+        DLOG(@"[STICKY-LEFTOVER] Returning %zd leftover bytes from sticky packet split (fd=%d)", leftoverLen, fd);
+        // Shift remaining leftover bytes
+        if (leftoverLen < g_stickyLeftoverLen) {
+            memmove(g_stickyLeftoverBuf, g_stickyLeftoverBuf + leftoverLen, g_stickyLeftoverLen - leftoverLen);
+        }
+        g_stickyLeftoverLen -= leftoverLen;
+        if (g_stickyLeftoverLen == 0) g_stickyLeftoverFd = -1;
+        return leftoverLen;
+    }
     
     ssize_t ret = orig_recv(fd, buf, len, flags);
     if (ret <= 0) {
@@ -3054,6 +3135,27 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             
             DLOG(@"%@", detail);
+            
+            // v36.68: STICKY PACKET SPLITTING - Critical fix for login flow
+            // When 0x80FFF494 (handshake) + 0x80000015 (heartbeat ACK) arrive in same buffer,
+            // the heartbeat ACK confuses the game state machine, causing it to enter heartbeat mode
+            // instead of proceeding to login. We split the sticky packet so game only sees handshake.
+            if ((rcmd == 0x80FFF494 || rcmd == 0x80FFF495) && pktLen < (uint32_t)ret) {
+                ssize_t extraLen = ret - (ssize_t)pktLen;
+                if (extraLen > 0 && extraLen < MAX_STICKY_LEFTOVER) {
+                    memcpy(g_stickyLeftoverBuf, p + pktLen, extraLen);
+                    g_stickyLeftoverLen = extraLen;
+                    g_stickyLeftoverFd = fd;
+                    DLOG(@"[STICKY-SPLIT] Splitting sticky packet: firstPkt=%u bytes (0x%08X), extra=%zd bytes saved for next recv",
+                         pktLen, rcmd, extraLen);
+                    DLOG(@"[STICKY-SPLIT] Extra bytes HEX: ");
+                    for (ssize_t i = 0; i < extraLen && i < 32; i++) {
+                        DLOG(@"[STICKY-SPLIT]   byte[%zd]=0x%02X", i, g_stickyLeftoverBuf[i]);
+                    }
+                    // Adjust return value to only include the first packet
+                    ret = pktLen;
+                }
+            }
             
             // v36.66: TCP STICKY PACKET DETECTION - Check for multiple packets in one recv
             DLOG(@"[STICKY-DETECT] Starting sticky packet detection: ret=%zd firstPktLen=%u firstCmd=0x%08X", 
@@ -4108,7 +4210,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.67 - Auto-respond to 0x00FFFF02 challenge packets");
+    DLOG(@"[VERSION] WangXianHook v36.68 - Sticky packet splitting + heartbeat blocking");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
