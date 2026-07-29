@@ -3712,17 +3712,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     if (rcmd == 0x80FFF494) {
                         DLOG(@"[GAME-PATCH] v36.90: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
                         [detail appendFormat:@"  [OBSERVE] v36.90: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
-                    } else if (rcmd == 0x80FFF495) {
-                        DLOG(@"[GAME-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status, rcmd);
-                        ((unsigned char *)buf)[12] = 0;
-                        [detail appendFormat:@"  [PATCH] 0x80FFF495 status patched to 0 (critical handshake fix)\n"];
-                    }
                         
                         // v36.79: Extract RSA public key certificate from 0x80FFF494 response
                         // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
                         // byte[13] = cert format type (0x88 = X.509 cert)
                         // bytes[14..end] = Base64-encoded DER certificate data
-                        if (rcmd == 0x80FFF494 && ret > 14 && !g_pubKeyCaptured) {
+                        if (ret > 14 && !g_pubKeyCaptured) {
                             // Debug: Log full packet structure
                             DLOG(@"[PUBKEY-DEBUG] Full 0x80FFF494 packet: ret=%zd bytes", ret);
                             DLOG(@"[PUBKEY-DEBUG] Bytes 0-15 hex: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
@@ -3855,6 +3850,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                 }
                             }
                         }
+                    } else if (rcmd == 0x80FFF495) {
+                        DLOG(@"[GAME-PATCH] v36.90 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status);
+                        ((unsigned char *)buf)[12] = 0;
+                        [detail appendFormat:@"  [PATCH] 0x80FFF495 status patched to 0 (critical handshake fix)\n"];
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
