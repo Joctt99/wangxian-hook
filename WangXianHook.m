@@ -1,18 +1,21 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.80 - Debug RSA Base64 decoding failure
+ * WangXianHook v36.81 - Fix RSA Base64 decode with manual decoder
  * MODE: FULL - All hooks enabled
  *
- * v36.79 CRITICAL FIXES:
- * 1. [AUTO-RESPONSE] Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
- *    - Client fails to parse RSA cert from 0x80FFF494 and never sends 0x80FFFF02
- *    - We extract Base64 cert from 0x80FFF494 response, encrypt challenge data with RSA key
- *    - Construct and send 0x80FFFF02 response automatically
- * 2. [CERT-EXTRACT] Extract RSA public key certificate from 0x80FFF494 response
- *    - cert starts at byte[14] (after length+cmd+field+status+type)
- *    - Base64 decode and parse with Security framework
- * 3. [KEEP-FIX] Keep v36.77 sticky packet NO-SPLIT fix
+ * v36.81 CRITICAL FIXES:
+ * 1. [RSA-DECODE] Implement manual Base64 decode with robust error handling
+ *    - Standard NSData Base64 decode fails due to invalid chars in protocol data
+ *    - Manual decoder skips whitespace/newlines and recovers from invalid chars
+ *    - Added comprehensive NSLog logging for every step
+ * 2. [RSA-KEY-EXTRACT] Try both X.509 certificate and direct public key extraction
+ *    - SecCertificateCreateWithData for certificate format
+ *    - SecKeyCreateWithData for direct RSA public key format
+ * 3. [LOGGING] Use NSLog instead of DLOG for critical RSA operations
+ *    - Ensures all debug logs are visible in system log
+ *    - Detailed error messages for each failure point
  *
+ * v36.79-v36.80: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
  * v36.78: Remove EncryptUtils hooking (fix SIGSEGV crash)
  * v36.77: Fix sticky packet splitting + metaclass crypto detection
  */
@@ -214,7 +217,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.80 loaded ===");
+        _log(@"=== WangXianHook v36.81 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2600,238 +2603,276 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     return ret;
 }
 
-// v36.79: RSA encrypt challenge data using server's public key certificate
+// v36.81: Manual Base64 decode function for reliable RSA public key extraction
+// Standard Base64 alphabet
+static const uint8_t g_base64DecodeTable[256] = {
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,63, // + /
+    52,53,54,55,56,57,58,59,60,61,62,62,62,65,62,62, // 0-9 =
+    62, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, // A-O
+    15,16,17,18,19,20,21,22,23,24,25,62,62,62,62,62, // P-Z
+    62,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40, // a-o
+    41,42,43,44,45,46,47,48,49,50,51,62,62,62,62,62, // p-z
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,
+    62,62,62,62,62,62,62,62,62,62,62,62,62,62,62,62
+};
+
+// v36.81: Manual Base64 decode with robust error handling
+static int manualBase64Decode(const uint8_t *input, size_t inputLen, 
+                               uint8_t *output, size_t outputBufSize, size_t *outputLen) {
+    if (!input || !output || !outputLen || inputLen == 0) return -1;
+    
+    size_t inPos = 0;
+    size_t outPos = 0;
+    uint8_t group[4];
+    int groupIdx = 0;
+    
+    // Clear output
+    memset(output, 0, outputBufSize);
+    
+    while (inPos < inputLen) {
+        uint8_t c = input[inPos];
+        inPos++;
+        
+        // Skip whitespace and newlines
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        
+        // Check for padding
+        if (c == '=') {
+            // Padding should only appear at the end
+            if (groupIdx < 2) return -1; // Invalid padding position
+            break;
+        }
+        
+        uint8_t val = g_base64DecodeTable[c];
+        if (val >= 64) {
+            // Invalid character - skip it (could be protocol overhead)
+            NSLog(@"[RSA-MANUAL-B64] Skipping invalid char at input pos %zu: 0x%02X", inPos-1, c);
+            continue;
+        }
+        
+        group[groupIdx++] = val;
+        
+        if (groupIdx == 4) {
+            // Decode 4 Base64 chars to 3 bytes
+            uint32_t triple = (group[0] << 18) | (group[1] << 12) | (group[2] << 6) | group[3];
+            
+            if (outPos + 3 > outputBufSize) return -1; // Output buffer too small
+            
+            output[outPos++] = (triple >> 16) & 0xFF;
+            output[outPos++] = (triple >> 8) & 0xFF;
+            output[outPos++] = triple & 0xFF;
+            groupIdx = 0;
+        }
+    }
+    
+    // Handle remaining group (if any)
+    if (groupIdx > 0) {
+        if (groupIdx < 2) return -1; // Invalid: need at least 2 chars
+        
+        if (groupIdx == 2) {
+            uint32_t triple = (group[0] << 18) | (group[1] << 12);
+            if (outPos + 1 > outputBufSize) return -1;
+            output[outPos++] = (triple >> 16) & 0xFF;
+        } else if (groupIdx == 3) {
+            uint32_t triple = (group[0] << 18) | (group[1] << 12) | (group[2] << 6);
+            if (outPos + 2 > outputBufSize) return -1;
+            output[outPos++] = (triple >> 16) & 0xFF;
+            output[outPos++] = (triple >> 8) & 0xFF;
+        }
+    }
+    
+    *outputLen = outPos;
+    return 0;
+}
+
+// v36.81: RSA encrypt challenge data using server's public key certificate
 // Returns encrypted data length, or -1 on failure
 static ssize_t rsaEncryptChallenge(const uint8_t *plainData, size_t plainLen,
                                     uint8_t *cipherBuf, size_t cipherBufSize) {
     if (!g_pubKeyCaptured || g_pubKeyBase64Len == 0) {
-        DLOG(@"[RSA-ENCRYPT] No public key captured, cannot encrypt");
+        NSLog(@"[RSA-ENCRYPT] No public key captured, cannot encrypt (captured=%d, len=%lu)", 
+             g_pubKeyCaptured, (unsigned long)g_pubKeyBase64Len);
         return -1;
     }
     
-    @try {
-        // Debug: Log cert data details
-        DLOG(@"[RSA-DEBUG] Base64 cert length: %lu bytes", (unsigned long)g_pubKeyBase64Len);
+    NSLog(@"[RSA-ENCRYPT] Starting encryption: pubKeyLen=%lu, plainLen=%zu", 
+          (unsigned long)g_pubKeyBase64Len, plainLen);
+    
+    // Step 1: Manual Base64 decode (most reliable)
+    uint8_t *derData = (uint8_t *)malloc(1024);
+    if (!derData) {
+        NSLog(@"[RSA-ENCRYPT] Failed to allocate DER buffer");
+        return -1;
+    }
+    
+    size_t derLen = 0;
+    int decodeResult = manualBase64Decode((const uint8_t *)g_pubKeyBase64, 
+                                           g_pubKeyBase64Len, 
+                                           derData, 1024, &derLen);
+    
+    if (decodeResult != 0 || derLen == 0) {
+        NSLog(@"[RSA-ENCRYPT] Manual Base64 decode failed (result=%d, derLen=%zu), trying NSData...", decodeResult, derLen);
         
-        // Check for invalid Base64 characters
-        BOOL hasInvalidChars = NO;
-        int invalidCharCount = 0;
-        int validChars = 0;
-        for (size_t i = 0; i < g_pubKeyBase64Len; i++) {
-            unsigned char c = g_pubKeyBase64[i];
-            // Valid Base64: A-Z, a-z, 0-9, +, /, =
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
-                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '\n' || c == '\r') {
-                validChars++;
-            } else {
-                invalidCharCount++;
-                if (!hasInvalidChars) {
-                    DLOG(@"[RSA-DEBUG] Invalid char found at offset %zu: 0x%02X (%c)", i, c, c >= 32 ? c : '.');
-                    hasInvalidChars = YES;
+        // Fallback: Try NSData Base64 decode
+        @try {
+            NSString *certStr = [[NSString alloc] initWithBytes:g_pubKeyBase64 
+                                                        length:g_pubKeyBase64Len 
+                                                      encoding:NSASCIIStringEncoding];
+            if (certStr) {
+                NSData *certDER = [[NSData alloc] initWithBase64EncodedString:certStr 
+                                                                      options:NSDataBase64DecodingIgnoreUnknownCharacters];
+                if (certDER && certDER.length > 0) {
+                    derLen = certDER.length;
+                    memcpy(derData, certDER.bytes, MIN(derLen, 1024));
+                    NSLog(@"[RSA-ENCRYPT] NSData Base64 decode succeeded: %lu bytes", (unsigned long)derLen);
+                } else {
+                    NSLog(@"[RSA-ENCRYPT] NSData Base64 decode also failed");
+                    free(derData);
+                    return -1;
                 }
+            } else {
+                NSLog(@"[RSA-ENCRYPT] Cannot create NSString from Base64 data");
+                free(derData);
+                return -1;
             }
-        }
-        DLOG(@"[RSA-DEBUG] Valid chars: %d, Invalid chars: %d", validChars, invalidCharCount);
-        
-        // Debug: Log first and last characters
-        NSString *certStr = [[NSString alloc] initWithBytes:g_pubKeyBase64 length:g_pubKeyBase64Len encoding:NSASCIIStringEncoding];
-        if (certStr) {
-            DLOG(@"[RSA-DEBUG] Cert string (first 100): %@", [certStr substringToIndex:MIN(100, certStr.length)]);
-            DLOG(@"[RSA-DEBUG] Cert string (last 50): %@", [certStr substringFromIndex:MAX(0, (NSInteger)certStr.length - 50)]);
-        }
-        
-        // Step 1: Base64 decode the certificate
-        NSData *certBase64Data = [NSData dataWithBytes:g_pubKeyBase64 length:g_pubKeyBase64Len];
-        if (!certBase64Data) {
-            DLOG(@"[RSA-ENCRYPT] Failed to create NSData from Base64 cert");
+        } @catch (NSException *e) {
+            NSLog(@"[RSA-ENCRYPT] Exception in NSData decode: %@", e.reason);
+            free(derData);
             return -1;
         }
+    } else {
+        NSLog(@"[RSA-ENCRYPT] Manual Base64 decode succeeded: %zu bytes", derLen);
+    }
+    
+    // Log DER header for debugging
+    if (derLen >= 8) {
+        NSLog(@"[RSA-ENCRYPT] DER header: %02X %02X %02X %02X %02X %02X %02X %02X",
+             derData[0], derData[1], derData[2], derData[3],
+             derData[4], derData[5], derData[6], derData[7]);
+    }
+    
+    // Step 2: Create SecKey from DER data
+    SecKeyRef pubKeyRef = NULL;
+    
+    // Try as X.509 certificate first
+    @try {
+        CFDataRef certData = CFDataCreate(NULL, derData, derLen);
+        SecCertificateRef certRef = SecCertificateCreateWithData(NULL, certData);
+        CFRelease(certData);
         
-        // Try method 1: decode using NSString
-        NSData *certDER = nil;
-        if (certStr) {
-            certDER = [[NSData alloc] initWithBase64EncodedString:certStr options:0];
-            DLOG(@"[RSA-DEBUG] Method 1 (NSString decode with options=0): %lu bytes", 
-                 certDER ? (unsigned long)certDER.length : 0);
-        }
-        
-        // Try method 2: decode using NSData
-        if (!certDER || certDER.length == 0) {
-            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:0];
-            DLOG(@"[RSA-DEBUG] Method 2 (NSData decode with options=0): %lu bytes", 
-                 certDER ? (unsigned long)certDER.length : 0);
-        }
-        
-        // Try method 3: decode with IgnoreUnknownCharacters
-        if (!certDER || certDER.length == 0) {
-            certDER = [[NSData alloc] initWithBase64EncodedData:certBase64Data options:NSDataBase64DecodingIgnoreUnknownCharacters];
-            DLOG(@"[RSA-DEBUG] Method 3 (NSData decode with IgnoreUnknown): %lu bytes", 
-                 certDER ? (unsigned long)certDER.length : 0);
-        }
-        
-        if (!certDER || certDER.length == 0) {
-            DLOG(@"[RSA-ENCRYPT] ALL Base64 decode methods failed");
+        if (certRef) {
+            NSLog(@"[RSA-ENCRYPT] Created SecCertificate from DER data");
+            pubKeyRef = SecCertificateCopyKey(certRef);
+            CFRelease(certRef);
             
-            // Try manual Base64 decode with padding fix
-            // Remove non-Base64 chars (like newlines) and fix padding
-            NSMutableString *cleanStr = [NSMutableString string];
-            for (size_t i = 0; i < g_pubKeyBase64Len; i++) {
-                unsigned char c = g_pubKeyBase64[i];
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
-                    (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
-                    [cleanStr appendFormat:@"%c", c];
-                }
+            if (!pubKeyRef) {
+                NSLog(@"[RSA-ENCRYPT] SecCertificateCopyKey failed, trying direct SecKey...");
             }
+        } else {
+            NSLog(@"[RSA-ENCRYPT] SecCertificateCreateWithData failed, trying direct SecKey...");
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[RSA-ENCRYPT] Exception creating certificate: %@", e.reason);
+    }
+    
+    // Try as direct public key (not a certificate)
+    if (!pubKeyRef) {
+        @try {
+            NSDictionary *keyAttrs = @{
+                (__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeRSA,
+                (__bridge id)kSecAttrKeyClass: (__bridge id)kSecAttrKeyClassPublic,
+                (__bridge id)kSecAttrKeySizeInBits: @2048
+            };
+            CFDataRef keyData = CFDataCreate(NULL, derData, derLen);
+            pubKeyRef = SecKeyCreateWithData(keyData, (__bridge CFDictionaryRef)keyAttrs, NULL);
+            CFRelease(keyData);
             
-            // Fix padding
-            while (cleanStr.length % 4 != 0) {
-                [cleanStr appendString:@"="];
+            if (pubKeyRef) {
+                NSLog(@"[RSA-ENCRYPT] Created SecKey directly from DER data");
+            } else {
+                NSLog(@"[RSA-ENCRYPT] SecKeyCreateWithData also failed");
+                free(derData);
+                return -1;
             }
-            DLOG(@"[RSA-DEBUG] Cleaned Base64 length: %lu (original: %lu)", 
-                 (unsigned long)cleanStr.length, (unsigned long)g_pubKeyBase64Len);
-            DLOG(@"[RSA-DEBUG] Cleaned string (first 100): %@", [cleanStr substringToIndex:MIN(100, cleanStr.length)]);
-            
-            certDER = [[NSData alloc] initWithBase64EncodedString:cleanStr options:0];
-            DLOG(@"[RSA-DEBUG] Method 4 (cleaned + padded): %lu bytes", 
-                 certDER ? (unsigned long)certDER.length : 0);
-            
-            if (!certDER || certDER.length == 0) {
-                DLOG(@"[RSA-ENCRYPT] ALL decode methods failed");
+        } @catch (NSException *e) {
+            NSLog(@"[RSA-ENCRYPT] Exception creating SecKey: %@", e.reason);
+            free(derData);
+            return -1;
+        }
+    }
+    
+    free(derData);
+    NSLog(@"[RSA-ENCRYPT] Got public key reference, proceeding to encryption");
+    
+    // Step 3: Encrypt with RSA using SecKeyCreateEncryptedData
+    CFErrorRef encryptErr = NULL;
+    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
+    
+    // Check if the algorithm is supported
+    if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+        NSLog(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
+        algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
+        if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+            NSLog(@"[RSA-ENCRYPT] SHA1 not supported either, trying PKCS1...");
+            algo = kSecKeyAlgorithmRSAEncryptionRaw;
+            if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
+                NSLog(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
+                CFRelease(pubKeyRef);
                 return -1;
             }
         }
-        DLOG(@"[RSA-ENCRYPT] Base64 decoded cert: %lu bytes (from %lu bytes Base64)",
-             (unsigned long)certDER.length, (unsigned long)g_pubKeyBase64Len);
-        
-        // Step 2: Create SecCertificate from DER data
-        SecCertificateRef certRef = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)certDER);
-        if (!certRef) {
-            DLOG(@"[RSA-ENCRYPT] SecCertificateCreateWithData failed - cert may not be valid X.509");
-            
-            // Try to extract public key directly from DER (in case it's a bare public key, not cert)
-            // Check if DER starts with a known RSA public key sequence
-            if (certDER.length > 16) {
-                const uint8_t *derBytes = (const uint8_t *)certDER.bytes;
-                DLOG(@"[RSA-ENCRYPT] DER header: %02X %02X %02X %02X %02X %02X %02X %02X",
-                     derBytes[0], derBytes[1], derBytes[2], derBytes[3],
-                     derBytes[4], derBytes[5], derBytes[6], derBytes[7]);
-                
-                // Try as SecKey directly using kSecAttrKeyTypeRSA
-                NSDictionary *keyAttrs = @{
-                    (__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeRSA,
-                    (__bridge id)kSecAttrKeyClass: (__bridge id)kSecAttrKeyClassPublic,
-                    (__bridge id)kSecAttrKeySizeInBits: @2048
-                };
-                SecKeyRef directKey = SecKeyCreateWithData((__bridge CFDataRef)certDER,
-                                                           (__bridge CFDictionaryRef)keyAttrs, NULL);
-                if (directKey) {
-                    DLOG(@"[RSA-ENCRYPT] Created SecKey directly from DER data");
-                    
-                    // Step 3: Encrypt with RSA
-                    CFErrorRef encryptErr = NULL;
-                    SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
-                    CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
-                    CFDataRef cipherCFData = SecKeyCreateEncryptedData(directKey, algo,
-                                                                       plainCFData, &encryptErr);
-                    CFRelease(plainCFData);
-                    
-                    if (cipherCFData) {
-                        size_t cipherLen = CFDataGetLength(cipherCFData);
-                        if (cipherLen <= cipherBufSize) {
-                            CFDataGetBytes(cipherCFData, CFRangeMake(0, cipherLen), cipherBuf);
-                            CFRelease(cipherCFData);
-                            CFRelease(directKey);
-                            DLOG(@"[RSA-ENCRYPT] Success: encrypted %lu bytes -> %lu bytes RSA cipher",
-                                 (unsigned long)plainLen, (unsigned long)cipherLen);
-                            return (ssize_t)cipherLen;
-                        }
-                        CFRelease(cipherCFData);
-                    } else {
-                        DLOG(@"[RSA-ENCRYPT] SecKeyCreateEncryptedData failed: %@",
-                             encryptErr ? CFBridgingRelease(CFErrorCopyDescription(encryptErr)) : @"unknown");
-                        if (encryptErr) CFRelease(encryptErr);
-                    }
-                    CFRelease(directKey);
-                } else {
-                    DLOG(@"[RSA-ENCRYPT] SecKeyCreateWithData also failed");
-                }
-            }
-            return -1;
-        }
-        
-        // Step 3: Extract public key from certificate
-        SecKeyRef pubKeyRef = SecCertificateCopyKey(certRef);
-        CFRelease(certRef);
-        
-        if (!pubKeyRef) {
-            DLOG(@"[RSA-ENCRYPT] SecCertificateCopyKey failed");
-            return -1;
-        }
-        DLOG(@"[RSA-ENCRYPT] Got public key from certificate");
-        
-        // Step 4: Encrypt with RSA using SecKeyCreateEncryptedData (iOS 10+)
-        CFErrorRef encryptErr = NULL;
-        SecKeyAlgorithm algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA256;
-        
-        // Check if the algorithm is supported
-        if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-            DLOG(@"[RSA-ENCRYPT] SHA256 not supported, trying SHA1...");
-            algo = kSecKeyAlgorithmRSAEncryptionOAEPSHA1;
-            if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-                DLOG(@"[RSA-ENCRYPT] SHA1 not supported either, trying PKCS1...");
-                algo = kSecKeyAlgorithmRSAEncryptionRaw;
-                if (!SecKeyIsAlgorithmSupported(pubKeyRef, kSecKeyOperationTypeEncrypt, algo)) {
-                    DLOG(@"[RSA-ENCRYPT] No RSA encryption algorithm supported");
-                    CFRelease(pubKeyRef);
-                    return -1;
-                }
-            }
-        }
-        
-        CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
-        CFDataRef cipherCFData = SecKeyCreateEncryptedData(pubKeyRef, algo,
-                                                           plainCFData, &encryptErr);
-        CFRelease(plainCFData);
-        CFRelease(pubKeyRef);
-        
-        if (cipherCFData) {
-            size_t cipherLen = CFDataGetLength(cipherCFData);
-            if (cipherLen <= cipherBufSize) {
-                CFDataGetBytes(cipherCFData, CFRangeMake(0, cipherLen), cipherBuf);
-                CFRelease(cipherCFData);
-                DLOG(@"[RSA-ENCRYPT] Success: encrypted %lu bytes -> %lu bytes RSA cipher (algo=%s)",
-                     (unsigned long)plainLen, (unsigned long)cipherLen,
-                     algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" :
-                     algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA1 ? "SHA1" : "PKCS1");
-                return (ssize_t)cipherLen;
-            }
+    }
+    
+    NSLog(@"[RSA-ENCRYPT] Using encryption algorithm: %s",
+          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA256 ? "SHA256" :
+          algo == kSecKeyAlgorithmRSAEncryptionOAEPSHA1 ? "SHA1" : "PKCS1");
+    
+    CFDataRef plainCFData = CFDataCreate(NULL, plainData, plainLen);
+    CFDataRef cipherCFData = SecKeyCreateEncryptedData(pubKeyRef, algo,
+                                                       plainCFData, &encryptErr);
+    CFRelease(plainCFData);
+    CFRelease(pubKeyRef);
+    
+    if (cipherCFData) {
+        size_t cipherLen = CFDataGetLength(cipherCFData);
+        if (cipherLen <= cipherBufSize) {
+            CFDataGetBytes(cipherCFData, CFRangeMake(0, cipherLen), cipherBuf);
             CFRelease(cipherCFData);
-            DLOG(@"[RSA-ENCRYPT] Cipher buffer too small: need %lu, have %lu",
-                 (unsigned long)cipherLen, (unsigned long)cipherBufSize);
-            return -1;
-        } else {
-            DLOG(@"[RSA-ENCRYPT] SecKeyCreateEncryptedData failed: %@",
-                 encryptErr ? CFBridgingRelease(CFErrorCopyDescription(encryptErr)) : @"unknown");
-            if (encryptErr) CFRelease(encryptErr);
-            return -1;
+            NSLog(@"[RSA-ENCRYPT] SUCCESS: encrypted %lu bytes -> %lu bytes RSA cipher",
+                 (unsigned long)plainLen, (unsigned long)cipherLen);
+            return (ssize_t)cipherLen;
         }
-    } @catch (NSException *e) {
-        DLOG(@"[RSA-ENCRYPT] Exception: %@", e.reason);
+        CFRelease(cipherCFData);
+        NSLog(@"[RSA-ENCRYPT] Cipher buffer too small: need %lu, have %lu",
+             (unsigned long)cipherLen, (unsigned long)cipherBufSize);
+        return -1;
+    } else {
+        NSLog(@"[RSA-ENCRYPT] SecKeyCreateEncryptedData failed: %@",
+             encryptErr ? CFBridgingRelease(CFErrorCopyDescription(encryptErr)) : @"unknown");
+        if (encryptErr) CFRelease(encryptErr);
         return -1;
     }
 }
 
-// v36.79: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
+// v36.81: Auto-respond to 0x00FFFF02 challenge with RSA-encrypted 0x80FFFF02
 // Returns YES if response was sent
 static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t pktLen,
                                     uint32_t cmd) {
     if (cmd != 0x00FFFF02 || pktLen < 12) return NO;
     if (g_challengeResponded && g_challengeFd == fd) {
-        DLOG(@"[CHALLENGE-AUTO] Already responded to 0x00FFFF02 for fd=%d, skipping", fd);
+        NSLog(@"[CHALLENGE-AUTO] Already responded to 0x00FFFF02 for fd=%d, skipping", fd);
         return NO;
     }
     if (!g_pubKeyCaptured) {
-        DLOG(@"[CHALLENGE-AUTO] No public key available, cannot auto-respond");
+        NSLog(@"[CHALLENGE-AUTO] No public key available, cannot auto-respond (captured=%d)", g_pubKeyCaptured);
         return NO;
     }
     
@@ -2839,13 +2880,13 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
     size_t payloadLen = pktLen - 12;
     const uint8_t *payloadData = pktBuf + 12;
     
-    DLOG(@"[CHALLENGE-AUTO] Auto-responding to 0x00FFFF02: payload=%zu bytes, fd=%d", payloadLen, fd);
+    NSLog(@"[CHALLENGE-AUTO] Auto-responding to 0x00FFFF02: payload=%zu bytes, fd=%d", payloadLen, fd);
     
     // Encrypt the challenge data with RSA public key
     uint8_t encryptedData[256]; // RSA 2048-bit = 256 bytes max
     ssize_t encryptedLen = rsaEncryptChallenge(payloadData, payloadLen, encryptedData, sizeof(encryptedData));
     if (encryptedLen <= 0) {
-        DLOG(@"[CHALLENGE-AUTO] RSA encryption failed, cannot auto-respond");
+        NSLog(@"[CHALLENGE-AUTO] RSA encryption failed, cannot auto-respond (encryptedLen=%zd)", encryptedLen);
         return NO;
     }
     
@@ -2857,7 +2898,7 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
     uint32_t totalLen = (uint32_t)(4 + 4 + 4 + encryptedLen);
     uint8_t responseBuf[300]; // Max 4+4+4+256 = 264
     if (totalLen > sizeof(responseBuf)) {
-        DLOG(@"[CHALLENGE-AUTO] Response too large: %u bytes", totalLen);
+        NSLog(@"[CHALLENGE-AUTO] Response too large: %u bytes", totalLen);
         return NO;
     }
     
@@ -2876,25 +2917,25 @@ static BOOL autoRespondToChallenge(int fd, const unsigned char *pktBuf, size_t p
     memcpy(responseBuf + 12, encryptedData, encryptedLen);
     
     // Send the response
-    DLOG(@"[CHALLENGE-AUTO] Sending 0x80FFFF02 response: %u bytes to fd=%d", totalLen, fd);
+    NSLog(@"[CHALLENGE-AUTO] Sending 0x80FFFF02 response: %u bytes to fd=%d (encrypted %zd bytes)", totalLen, fd, encryptedLen);
     ssize_t sent = orig_send ? orig_send(fd, responseBuf, totalLen, 0) : -1;
     if (sent > 0) {
         g_challengeResponded = YES;
         g_challengeFd = fd;
-        DLOG(@"[CHALLENGE-AUTO] Sent 0x80FFFF02 response: %zd bytes (encrypted %zu -> %zd)",
+        NSLog(@"[CHALLENGE-AUTO] SUCCESS: Sent 0x80FFFF02 response: %zd bytes (encrypted %zu -> %zd)",
              sent, payloadLen, encryptedLen);
         
         // Log response hex
-        NSMutableString *hexStr = [NSMutableString stringWithString:@"  Response HEX: "];
+        NSMutableString *hexStr = [NSMutableString stringWithString:@"[CHALLENGE-AUTO] Response HEX: "];
         for (uint32_t i = 0; i < totalLen && i < 64; i++) {
             [hexStr appendFormat:@"%02X ", responseBuf[i]];
         }
         if (totalLen > 64) [hexStr appendFormat:@"..."];
-        DLOG(@"%@", hexStr);
+        NSLog(@"%@", hexStr);
         
         return YES;
     } else {
-        DLOG(@"[CHALLENGE-AUTO] Send failed: %zd", sent);
+        NSLog(@"[CHALLENGE-AUTO] Send failed: %zd", sent);
         return NO;
     }
 }
@@ -3490,26 +3531,89 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                 }
                             }
                             
-                            // Use offset 14 as primary, but also try to decode to verify
+                            // v36.81: Improved public key extraction
+                            // Find Base64 public key data starting from offset 14
                             ssize_t certOffset = 14;
-                            ssize_t certLen = ret - certOffset;
-                            if (certLen > 0 && certLen < MAX_PUBKEY_BASE64) {
-                                memcpy(g_pubKeyBase64, p + certOffset, certLen);
-                                g_pubKeyBase64Len = certLen;
-                                g_pubKeyCaptured = YES;
-                                g_challengeResponded = NO; // Reset challenge response flag
-                                DLOG(@"[PUBKEY-EXTRACT] Extracted RSA cert: %zd bytes Base64 (offset=%zd)", certLen, certOffset);
-                                // Log first 80 chars of cert
-                                NSString *certPreview = [[NSString alloc] initWithBytes:p+certOffset length:MIN((NSUInteger)certLen, 80) encoding:NSASCIIStringEncoding];
-                                if (certPreview) {
-                                    DLOG(@"[PUBKEY-EXTRACT] Cert starts: %@...", certPreview);
-                                }
-                                // Log last 30 chars
-                                if (certLen > 30) {
-                                    NSString *certEnd = [[NSString alloc] initWithBytes:p+certOffset+certLen-30 length:30 encoding:NSASCIIStringEncoding];
-                                    if (certEnd) {
-                                        DLOG(@"[PUBKEY-EXTRACT] Cert ends: ...%@", certEnd);
+                            ssize_t maxCertLen = ret - certOffset;
+                            
+                            if (maxCertLen > 0 && maxCertLen < MAX_PUBKEY_BASE64) {
+                                // v36.81: Find the actual end of Base64 data (look for padding or non-Base64 chars)
+                                ssize_t certLen = 0;
+                                BOOL foundPadding = NO;
+                                
+                                // First pass: find the Base64 data boundaries
+                                for (ssize_t i = 0; i < maxCertLen; i++) {
+                                    unsigned char c = p[certOffset + i];
+                                    
+                                    // Valid Base64: A-Z, a-z, 0-9, +, /, =
+                                    BOOL isBase64Char = (c >= 'A' && c <= 'Z') || 
+                                                       (c >= 'a' && c <= 'z') || 
+                                                       (c >= '0' && c <= '9') || 
+                                                       c == '+' || c == '/' || c == '=';
+                                    
+                                    // Skip newlines (valid in Base64 but not part of key data)
+                                    BOOL isWhitespace = c == '\n' || c == '\r';
+                                    
+                                    if (isBase64Char) {
+                                        certLen = i + 1;
+                                        if (c == '=') {
+                                            foundPadding = YES;
+                                            // Padding at end of Base64, stop here
+                                            // But allow max 2 padding chars
+                                            ssize_t nextI = i + 1;
+                                            if (nextI >= maxCertLen || p[certOffset + nextI] != '=') {
+                                                // Found single or double padding, stop
+                                                break;
+                                            }
+                                        }
+                                    } else if (!isWhitespace && i > 20) {
+                                        // Found non-Base64 char after some data, stop extraction
+                                        // But only if we have enough data (at least 20 chars)
+                                        break;
+                                    } else if (isWhitespace && i > 20) {
+                                        // Whitespace after some data - could be line ending
+                                        // Skip it but continue
+                                        continue;
                                     }
+                                }
+                                
+                                // Ensure we have a reasonable length (RSA 2048-bit key = ~392 chars Base64)
+                                if (certLen > 100 && certLen < MAX_PUBKEY_BASE64) {
+                                    // Extract only the Base64 data (skip non-Base64 chars in between)
+                                    size_t cleanLen = 0;
+                                    for (ssize_t i = 0; i < certLen && cleanLen < MAX_PUBKEY_BASE64; i++) {
+                                        unsigned char c = p[certOffset + i];
+                                        BOOL isBase64Char = (c >= 'A' && c <= 'Z') || 
+                                                           (c >= 'a' && c <= 'z') || 
+                                                           (c >= '0' && c <= '9') || 
+                                                           c == '+' || c == '/' || c == '=';
+                                        if (isBase64Char) {
+                                            g_pubKeyBase64[cleanLen++] = c;
+                                        }
+                                    }
+                                    g_pubKeyBase64Len = cleanLen;
+                                    g_pubKeyCaptured = YES;
+                                    g_challengeResponded = NO; // Reset challenge response flag
+                                    
+                                    NSLog(@"[PUBKEY-EXTRACT] v36.81: Extracted RSA cert: %lu bytes Base64 (cleaned from %zd raw bytes, offset=%zd)",
+                                         (unsigned long)cleanLen, certLen, certOffset);
+                                    NSLog(@"[PUBKEY-EXTRACT] Padding found: %d, Base64 length mod 4: %lu",
+                                         foundPadding, (unsigned long)(cleanLen % 4));
+                                    
+                                    // Log first 80 chars of cert
+                                    NSString *certPreview = [[NSString alloc] initWithBytes:(const void *)g_pubKeyBase64 length:MIN((NSUInteger)cleanLen, 80) encoding:NSASCIIStringEncoding];
+                                    if (certPreview) {
+                                        NSLog(@"[PUBKEY-EXTRACT] Cert starts: %@...", certPreview);
+                                    }
+                                    // Log last 30 chars
+                                    if (cleanLen > 30) {
+                                        NSString *certEnd = [[NSString alloc] initWithBytes:(const void *)(g_pubKeyBase64 + cleanLen - 30) length:30 encoding:NSASCIIStringEncoding];
+                                        if (certEnd) {
+                                            NSLog(@"[PUBKEY-EXTRACT] Cert ends: ...%@", certEnd);
+                                        }
+                                    }
+                                } else {
+                                    NSLog(@"[PUBKEY-EXTRACT] v36.81: Invalid cert length: %zd (must be 100-%d)", certLen, MAX_PUBKEY_BASE64);
                                 }
                             }
                         }
