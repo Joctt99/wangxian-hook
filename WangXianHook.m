@@ -1028,6 +1028,10 @@ static uint8_t g_localHeartbeatAckBuf[MAX_LOCAL_HEARTBEAT_ACK];
 static ssize_t g_localHeartbeatAckLen = 0;
 static int g_localHeartbeatAckFd = -1;
 
+// v36.68: Global handshake state tracking (moved from hook_recv for cross-function access)
+static BOOL g_handshakeComplete = NO;
+static int g_heartbeatCount = 0;
+
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
 typedef struct {
@@ -3074,16 +3078,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 [detail appendFormat:@"  [UNKNOWN] Unknown command (cmd=0x%08X) - possible protocol data\n", rcmd];
             }
             
-            // v36.61: Track game server protocol flow
+            // v36.68: Track game server protocol flow (now using global g_handshakeComplete/g_heartbeatCount)
             // After handshake (0x80FFF494), client should send 0x000EE007 (device info)
             // If only heartbeats are being sent, the device info packet may be missing
-            static BOOL g_handshakeComplete = NO;
-            static int g_heartbeatCount = 0;
             
             if (rcmd == 0x80FFF494 || rcmd == 0x80FFF495) {
                 if (!g_handshakeComplete) {
                     g_handshakeComplete = YES;
                     g_heartbeatCount = 0;
+                    // v36.68: Clear local heartbeat ACK buffer when handshake completes
+                    g_localHeartbeatAckLen = 0;
+                    g_localHeartbeatAckFd = -1;
                     DLOG(@"[GAME-FLOW] Handshake complete (cmd=0x%08X). Client should now send 0x000EE007...", rcmd);
                     
                     // v36.66: FORCE send captured 0x000EE007 to game server fd
@@ -3131,6 +3136,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (g_handshakeComplete && ret == 0) {
                 g_handshakeComplete = NO;
                 g_heartbeatCount = 0;
+                // v36.68: Clear all leftover buffers on disconnect
+                g_stickyLeftoverLen = 0;
+                g_stickyLeftoverFd = -1;
+                g_localHeartbeatAckLen = 0;
+                g_localHeartbeatAckFd = -1;
+                g_deviceInfoSentToGame = NO;
                 DLOG(@"[GAME-FLOW] Connection closed, resetting handshake state");
             }
             
