@@ -1100,7 +1100,7 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     switch (requestCmd) {
         case 0x00FFF493:  // Login data request -> login success response
         case 0x000EE007:  // Device info request -> success response
-        case 0x000EE121:  // Auth request -> success response
+        case 0x000EE121: {  // Auth request -> success response
             respLen = 128;  // Standard response size
             if (respLen > bufSize) respLen = bufSize;
             memset(respBuf, 0, respLen);
@@ -1135,7 +1135,7 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             
             // byte[24-55]: token (32 bytes, Base64-like)
             const char *fakeToken = "AAAAQVBJLTQ3NzY2ODc5OTA=";
-            uint32_t tokenLen = strlen(fakeToken);
+            uint32_t tokenLen = (uint32_t)strlen(fakeToken);
             if (tokenLen > 32) tokenLen = 32;
             memcpy(respBuf + 24, fakeToken, tokenLen);
             
@@ -1148,10 +1148,11 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             respBuf[respLen - 2] = 0x03;
             respBuf[respLen - 1] = 0x04;
             break;
+        }
             
         case 0x00000015:  // Heartbeat request -> heartbeat response
         case 0x00FFFF01:  // Challenge response -> echo
-        case 0x00FFFF02:
+        case 0x00FFFF02: {
             respLen = 16;  // Minimal response
             memset(respBuf, 0, respLen);
             
@@ -1169,8 +1170,9 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             respBuf[12] = 0x00; respBuf[13] = 0x00;
             respBuf[14] = 0x00; respBuf[15] = 0x00;
             break;
+        }
             
-        case 0x0000F013:  // Server select request -> success response
+        case 0x0000F013: {  // Server select request -> success response
             respLen = 32;
             memset(respBuf, 0, respLen);
             
@@ -1201,8 +1203,9 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
                 respBuf[i] = 0x00;
             }
             break;
+        }
             
-        default:
+        default: {
             // Unknown command: generate generic success response
             respLen = 16;
             memset(respBuf, 0, respLen);
@@ -1218,6 +1221,7 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             respBuf[12] = 0x00; respBuf[13] = 0x00;
             respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
             break;
+        }
     }
     
     return respLen;
