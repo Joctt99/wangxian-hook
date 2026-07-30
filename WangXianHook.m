@@ -1,7 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.97 - Fix heartbeat detection + send/getsockopt hook + dlsym search
+ * WangXianHook v36.98: Fix FAKE-RESP state reset on server rotation
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.98 FIXES:
+ *   1. Reset g_fakeRespInjected on server rotation (tryNextServer)
+ *   2. Reset g_fakeRespInjected on new game server connection (hook_connect)
+ *   3. This ensures FAKE-RESP can be injected on each new connection attempt
  *
  * v36.97 FIXES:
  *   1. Hook send() for fake resp fd - simulate send success
@@ -2300,6 +2305,16 @@ static BOOL tryNextServer(void) {
     DLOG(@"[SERVER-ROTATE] Switching to server %d/%d: %s:12003 (forced port, parsed was %d, fail count=%d)", 
          g_currentServerIndex + 1, g_serverCount, g_gameServerIP, g_serverList[g_currentServerIndex].port, g_connectionFailCount);
     
+    // v36.98: Reset fake response state for new connection
+    // This ensures the new connection can trigger fake response injection again
+    g_fakeRespInjected = NO;
+    g_fakeRespFd = -1;
+    g_fakeRespSentCount = 0;
+    g_loginPacketsSent = NO;
+    g_handshakeComplete = NO;
+    g_heartbeatCount = 0;
+    DLOG(@"[SERVER-ROTATE] v36.98: Reset fake response state for new connection");
+    
     // Update stub data
     if (g_msiStubData) {
         [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
@@ -2448,6 +2463,18 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 g_gameConnectTime = [[NSDate date] timeIntervalSince1970];
                 DLOG(@"[GAME-CONNECT] Game server connected fd=%d target=%s:%d (confirmed working port)", 
                      sockfd, host, port);
+                
+                // v36.98: Reset fake response state on new game server connection
+                // This ensures the new connection can trigger fake response injection
+                if (g_fakeRespInjected) {
+                    DLOG(@"[GAME-CONNECT] v36.98: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
+                    g_fakeRespInjected = NO;
+                    g_fakeRespFd = -1;
+                    g_fakeRespSentCount = 0;
+                    g_loginPacketsSent = NO;
+                    g_handshakeComplete = NO;
+                    g_heartbeatCount = 0;
+                }
             }
             DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d origPort=%d elapsed=%.3fs",
                  sockfd, host, port, origPort, elapsed);
