@@ -1,7 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.100: Smart fake response system - generate responses dynamically
+ * WangXianHook v36.101: Fix infinite loop - one response per request, then EAGAIN
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.101 FIXES:
+ *   1. Fix infinite loop: fake response delivered only ONCE per client request
+ *   2. After delivery, return EAGAIN until client sends a new command
+ *   3. g_fakeRespDelivered flag cleared in send hook when new cmd is sent
  *
  * v36.100 FIXES:
  *   1. Smart fake response system - track client requests and generate responses
@@ -242,7 +247,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.100 loaded ===");
+        _log(@"=== WangXianHook v36.101 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1088,6 +1093,7 @@ static uint32_t g_forceHandshakeLen = 0;
 static uint32_t g_lastGameCmd = 0;
 static int g_lastGameCmdFd = -1;
 static BOOL g_fakeRespActive = NO;  // v36.100: TRUE when we're in fake response mode
+static BOOL g_fakeRespDelivered = NO;  // v36.101: TRUE after delivering a response, reset on new send
 
 // v36.100: Generate fake response based on request command
 // Returns response length, 0 if no response needed
@@ -2464,6 +2470,7 @@ static BOOL tryNextServer(void) {
     // This ensures the new connection can trigger fake response injection again
     g_fakeRespInjected = NO;
     g_fakeRespActive = NO;  // v36.100: Reset active fake response mode
+    g_fakeRespDelivered = NO;  // v36.101: Reset delivered flag
     g_fakeRespFd = -1;
     g_fakeRespSentCount = 0;
     g_loginPacketsSent = NO;
@@ -2471,7 +2478,7 @@ static BOOL tryNextServer(void) {
     g_heartbeatCount = 0;
     g_lastGameCmd = 0;  // v36.100: Reset last game command
     g_lastGameCmdFd = -1;
-    DLOG(@"[SERVER-ROTATE] v36.100: Reset fake response state for new connection");
+    DLOG(@"[SERVER-ROTATE] v36.101: Reset fake response state for new connection");
     
     // Update stub data
     if (g_msiStubData) {
@@ -2625,15 +2632,16 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 // v36.98: Reset fake response state on new game server connection
                 // This ensures the new connection can trigger fake response injection
                 if (g_fakeRespInjected || g_fakeRespActive) {
-                    DLOG(@"[GAME-CONNECT] v36.100: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
+                    DLOG(@"[GAME-CONNECT] v36.101: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
                     g_fakeRespInjected = NO;
-                    g_fakeRespActive = NO;  // v36.100: Reset active mode
+                    g_fakeRespActive = NO;
+                    g_fakeRespDelivered = NO;  // v36.101: Reset delivered flag
                     g_fakeRespFd = -1;
                     g_fakeRespSentCount = 0;
                     g_loginPacketsSent = NO;
                     g_handshakeComplete = NO;
                     g_heartbeatCount = 0;
-                    g_lastGameCmd = 0;  // v36.100: Reset last game command
+                    g_lastGameCmd = 0;
                     g_lastGameCmdFd = -1;
                 }
             }
@@ -2858,7 +2866,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (isGamePortOnly && trackCmd != 0 && trackCmd < 0x80000000) {
                     g_lastGameCmd = trackCmd;
                     g_lastGameCmdFd = fd;
-                    DLOG(@"[CMD-TRACK] v36.100: Tracked game server cmd=0x%08X fd=%d for fake response", trackCmd, fd);
+                    // v36.101: Clear delivered flag so next recv can return a new response
+                    if (g_fakeRespDelivered) {
+                        g_fakeRespDelivered = NO;
+                        DLOG(@"[CMD-TRACK] v36.101: New cmd=0x%08X fd=%d, cleared delivered flag for next response", trackCmd, fd);
+                    } else {
+                        DLOG(@"[CMD-TRACK] v36.101: Tracked game server cmd=0x%08X fd=%d", trackCmd, fd);
+                    }
                 }
                 
                 // Categorize the command
@@ -3624,9 +3638,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.100: Smart fake response system
-    // When in fake response mode, generate responses dynamically based on last game cmd
+    // v36.101: Smart fake response system - ONE response per request, then EAGAIN
+    // When in fake response mode, generate ONE response for the last game cmd
+    // Then return EAGAIN until client sends a new command (cleared in send hook)
     if (g_fakeRespActive && g_fakeRespFd == fd) {
+        // v36.101: If we already delivered a response, return EAGAIN
+        // Client must send a new command to get another response
+        if (g_fakeRespDelivered) {
+            errno = EAGAIN;
+            return -1;
+        }
+        
         // Generate fake response based on last tracked game server command
         uint8_t tempBuf[MAX_FAKE_RESP_BUF];
         uint32_t respLen = generateFakeResponse(g_lastGameCmd, tempBuf, sizeof(tempBuf));
@@ -3635,14 +3657,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // Return generated fake response
             memcpy(buf, tempBuf, respLen);
             g_fakeRespSentCount++;
-            DLOG(@"[FAKE-RESP] v36.100: Generated fake response for cmd=0x%08X len=%u (sent #%d)", 
+            g_fakeRespDelivered = YES;  // v36.101: Mark as delivered
+            DLOG(@"[FAKE-RESP] v36.101: Delivered response for cmd=0x%08X len=%u (total #%d), next recv=EAGAIN until new cmd", 
                  g_lastGameCmd, respLen, g_fakeRespSentCount);
             return (ssize_t)respLen;
         }
         
         // No response needed or buffer too small, return EAGAIN
-        DLOG(@"[FAKE-RESP] v36.100: No fake response for cmd=0x%08X (buf=%zu), returning EAGAIN", 
-             g_lastGameCmd, len);
         errno = EAGAIN;
         return -1;
     }
@@ -3650,9 +3671,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     // v36.96: Check for fake response state FIRST - before any real recv call
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
         if (g_fakeRespSentCount >= 1) {
-            // v36.100: Instead of returning EAGAIN, switch to active fake response mode
-            g_fakeRespActive = YES;
-            DLOG(@"[FAKE-RESP] v36.100: Switching to ACTIVE fake response mode for fd=%d", fd);
+            // v36.101: Switch to active mode but respect delivered flag
+            if (!g_fakeRespActive) {
+                g_fakeRespActive = YES;
+                DLOG(@"[FAKE-RESP] v36.101: Switching to ACTIVE fake response mode for fd=%d", fd);
+            }
+            // v36.101: If already delivered, return EAGAIN (handled by active mode check above)
+            if (g_fakeRespDelivered) {
+                errno = EAGAIN;
+                return -1;
+            }
             
             // Generate fake response based on last tracked game server command
             uint8_t tempBuf[MAX_FAKE_RESP_BUF];
@@ -3661,13 +3689,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (respLen > 0 && respLen <= len) {
                 memcpy(buf, tempBuf, respLen);
                 g_fakeRespSentCount++;
-                DLOG(@"[FAKE-RESP] v36.100: Generated fake response for cmd=0x%08X len=%u (sent #%d)", 
+                g_fakeRespDelivered = YES;  // v36.101: Mark as delivered
+                DLOG(@"[FAKE-RESP] v36.101: Delivered response for cmd=0x%08X len=%u (total #%d)", 
                      g_lastGameCmd, respLen, g_fakeRespSentCount);
                 return (ssize_t)respLen;
             }
             
             // No response needed, return EAGAIN
-            DLOG(@"[FAKE-RESP] v36.100: No fake response for cmd=0x%08X, returning EAGAIN", g_lastGameCmd);
             errno = EAGAIN;
             return -1;
         }
@@ -5533,7 +5561,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.100 - Fix fake response structure + version number update");
+    DLOG(@"[VERSION] WangXianHook v36.101 - Fix infinite loop: one response per request, then EAGAIN");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
