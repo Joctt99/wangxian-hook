@@ -1,36 +1,25 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.93 - OBSERVATION MODE + CLOSE BLOCK for game server
- * MODE: OBSERVATION - Let client handle protocol naturally, block close() to prevent disconnect
+ * WangXianHook v36.94 - Fake login success response injection + NetImpl::quitFromServer hook
+ * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
  *
- * v36.92 vs v36.93 CRITICAL FINDING:
- *   v36.92 PROBLEM:
- *     - Patch 0x80FFF495 status 1→0 to prevent quitFromServer
- *     - But client state machine SKIPS login packet dispatch when status=0
- *     - FORCE-SEND 0x000EE007 was IGNORED by server (needs encrypted version)
- *     - Client enters heartbeat loop only, never sends 0x00FFF493
+ * v36.93 DISCOVERY (TRUE ROOT CAUSE):
+ *   The SERVER is closing the connection, not the client!
+ *   Sequence: client sends 0x000EE007 + 0x00FFF493 → server closes connection
+ *   recv() returns 0 BEFORE the client calls quitFromServer
+ *   Close block is useless - server already terminated the connection
  *
- *   v36.93 SOLUTION (based on v36.89 observation):
- *     - v36.89 PROVED: When status NOT patched, client sends 0x000EE007 + 0x00FFF493
- *       BEFORE calling quitFromServer. The packets go out, but disconnect prevents
- *       server response processing.
- *     - v36.93: DON'T patch 0x80FFF495 status at all (let client send native login packets)
- *     - v36.93: HOOK close() to BLOCK game server fd closure (prevent quitFromServer disconnect)
- *     - This allows client to complete login flow naturally:
- *       status=1 → client sends encrypted 0x000EE007 + 0x00FFF493 → server processes
- *       → client calls quitFromServer → close() BLOCKED → connection stays alive
+ * v36.94 SOLUTION:
+ *   1. [FAKE-RESP] When recv() returns 0 (server closed) for game server fd,
+ *      inject fake 0x80FFF493 success response packet (status=0)
+ *      This tells client "login successful" and prevents disconnection
+ *   2. [NETIMPL-HOOK] Hook NetImpl::quitFromServer as no-op
+ *      Prevents client state machine from entering disconnected state
+ *      Uses dlsym + Objective-C runtime to find and hook the method
  *
- *   KEY INSIGHT from v36.89:
- *     Client's handler order for 0x80FFF495:
- *       1. Enqueue 0x000EE007 + 0x00FFF493 packets (triggered by status=1)
- *       2. Error check callback → quitFromServer (also triggered by status=1)
- *     By blocking close(), step 2 is prevented while step 1 packets already sent.
- *     Server will respond to 0x000EE007/0x00FFF493 before quit is fully processed.
- *
- * REMAINS from v36.91:
+ * REMAINS from v36.91-v36.93:
  *   DELETE: FORCE-HS mechanism (no fake 0x80FFF495 injection)
  *   DELETE: 0x00FFFF02 auto-respond (let client send native 0x00FFF495 703B)
- * REMAINS from v36.93:
  *   DELETE: FORCE-SEND logic (let client send native encrypted 0x000EE007)
  */
 /*
@@ -231,7 +220,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.93 loaded ===");
+        _log(@"=== WangXianHook v36.94 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1071,6 +1060,23 @@ static BOOL g_forceHandshakeComplete = NO;
 static int g_forceHandshakeFd = -1;
 static uint8_t g_forceHandshakeBuf[MAX_FORCE_HS_BUF];
 static uint32_t g_forceHandshakeLen = 0;
+
+// v36.94: Fake login success response injection
+// When server closes connection (recv returns 0) after client sends login packets,
+// inject fake 0x80FFF493 success response to prevent disconnection
+#define MAX_FAKE_RESP_BUF 256
+static BOOL g_fakeRespInjected = NO;
+static int g_fakeRespFd = -1;
+static uint8_t g_fakeRespBuf[MAX_FAKE_RESP_BUF];
+static uint32_t g_fakeRespLen = 0;
+static int g_fakeRespSentCount = 0;  // Track how many fake responses sent
+
+// v36.94: Hook for NetImpl::quitFromServer
+// This C++ method is called when heartbeat detects dead connection
+// Making it a no-op prevents client state machine from entering disconnected state
+typedef void (*NetImplQuitFunc)(void);
+static NetImplQuitFunc orig_NetImpl_quitFromServer = NULL;
+static BOOL g_quitFromServerHooked = NO;
 
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
@@ -3407,6 +3413,75 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             BOOL isGamePort = (port == 12003 || port == 58158 || 
                                (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
             if (isGamePort) {
+                // v36.94: Check if we need to inject fake login success response
+                // When server closes after receiving login packets, inject fake 0x80FFF493
+                if (g_handshakeComplete && g_challengeResponded && !g_fakeRespInjected) {
+                    // v36.94: Construct fake 0x80FFF493 success response packet
+                    // This tells client "login successful" and prevents disconnection
+                    uint32_t fakePktLen = 32;  // Minimal valid packet
+                    memset(g_fakeRespBuf, 0, fakePktLen);
+                    
+                    // Packet structure: [length(4)] [cmd(4)] [seq(4)] [status(4)] [payload(...)]
+                    // Length = 32 (0x00000020)
+                    g_fakeRespBuf[0] = 0x00; g_fakeRespBuf[1] = 0x00;
+                    g_fakeRespBuf[2] = 0x00; g_fakeRespBuf[3] = fakePktLen;
+                    
+                    // Command = 0x80FFF493 (login success response)
+                    g_fakeRespBuf[4] = 0x80; g_fakeRespBuf[5] = 0xFF;
+                    g_fakeRespBuf[6] = 0xF4; g_fakeRespBuf[7] = 0x93;
+                    
+                    // Sequence number
+                    g_fakeRespBuf[8] = 0x00; g_fakeRespBuf[9] = 0x00;
+                    g_fakeRespBuf[10] = 0x00; g_fakeRespBuf[11] = 0x01;
+                    
+                    // Status = 0 (success!)
+                    g_fakeRespBuf[12] = 0x00; g_fakeRespBuf[13] = 0x00;
+                    g_fakeRespBuf[14] = 0x00; g_fakeRespBuf[15] = 0x00;
+                    
+                    // Some dummy payload data
+                    g_fakeRespBuf[16] = 0x00; g_fakeRespBuf[17] = 0x00;
+                    g_fakeRespBuf[18] = 0x00; g_fakeRespBuf[19] = 0x01;
+                    g_fakeRespBuf[20] = 0x00; g_fakeRespBuf[21] = 0x00;
+                    g_fakeRespBuf[22] = 0x00; g_fakeRespBuf[23] = 0x00;
+                    g_fakeRespBuf[24] = 0x00; g_fakeRespBuf[25] = 0x00;
+                    g_fakeRespBuf[26] = 0x00; g_fakeRespBuf[27] = 0x00;
+                    g_fakeRespBuf[28] = 0x00; g_fakeRespBuf[29] = 0x00;
+                    g_fakeRespBuf[30] = 0x00; g_fakeRespBuf[31] = 0x00;
+                    
+                    g_fakeRespInjected = YES;
+                    g_fakeRespFd = fd;
+                    g_fakeRespLen = fakePktLen;
+                    g_fakeRespSentCount = 0;
+                    
+                    // Copy fake packet to user buffer
+                    if (len >= fakePktLen && buf) {
+                        memcpy(buf, g_fakeRespBuf, fakePktLen);
+                        DLOG(@"[FAKE-RESP] v36.94: Injected fake 0x80FFF493 SUCCESS response (%u bytes) to fd=%d", fakePktLen, fd);
+                        DLOG(@"[FAKE-RESP] v36.94: Server closed connection, faking login success to prevent disconnect");
+                        
+                        // Log the fake packet
+                        NSMutableString *fakeHex = [NSMutableString stringWithCapacity:fakePktLen * 3];
+                        for (uint32_t i = 0; i < fakePktLen; i++) {
+                            [fakeHex appendFormat:@"%02X ", g_fakeRespBuf[i]];
+                        }
+                        DLOG(@"[FAKE-RESP] v36.94: Fake packet hex: %@", fakeHex);
+                        
+                        return (ssize_t)fakePktLen;
+                    }
+                }
+                
+                // v36.94: If fake response already injected and consumed, return error for subsequent recv
+                if (g_fakeRespInjected && g_fakeRespFd == fd) {
+                    g_fakeRespSentCount++;
+                    if (g_fakeRespSentCount > 1) {
+                        DLOG(@"[FAKE-RESP] v36.94: Fake response consumed, returning EAGAIN for fd=%d", fd);
+                        errno = EAGAIN;
+                        g_fakeRespInjected = NO;
+                        return -1;
+                    }
+                }
+                
+                // v36.61: Original rotation logic
                 DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
                 @try {
                     BOOL rotated = tryNextServer();
@@ -5073,7 +5148,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.93 - OBSERVATION MODE + CLOSE BLOCK for game server (no status patch, block disconnect)");
+    DLOG(@"[VERSION] WangXianHook v36.94 - Fake login success injection + NetImpl::quitFromServer hook (prevent disconnect)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -5831,6 +5906,125 @@ static void installAllHooks(void) {
             }
         } @catch (NSException *e) {
             DLOG(@"[CRYPTO-CLASS] Exception: %@", e);
+        }
+    });
+    
+    // === v36.94: Hook NetImpl::quitFromServer to prevent client disconnect ===
+    // This C++ method is called when heartbeat detects dead connection
+    // Making it a no-op prevents client state machine from entering disconnected state
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            // v36.94: Find and hook NetImpl::quitFromServer
+            // Mangled name: _ZN7NetImpl14quitFromServerEv
+            const char *mangledName = "_ZN7NetImpl14quitFromServerEv";
+            void *funcPtr = dlsym(RTLD_DEFAULT, mangledName);
+            
+            if (!funcPtr) {
+                // Try searching in all image headers
+                DLOG(@"[NETIMPL-HOOK] v36.94: Searching for NetImpl::quitFromServer...");
+                int imageCount = _dyld_image_count();
+                for (int i = 0; i < imageCount; i++) {
+                    const char *imageName = _dyld_get_image_name(i);
+                    if (imageName && strstr(imageName, "wangxian")) {
+                        DLOG(@"[NETIMPL-HOOK] v36.94: Checking image: %s", imageName);
+                        void *imageHandle = _dyld_get_image_header(i);
+                        if (imageHandle) {
+                            funcPtr = dlsym(imageHandle, mangledName);
+                            if (funcPtr) {
+                                DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl::quitFromServer in image %s at %p", imageName, funcPtr);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (!funcPtr) {
+                // v36.94: Alternative - try finding NetImpl class and hooking its method
+                DLOG(@"[NETIMPL-HOOK] v36.94: Trying Objective-C method lookup for NetImpl...");
+                Class netImplCls = NSClassFromString(@"NetImpl");
+                if (netImplCls) {
+                    DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl class");
+                    
+                    unsigned int mcount = 0;
+                    Method *methods = class_copyMethodList(netImplCls, &mcount);
+                    for (unsigned int i = 0; i < mcount; i++) {
+                        SEL sel = method_getName(methods[i]);
+                        NSString *selName = NSStringFromSelector(sel);
+                        DLOG(@"[NETIMPL-HOOK] v36.94: NetImpl method: -[%@ %@]", NSStringFromClass(netImplCls), selName);
+                        
+                        if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"] ||
+                            [selName containsString:@"disconnect"] || [selName containsString:@"closeServer"]) {
+                            DLOG(@"[NETIMPL-HOOK] v36.94: Hooking method: %@", selName);
+                            IMP noopImpl = imp_implementationWithBlock(^(void) {
+                                DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED NetImpl::quitFromServer (no-op)");
+                            });
+                            method_setImplementation(methods[i], noopImpl);
+                            g_quitFromServerHooked = YES;
+                            DLOG(@"[NETIMPL-HOOK] v36.94: Successfully hooked %@ as no-op!", selName);
+                        }
+                    }
+                    if (methods) free(methods);
+                } else {
+                    DLOG(@"[NETIMPL-HOOK] v36.94: NetImpl class NOT found");
+                }
+                
+                // Also try other common class names
+                NSArray *clsNames = @[@"NetManager", @"NetworkManager", @"GameNetwork", @"GameNet", @"NetClient"];
+                for (NSString *clsName in clsNames) {
+                    Class cls = NSClassFromString(clsName);
+                    if (cls) {
+                        unsigned int mcount2 = 0;
+                        Method *methods2 = class_copyMethodList(cls, &mcount2);
+                        for (unsigned int i = 0; i < mcount2; i++) {
+                            SEL sel = method_getName(methods2[i]);
+                            NSString *selName = NSStringFromSelector(sel);
+                            if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"] ||
+                                [selName containsString:@"disconnect"]) {
+                                DLOG(@"[NETIMPL-HOOK] v36.94: Found %@.%@ - hooking!", clsName, selName);
+                                IMP noopImpl = imp_implementationWithBlock(^(void) {
+                                    DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED %@.%@ (no-op)", clsName, selName);
+                                });
+                                method_setImplementation(methods2[i], noopImpl);
+                                g_quitFromServerHooked = YES;
+                                DLOG(@"[NETIMPL-HOOK] v36.94: Successfully hooked %@.%@!", clsName, selName);
+                            }
+                        }
+                        if (methods2) free(methods2);
+                    }
+                }
+            } else {
+                // v36.94: Direct C++ function found
+                DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl::quitFromServer at %p", funcPtr);
+                
+                // Try to find and hook the Objective-C wrapper
+                Class netImplCls = NSClassFromString(@"NetImpl");
+                if (netImplCls) {
+                    unsigned int mcount = 0;
+                    Method *methods = class_copyMethodList(netImplCls, &mcount);
+                    for (unsigned int i = 0; i < mcount; i++) {
+                        SEL sel = method_getName(methods[i]);
+                        NSString *selName = NSStringFromSelector(sel);
+                        if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"]) {
+                            DLOG(@"[NETIMPL-HOOK] v36.94: Hooking Objective-C method: %@", selName);
+                            IMP noopImpl = imp_implementationWithBlock(^(void) {
+                                DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED NetImpl::quitFromServer (no-op)");
+                            });
+                            method_setImplementation(methods[i], noopImpl);
+                            g_quitFromServerHooked = YES;
+                        }
+                    }
+                    if (methods) free(methods);
+                }
+            }
+            
+            if (!g_quitFromServerHooked) {
+                DLOG(@"[NETIMPL-HOOK] v36.94: WARNING - Could not hook NetImpl::quitFromServer");
+                DLOG(@"[NETIMPL-HOOK] v36.94: Will rely on fake response injection in recv() hook");
+            }
+            
+        } @catch (NSException *e) {
+            DLOG(@"[NETIMPL-HOOK] v36.94: Exception during hooking: %@", e);
         }
     });
 }
