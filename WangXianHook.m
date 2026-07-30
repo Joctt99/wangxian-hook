@@ -1,7 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.104: Hook poll/select to prevent heartbeat detecting dead connection
+ * WangXianHook v36.105: Reset delivered flag on every send, add response cap + cmd tracking
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.105 FIXES:
+ *   1. Reset g_fakeRespDelivered in FAKE-SEND path - every send gets a response
+ *   2. Add g_lastRespCmd tracking to prevent infinite loop on same cmd
+ *   3. Add g_respCount cap (200) to prevent any infinite loop
+ *   4. Fix stuck at "正在进入..." - now client can proceed with responses
  *
  * v36.104 FIXES:
  *   1. Disable dangerous inline patch (caused crash on iOS)
@@ -286,7 +292,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.104 loaded ===");
+        _log(@"=== WangXianHook v36.105 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1133,6 +1139,8 @@ static uint32_t g_lastGameCmd = 0;
 static int g_lastGameCmdFd = -1;
 static BOOL g_fakeRespActive = NO;  // v36.100: TRUE when we're in fake response mode
 static BOOL g_fakeRespDelivered = NO;  // v36.101: TRUE after delivering a response, reset on new send
+static uint32_t g_lastRespCmd = 0;     // v36.105: Last cmd we responded to
+static int g_respCount = 0;            // v36.105: Total responses sent
 
 // v36.103: Inline patch system - patch C++ functions to ret using backtrace addresses
 static BOOL g_quitFromServerPatched = NO;
@@ -2641,6 +2649,8 @@ static BOOL tryNextServer(void) {
     g_fakeRespDelivered = NO;  // v36.101: Reset delivered flag
     g_fakeRespFd = -1;
     g_fakeRespSentCount = 0;
+    g_lastRespCmd = 0;  // v36.105: Reset last response cmd
+    g_respCount = 0;  // v36.105: Reset response counter
     g_loginPacketsSent = NO;
     g_handshakeComplete = NO;
     g_heartbeatCount = 0;
@@ -2934,10 +2944,12 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     
-    // v36.97: If this is the fake response fd, pretend send succeeds
+    // v36.105: If this is the fake response fd, pretend send succeeds
     // This prevents heartbeat from detecting the dead connection via send()
+    // v36.105: Also reset delivered flag so next recv gets a response
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
-        DLOG(@"[FAKE-SEND] v36.97: Simulating send success for fd=%d len=%zu (fake resp fd)", fd, len);
+        DLOG(@"[FAKE-SEND] v36.105: Simulating send success for fd=%d len=%zu (fake resp fd, reset delivered)", fd, len);
+        g_fakeRespDelivered = NO;  // v36.105: Allow next recv to get fake response
         return (ssize_t)len;
     }
     
@@ -3883,13 +3895,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.101: Smart fake response system - ONE response per request, then EAGAIN
-    // When in fake response mode, generate ONE response for the last game cmd
-    // Then return EAGAIN until client sends a new command (cleared in send hook)
+    // v36.105: Smart fake response system - response with loop protection
+    // Every send resets delivered flag, so every new send gets a response
+    // But track duplicate cmds to prevent infinite loop
     if (g_fakeRespActive && g_fakeRespFd == fd) {
-        // v36.101: If we already delivered a response, return EAGAIN
-        // Client must send a new command to get another response
-        if (g_fakeRespDelivered) {
+        // v36.105: If we already delivered a response AND cmd is same, return EAGAIN
+        // This prevents infinite loop when client keeps sending same unhandled cmd
+        if (g_fakeRespDelivered && g_lastGameCmd == g_lastRespCmd) {
+            errno = EAGAIN;
+            return -1;
+        }
+        
+        // v36.105: Cap total responses to prevent infinite loop
+        if (g_respCount >= 200) {
+            DLOG(@"[FAKE-RESP] v36.105: Response cap reached (200), returning EAGAIN");
             errno = EAGAIN;
             return -1;
         }
@@ -3903,8 +3922,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             memcpy(buf, tempBuf, respLen);
             g_fakeRespSentCount++;
             g_fakeRespDelivered = YES;  // v36.101: Mark as delivered
-            DLOG(@"[FAKE-RESP] v36.101: Delivered response for cmd=0x%08X len=%u (total #%d), next recv=EAGAIN until new cmd", 
-                 g_lastGameCmd, respLen, g_fakeRespSentCount);
+            g_lastRespCmd = g_lastGameCmd;  // v36.105: Track which cmd we responded to
+            g_respCount++;  // v36.105: Increment response counter
+            DLOG(@"[FAKE-RESP] v36.105: Delivered response for cmd=0x%08X len=%u (total #%d, respCount=%d)", 
+                 g_lastGameCmd, respLen, g_fakeRespSentCount, g_respCount);
             return (ssize_t)respLen;
         }
         
@@ -3919,10 +3940,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // v36.101: Switch to active mode but respect delivered flag
             if (!g_fakeRespActive) {
                 g_fakeRespActive = YES;
-                DLOG(@"[FAKE-RESP] v36.101: Switching to ACTIVE fake response mode for fd=%d", fd);
+                DLOG(@"[FAKE-RESP] v36.105: Switching to ACTIVE fake response mode for fd=%d", fd);
             }
-            // v36.101: If already delivered, return EAGAIN (handled by active mode check above)
-            if (g_fakeRespDelivered) {
+            // v36.105: If already delivered AND same cmd, return EAGAIN
+            if (g_fakeRespDelivered && g_lastGameCmd == g_lastRespCmd) {
+                errno = EAGAIN;
+                return -1;
+            }
+            if (g_respCount >= 200) {
                 errno = EAGAIN;
                 return -1;
             }
@@ -3935,8 +3960,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 memcpy(buf, tempBuf, respLen);
                 g_fakeRespSentCount++;
                 g_fakeRespDelivered = YES;  // v36.101: Mark as delivered
-                DLOG(@"[FAKE-RESP] v36.101: Delivered response for cmd=0x%08X len=%u (total #%d)", 
-                     g_lastGameCmd, respLen, g_fakeRespSentCount);
+                g_lastRespCmd = g_lastGameCmd;  // v36.105: Track which cmd we responded to
+                g_respCount++;  // v36.105: Increment response counter
+                DLOG(@"[FAKE-RESP] v36.105: Delivered response for cmd=0x%08X len=%u (total #%d, respCount=%d)", 
+                     g_lastGameCmd, respLen, g_fakeRespSentCount, g_respCount);
                 return (ssize_t)respLen;
             }
             
@@ -4095,6 +4122,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     g_fakeRespSentCount = 1;  // v36.96: Mark as already sent (we return it immediately)
                     g_fakeRespActive = YES;  // v36.100: Switch to ACTIVE mode for subsequent responses
                     g_fakeRespDelivered = YES;  // v36.103: Mark as delivered to prevent double response
+                    g_lastRespCmd = g_lastGameCmd;  // v36.105: Track initial response cmd
+                    g_respCount = 1;  // v36.105: Count initial response
                     
                     // Copy fake packet to user buffer and return it NOW
                     // Subsequent recv calls will return EAGAIN via the check at hook_recv start
@@ -5811,7 +5840,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.104 - Hook poll/select to prevent heartbeat detecting dead connection");
+    DLOG(@"[VERSION] WangXianHook v36.105 - Reset delivered flag on every send, add response cap + cmd tracking");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
