@@ -1,7 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.99: NEVER return 0 for game server fd - return EAGAIN instead
+ * WangXianHook v36.100: Smart fake response system - generate responses dynamically
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.100 FIXES:
+ *   1. Smart fake response system - track client requests and generate responses
+ *   2. Active fake response mode - continuously generate responses instead of EAGAIN
+ *   3. Dynamic response generation based on last game server command
+ *   4. Updated version numbers throughout the codebase
  *
  * v36.99 FIXES:
  *   1. ALWAYS return EAGAIN for game server fd when orig_recv returns 0
@@ -236,7 +242,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.96 loaded ===");
+        _log(@"=== WangXianHook v36.100 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1076,6 +1082,146 @@ static BOOL g_forceHandshakeComplete = NO;
 static int g_forceHandshakeFd = -1;
 static uint8_t g_forceHandshakeBuf[MAX_FORCE_HS_BUF];
 static uint32_t g_forceHandshakeLen = 0;
+
+// v36.100: Smart fake response system - track client requests and generate responses
+// Track last game server command for generating appropriate fake responses
+static uint32_t g_lastGameCmd = 0;
+static int g_lastGameCmdFd = -1;
+static BOOL g_fakeRespActive = NO;  // v36.100: TRUE when we're in fake response mode
+
+// v36.100: Generate fake response based on request command
+// Returns response length, 0 if no response needed
+static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint32_t bufSize) {
+    if (!respBuf || bufSize < 16) return 0;
+    
+    uint32_t respCmd = requestCmd | 0x80000000;  // Response cmd = request cmd | 0x80000000
+    uint32_t respLen = 0;
+    
+    switch (requestCmd) {
+        case 0x00FFF493:  // Login data request -> login success response
+        case 0x000EE007:  // Device info request -> success response
+        case 0x000EE121:  // Auth request -> success response
+            respLen = 128;  // Standard response size
+            if (respLen > bufSize) respLen = bufSize;
+            memset(respBuf, 0, respLen);
+            
+            // Header: [length(4)] [cmd(4)] [seq(4)] [status(4)]
+            respBuf[0] = (respLen >> 24) & 0xFF;
+            respBuf[1] = (respLen >> 16) & 0xFF;
+            respBuf[2] = (respLen >> 8) & 0xFF;
+            respBuf[3] = respLen & 0xFF;
+            
+            respBuf[4] = (respCmd >> 24) & 0xFF;
+            respBuf[5] = (respCmd >> 16) & 0xFF;
+            respBuf[6] = (respCmd >> 8) & 0xFF;
+            respBuf[7] = respCmd & 0xFF;
+            
+            // Sequence number
+            respBuf[8] = 0x00; respBuf[9] = 0x00;
+            respBuf[10] = 0x00; respBuf[11] = 0x01;
+            
+            // Status = 0 (success)
+            respBuf[12] = 0x00; respBuf[13] = 0x00;
+            respBuf[14] = 0x00; respBuf[15] = 0x00;
+            
+            // Payload: generate realistic-looking data
+            // byte[16-19]: server timestamp
+            respBuf[16] = 0x00; respBuf[17] = 0x00;
+            respBuf[18] = 0x00; respBuf[19] = 0x01;
+            
+            // byte[20-23]: user ID
+            respBuf[20] = 0x00; respBuf[21] = 0x00;
+            respBuf[22] = 0x00; respBuf[23] = 0x01;
+            
+            // byte[24-55]: token (32 bytes, Base64-like)
+            const char *fakeToken = "AAAAQVBJLTQ3NzY2ODc5OTA=";
+            uint32_t tokenLen = strlen(fakeToken);
+            if (tokenLen > 32) tokenLen = 32;
+            memcpy(respBuf + 24, fakeToken, tokenLen);
+            
+            // Fill remaining with alternating pattern
+            for (uint32_t i = 56; i < respLen; i++) {
+                respBuf[i] = (i % 2 == 0) ? 0x00 : 0x01;
+            }
+            respBuf[respLen - 4] = 0x01;
+            respBuf[respLen - 3] = 0x02;
+            respBuf[respLen - 2] = 0x03;
+            respBuf[respLen - 1] = 0x04;
+            break;
+            
+        case 0x00000015:  // Heartbeat request -> heartbeat response
+        case 0x00FFFF01:  // Challenge response -> echo
+        case 0x00FFFF02:
+            respLen = 16;  // Minimal response
+            memset(respBuf, 0, respLen);
+            
+            respBuf[0] = 0x00; respBuf[1] = 0x00;
+            respBuf[2] = 0x00; respBuf[3] = respLen;
+            
+            respBuf[4] = (respCmd >> 24) & 0xFF;
+            respBuf[5] = (respCmd >> 16) & 0xFF;
+            respBuf[6] = (respCmd >> 8) & 0xFF;
+            respBuf[7] = respCmd & 0xFF;
+            
+            respBuf[8] = 0x00; respBuf[9] = 0x00;
+            respBuf[10] = 0x00; respBuf[11] = 0x01;
+            
+            respBuf[12] = 0x00; respBuf[13] = 0x00;
+            respBuf[14] = 0x00; respBuf[15] = 0x00;
+            break;
+            
+        case 0x0000F013:  // Server select request -> success response
+            respLen = 32;
+            memset(respBuf, 0, respLen);
+            
+            respBuf[0] = 0x00; respBuf[1] = 0x00;
+            respBuf[2] = 0x00; respBuf[3] = respLen;
+            
+            respBuf[4] = (respCmd >> 24) & 0xFF;
+            respBuf[5] = (respCmd >> 16) & 0xFF;
+            respBuf[6] = (respCmd >> 8) & 0xFF;
+            respBuf[7] = respCmd & 0xFF;
+            
+            respBuf[12] = 0x00; respBuf[13] = 0x00;
+            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
+            
+            // Server list data (minimal)
+            respBuf[16] = 0x00; respBuf[17] = 0x00;
+            respBuf[18] = 0x00; respBuf[19] = 0x01;  // 1 server
+            
+            // IP: 127.0.0.1
+            respBuf[20] = 127; respBuf[21] = 0;
+            respBuf[22] = 0; respBuf[23] = 1;
+            
+            // Port: 12003
+            respBuf[24] = 0x2EE9 >> 8; respBuf[25] = 0x2EE9 & 0xFF;
+            respBuf[26] = 0x00; respBuf[27] = 0x00;
+            
+            for (uint32_t i = 28; i < respLen; i++) {
+                respBuf[i] = 0x00;
+            }
+            break;
+            
+        default:
+            // Unknown command: generate generic success response
+            respLen = 16;
+            memset(respBuf, 0, respLen);
+            
+            respBuf[0] = 0x00; respBuf[1] = 0x00;
+            respBuf[2] = 0x00; respBuf[3] = respLen;
+            
+            respBuf[4] = (respCmd >> 24) & 0xFF;
+            respBuf[5] = (respCmd >> 16) & 0xFF;
+            respBuf[6] = (respCmd >> 8) & 0xFF;
+            respBuf[7] = respCmd & 0xFF;
+            
+            respBuf[12] = 0x00; respBuf[13] = 0x00;
+            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
+            break;
+    }
+    
+    return respLen;
+}
 
 // v36.95: Track when client sends login packets to game server
 // This replaces g_challengeResponded for fake response injection trigger
@@ -2313,12 +2459,15 @@ static BOOL tryNextServer(void) {
     // v36.98: Reset fake response state for new connection
     // This ensures the new connection can trigger fake response injection again
     g_fakeRespInjected = NO;
+    g_fakeRespActive = NO;  // v36.100: Reset active fake response mode
     g_fakeRespFd = -1;
     g_fakeRespSentCount = 0;
     g_loginPacketsSent = NO;
     g_handshakeComplete = NO;
     g_heartbeatCount = 0;
-    DLOG(@"[SERVER-ROTATE] v36.98: Reset fake response state for new connection");
+    g_lastGameCmd = 0;  // v36.100: Reset last game command
+    g_lastGameCmdFd = -1;
+    DLOG(@"[SERVER-ROTATE] v36.100: Reset fake response state for new connection");
     
     // Update stub data
     if (g_msiStubData) {
@@ -2471,14 +2620,17 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 
                 // v36.98: Reset fake response state on new game server connection
                 // This ensures the new connection can trigger fake response injection
-                if (g_fakeRespInjected) {
-                    DLOG(@"[GAME-CONNECT] v36.98: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
+                if (g_fakeRespInjected || g_fakeRespActive) {
+                    DLOG(@"[GAME-CONNECT] v36.100: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
                     g_fakeRespInjected = NO;
+                    g_fakeRespActive = NO;  // v36.100: Reset active mode
                     g_fakeRespFd = -1;
                     g_fakeRespSentCount = 0;
                     g_loginPacketsSent = NO;
                     g_handshakeComplete = NO;
                     g_heartbeatCount = 0;
+                    g_lastGameCmd = 0;  // v36.100: Reset last game command
+                    g_lastGameCmdFd = -1;
                 }
             }
             DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d origPort=%d elapsed=%.3fs",
@@ -2696,6 +2848,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         g_loginPacketsSent = YES;
                         DLOG(@"[LOGIN-PACKETS] v36.95: Client sending login packets to game server (cmd=0x%08X port=%d) - FAKE-RESP armed", trackCmd, port);
                     }
+                }
+                
+                // v36.100: Track game server commands for smart fake response generation
+                if (isGamePortOnly && trackCmd != 0 && trackCmd < 0x80000000) {
+                    g_lastGameCmd = trackCmd;
+                    g_lastGameCmdFd = fd;
+                    DLOG(@"[CMD-TRACK] v36.100: Tracked game server cmd=0x%08X fd=%d for fake response", trackCmd, fd);
                 }
                 
                 // Categorize the command
@@ -3461,13 +3620,50 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
+    // v36.100: Smart fake response system
+    // When in fake response mode, generate responses dynamically based on last game cmd
+    if (g_fakeRespActive && g_fakeRespFd == fd) {
+        // Generate fake response based on last tracked game server command
+        uint8_t tempBuf[MAX_FAKE_RESP_BUF];
+        uint32_t respLen = generateFakeResponse(g_lastGameCmd, tempBuf, sizeof(tempBuf));
+        
+        if (respLen > 0 && respLen <= len) {
+            // Return generated fake response
+            memcpy(buf, tempBuf, respLen);
+            g_fakeRespSentCount++;
+            DLOG(@"[FAKE-RESP] v36.100: Generated fake response for cmd=0x%08X len=%u (sent #%d)", 
+                 g_lastGameCmd, respLen, g_fakeRespSentCount);
+            return (ssize_t)respLen;
+        }
+        
+        // No response needed or buffer too small, return EAGAIN
+        DLOG(@"[FAKE-RESP] v36.100: No fake response for cmd=0x%08X (buf=%zu), returning EAGAIN", 
+             g_lastGameCmd, len);
+        errno = EAGAIN;
+        return -1;
+    }
+    
     // v36.96: Check for fake response state FIRST - before any real recv call
-    // After server closes and we inject fake response, ALL subsequent recv calls on this fd
-    // must return EAGAIN without ever calling the real recv (which returns 0)
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
         if (g_fakeRespSentCount >= 1) {
-            // Already sent fake response, return EAGAIN for all subsequent calls
-            DLOG(@"[FAKE-RESP] v36.96: Fake response already sent, returning EAGAIN for fd=%d (count=%d)", fd, g_fakeRespSentCount);
+            // v36.100: Instead of returning EAGAIN, switch to active fake response mode
+            g_fakeRespActive = YES;
+            DLOG(@"[FAKE-RESP] v36.100: Switching to ACTIVE fake response mode for fd=%d", fd);
+            
+            // Generate fake response based on last tracked game server command
+            uint8_t tempBuf[MAX_FAKE_RESP_BUF];
+            uint32_t respLen = generateFakeResponse(g_lastGameCmd, tempBuf, sizeof(tempBuf));
+            
+            if (respLen > 0 && respLen <= len) {
+                memcpy(buf, tempBuf, respLen);
+                g_fakeRespSentCount++;
+                DLOG(@"[FAKE-RESP] v36.100: Generated fake response for cmd=0x%08X len=%u (sent #%d)", 
+                     g_lastGameCmd, respLen, g_fakeRespSentCount);
+                return (ssize_t)respLen;
+            }
+            
+            // No response needed, return EAGAIN
+            DLOG(@"[FAKE-RESP] v36.100: No fake response for cmd=0x%08X, returning EAGAIN", g_lastGameCmd);
             errno = EAGAIN;
             return -1;
         }
@@ -3620,6 +3816,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     g_fakeRespFd = fd;
                     g_fakeRespLen = fakePktLen;
                     g_fakeRespSentCount = 1;  // v36.96: Mark as already sent (we return it immediately)
+                    g_fakeRespActive = YES;  // v36.100: Switch to ACTIVE mode for subsequent responses
                     
                     // Copy fake packet to user buffer and return it NOW
                     // Subsequent recv calls will return EAGAIN via the check at hook_recv start
@@ -5332,7 +5529,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.96 - Fix FAKE-RESP EAGAIN logic + realistic 128B response + enhanced NetImpl/SocketClient hook");
+    DLOG(@"[VERSION] WangXianHook v36.100 - Fix fake response structure + version number update");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
