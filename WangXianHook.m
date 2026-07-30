@@ -1,13 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.115: Fix SIGSEGV by using 200-byte padded responses for all fake responses
+ * WangXianHook v36.116: Fix UUID injection applied to actual send, patch 0x80FFF495 status=1→0
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.115 FIXES:
- *   1. ALL fake responses now use 200-byte zero-padded format (was 16 bytes)
- *   2. Fixes SIGSEGV in handle_CHOOSE_WOOD_BOX_RES which reads payload beyond 16-byte header
- *   3. 0x80FFF495 response includes 0x88 format flag at byte 13 (from v36.88 FORCE-HS-PREP)
- *   4. Simplified generateFakeResponse - all commands use same safe 200-byte format
+ * v36.116 FIXES (CRITICAL):
+ *   1. UUID-INJECT now applies DIRECTLY to sendBuf/sendLen - server now receives 217 bytes with UUID
+ *      (Previous bug: injected to global buffers but NOT used in send(), server got 179B without UUID)
+ *   2. 0x80FFF495 status=1 now patched to 0 (handshake/auth failed → success)
+ *      (Previous observation mode left status=1, causing server rejection and close)
+ *   3. CMD-QUEUE now uses actualSendLen (after injection) instead of original len
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -363,7 +364,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.115 loaded ===");
+        _log(@"=== WangXianHook v36.116 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -542,7 +543,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.115 诊断面板";
+            lbl.text = @"WXHook v36.116 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -3147,6 +3148,23 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // Fallback: use original if injection fails
                         DLOG(@"[DEVICE-INFO] ENHANCED FAILED, will use original %zd bytes", len);
                     }
+                    
+                    // v36.116: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
+                    // Previous bug: UUID was injected to global buffers but NOT applied to the
+                    // actual send() call, so server received 179 bytes without UUID and rejected.
+                    if (enhancedLen > 0) {
+                        size_t newLen = (size_t)enhancedLen;
+                        uint8_t *newBuf = (uint8_t *)malloc(newLen);
+                        if (newBuf) {
+                            memcpy(newBuf, g_deviceInfoEnhanced, newLen);
+                            // Update sendBuf and sendLen BEFORE orig_send() is called
+                            if (sendBuf != buf) free(sendBuf);
+                            sendBuf = newBuf;
+                            sendLen = newLen;
+                            DLOG(@"[UUID-INJECT] v36.116: APPLIED to send: %zu -> %zu bytes (actually sent!)",
+                                 len, newLen);
+                        }
+                    }
                 }
             } @catch (NSException *e) {
                 // Silently ignore any errors in packet analysis
@@ -3218,10 +3236,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                       ((uint32_t)tp[10] << 8)  | (uint32_t)tp[11];
                     }
                     g_lastSeqNum = trackSeqNum;
-                    // v36.107: Add to command queue with sequence number
-                    enqueueGameCmd(trackCmd, fd, (uint32_t)len, trackSeqNum);
-                    DLOG(@"[CMD-TRACK] v36.107: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (queue=%d)", 
-                         trackCmd, trackSeqNum, fd, (uint32_t)len, g_cmdQueueCount);
+                    // v36.116: Use actual sendLen (after UUID injection) instead of original len
+                    // For 0x000EE007, sendBuf was replaced with enhanced 217 bytes (UUID injected)
+                    uint32_t actualSendLen = (uint32_t)sendLen;
+                    if (trackCmd == 0x000EE007 && actualSendLen == (uint32_t)len) {
+                        // If injection was not applied but g_deviceInfoEnhancedReady exists, use that
+                        if (g_deviceInfoEnhancedReady && g_deviceInfoEnhancedLen > 0) {
+                            actualSendLen = (uint32_t)g_deviceInfoEnhancedLen;
+                        }
+                    }
+                    // v36.107: Add to command queue with sequence number and actual send length
+                    enqueueGameCmd(trackCmd, fd, actualSendLen, trackSeqNum);
+                    DLOG(@"[CMD-TRACK] v36.116: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (origLen=%zu queue=%d)", 
+                         trackCmd, trackSeqNum, fd, actualSendLen, len, g_cmdQueueCount);
                     // v36.107: Clear delivered flag so next recv can return a response
                     g_fakeRespDelivered = NO;
                 }
@@ -4732,14 +4759,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.93: OBSERVATION MODE - Do NOT patch status
-                        // Let client handle status=1 naturally:
-                        //   status=1 triggers client to send 0x000EE007 + 0x00FFF493 (encrypted)
-                        //   Then client calls quitFromServer() → close() is BLOCKED by hook_close
-                        // This allows native encrypted login packets to reach the server
-                        DLOG(@"[GAME-PATCH] v36.93 OBSERVATION MODE: NOT patching status %u for 0x80FFF495 (let client handle naturally)", status);
-                        [detail appendFormat:@"  [OBSERVE] v36.93: 0x80FFF495 status=%u NOT patched (observation mode - let client send native login packets)\n", status];
-                        [detail appendFormat:@"  [OBSERVE] v36.93: close() hook will block disconnect if client calls quitFromServer\n"];
+                        // v36.116: ACTIVE PATCH MODE - Previously was observation mode
+                        // Analysis (v36.115 log): status=1 means handshake/auth failed
+                        // Server: 139.224.129.92:12003 returned status=1 in 0x80FFF495
+                        // Client sent native login packets (0x000EE007 179B, 0x00FFF493 703B)
+                        // but server closed connection (RECV-CLOSE ret=0)
+                        // Root cause: UUID injection was NOT applied to send (179B vs 217B)
+                        // After v36.116 UUID fix, we ALSO patch status=1→0 to prevent
+                        // client from trying to resend without UUID, or from calling quitFromServer
+                        if (status != 0) {
+                            DLOG(@"[GAME-PATCH] v36.116: Patching 0x80FFF495 status %u -> 0 (server auth failed, fix handshake)", status);
+                            ((unsigned char *)buf)[12] = 0;
+                            g_handshakeComplete = YES;
+                            g_challengeResponded = YES;
+                        } else {
+                            DLOG(@"[GAME-PATCH] v36.116: 0x80FFF495 status=0 already OK");
+                            g_handshakeComplete = YES;
+                            g_challengeResponded = YES;
+                        }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
@@ -5980,7 +6017,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.115 - Fix SIGSEGV with 200-byte padded fake responses");
+    DLOG(@"[VERSION] WangXianHook v36.116 - Fix UUID inject applied to send, patch 0x80FFF495 status=1→0");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
