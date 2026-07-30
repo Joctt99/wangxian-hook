@@ -5927,8 +5927,9 @@ static void installAllHooks(void) {
                     const char *imageName = _dyld_get_image_name(i);
                     if (imageName && strstr(imageName, "wangxian")) {
                         DLOG(@"[NETIMPL-HOOK] v36.94: Checking image: %s", imageName);
-                        void *imageHandle = _dyld_get_image_header(i);
-                        if (imageHandle) {
+                        const struct mach_header *imageHeader = _dyld_get_image_header(i);
+                        if (imageHeader) {
+                            void *imageHandle = (void *)imageHeader;
                             funcPtr = dlsym(imageHandle, mangledName);
                             if (funcPtr) {
                                 DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl::quitFromServer in image %s at %p", imageName, funcPtr);
