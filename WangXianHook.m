@@ -1,12 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.112: Patch login server response error codes, update game port detection
+ * WangXianHook v36.113: Disable DECODE-SEARCH and CRYPTO-CLASS scans, revert bad LOGIN-PATCH
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.112 FIXES:
- *   1. Patch 0x8000E002 and 0x8002A016 login responses (errorCode 5 -> 0)
- *   2. Add isGameServerPort() function with support for 5679/5680/5681 ports
- *   3. Fix root cause: login server returns errorCode=5, client won't connect game server
+ * v36.113 FIXES:
+ *   1. Completely disable DECODE-SEARCH scan (was causing crash by iterating thousands of classes)
+ *   2. Completely disable CRYPTO-CLASS scan (same crash issue, was blocking main thread)
+ *   3. Revert v36.112 LOGIN-PATCH (was corrupting string length field, not errorCode)
+ *   4. Keep EncryptUtils-only check (safe, no full class enumeration)
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -362,7 +363,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.112 loaded ===");
+        _log(@"=== WangXianHook v36.113 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -541,7 +542,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.112 诊断面板";
+            lbl.text = @"WXHook v36.113 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -4471,24 +4472,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
         }
         
-        // v36.112: Patch login server response error codes
-        // 0x8000E002: Handshake response - errorCode at offset 12-15
-        // 0x8002A016: Version response - errorCode at offset 12-15 (was 5, should be 0)
-        if (port == 5678 && ret >= 16) {
-            if (cmd == 0x8000E002 || cmd == 0x8002A016) {
-                uint32_t errorCode = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
-                if (errorCode != 0) {
-                    DLOG(@"[LOGIN-PATCH] v36.112: Patching cmd=0x%08X errorCode from 0x%08X to 0x00000000", cmd, errorCode);
-                    ((unsigned char *)buf)[12] = 0;
-                    ((unsigned char *)buf)[13] = 0;
-                    ((unsigned char *)buf)[14] = 0;
-                    ((unsigned char *)buf)[15] = 0;
-                } else {
-                    DLOG(@"[LOGIN-PATCH] v36.112: cmd=0x%08X errorCode already 0, no patch needed", cmd);
-                }
-            }
-        }
+        // v36.113: REMOVED incorrect LOGIN-PATCH from v36.112
+        // Analysis: 0x8002A016 offset 12-15 is string length (5), NOT errorCode
+        // The actual status code is at offset 21-24 and is already 0 (success)
+        // Patching offset 12-15 to 0 corrupts the protocol data!
     }
     
     // v36.50: ONLY clear '版本过低'/'当前版本' on login server (port 5678) - NOT on game server!
@@ -6033,7 +6020,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.112 - Patch login server responses, fix game port detection");
+    DLOG(@"[VERSION] WangXianHook v36.113 - Disable DECODE-SEARCH and CRYPTO-CLASS scans, revert bad LOGIN-PATCH");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -6375,118 +6362,10 @@ static void installAllHooks(void) {
         }
     }
     
-    // === DECODE-SEARCH: Search for decode/decrypt/parse methods ===
-    // v36.111: Move to background thread to avoid blocking main thread
-    DLOG(@"[DECODE-SEARCH] Deferred scan to background thread...");
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        @try {
-            DLOG(@"[DECODE-SEARCH] Starting scan for decode/decrypt/parse methods...");
-            
-            unsigned int classCount = 0;
-            Class *allClasses = objc_copyClassList(&classCount);
-            if (allClasses) {
-                NSArray *decodeKeywords = @[
-                    @"decrypt", @"Decrypt", @"DECRYPT",
-                    @"decode", @"Decode", @"DECODE",
-                    @"parse", @"Parse", @"PARSE",
-                    @"unpack", @"Unpack", @"UNPACK",
-                    @"decompress", @"Decompress", @"DECOMPRESS",
-                    @"decipher", @"Decipher", @"DECIPHER",
-                    @"decodePacket", @"decodeData", @"parsePacket",
-                    @"processPacket", @"handlePacket", @"readPacket",
-                    @"decodeServer", @"parseServer", @"serverList"
-                ];
-                
-                for (unsigned int i = 0; i < classCount; i++) {
-                    @autoreleasepool {
-                        Class cls = allClasses[i];
-                        if (!cls) continue;
-                        
-                        NSString *clsName = nil;
-                        @try {
-                            clsName = NSStringFromClass(cls);
-                        } @catch (NSException *e) {
-                            continue;
-                        }
-                        if (!clsName || clsName.length == 0) continue;
-                        
-                        unsigned int mcount = 0;
-                        Method *methods = NULL;
-                        @try {
-                            methods = class_copyMethodList(cls, &mcount);
-                        } @catch (NSException *e) {}
-                        
-                        if (methods && mcount > 0) {
-                            for (unsigned int j = 0; j < mcount; j++) {
-                                @autoreleasepool {
-                                    @try {
-                                        SEL sel = method_getName(methods[j]);
-                                        if (!sel) continue;
-                                        NSString *selName = NSStringFromSelector(sel);
-                                        if (!selName) continue;
-                                        
-                                        for (NSString *keyword in decodeKeywords) {
-                                            if ([selName containsString:keyword]) {
-                                                DLOG(@"[DECODE-FOUND] Class: %@, Method: -[%@ %@]", 
-                                                     clsName, clsName, selName);
-                                                break;
-                                            }
-                                        }
-                                    } @catch (NSException *e) {
-                                        break;
-                                    }
-                                }
-                            }
-                            free(methods);
-                        }
-                        
-                        Class metaCls = NULL;
-                        @try {
-                            metaCls = object_getClass(cls);
-                        } @catch (NSException *e) {
-                            continue;
-                        }
-                        
-                        Method *classMethods = NULL;
-                        @try {
-                            classMethods = class_copyMethodList(metaCls, &mcount);
-                        } @catch (NSException *e) {}
-                        
-                        if (classMethods && mcount > 0) {
-                            for (unsigned int j = 0; j < mcount; j++) {
-                                @autoreleasepool {
-                                    @try {
-                                        SEL sel = method_getName(classMethods[j]);
-                                        if (!sel) continue;
-                                        NSString *selName = NSStringFromSelector(sel);
-                                        if (!selName) continue;
-                                        
-                                        for (NSString *keyword in decodeKeywords) {
-                                            if ([selName containsString:keyword]) {
-                                                DLOG(@"[DECODE-FOUND] Class: %@, Method: +[%@ %@]", 
-                                                     clsName, clsName, selName);
-                                                break;
-                                            }
-                                        }
-                                    } @catch (NSException *e) {
-                                        break;
-                                    }
-                                }
-                            }
-                            free(classMethods);
-                        }
-                    }
-                }
-                free(allClasses);
-                DLOG(@"[DECODE-SEARCH] Scan completed.");
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[DECODE-SEARCH] Exception during scan: %@", [e reason]);
-        } @catch (...) {
-            DLOG(@"[DECODE-SEARCH] Unknown exception during scan");
-        }
-    });
+    // === v36.113: DECODE-SEARCH COMPLETELY DISABLED ===
+    // This scan was causing crashes by iterating thousands of ObjC classes.
+    // It was only diagnostic and serves no functional purpose.
+    DLOG(@"[DECODE-SEARCH] v36.113: Scan DISABLED (was causing crashes)");
     
     // === DEFERRED: Create UI button with retry ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -6721,131 +6600,44 @@ static void installAllHooks(void) {
         }
     });
     
-    // === DEFERRED: Hook ALL crypto-related classes for RSA tracing ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            // v36.77: Search for ALL crypto-related classes in the game binary
-            // EncryptUtils is a WeChat class, not the game's crypto handler
-            NSArray *cryptoKeywords = @[@"Encrypt", @"Crypto", @"RSA", @"Cert", @"Key", 
-                                         @"Session", @"Token", @"Login", @"Handshake",
-                                         @"Protocol", @"Message", @"Network", @"Socket"];
+    // === v36.113: CRYPTO-CLASS SCAN COMPLETELY DISABLED ===
+    // This scan was causing crashes by iterating thousands of ObjC classes on the main thread.
+    // It was only diagnostic (finding crypto/protocol classes) and serves no functional purpose.
+    DLOG(@"[CRYPTO-CLASS] v36.113: Scan DISABLED (was causing crashes)");
+    
+    // === v36.113: EncryptUtils check only (no full class scan) ===
+    @try {
+        Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
+        if (encryptUtilsCls) {
+            unsigned int instCount = 0;
+            Method *instMethods = class_copyMethodList(encryptUtilsCls, &instCount);
+            Class metaCls = object_getClass(encryptUtilsCls);
+            unsigned int clsCount = 0;
+            Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
             
-            NSMutableArray *foundClasses = [NSMutableArray array];
-            unsigned int totalClassCount = 0;
-            Class *allClasses = objc_copyClassList(&totalClassCount);
+            DLOG(@"[ENCRYPT-UTILS] EncryptUtils: %u inst methods, %u cls methods", instCount, clsCount);
             
-            for (unsigned int i = 0; i < totalClassCount; i++) {
-                Class cls = allClasses[i];
-                NSString *clsName = NSStringFromClass(cls);
-                if (!clsName) continue;
-                
-                // Skip Apple system classes (NS, UI, CA, etc.)
-                if ([clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"UI"] || 
-                    [clsName hasPrefix:@"CA"] || [clsName hasPrefix:@"CF"] ||
-                    [clsName hasPrefix:@"CG"] || [clsName hasPrefix:@"AB"] ||
-                    [clsName hasPrefix:@"SK"] || [clsName hasPrefix:@"GK"] ||
-                    [clsName hasPrefix:@"PK"] || [clsName hasPrefix:@"LK"] ||
-                    [clsName hasPrefix:@"MK"] || [clsName hasPrefix:@"IK"] ||
-                    [clsName hasPrefix:@"NE"] || [clsName hasPrefix:@"CK"] ||
-                    [clsName hasPrefix:@"MS"] || [clsName hasPrefix:@"MC"] ||
-                    [clsName hasPrefix:@"CL"] || [clsName hasPrefix:@"AL"] ||
-                    [clsName hasPrefix:@"AV"] || [clsName hasPrefix:@"BE"] ||
-                    [clsName hasPrefix:@"BF"] || [clsName hasPrefix:@"AB"] ||
-                    [clsName hasPrefix:@"SP"] || [clsName hasPrefix:@"WK"] ||
-                    [clsName hasPrefix:@"TP"] || [clsName hasPrefix:@"TL"] ||
-                    [clsName hasPrefix:@"VM"] || [clsName hasPrefix:@"IM"] ||
-                    [clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"CF"] ||
-                    [clsName hasPrefix:@"UIV"] || [clsName hasPrefix:@"NSV"]) {
-                    continue;
-                }
-                
-                // Check if class name contains crypto-related keywords
-                BOOL isCryptoRelated = NO;
-                for (NSString *keyword in cryptoKeywords) {
-                    if ([clsName containsString:keyword]) {
-                        isCryptoRelated = YES;
-                        break;
-                    }
-                }
-                
-                if (isCryptoRelated) {
-                    // Get both instance AND class methods
-                    unsigned int instCount = 0;
-                    Method *instMethods = class_copyMethodList(cls, &instCount);
-                    
-                    Class metaCls = object_getClass(cls);
-                    unsigned int clsCount = 0;
-                    Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
-                    
-                    unsigned int totalMethods = instCount + clsCount;
-                    
-                    // Only log classes with methods (skip empty/placeholder classes)
-                    if (totalMethods > 0 && totalMethods < 200) {
-                        NSMutableString *methodList = [NSMutableString string];
-                        
-                        // List instance methods
-                        for (unsigned int j = 0; j < instCount; j++) {
-                            SEL sel = method_getName(instMethods[j]);
-                            NSString *selName = NSStringFromSelector(sel);
-                            [methodList appendFormat:@"\n    -%@", selName];
-                        }
-                        
-                        // List class methods
-                        for (unsigned int j = 0; j < clsCount; j++) {
-                            SEL sel = method_getName(clsMethods[j]);
-                            NSString *selName = NSStringFromSelector(sel);
-                            [methodList appendFormat:@"\n    +%@", selName];
-                        }
-                        
-                        DLOG(@"[CRYPTO-CLASS] %@ (%u methods total: %u inst, %u cls)%@", 
-                             clsName, totalMethods, instCount, clsCount, methodList);
-                        [foundClasses addObject:clsName];
-                    }
-                    
-                    if (instMethods) free(instMethods);
-                    if (clsMethods) free(clsMethods);
-                }
+            NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Instance methods:"];
+            for (unsigned int i = 0; i < instCount; i++) {
+                SEL sel = method_getName(instMethods[i]);
+                [allMethods appendFormat:@"\n  -%@", NSStringFromSelector(sel)];
             }
-            if (allClasses) free(allClasses);
+            DLOG(@"%@", allMethods);
             
-            DLOG(@"[CRYPTO-CLASS] Found %lu crypto-related classes", (unsigned long)foundClasses.count);
-            
-            // v36.77: Also specifically check EncryptUtils with metaclass
-            Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
-            if (encryptUtilsCls) {
-                unsigned int instCount = 0;
-                Method *instMethods = class_copyMethodList(encryptUtilsCls, &instCount);
-                Class metaCls = object_getClass(encryptUtilsCls);
-                unsigned int clsCount = 0;
-                Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
-                
-                DLOG(@"[ENCRYPT-UTILS] EncryptUtils: %u inst methods, %u cls methods", instCount, clsCount);
-                
-                NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Instance methods:"];
-                for (unsigned int i = 0; i < instCount; i++) {
-                    SEL sel = method_getName(instMethods[i]);
-                    [allMethods appendFormat:@"\n  -%@", NSStringFromSelector(sel)];
-                }
-                DLOG(@"%@", allMethods);
-                
-                NSMutableString *clsMethodList = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Class methods:"];
-                for (unsigned int i = 0; i < clsCount; i++) {
-                    SEL sel = method_getName(clsMethods[i]);
-                    [clsMethodList appendFormat:@"\n  +%@", NSStringFromSelector(sel)];
-                }
-                DLOG(@"%@", clsMethodList);
-                
-                // v36.78: DO NOT hook EncryptUtils methods - va_list forwarding causes SIGSEGV
-                // The game IS calling EncryptUtils (confirmed in v36.77 logs)
-                // We just log the method names for reference, no hooking needed
-                DLOG(@"[ENCRYPT-UTILS] %u inst + %u cls methods listed (no hooking - va_list crash risk)", instCount, clsCount);
-                if (instMethods) free(instMethods);
-                if (clsMethods) free(clsMethods);
+            NSMutableString *clsMethodList = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Class methods:"];
+            for (unsigned int i = 0; i < clsCount; i++) {
+                SEL sel = method_getName(clsMethods[i]);
+                [clsMethodList appendFormat:@"\n  +%@", NSStringFromSelector(sel)];
             }
-        } @catch (NSException *e) {
-            DLOG(@"[CRYPTO-CLASS] Exception: %@", e);
+            DLOG(@"%@", clsMethodList);
+            
+            DLOG(@"[ENCRYPT-UTILS] %u inst + %u cls methods listed (no hooking - va_list crash risk)", instCount, clsCount);
+            if (instMethods) free(instMethods);
+            if (clsMethods) free(clsMethods);
         }
-    });
+    } @catch (NSException *e) {
+        DLOG(@"[ENCRYPT-UTILS] Exception: %@", e);
+    }
     
     // === v36.96: Enhanced NetImpl/SocketClient hook ===
     // Try multiple approaches to prevent client disconnect after fake response
