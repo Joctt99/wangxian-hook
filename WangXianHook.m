@@ -1,13 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.113: Disable DECODE-SEARCH and CRYPTO-CLASS scans, revert bad LOGIN-PATCH
+ * WangXianHook v36.114: Patch 0x802EE118 sticky packet status, fix login server TCP sticky detection
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.113 FIXES:
- *   1. Completely disable DECODE-SEARCH scan (was causing crash by iterating thousands of classes)
- *   2. Completely disable CRYPTO-CLASS scan (same crash issue, was blocking main thread)
- *   3. Revert v36.112 LOGIN-PATCH (was corrupting string length field, not errorCode)
- *   4. Keep EncryptUtils-only check (safe, no full class enumeration)
+ * v36.114 FIXES:
+ *   1. Patch 0x802EE118/0x802EE120 status byte (was only patching 0x802EE121)
+ *   2. Add TCP sticky packet detection for login server (port 5678)
+ *   3. Patch sticky sub-packets containing 0x802EE118 with status=1 -> 0
+ *   4. ROOT CAUSE: 0x802EE118 status=1 in sticky packet prevented game server connection
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -363,7 +363,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.113 loaded ===");
+        _log(@"=== WangXianHook v36.114 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -542,7 +542,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.113 诊断面板";
+            lbl.text = @"WXHook v36.114 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -4464,18 +4464,45 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
             
+            // v36.114: Patch status byte for ALL version/auth responses (0x802EE118/120/121)
             // v36.49: ALWAYS patch status byte for 0x802EE121 - KEEP original ret (don't truncate!)
-            if (cmd == 0x802EE121 && ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] Status %u -> 0 (critical login patch, keeping %zd bytes)", p[12], ret);
+            if ((cmd == 0x802EE121 || cmd == 0x802EE118 || cmd == 0x802EE120) && ret >= 13 && p[12] != 0) {
+                DLOG(@"[PROTO-R-PATCH] v36.114: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", p[12], cmd, ret);
                 ((unsigned char *)buf)[12] = 0;
-                // v36.49: Do NOT truncate ret! Game needs full response including sessionId etc.
             }
         }
         
-        // v36.113: REMOVED incorrect LOGIN-PATCH from v36.112
-        // Analysis: 0x8002A016 offset 12-15 is string length (5), NOT errorCode
-        // The actual status code is at offset 21-24 and is already 0 (success)
-        // Patching offset 12-15 to 0 corrupts the protocol data!
+        // v36.114: TCP STICKY PACKET DETECTION for login server (port 5678)
+        // Login server responses can contain multiple packets in one recv
+        // Example: 0x8000E002 (120 bytes) + 0x802EE118 (13 bytes) in one recv of 133 bytes
+        if (port == 5678 && ret >= 16 && pktLenBE < ret) {
+            // There are extra bytes after the first packet - check for sticky sub-packets
+            ssize_t offset = pktLenBE;  // Start after first packet
+            while (offset < ret) {
+                ssize_t remaining = ret - offset;
+                if (remaining < 8) break;
+                
+                uint32_t subPktLen = ((uint32_t)p[offset] << 24) | ((uint32_t)p[offset+1] << 16) |
+                                     ((uint32_t)p[offset+2] << 8)  | (uint32_t)p[offset+3];
+                uint32_t subCmd    = ((uint32_t)p[offset+4] << 24) | ((uint32_t)p[offset+5] << 16) |
+                                     ((uint32_t)p[offset+6] << 8)  | (uint32_t)p[offset+7];
+                
+                if (subPktLen < 8 || subPktLen > (uint32_t)remaining) break;
+                
+                DLOG(@"[LOGIN-STICKY] v36.114: Sub-packet at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
+                     offset, subCmd, subPktLen, remaining);
+                
+                // Patch status for version/auth responses in sticky packets
+                if ((subCmd == 0x802EE118 || subCmd == 0x802EE120 || subCmd == 0x802EE121) && 
+                    remaining >= 13 && p[offset + 12] != 0) {
+                    DLOG(@"[LOGIN-STICKY-PATCH] v36.114: Patching sticky sub-packet cmd=0x%08X status %u -> 0", 
+                         subCmd, p[offset + 12]);
+                    ((unsigned char *)buf)[offset + 12] = 0;
+                }
+                
+                offset += subPktLen;
+            }
+        }
     }
     
     // v36.50: ONLY clear '版本过低'/'当前版本' on login server (port 5678) - NOT on game server!
@@ -6020,7 +6047,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.113 - Disable DECODE-SEARCH and CRYPTO-CLASS scans, revert bad LOGIN-PATCH");
+    DLOG(@"[VERSION] WangXianHook v36.114 - Patch 0x802EE118 sticky packet status, login server TCP sticky detection");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
