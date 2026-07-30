@@ -1,7 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.103: mach_vm_remap to bypass iOS code page protection
+ * WangXianHook v36.104: Hook poll/select to prevent heartbeat detecting dead connection
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.104 FIXES:
+ *   1. Disable dangerous inline patch (caused crash on iOS)
+ *   2. Hook poll() to clear POLLHUP/POLLERR for fake response fd
+ *   3. Hook select() to clear exception for fake response fd
+ *   4. This prevents heartbeat from detecting dead connection
  *
  * v36.103 FIXES:
  *   1. Use mach_vm_remap to bypass iOS code page write protection (kr=2 fix)
@@ -278,7 +284,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.103 loaded ===");
+        _log(@"=== WangXianHook v36.104 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1130,76 +1136,13 @@ static BOOL g_fakeRespDelivered = NO;  // v36.101: TRUE after delivering a respo
 static BOOL g_quitFromServerPatched = NO;
 static BOOL g_heartbeatPatched = NO;
 
-// v36.103: Patch a function's first instruction to ARM64 ret (0xD65F03C0)
-// Uses mach_vm_remap to bypass iOS code page write protection
+// v36.104: Disabled inline patch (caused crash) - using poll/select hook instead
 static BOOL patchFunctionToReturn(void *funcAddr, const char *funcName) {
-    if (!funcAddr) return NO;
-    
-    uint32_t retInstr = 0xD65F03C0;  // ARM64 ret instruction
-    vm_size_t pageSize = vm_page_size;
-    vm_address_t pageAddr = (vm_address_t)funcAddr & ~(pageSize - 1);
-    uint32_t offsetInPage = (uint32_t)((vm_address_t)funcAddr - pageAddr);
-    
-    DLOG(@"[INLINE-PATCH] v36.103: Patching %s at %p (page=%p offset=%u)", funcName, funcAddr, (void*)pageAddr, offsetInPage);
-    
-    // v36.103: Use mach_vm_remap approach
-    // Step 1: Allocate a new page
-    vm_address_t newPage = 0;
-    kern_return_t kr = vm_allocate(mach_task_self(), &newPage, pageSize, VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) {
-        DLOG(@"[INLINE-PATCH] v36.103: vm_allocate failed: %d", kr);
-        return NO;
-    }
-    
-    // Step 2: Copy original page content to new page
-    memcpy((void *)newPage, (void *)pageAddr, pageSize);
-    
-    // Step 3: Modify the copy - write ret instruction
-    memcpy((void *)(newPage + offsetInPage), &retInstr, sizeof(retInstr));
-    
-    // Step 4: Use mach_vm_remap to map modified page over original
-    // VM_FLAGS_OVERWRITE allows replacing existing mapping
-    vm_address_t remapAddr = pageAddr;
-    vm_prot_t curProt = VM_PROT_READ | VM_PROT_EXECUTE;
-    vm_prot_t maxProt = VM_PROT_READ | VM_PROT_EXECUTE;
-    
-    kr = mach_vm_remap(
-        mach_task_self(),
-        (mach_vm_address_t *)&remapAddr,
-        (mach_vm_size_t)pageSize,
-        0,                                    // mask
-        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,  // flags
-        mach_task_self(),                     // source task
-        (mach_vm_offset_t)newPage,            // source address
-        FALSE,                                // copy (not shared)
-        &curProt,
-        &maxProt,
-        VM_INHERIT_COPY
-    );
-    
-    if (kr != KERN_SUCCESS) {
-        DLOG(@"[INLINE-PATCH] v36.103: mach_vm_remap failed: %d (curProt=%d maxProt=%d)", kr, curProt, maxProt);
-        // Try alternative: mprotect approach (may work on jailbroken devices)
-        if (mprotect((void *)pageAddr, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            memcpy(funcAddr, &retInstr, sizeof(retInstr));
-            mprotect((void *)pageAddr, pageSize * 2, PROT_READ | PROT_EXEC);
-            sys_icache_invalidate(funcAddr, sizeof(retInstr));
-            vm_deallocate(mach_task_self(), newPage, pageSize);
-            DLOG(@"[INLINE-PATCH] v36.103: Patched %s via mprotect fallback", funcName);
-            return YES;
-        }
-        vm_deallocate(mach_task_self(), newPage, pageSize);
-        return NO;
-    }
-    
-    // Clear instruction cache
-    sys_icache_invalidate(funcAddr, sizeof(retInstr));
-    
-    // Free the temporary page (content is now copied to target)
-    vm_deallocate(mach_task_self(), newPage, pageSize);
-    
-    DLOG(@"[INLINE-PATCH] v36.103: Successfully patched %s at %p via mach_vm_remap", funcName, funcAddr);
-    return YES;
+    // v36.104: Inline patching causes crash on iOS - disabled
+    // Instead, we hook poll()/select() to prevent heartbeat from detecting dead connection
+    DLOG(@"[INLINE-PATCH] v36.104: Inline patch disabled (caused crash), using poll/select hook instead");
+    (void)funcAddr; (void)funcName;
+    return NO;
 }
 
 // v36.103: Find and patch C++ functions using backtrace from close() call
@@ -2245,6 +2188,8 @@ typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, soc
 typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
 typedef int (*CloseFunc)(int);
 typedef int (*GetsockoptFunc)(int, int, int, void *, socklen_t *);
+typedef int (*PollFunc)(struct pollfd *, nfds_t, int);
+typedef int (*SelectFunc)(int, fd_set *, fd_set *, fd_set *, struct timeval *);
 
 static ConnectFunc orig_connect = NULL;
 static SendFunc orig_send = NULL;
@@ -2255,6 +2200,8 @@ static WriteFunc orig_write = NULL;
 static ReadFunc orig_read = NULL;
 static CloseFunc orig_close = NULL;
 static GetsockoptFunc orig_getsockopt = NULL;
+static PollFunc orig_poll = NULL;
+static SelectFunc orig_select = NULL;
 
 #define MAX_TRACKED_FDS 64
 static int g_trackedFds[MAX_TRACKED_FDS];
@@ -2724,6 +2671,80 @@ static int hook_getsockopt(int fd, int level, int optname, void *optval, socklen
     }
     
     return orig_getsockopt ? orig_getsockopt(fd, level, optname, optval, optlen) : -1;
+}
+
+// v36.104: Hook poll() to prevent heartbeat from detecting dead connection
+// When server closes connection, poll() returns POLLHUP/POLLERR
+// We clear these flags for the fake response fd to pretend connection is alive
+static int hook_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    if (!orig_poll) orig_poll = (PollFunc)dlsym(RTLD_NEXT, "poll");
+    if (!orig_poll || !fds) return -1;
+    
+    int result = orig_poll(fds, nfds, timeout);
+    
+    // v36.104: If fake response fd is in the poll set, clear error flags
+    if (g_fakeRespInjected && g_fakeRespFd >= 0 && result > 0) {
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd == g_fakeRespFd) {
+                // Clear POLLHUP and POLLERR flags - pretend connection is alive
+                if (fds[i].revents & (POLLHUP | POLLERR)) {
+                    DLOG(@"[FAKE-POLL] v36.104: Clearing POLLHUP/POLLERR for fake resp fd=%d (was 0x%x)", 
+                         fds[i].fd, fds[i].revents);
+                    fds[i].revents &= ~(POLLHUP | POLLERR);
+                    // If only error flags were set, set POLLIN instead so recv can return EAGAIN
+                    if (fds[i].revents == 0) {
+                        fds[i].revents = 0;  // No events - connection appears idle
+                        result = 0;  // No events ready
+                    }
+                }
+                // Clear POLLIN for fake response fd if response already delivered
+                if (g_fakeRespDelivered) {
+                    fds[i].revents &= ~POLLIN;
+                }
+            }
+        }
+        // Recalculate result
+        result = 0;
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].revents != 0) result++;
+        }
+    }
+    
+    return result;
+}
+
+// v36.104: Hook select() to prevent heartbeat from detecting dead connection
+static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
+    if (!orig_select) orig_select = (SelectFunc)dlsym(RTLD_NEXT, "select");
+    if (!orig_select) return -1;
+    
+    int result = orig_select(nfds, readfds, writefds, exceptfds, timeout);
+    
+    // v36.104: If fake response fd is in the except set, clear it
+    if (g_fakeRespInjected && g_fakeRespFd >= 0 && result >= 0) {
+        if (exceptfds && FD_ISSET(g_fakeRespFd, exceptfds)) {
+            DLOG(@"[FAKE-SELECT] v36.104: Clearing exception for fake resp fd=%d", g_fakeRespFd);
+            FD_CLR(g_fakeRespFd, exceptfds);
+            // Recalculate result
+            result = 0;
+            if (readfds) {
+                for (int i = 0; i < nfds; i++) {
+                    if (FD_ISSET(i, readfds)) result++;
+                }
+            }
+            if (writefds) {
+                for (int i = 0; i < nfds; i++) {
+                    if (FD_ISSET(i, writefds)) result++;
+                }
+            }
+        }
+        // Also clear readfds for fake response fd if response already delivered
+        if (readfds && g_fakeRespDelivered && FD_ISSET(g_fakeRespFd, readfds)) {
+            FD_CLR(g_fakeRespFd, readfds);
+        }
+    }
+    
+    return result;
 }
 
 static int hook_close(int fd) {
@@ -5107,6 +5128,8 @@ static void installSocketHooks(void) {
     int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
     int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
     int gs = rebindSymbol("_getsockopt", (void *)hook_getsockopt, (void **)&orig_getsockopt);
+    int p = rebindSymbol("_poll", (void *)hook_poll, (void **)&orig_poll);
+    int sel = rebindSymbol("_select", (void *)hook_select, (void **)&orig_select);
     
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
@@ -5117,10 +5140,12 @@ static void installSocketHooks(void) {
     if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
     if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
+    if (!orig_poll) orig_poll = (PollFunc)dlsym(RTLD_NEXT, "poll");
+    if (!orig_select) orig_select = (SelectFunc)dlsym(RTLD_NEXT, "select");
     
-    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d getsockopt=%d", c, s, r, rf, rm, w, rd, cl, gs);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p getsockopt=%p", 
-         orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close, orig_getsockopt);
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d getsockopt=%d poll=%d select=%d", c, s, r, rf, rm, w, rd, cl, gs, p, sel);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p getsockopt=%p poll=%p select=%p", 
+         orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close, orig_getsockopt, orig_poll, orig_select);
     
     if (!orig_connect) DLOG(@"[SOCK-ERROR] connect hook failed - network monitoring disabled!");
     if (!orig_send) DLOG(@"[SOCK-ERROR] send hook failed - outgoing data monitoring disabled!");
@@ -5784,7 +5809,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.103 - mach_vm_remap to bypass iOS code page protection");
+    DLOG(@"[VERSION] WangXianHook v36.104 - Hook poll/select to prevent heartbeat detecting dead connection");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
