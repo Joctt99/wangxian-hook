@@ -1,14 +1,19 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.117: Fix SEND-CMD log timing, verify UUID actually sent, complete 0x80FFF495 patch
+ * WangXianHook v36.118: UUID injection ONLY for game server (12003), NOT login server (5678)
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.117 FIXES (CRITICAL):
+ * v36.118 FIXES (CRITICAL):
+ *   1. UUID injection now ONLY applies to GAME SERVER ports (12003/58158/dynamic)
+ *      Login server (5678) gets ORIGINAL packet (143 bytes, no UUID)
+ *      Root cause: v36.117 injected UUID to login server's 0x000EE007 (143→181 bytes),
+ *      login server rejected it and closed connection → "network interrupted" at login
+ *   2. Enhanced buffer still prepared on login server capture, used later by game server
+ *
+ * v36.117 FIXES:
  *   1. [SEND-CMD] log now prints FINAL sendLen (after UUID injection), not original len
- *      (Previous bug: log before injection showed 179B, confusing even when 217B was sent)
  *   2. Added [SEND-FINAL] log to confirm exactly what was sent to orig_send()
  *   3. 0x80FFF495 status=1 patch strengthened + set handshake flags correctly
- *   4. CMD-QUEUE uses actualSendLen consistently
  *
  * v36.116 FIXES (CRITICAL):
  *   1. UUID-INJECT now applies DIRECTLY to sendBuf/sendLen - server now receives 217 bytes with UUID
@@ -3157,7 +3162,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // v36.117: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
                     // Previous bug: UUID was injected to global buffers but NOT applied to the
                     // actual send() call, so server received 179 bytes without UUID and rejected.
-                    if (enhancedLen > 0) {
+                    //
+                    // v36.118 FIX: Only apply UUID injection to GAME SERVER (12003/58158), NOT login server (5678)!
+                    // Root cause: Login server (5678) rejects UUID-injected 0x000EE007 (181 bytes),
+                    //   causing "network interrupted" at login. Login server expects original 143 bytes.
+                    //   Game server (12003) requires UUID-injected 181 bytes.
+                    BOOL isGamePortForInject = (port == 12003 || port == 58158 ||
+                                                (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+                    if (enhancedLen > 0 && isGamePortForInject) {
                         size_t newLen = (size_t)enhancedLen;
                         uint8_t *newBuf = (uint8_t *)malloc(newLen);
                         if (newBuf) {
@@ -3166,8 +3178,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             if (sendBuf != buf) free(sendBuf);
                             sendBuf = newBuf;
                             sendLen = newLen;
-                            DLOG(@"[UUID-INJECT] v36.117: APPLIED to sendBuf: %zu -> %zu bytes (WILL be sent!)",
-                                 len, newLen);
+                            DLOG(@"[UUID-INJECT] v36.118: APPLIED to sendBuf (GAME port=%d): %zu -> %zu bytes (WILL be sent!)",
+                                 port, len, newLen);
                             // v36.117: Immediately log corrected SEND-CMD with FINAL length
                             const char *host2 = getHostForFd(fd);
                             int port2 = getPortForFd(fd);
@@ -3180,6 +3192,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                  fd, cmd, sendLen, serverType2, port2);
                             (void)host2;
                         }
+                    } else if (enhancedLen > 0 && !isGamePortForInject) {
+                        // v36.118: Login server - do NOT inject UUID, send original packet
+                        // Enhanced buffer is still prepared for later game server use
+                        DLOG(@"[UUID-INJECT] v36.118: SKIP inject for LOGIN port=%d (send original %zu bytes), enhanced buffer ready for game server",
+                             port, len);
                     }
                 }
             } @catch (NSException *e) {
@@ -6059,7 +6076,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.117 - SEND-CMD uses final sendLen, SEND-FINAL confirms actual payload, 0x80FFF495 patch complete");
+    DLOG(@"[VERSION] WangXianHook v36.118 - UUID inject ONLY for game server (12003), NOT login server (5678)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
