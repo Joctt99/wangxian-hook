@@ -148,6 +148,7 @@
 #include <mach/mach.h>
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#include <libkern/OSCacheControl.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <sys/mman.h>
