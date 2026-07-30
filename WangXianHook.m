@@ -1,7 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.98: Fix FAKE-RESP state reset on server rotation
+ * WangXianHook v36.99: NEVER return 0 for game server fd - return EAGAIN instead
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.99 FIXES:
+ *   1. ALWAYS return EAGAIN for game server fd when orig_recv returns 0
+ *   2. This prevents SocketClient/NetImpl from detecting "connection closed"
+ *   3. Prevents internal disconnected state being set, avoiding "网络中断" error
  *
  * v36.98 FIXES:
  *   1. Reset g_fakeRespInjected on server rotation (tryNextServer)
@@ -3536,9 +3541,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             BOOL isGamePort = (port == 12003 || port == 58158 || 
                                (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
             if (isGamePort) {
-                // v36.96: Use g_loginPacketsSent instead of g_challengeResponded
-                // g_challengeResponded is never set because we don't auto-respond to challenges
-                // g_loginPacketsSent is set when client sends 0x000EE007 or 0x00FFF493 to game server
+                // v36.99: KEY FIX - For game server fd, NEVER return 0 to client!
+                // Returning 0 causes SocketClient/NetImpl to detect "connection closed"
+                // and set internal disconnected state, leading to "网络中断" error.
+                // Instead: inject fake response or return EAGAIN to keep connection alive.
+                
+                // First priority: inject fake 0x80FFF493 success response if conditions met
                 if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
                     // v36.96: Construct realistic 0x80FFF493 success response
                     // Real response structure: header(16) + login data payload
@@ -3653,6 +3661,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 } @catch (NSException *e) {
                     DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
                 }
+                
+                // v36.99: KEY FIX - For game server fd, NEVER return 0 to client!
+                // Always return EAGAIN for game server fd when server closes
+                // This prevents SocketClient/NetImpl from detecting "connection closed"
+                // and setting internal disconnected state, leading to "网络中断" error
+                DLOG(@"[RECV-EAGAIN] v36.99: Game server fd=%d ret=0 -> returning EAGAIN (prevent disconnect detection)", fd);
+                errno = EAGAIN;
+                return -1;
             }
         } else {
             DLOG(@"[RECV-ERR] fd=%d %s:%d ret=%zd errno=%d (%s)", fd, host, port, ret, errno, strerror(errno));
