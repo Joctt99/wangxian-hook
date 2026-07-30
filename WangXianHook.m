@@ -156,7 +156,7 @@
 #include <libkern/OSCacheControl.h>
 
 // v36.103: Declare private Mach API for code page patching
-extern kern_return_t mach_vm_remap(
+extern "C" kern_return_t mach_vm_remap(
     vm_map_t target_task,
     mach_vm_address_t *target_address,
     mach_vm_size_t size,
