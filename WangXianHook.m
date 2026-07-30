@@ -1,42 +1,37 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.92 - SELECTIVE patch + FORCE-SEND ENHANCED 0x000EE007 after 0x80FFF495
- * MODE: TARGETED - Keep 0x80FFF495 status=1→0 patch + auto-send captured device info + UUID
+ * WangXianHook v36.93 - OBSERVATION MODE + CLOSE BLOCK for game server
+ * MODE: OBSERVATION - Let client handle protocol naturally, block close() to prevent disconnect
  *
- * v36.91 vs v36.92 CRITICAL DISCOVERY (PARADOX):
- *   Scenario A (v36.89 OBSERVATION, status NOT patched):
- *     - Server returns 0x80FFF495 status=1 (365B)
- *     - Client DOES send 0x000EE007 (217B) + 0x00FFF493 (1697B/896B) ✅
- *     - But THEN calls quitFromServer() -> "network interrupted" ❌
+ * v36.92 vs v36.93 CRITICAL FINDING:
+ *   v36.92 PROBLEM:
+ *     - Patch 0x80FFF495 status 1→0 to prevent quitFromServer
+ *     - But client state machine SKIPS login packet dispatch when status=0
+ *     - FORCE-SEND 0x000EE007 was IGNORED by server (needs encrypted version)
+ *     - Client enters heartbeat loop only, never sends 0x00FFF493
  *
- *   Scenario B (v36.91, status 1→0 PATCHED):
- *     - Hook patches 0x80FFF495 status 1→0
- *     - Client does NOT call quitFromServer (connection stays alive) ✅
- *     - But client STOPS at heartbeat only! NO 0x000EE007! NO 0x00FFF493! ❌
+ *   v36.93 SOLUTION (based on v36.89 observation):
+ *     - v36.89 PROVED: When status NOT patched, client sends 0x000EE007 + 0x00FFF493
+ *       BEFORE calling quitFromServer. The packets go out, but disconnect prevents
+ *       server response processing.
+ *     - v36.93: DON'T patch 0x80FFF495 status at all (let client send native login packets)
+ *     - v36.93: HOOK close() to BLOCK game server fd closure (prevent quitFromServer disconnect)
+ *     - This allows client to complete login flow naturally:
+ *       status=1 → client sends encrypted 0x000EE007 + 0x00FFF493 → server processes
+ *       → client calls quitFromServer → close() BLOCKED → connection stays alive
  *
- * PARADOX EXPLANATION:
- *   0x80FFF495 status byte has DUAL SEMANTICS:
- *     status=1 → Client treats as "error" AND simultaneously triggers "send login data now" handler
- *                 (calls quitFromServer in error branch AFTER enqueuing login packets)
- *     status=0 → Client treats as "ACK only" (clean handshake, no further action needed,
- *                 skips the login packet dispatch handler entirely!)
+ *   KEY INSIGHT from v36.89:
+ *     Client's handler order for 0x80FFF495:
+ *       1. Enqueue 0x000EE007 + 0x00FFF493 packets (triggered by status=1)
+ *       2. Error check callback → quitFromServer (also triggered by status=1)
+ *     By blocking close(), step 2 is prevented while step 1 packets already sent.
+ *     Server will respond to 0x000EE007/0x00FFF493 before quit is fully processed.
  *
- *   In v36.89 observation: Client first enqueues 0x000EE007+0x00FFF493, then checks status=1
- *   in the error-check callback → quits.  Packets go out but the subsequent server
- *   response is never processed due to disconnect.
- *
- * v36.92 RESOLUTION (COMPROMISE):
- *   1. [PATCH] Still patch 0x80FFF495 status 1→0 to prevent quitFromServer/disconnect
- *   2. [FORCE-SEND] RIGHT AFTER patching 0x80FFF495, inject 0x000EE007 (enhanced with UUID)
- *      via orig_send() directly, to manually trigger what status=1 would have triggered.
- *   3. [FALLBACK] If heartbeat count reaches 3 (still no 0x00FFF493 after force-send),
- *      send again + mark g_deviceInfoSentToGame as complete.
- *
- *   This combines: "no disconnect" (status=0 effect) + "send login packets anyway" (status=1 effect).
- *
- * ALSO REMAINS from v36.91:
+ * REMAINS from v36.91:
  *   DELETE: FORCE-HS mechanism (no fake 0x80FFF495 injection)
  *   DELETE: 0x00FFFF02 auto-respond (let client send native 0x00FFF495 703B)
+ * REMAINS from v36.93:
+ *   DELETE: FORCE-SEND logic (let client send native encrypted 0x000EE007)
  */
 /*
  * HISTORY:
@@ -236,7 +231,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.92 loaded ===");
+        _log(@"=== WangXianHook v36.93 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -2283,27 +2278,37 @@ static BOOL tryNextServer(void) {
 
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
-    // v36.61: Track game server port closures (12003, 58158, or dynamic)
+    
+    // v36.93: Track game server port closures and BLOCK them during login flow
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd && g_trackedActive[i]) {
             int port = g_trackedPorts[i];
             BOOL isGamePort = (port == 58158 || port == 12003 || 
                                (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
             if (isGamePort) {
-                DLOG(@"[CLOSE-TRACE] close(%d) for game server %s:%d (matched port %d)", fd, g_trackedHosts[i], port, port);
+                DLOG(@"[CLOSE-BLOCK] v36.93 BLOCKING close(%d) for game server %s:%d (port=%d)", fd, g_trackedHosts[i], port, port);
+                
+                // v36.93: Log call stack for debugging
                 void *callstack[8];
                 int frames = backtrace(callstack, 8);
                 char **strs = backtrace_symbols(callstack, frames);
                 if (strs) {
                     for (int j = 1; j < frames && j < 8; j++) {
-                        DLOG(@"[BT] %d: %s", j, strs[j] ? strs[j] : "?");
+                        DLOG(@"[CLOSE-BT] %d: %s", j, strs[j] ? strs[j] : "?");
                     }
                     free(strs);
                 }
-                break;
+                
+                // v36.93: BLOCK close() for game server fd during login handshake
+                // This prevents quitFromServer() from disconnecting the game server
+                // while client is still sending login packets (0x000EE007, 0x00FFF493)
+                // Return 0 (success) to trick the client into thinking close succeeded
+                DLOG(@"[CLOSE-BLOCK] v36.93: Returning 0 (blocked) to prevent game server disconnect");
+                return 0;  // Block the close, return success
             }
         }
     }
+    
     clearTrackedFd(fd);
     return orig_close ? orig_close(fd) : -1;
 }
@@ -3830,37 +3835,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        DLOG(@"[GAME-PATCH] v36.92 CRITICAL: Patching 0x80FFF495 status %u -> 0 (handshake completion ACK)", status);
-                        ((unsigned char *)buf)[12] = 0;
-                        [detail appendFormat:@"  [PATCH] 0x80FFF495 status patched to 0 (critical handshake fix)\n"];
-                        
-                        // v36.92: FORCE-SEND captured 0x000EE007 device info RIGHT AFTER patching 0x80FFF495
-                        // Status byte DUAL SEMANTICS DISCOVERY:
-                        //   status=1 -> triggers send-login-packets handler (then calls quit)
-                        //   status=0 -> prevents quit (but also skips login packet handler entirely!)
-                        // Compromise: patch to 0 (no quit) + MANUALLY send device info via orig_send
-                        if (g_deviceInfoCaptured && !g_deviceInfoSentToGame && orig_send) {
-                            const uint8_t *pktToSend = g_deviceInfoEnhancedReady ? g_deviceInfoEnhanced : g_deviceInfoPacket;
-                            ssize_t pktToLen = g_deviceInfoEnhancedReady ? g_deviceInfoEnhancedLen : g_deviceInfoPacketLen;
-                            DLOG(@"[GAME-FORCE-SEND] v36.92: Sending %@ 0x000EE007 (%zd bytes) to game fd=%d RIGHT AFTER 0x80FFF495 patch",
-                                 g_deviceInfoEnhancedReady ? @"ENHANCED" : @"CAPTURED",
-                                 pktToLen, fd);
-                            ssize_t fSent = orig_send(fd, pktToSend, pktToLen, 0);
-                            if (fSent > 0) {
-                                g_deviceInfoSentToGame = YES;
-                                DLOG(@"[GAME-FORCE-SEND] SUCCESS: Sent %zd bytes (expected %zd) to fd=%d",
-                                     fSent, pktToLen, fd);
-                                [detail appendFormat:@"  [FORCE-SEND] v36.92: Sent %s %zd bytes 0x000EE007 device info\n",
-                                 g_deviceInfoEnhancedReady ? "ENHANCED" : "CAPTURED",
-                                 pktToLen];
-                            } else {
-                                DLOG(@"[GAME-FORCE-SEND] FAILED: orig_send returned %zd (errno=%d)",
-                                     fSent, errno);
-                            }
-                        } else {
-                            DLOG(@"[GAME-FORCE-SEND] v36.92: SKIP send - captured=%d sent=%d orig_send=%p",
-                                 g_deviceInfoCaptured, g_deviceInfoSentToGame, orig_send);
-                        }
+                        // v36.93: OBSERVATION MODE - Do NOT patch status
+                        // Let client handle status=1 naturally:
+                        //   status=1 triggers client to send 0x000EE007 + 0x00FFF493 (encrypted)
+                        //   Then client calls quitFromServer() → close() is BLOCKED by hook_close
+                        // This allows native encrypted login packets to reach the server
+                        DLOG(@"[GAME-PATCH] v36.93 OBSERVATION MODE: NOT patching status %u for 0x80FFF495 (let client handle naturally)", status);
+                        [detail appendFormat:@"  [OBSERVE] v36.93: 0x80FFF495 status=%u NOT patched (observation mode - let client send native login packets)\n", status];
+                        [detail appendFormat:@"  [OBSERVE] v36.93: close() hook will block disconnect if client calls quitFromServer\n"];
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
@@ -3934,32 +3916,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // Count server responses after handshake - these are likely responses to client heartbeats
                 g_heartbeatCount++;
                 if (g_heartbeatCount == 3) {
-                    DLOG(@"[GAME-FLOW] WARNING: Received %d server responses after handshake, but no 0x000EE007 sent yet!", g_heartbeatCount);
-                    DLOG(@"[GAME-FLOW] Client may be stuck on heartbeats only. Check if game is sending 0x000EE007...");
-                    
-                    // v36.92 FALLBACK FORCE-SEND: If heartbeat reaches 3 (stuck detected) and we still
-                    // haven't sent device info, force-send now. Status patch 1->0 would have blocked
-                    // the native send handler, so we re-trigger here.
-                    if (g_deviceInfoCaptured && !g_deviceInfoSentToGame && orig_send) {
-                        const uint8_t *pktToSend = g_deviceInfoEnhancedReady ? g_deviceInfoEnhanced : g_deviceInfoPacket;
-                        ssize_t pktToLen = g_deviceInfoEnhancedReady ? g_deviceInfoEnhancedLen : g_deviceInfoPacketLen;
-                        DLOG(@"[GAME-FORCE-SEND] v36.92 FALLBACK (after %d heartbeats): Sending %@ 0x000EE007 (%zd bytes) to fd=%d",
-                             g_heartbeatCount,
-                             g_deviceInfoEnhancedReady ? @"ENHANCED" : @"CAPTURED",
-                             pktToLen, fd);
-                        ssize_t fSent = orig_send(fd, pktToSend, pktToLen, 0);
-                        if (fSent > 0) {
-                            g_deviceInfoSentToGame = YES;
-                            DLOG(@"[GAME-FORCE-SEND] FALLBACK SUCCESS: Sent %zd bytes (expected %zd) to fd=%d",
-                                 fSent, pktToLen, fd);
-                        } else {
-                            DLOG(@"[GAME-FORCE-SEND] FALLBACK FAILED: orig_send=%zd errno=%d", fSent, errno);
-                        }
-                    }
+                    // v36.93: OBSERVATION MODE - No FALLBACK FORCE-SEND needed
+                    // In v36.93, we DON'T patch status, so client sends native encrypted login packets.
+                    // close() hook blocks disconnect. If client enters heartbeat loop anyway,
+                    // the close block prevents disconnection and server will eventually respond.
+                    DLOG(@"[GAME-FLOW] v36.93 OBSERVATION: Received %d server responses after handshake (no FORCE-SEND needed)", g_heartbeatCount);
+                    DLOG(@"[GAME-FLOW] v36.93: If client in heartbeat loop, close() hook prevents disconnect");
                 }
                 if (g_heartbeatCount == 10) {
-                    DLOG(@"[GAME-FLOW] CRITICAL WARNING: %d heartbeats after handshake! Game is stuck.", g_heartbeatCount);
-                    DLOG(@"[GAME-FLOW] This is likely because: 1) FORCE-SEND packet not recognized by server, or 2) next step requires 0x00FFF493");
+                    DLOG(@"[GAME-FLOW] v36.93 CRITICAL: %d heartbeats after handshake! close() blocking disconnect.", g_heartbeatCount);
+                    DLOG(@"[GAME-FLOW] v36.93: close() hook still active - connection should remain alive");
                 }
             }
             
@@ -4009,20 +3975,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (scanPktLen < 8 || scanPktLen > 65535) break;
                 if (scanPktLen > (uint32_t)scanRemaining) break;
                 
-                // v36.92: SELECTIVE status patching for sticky sub-packets
-                // Same logic as main packet: only patch 0x80FFF495, not 0x80FFF494
+                // v36.93: OBSERVATION MODE - No status patching for sticky sub-packets
+                // Let client handle all status values naturally
                 if (scanRemaining >= 13) {
                     uint8_t scanStatus = p[scanOffset + 12];
                     if (scanStatus != 0 && (scanCmd == 0x80FFF494 || scanCmd == 0x80FFF495)) {
-                        if (scanCmd == 0x80FFF494) {
-                            DLOG(@"[STICKY-PATCH] v36.92: NOT patching status %u for 0x80FFF494 sub-packet at offset %zd (preserve challenge signal)",
-                                 scanStatus, scanOffset);
-                        } else if (scanCmd == 0x80FFF495) {
-                            DLOG(@"[STICKY-PATCH] v36.92 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
-                                 scanStatus, scanOffset);
-                            ((unsigned char *)buf)[scanOffset + 12] = 0;
-                            patchedExtra = YES;
-                        }
+                        DLOG(@"[STICKY-PATCH] v36.93 OBSERVATION: NOT patching status %u for %s sub-packet at offset %zd",
+                             scanStatus,
+                             scanCmd == 0x80FFF495 ? @"0x80FFF495" : @"0x80FFF494",
+                             scanOffset);
                     }
                 }
                 
@@ -4076,18 +4037,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[STICKY-PACKET] Sub-packet #%d at offset %zd: cmd=0x%08X pktLen=%u remaining=%zd", 
                          subPacketCount, offset, subCmd, subPktLen, remaining);
                     
-                    // v36.92: SELECTIVE status patching for detected sticky sub-packets
+                    // v36.93: OBSERVATION MODE - No status patching for detected sticky sub-packets
                     if (remaining >= 13) {
                         uint8_t subStatus = p[offset + 12];
                         if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
-                            if (subCmd == 0x80FFF494) {
-                                DLOG(@"[STICKY-PACKET] v36.92: NOT patching 0x80FFF494 sub-packet status %u at offset %zd (preserve challenge signal)",
-                                     subStatus, offset);
-                            } else if (subCmd == 0x80FFF495) {
-                                DLOG(@"[STICKY-PACKET] v36.92 CRITICAL: Patching 0x80FFF495 sub-packet status %u -> 0 at offset %zd",
-                                     subStatus, offset);
-                                ((unsigned char *)buf)[offset + 12] = 0;
-                            }
+                            DLOG(@"[STICKY-PACKET] v36.93 OBSERVATION: NOT patching status %u for %s sub-packet at offset %zd",
+                                 subStatus,
+                                 subCmd == 0x80FFF495 ? @"0x80FFF495" : @"0x80FFF494",
+                                 offset);
                         }
                     }
                 }
@@ -5116,7 +5073,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.92 - Selective patch 0x80FFF495 + FORCE-SEND enhanced 0x000EE007 after handshake");
+    DLOG(@"[VERSION] WangXianHook v36.93 - OBSERVATION MODE + CLOSE BLOCK for game server (no status patch, block disconnect)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
