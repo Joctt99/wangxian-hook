@@ -3482,15 +3482,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
             }
             
-            // v36.92: DISABLED auto-respond to 0x00FFFF02! (same as v36.91)
+            // v36.93: DISABLED auto-respond to 0x00FFFF02! (same as v36.91-v36.92)
             // v36.90 analysis: Hook's auto-response (0x80FFFF02) + Client's native response (0x00FFF495)
             // cause DOUBLE response to single challenge, activating FORCE-HS and corrupting state machine.
             // v36.89 observation PROVED client can handle 0x00FFFF02 challenge natively.
             // Let client send 0x00FFF495 (703B RSA response) - this is the PROPER response format!
             if (cmd == 0x00FFFF02 && ret >= 28) {
-                [challengeDetail appendFormat:@"  [V36.92] SKIP AUTO-RESPOND: Let client handle 0x00FFFF02 challenge natively\n"];
-                [challengeDetail appendFormat:@"  [V36.92] Client will parse RSA cert from 0x80FFF494 and send 0x00FFF495 response\n"];
-                DLOG(@"[CHALLENGE] v36.92: Skipping auto-respond - let client send native 0x00FFF495 (703B RSA response)");
+                [challengeDetail appendFormat:@"  [V36.93] SKIP AUTO-RESPOND: Let client handle 0x00FFFF02 challenge natively\n"];
+                [challengeDetail appendFormat:@"  [V36.93] Client will parse RSA cert from 0x80FFF494 and send 0x00FFF495 response\n"];
+                DLOG(@"[CHALLENGE] v36.93: Skipping auto-respond - let client send native 0x00FFF495 (703B RSA response)");
             } else if (cmd == 0x00FFFF01) {
                 [challengeDetail appendFormat:@"  [NOTE] 0x00FFFF01 (first challenge) - game handles this normally\n"];
             }
@@ -3694,8 +3694,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     //       causing client to call quitFromServer() -> "network interrupted".
                     //       Patching 1->0 allows client to proceed to send 0x000EE007 + 0x00FFF493.
                     if (rcmd == 0x80FFF494) {
-                        DLOG(@"[GAME-PATCH] v36.92: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
-                        [detail appendFormat:@"  [OBSERVE] v36.92: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
+                        DLOG(@"[GAME-PATCH] v36.93: NOT patching status %u for 0x80FFF494 (means 'challenge required')", status);
+                        [detail appendFormat:@"  [OBSERVE] v36.93: 0x80FFF494 status NOT patched (preserve challenge signal)\n"];
                         
                         // v36.79: Extract RSA public key certificate from 0x80FFF494 response
                         // Cert starts at byte[14] (4 bytes length + 4 bytes cmd + 4 bytes field + 1 byte status + 1 byte type)
@@ -3997,7 +3997,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // rejected our format (extra status byte, wrong seq, etc.).
                 // v36.89 observation confirmed client handles challenge perfectly.
                 if (scanCmd == 0x00FFFF02 && scanRemaining >= 28) {
-                    DLOG(@"[STICKY-SCAN] v36.92: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
+                    DLOG(@"[STICKY-SCAN] v36.93: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                     DLOG(@"[STICKY-SCAN] Challenge data at offset %zd: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                          scanOffset,
                          p[scanOffset+12], p[scanOffset+13], p[scanOffset+14], p[scanOffset+15],
@@ -4049,9 +4049,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 
-                // v36.92: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
+                // v36.93: DO NOT auto-respond to 0x00FFFF02! (confirmed working in v36.89)
                 if (subCmd == 0x00FFFF02 && remaining >= 28) {
-                    DLOG(@"[STICKY-AUTO] v36.92: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
+                    DLOG(@"[STICKY-AUTO] v36.93: Letting CLIENT handle 0x00FFFF02 challenge (auto-response disabled)");
                 }
                 
                 // Move to next packet
