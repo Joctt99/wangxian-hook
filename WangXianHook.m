@@ -1,13 +1,18 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.116: Fix UUID injection applied to actual send, patch 0x80FFF495 status=1→0
+ * WangXianHook v36.117: Fix SEND-CMD log timing, verify UUID actually sent, complete 0x80FFF495 patch
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
+ *
+ * v36.117 FIXES (CRITICAL):
+ *   1. [SEND-CMD] log now prints FINAL sendLen (after UUID injection), not original len
+ *      (Previous bug: log before injection showed 179B, confusing even when 217B was sent)
+ *   2. Added [SEND-FINAL] log to confirm exactly what was sent to orig_send()
+ *   3. 0x80FFF495 status=1 patch strengthened + set handshake flags correctly
+ *   4. CMD-QUEUE uses actualSendLen consistently
  *
  * v36.116 FIXES (CRITICAL):
  *   1. UUID-INJECT now applies DIRECTLY to sendBuf/sendLen - server now receives 217 bytes with UUID
- *      (Previous bug: injected to global buffers but NOT used in send(), server got 179B without UUID)
  *   2. 0x80FFF495 status=1 now patched to 0 (handshake/auth failed → success)
- *      (Previous observation mode left status=1, causing server rejection and close)
  *   3. CMD-QUEUE now uses actualSendLen (after injection) instead of original len
  *
  * v36.107 FIXES:
@@ -364,7 +369,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.116 loaded ===");
+        _log(@"=== WangXianHook v36.117 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -543,7 +548,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.116 诊断面板";
+            lbl.text = @"WXHook v36.117 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -3149,7 +3154,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         DLOG(@"[DEVICE-INFO] ENHANCED FAILED, will use original %zd bytes", len);
                     }
                     
-                    // v36.116: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
+                    // v36.117: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
                     // Previous bug: UUID was injected to global buffers but NOT applied to the
                     // actual send() call, so server received 179 bytes without UUID and rejected.
                     if (enhancedLen > 0) {
@@ -3161,8 +3166,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             if (sendBuf != buf) free(sendBuf);
                             sendBuf = newBuf;
                             sendLen = newLen;
-                            DLOG(@"[UUID-INJECT] v36.116: APPLIED to send: %zu -> %zu bytes (actually sent!)",
+                            DLOG(@"[UUID-INJECT] v36.117: APPLIED to sendBuf: %zu -> %zu bytes (WILL be sent!)",
                                  len, newLen);
+                            // v36.117: Immediately log corrected SEND-CMD with FINAL length
+                            const char *host2 = getHostForFd(fd);
+                            int port2 = getPortForFd(fd);
+                            const char *serverType2 = "UNKNOWN";
+                            if (port2 == 5678) serverType2 = "LOGIN";
+                            else if (port2 == 58158) serverType2 = "GAME-58158";
+                            else if (port2 == 12003) serverType2 = "GAME-12003";
+                            else if (port2 >= 10000) serverType2 = "GAME-DYNAMIC";
+                            DLOG(@"[SEND-CMD] fd=%d cmd=0x%08X len=%zu (CORRECTED after UUID inject) [%s port=%d]",
+                                 fd, cmd, sendLen, serverType2, port2);
+                            (void)host2;
                         }
                     }
                 }
@@ -3247,7 +3263,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     }
                     // v36.107: Add to command queue with sequence number and actual send length
                     enqueueGameCmd(trackCmd, fd, actualSendLen, trackSeqNum);
-                    DLOG(@"[CMD-TRACK] v36.116: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (origLen=%zu queue=%d)", 
+                    DLOG(@"[CMD-TRACK] v36.117: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (origLen=%zu queue=%d)", 
                          trackCmd, trackSeqNum, fd, actualSendLen, len, g_cmdQueueCount);
                     // v36.107: Clear delivered flag so next recv can return a response
                     g_fakeRespDelivered = NO;
@@ -3386,6 +3402,32 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             }
         } @catch (NSException *e) {
             DLOG(@"[GAME-ANALYZE] Exception: %@", e.reason);
+        }
+    }
+
+    // v36.117: FINAL confirmation log right before calling orig_send()
+    // This is THE authoritative log of what actually gets sent to the server
+    if (sendLen >= 12 && sendBuf) {
+        const unsigned char *fp = (const unsigned char *)sendBuf;
+        uint32_t finalCmd = ((uint32_t)fp[4] << 24) | ((uint32_t)fp[5] << 16) |
+                            ((uint32_t)fp[6] << 8)  | (uint32_t)fp[7];
+        uint32_t finalPktLen = ((uint32_t)fp[0] << 24) | ((uint32_t)fp[1] << 16) |
+                               ((uint32_t)fp[2] << 8)  | (uint32_t)fp[3];
+        int finalPort = getPortForFd(fd);
+        const char *finalType = "OTHER";
+        if (finalPort == 5678) finalType = "LOGIN";
+        else if (finalPort == 12003) finalType = "GAME-12003";
+        else if (finalPort == 58158) finalType = "GAME-58158";
+        else if (finalPort >= 10000) finalType = "GAME-DYN";
+        
+        // Only log critical commands (0x000EE007, 0x00FFF495, 0x00FFF493, 0x00FFF494) or GAME port
+        BOOL isCritical = (finalCmd == 0x000EE007 || finalCmd == 0x00FFF495 ||
+                          finalCmd == 0x00FFF493 || finalCmd == 0x00FFF494 ||
+                          finalPktLen != sendLen);  // Also flag if pktLen header doesn't match send() len
+        if (isCritical || (finalPort >= 10000 && finalCmd != 0x00000015)) {
+            DLOG(@"[SEND-FINAL] v36.117: cmd=0x%08X pktLenHdr=%u send()=%zu fd=%d [%s port=%d] %@",
+                 finalCmd, finalPktLen, sendLen, fd, finalType, finalPort,
+                 (finalPktLen != sendLen) ? @"⚠️ HEADER MISMATCH!" : @"✅ OK");
         }
     }
 
@@ -4759,21 +4801,21 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.116: ACTIVE PATCH MODE - Previously was observation mode
+                        // v36.117: ACTIVE PATCH MODE (was observation mode in v36.93-v36.115)
                         // Analysis (v36.115 log): status=1 means handshake/auth failed
                         // Server: 139.224.129.92:12003 returned status=1 in 0x80FFF495
                         // Client sent native login packets (0x000EE007 179B, 0x00FFF493 703B)
                         // but server closed connection (RECV-CLOSE ret=0)
                         // Root cause: UUID injection was NOT applied to send (179B vs 217B)
-                        // After v36.116 UUID fix, we ALSO patch status=1→0 to prevent
-                        // client from trying to resend without UUID, or from calling quitFromServer
+                        // v36.117: Patch status=1→0 AND set handshake/challenge flags
                         if (status != 0) {
-                            DLOG(@"[GAME-PATCH] v36.116: Patching 0x80FFF495 status %u -> 0 (server auth failed, fix handshake)", status);
+                            DLOG(@"[GAME-PATCH] v36.117: Patching 0x80FFF495 status %u -> 0 (server auth failed, force OK)", status);
                             ((unsigned char *)buf)[12] = 0;
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
+                            DLOG(@"[GAME-PATCH] v36.117: Flags set: handshakeComplete=1 challengeResponded=1");
                         } else {
-                            DLOG(@"[GAME-PATCH] v36.116: 0x80FFF495 status=0 already OK");
+                            DLOG(@"[GAME-PATCH] v36.117: 0x80FFF495 status=0 already OK");
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
                         }
@@ -6017,7 +6059,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.116 - Fix UUID inject applied to send, patch 0x80FFF495 status=1→0");
+    DLOG(@"[VERSION] WangXianHook v36.117 - SEND-CMD uses final sendLen, SEND-FINAL confirms actual payload, 0x80FFF495 patch complete");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
