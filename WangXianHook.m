@@ -3009,26 +3009,34 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     
-    // v36.108: If this is the fake response fd, pretend send succeeds
+    // v36.115: If this is the fake response fd, pretend send succeeds
     // This prevents heartbeat from detecting the dead connection via send()
-    // v36.108: Only reset delivered flag when client sends a NEW command (not heartbeat)
+    // v36.115: Enqueue new commands AND reset delivered flag
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
         // Check if this is a new command (not heartbeat)
         BOOL isNewCmd = NO;
+        uint32_t newCmd = 0;
+        uint32_t newSeq = 0;
         if (len >= 12) {
             const unsigned char *p = (const unsigned char *)buf;
-            uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+            newCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                            ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+            newSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                     ((uint32_t)p[10] << 8)  | (uint32_t)p[11];
             // Only reset for game commands, not heartbeat
-            if (cmd != 0x00000015 && cmd < 0x80000000) {
+            if (newCmd != 0x00000015 && newCmd < 0x80000000) {
                 isNewCmd = YES;
-                DLOG(@"[FAKE-SEND] v36.108: New cmd=0x%08X detected, resetting delivered flag", cmd);
+                DLOG(@"[FAKE-SEND] v36.115: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             }
         }
         if (isNewCmd) {
             g_fakeRespDelivered = NO;
+            // v36.115: Enqueue the new command so the hook can generate a response for it
+            enqueueGameCmd(newCmd, fd, (uint32_t)len, newSeq);
+            g_lastGameCmd = newCmd;
+            g_lastSeqNum = newSeq;
         } else {
-            DLOG(@"[FAKE-SEND] v36.108: Simulating send success for fd=%d len=%zu (heartbeat/ack, keep delivered)", fd, len);
+            DLOG(@"[FAKE-SEND] v36.115: Simulating send success for fd=%d len=%zu (heartbeat/ack, keep delivered)", fd, len);
         }
         return (ssize_t)len;
     }
@@ -3981,17 +3989,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.108: Queue-based fake response system (PRIORITY PATH)
+    // v36.115: Queue-based fake response system (PRIORITY PATH)
     // This handles ALL subsequent recv calls after initial injection
     if (g_fakeRespActive && g_fakeRespFd == fd) {
-        // v36.108: Cap total responses to prevent infinite loop
+        // v36.115: Cap total responses to prevent infinite loop
         if (g_respCount >= 200) {
-            DLOG(@"[FAKE-RESP] v36.108: Response cap reached (%d), returning EAGAIN", g_respCount);
+            DLOG(@"[FAKE-RESP] v36.115: Response cap reached (%d), returning EAGAIN", g_respCount);
             errno = EAGAIN;
             return -1;
         }
         
-        // v36.108: Try to dequeue next command with sequence number
+        // v36.115: Try to dequeue next command with sequence number
         GameCmdEntry entry;
         uint32_t responseCmd = 0;
         uint32_t respSeqNum = 0;
@@ -4001,10 +4009,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             responseCmd = entry.cmd;
             respSeqNum = entry.seqNum;
             dequeued = YES;
-            DLOG(@"[FAKE-RESP] v36.108: Dequeued cmd=0x%08X seq=0x%08X from queue (remaining=%d)", 
+            DLOG(@"[FAKE-RESP] v36.115: Dequeued cmd=0x%08X seq=0x%08X from queue (remaining=%d)", 
                  responseCmd, respSeqNum, g_cmdQueueCount);
         } else if (g_lastGameCmd != 0) {
-            // v36.108: Queue empty but we have a last command
+            // v36.115: Queue empty but we have a last command
             responseCmd = g_lastGameCmd;
             respSeqNum = g_lastSeqNum;
             
@@ -4016,16 +4024,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 errno = EAGAIN;
                 return -1;
             }
-            DLOG(@"[FAKE-RESP] v36.108: Queue empty, using last cmd=0x%08X seq=0x%08X (delivered=%d)", 
+            DLOG(@"[FAKE-RESP] v36.115: Queue empty, using last cmd=0x%08X seq=0x%08X (delivered=%d)", 
                  responseCmd, respSeqNum, g_fakeRespDelivered);
         } else {
             // No commands at all
-            DLOG(@"[FAKE-RESP] v36.108: No commands to respond to, returning EAGAIN");
+            DLOG(@"[FAKE-RESP] v36.115: No commands to respond to, returning EAGAIN");
             errno = EAGAIN;
             return -1;
         }
         
-        // v36.108: Generate response for the command with correct sequence number
+        // v36.115: Generate response for the command with correct sequence number
         uint8_t tempBuf[MAX_FAKE_RESP_BUF];
         uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, sizeof(tempBuf), respSeqNum);
         
@@ -4036,17 +4044,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             g_lastRespCmd = responseCmd;
             g_respCount++;
             
-            // v36.108: Log full response details for debugging
+            // v36.115: Log full response details for debugging
             NSMutableString *respHex = [NSMutableString stringWithCapacity:48];
             for (uint32_t i = 0; i < MIN(respLen, 16); i++) {
                 [respHex appendFormat:@"%02X ", tempBuf[i]];
             }
-            DLOG(@"[FAKE-RESP] v36.108: Delivered response for cmd=0x%08X seq=0x%08X len=%u (queue=%d, respCount=%d, hex=%@)", 
+            DLOG(@"[FAKE-RESP] v36.115: Delivered response for cmd=0x%08X seq=0x%08X len=%u (queue=%d, respCount=%d, hex=%@)", 
                  responseCmd, respSeqNum, respLen, g_cmdQueueCount, g_respCount, respHex);
             return (ssize_t)respLen;
         }
         
-        DLOG(@"[FAKE-RESP] v36.108: generateFakeResponse returned invalid len=%u (max=%zu), returning EAGAIN", respLen, len);
+        DLOG(@"[FAKE-RESP] v36.115: generateFakeResponse returned invalid len=%u (max=%zu), returning EAGAIN", respLen, len);
         errno = EAGAIN;
         return -1;
     }
@@ -4057,30 +4065,41 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // v36.101: Switch to active mode but respect delivered flag
             if (!g_fakeRespActive) {
                 g_fakeRespActive = YES;
-                DLOG(@"[FAKE-RESP] v36.105: Switching to ACTIVE fake response mode for fd=%d", fd);
+                DLOG(@"[FAKE-RESP] v36.115: Switching to ACTIVE fake response mode for fd=%d", fd);
             }
-            // v36.105: If already delivered AND same cmd, return EAGAIN
-            if (g_fakeRespDelivered && g_lastGameCmd == g_lastRespCmd) {
-                errno = EAGAIN;
-                return -1;
-            }
+            // v36.115: Use command queue for ALL responses, not just g_lastGameCmd
             if (g_respCount >= 200) {
                 errno = EAGAIN;
                 return -1;
             }
             
-            // v36.107: Generate fake response based on last tracked game server command with correct seq
+            // v36.115: Dequeue next command from queue (fixes wrong cmd/seq in subsequent responses)
+            GameCmdEntry entry;
+            uint32_t activeCmd = 0;
+            uint32_t activeSeq = 0;
+            
+            if (dequeueGameCmd(&entry)) {
+                activeCmd = entry.cmd;
+                activeSeq = entry.seqNum;
+            } else {
+                // v36.115: Queue empty - all commands have been responded to
+                DLOG(@"[FAKE-RESP] v36.115: Queue empty, returning EAGAIN (all %d responses delivered)", g_respCount);
+                errno = EAGAIN;
+                return -1;
+            }
+            
+            // v36.115: Generate fake response using dequeued command with correct seq
             uint8_t tempBuf[MAX_FAKE_RESP_BUF];
-            uint32_t respLen = generateFakeResponse(g_lastGameCmd, tempBuf, sizeof(tempBuf), g_lastSeqNum);
+            uint32_t respLen = generateFakeResponse(activeCmd, tempBuf, sizeof(tempBuf), activeSeq);
             
             if (respLen > 0 && respLen <= len) {
                 memcpy(buf, tempBuf, respLen);
                 g_fakeRespSentCount++;
-                g_fakeRespDelivered = YES;  // v36.101: Mark as delivered
-                g_lastRespCmd = g_lastGameCmd;  // v36.107: Track which cmd we responded to
-                g_respCount++;  // v36.107: Increment response counter
-                DLOG(@"[FAKE-RESP] v36.107: Delivered response for cmd=0x%08X seq=0x%08X len=%u (total #%d, respCount=%d)", 
-                     g_lastGameCmd, g_lastSeqNum, respLen, g_fakeRespSentCount, g_respCount);
+                g_fakeRespDelivered = YES;
+                g_lastRespCmd = activeCmd;
+                g_respCount++;
+                DLOG(@"[FAKE-RESP] v36.115: Delivered response for cmd=0x%08X seq=0x%08X len=%u (total #%d, respCount=%d, queue=%d)", 
+                     activeCmd, activeSeq, respLen, g_fakeRespSentCount, g_respCount, g_cmdQueueCount);
                 return (ssize_t)respLen;
             }
             
@@ -4094,11 +4113,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             ssize_t retLen = (ssize_t)g_fakeRespLen;
             if (retLen > (ssize_t)len) retLen = (ssize_t)len;
             memcpy(buf, g_fakeRespBuf, retLen);
-            DLOG(@"[FAKE-RESP] v36.96: Returning stored fake response (%zd bytes) for fd=%d", retLen, fd);
+            DLOG(@"[FAKE-RESP] v36.115: Returning stored fake response (%zd bytes) for fd=%d", retLen, fd);
             return retLen;
         }
         // No fake response data available, return EAGAIN
-        DLOG(@"[FAKE-RESP] v36.96: No fake response data, returning EAGAIN for fd=%d", fd);
+        DLOG(@"[FAKE-RESP] v36.115: No fake response data, returning EAGAIN for fd=%d", fd);
         errno = EAGAIN;
         return -1;
     }
@@ -4163,9 +4182,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // and set internal disconnected state, leading to "网络中断" error.
                 // Instead: inject fake response or return EAGAIN to keep connection alive.
                 
-                // v36.108: Fix initial injection - use command queue instead of hardcoding
+                // v36.115: Fix initial injection - use command queue instead of hardcoding
                 if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
-                    // v36.108: Get first command from queue for proper response matching
+                    // v36.115: Get first command from queue for proper response matching
                     GameCmdEntry firstEntry;
                     uint32_t responseCmd = 0;
                     uint32_t respSeqNum = 0;
@@ -4176,30 +4195,33 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         responseCmd = firstEntry.cmd;
                         respSeqNum = firstEntry.seqNum;
                         hasEntry = YES;
-                        DLOG(@"[FAKE-RESP] v36.108: Using queued cmd=0x%08X seq=0x%08X for initial injection", responseCmd, respSeqNum);
+                        DLOG(@"[FAKE-RESP] v36.115: Using queued cmd=0x%08X seq=0x%08X for initial injection", responseCmd, respSeqNum);
                     } else if (g_lastGameCmd != 0) {
                         // Fallback: use last tracked command
                         responseCmd = g_lastGameCmd;
                         respSeqNum = g_lastSeqNum;
-                        DLOG(@"[FAKE-RESP] v36.108: No queued cmd, using last cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
+                        DLOG(@"[FAKE-RESP] v36.115: No queued cmd, using last cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
                     } else {
-                        DLOG(@"[FAKE-RESP] v36.108: No commands tracked, using default response");
+                        DLOG(@"[FAKE-RESP] v36.115: No commands tracked, using default response");
                         responseCmd = 0x000EE007;  // Default to device info response
                         respSeqNum = 0;
                     }
                     
-                    // v36.108: Generate response using proper function with correct sequence number
+                    // v36.115: Generate response using proper function with correct sequence number
                     uint8_t *tempBuf = g_fakeRespBuf;
                     uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, MAX_FAKE_RESP_BUF, respSeqNum);
                     
                     if (respLen == 0) {
-                        respLen = 16;
+                        // v36.115: Fallback should also use 200 bytes, not 16
+                        respLen = 200;
                         memset(tempBuf, 0, respLen);
-                        tempBuf[3] = respLen;
-                        tempBuf[4] = (responseCmd >> 24) | 0x80;
-                        tempBuf[5] = (responseCmd >> 16) & 0xFF;
-                        tempBuf[6] = (responseCmd >> 8) & 0xFF;
-                        tempBuf[7] = responseCmd & 0xFF;
+                        tempBuf[0] = 0x00; tempBuf[1] = 0x00;
+                        tempBuf[2] = (respLen >> 8) & 0xFF;
+                        tempBuf[3] = respLen & 0xFF;
+                        tempBuf[4] = ((responseCmd | 0x80000000) >> 24) & 0xFF;
+                        tempBuf[5] = ((responseCmd | 0x80000000) >> 16) & 0xFF;
+                        tempBuf[6] = ((responseCmd | 0x80000000) >> 8) & 0xFF;
+                        tempBuf[7] = (responseCmd | 0x80000000) & 0xFF;
                         tempBuf[8] = (respSeqNum >> 24) & 0xFF;
                         tempBuf[9] = (respSeqNum >> 16) & 0xFF;
                         tempBuf[10] = (respSeqNum >> 8) & 0xFF;
@@ -4219,14 +4241,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         ssize_t retLen = (ssize_t)respLen;
                         if (retLen > (ssize_t)len) retLen = (ssize_t)len;
                         memcpy(buf, tempBuf, retLen);
-                        DLOG(@"[FAKE-RESP] v36.108: Injected response for cmd=0x%08X seq=0x%08X len=%u (queue=%d)", 
+                        DLOG(@"[FAKE-RESP] v36.115: Injected response for cmd=0x%08X seq=0x%08X len=%u (queue=%d)", 
                              responseCmd, respSeqNum, respLen, g_cmdQueueCount);
                         
                         NSMutableString *fakeHex = [NSMutableString stringWithCapacity:64];
                         for (uint32_t i = 0; i < MIN(respLen, 32); i++) {
                             [fakeHex appendFormat:@"%02X ", tempBuf[i]];
                         }
-                        DLOG(@"[FAKE-RESP] v36.108: Response hex: %@", fakeHex);
+                        DLOG(@"[FAKE-RESP] v36.115: Response hex: %@", fakeHex);
                         
                         return retLen;
                     }
@@ -4236,7 +4258,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // Primary fake response handling is at the BEGINNING of hook_recv (line 3377)
                 // which returns EAGAIN immediately for ALL subsequent recv calls
                 if (g_fakeRespInjected && g_fakeRespFd == fd && g_fakeRespSentCount > 2) {
-                    DLOG(@"[FAKE-RESP] v36.96: Safety net triggered - returning EAGAIN for fd=%d", fd);
+                    DLOG(@"[FAKE-RESP] v36.115: Safety net triggered - returning EAGAIN for fd=%d", fd);
                     errno = EAGAIN;
                     return -1;
                 }
