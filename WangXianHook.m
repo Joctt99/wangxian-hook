@@ -179,6 +179,8 @@ extern "C" kern_return_t mach_vm_remap(
 #include <string.h>
 #include <sys/mman.h>
 #include <execinfo.h>
+#include <poll.h>
+#include <sys/select.h>
 #include <zlib.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonCryptor.h>
