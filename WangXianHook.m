@@ -1,13 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.108: Fix initial injection to use command queue, prevent response loop
+ * WangXianHook v36.109: Fix SIGSEGV crash - all responses minimal 16-byte header only
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.108 FIXES:
- *   1. Fix initial injection path to use command queue instead of hardcoding 0x80FFF493
- *   2. Fix response loop - only reset delivered flag when NEW command sent, not on every send
- *   3. Enhanced diagnostics logging for all fake responses
- *   4. Proper sequence number matching for all responses
+ * v36.109 FIXES:
+ *   1. Fix SIGSEGV crash: 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES(string)
+ *   2. ALL fake responses now use 16-byte header only (no payload) to prevent parsing crashes
+ *   3. Remove all fabricated payload data that caused string parsing crashes
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -483,7 +482,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.108 诊断面板";
+            lbl.text = @"WXHook v36.109 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1373,125 +1372,40 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             break;
         }
             
-        case 0x00FFF495: {  // v36.107: Large login/character data request (703 bytes)
-            respLen = 256;  // Larger response for character data
-            if (respLen > bufSize) respLen = bufSize;
+        case 0x00FFF495: {  // v36.109: CHOOSE_WOOD_BOX_RES - minimal header only to prevent crash
+            // v36.108 CRASH FIX: 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES(string)
+            // Any payload data causes string parsing crash. Use 16-byte header only.
+            respLen = 16;
             memset(respBuf, 0, respLen);
-            
-            // Header: [length(4)] [cmd(4)] [seq(4)] [status(4)]
-            respBuf[0] = (respLen >> 24) & 0xFF;
-            respBuf[1] = (respLen >> 16) & 0xFF;
-            respBuf[2] = (respLen >> 8) & 0xFF;
-            respBuf[3] = respLen & 0xFF;
-            
+            respBuf[0] = 0x00; respBuf[1] = 0x00;
+            respBuf[2] = 0x00; respBuf[3] = respLen;
             respBuf[4] = (respCmd >> 24) & 0xFF;
             respBuf[5] = (respCmd >> 16) & 0xFF;
             respBuf[6] = (respCmd >> 8) & 0xFF;
             respBuf[7] = respCmd & 0xFF;
-            
-            // v36.107: Preserve sequence number from request
             respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
             respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            
-            // Status = 0 (success)
             respBuf[12] = 0x00; respBuf[13] = 0x00;
             respBuf[14] = 0x00; respBuf[15] = 0x00;
-            
-            // Character data payload
-            // byte[16-19]: server time
-            respBuf[16] = 0x00; respBuf[17] = 0x00;
-            respBuf[18] = 0x00; respBuf[19] = 0x01;
-            
-            // byte[20-23]: user ID
-            respBuf[20] = 0x00; respBuf[21] = 0x00;
-            respBuf[22] = 0x00; respBuf[23] = 0x01;
-            
-            // byte[24-55]: token (32 bytes)
-            const char *fakeToken = "AAAAQVBJLTQ3NzY2ODc5OTA=";
-            uint32_t tokenLen = (uint32_t)strlen(fakeToken);
-            if (tokenLen > 32) tokenLen = 32;
-            memcpy(respBuf + 24, fakeToken, tokenLen);
-            
-            // byte[56-59]: character count
-            respBuf[56] = 0x00; respBuf[57] = 0x00;
-            respBuf[58] = 0x00; respBuf[59] = 0x01;
-            
-            // byte[60-63]: character ID
-            respBuf[60] = 0x00; respBuf[61] = 0x00;
-            respBuf[62] = 0x00; respBuf[63] = 0x01;
-            
-            // byte[64-67]: level
-            respBuf[64] = 0x00; respBuf[65] = 0x00;
-            respBuf[66] = 0x00; respBuf[67] = 0x01;
-            
-            // byte[68-71]: server ID
-            respBuf[68] = 0x00; respBuf[69] = 0x00;
-            respBuf[70] = 0x00; respBuf[71] = 0x01;
-            
-            // byte[72-75]: flags
-            respBuf[72] = 0x00; respBuf[73] = 0x00;
-            respBuf[74] = 0x00; respBuf[75] = 0x01;
-            
-            // Fill remaining with pattern
-            for (uint32_t i = 76; i < respLen; i++) {
-                respBuf[i] = (i % 2 == 0) ? 0x00 : 0x01;
-            }
-            respBuf[respLen - 4] = 0x01;
-            respBuf[respLen - 3] = 0x02;
-            respBuf[respLen - 2] = 0x03;
-            respBuf[respLen - 1] = 0x04;
             break;
         }
             
-        case 0x00FFF493:  // Login data request -> login success response
+        case 0x00FFF493:  // Login data request -> success response
         case 0x000EE007:  // Device info request -> success response
         case 0x000EE121: {  // Auth request -> success response
-            respLen = 128;
-            if (respLen > bufSize) respLen = bufSize;
+            // v36.109: Minimal 16-byte header only to prevent payload parsing crashes
+            respLen = 16;
             memset(respBuf, 0, respLen);
-            
-            // Header: [length(4)] [cmd(4)] [seq(4)] [status(4)]
-            respBuf[0] = (respLen >> 24) & 0xFF;
-            respBuf[1] = (respLen >> 16) & 0xFF;
-            respBuf[2] = (respLen >> 8) & 0xFF;
-            respBuf[3] = respLen & 0xFF;
-            
+            respBuf[0] = 0x00; respBuf[1] = 0x00;
+            respBuf[2] = 0x00; respBuf[3] = respLen;
             respBuf[4] = (respCmd >> 24) & 0xFF;
             respBuf[5] = (respCmd >> 16) & 0xFF;
             respBuf[6] = (respCmd >> 8) & 0xFF;
             respBuf[7] = respCmd & 0xFF;
-            
-            // v36.107: Preserve sequence number from request
             respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
             respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            
-            // Status = 0 (success)
             respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;
-            
-            // Payload: generate realistic-looking data
-            // byte[16-19]: server timestamp
-            respBuf[16] = 0x00; respBuf[17] = 0x00;
-            respBuf[18] = 0x00; respBuf[19] = 0x01;
-            
-            // byte[20-23]: user ID
-            respBuf[20] = 0x00; respBuf[21] = 0x00;
-            respBuf[22] = 0x00; respBuf[23] = 0x01;
-            
-            // byte[24-55]: token (32 bytes, Base64-like)
-            const char *fakeToken = "AAAAQVBJLTQ3NzY2ODc5OTA=";
-            uint32_t tokenLen = (uint32_t)strlen(fakeToken);
-            if (tokenLen > 32) tokenLen = 32;
-            memcpy(respBuf + 24, fakeToken, tokenLen);
-            
-            // Fill remaining with alternating pattern
-            for (uint32_t i = 56; i < respLen; i++) {
-                respBuf[i] = (i % 2 == 0) ? 0x00 : 0x01;
-            }
-            respBuf[respLen - 4] = 0x01;
-            respBuf[respLen - 3] = 0x02;
-            respBuf[respLen - 2] = 0x03;
-            respBuf[respLen - 1] = 0x04;
+            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Status = 0 (success)
             break;
         }
             
@@ -6040,7 +5954,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.108 - Fix initial injection, prevent response loop, proper seq matching");
+    DLOG(@"[VERSION] WangXianHook v36.109 - Fix SIGSEGV crash, all responses minimal 16-byte header only");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
