@@ -1,7 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.96 - Comprehensive fix: FAKE-RESP EAGAIN + realistic response + NetImpl heartbeat hook
+ * WangXianHook v36.97 - Fix heartbeat detection + send/getsockopt hook + dlsym search
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
+ *
+ * v36.97 FIXES:
+ *   1. Hook send() for fake resp fd - simulate send success
+ *   2. Hook getsockopt() for fake resp fd - return SO_ERROR=0
+ *   3. Fix dlsym search logic - use dlopen instead of raw image header
+ *   4. Use rebindSymbol (fishhook) to hook C++ heartbeat/disconnect functions
  *
  * v36.93 DISCOVERY (TRUE ROOT CAUSE):
  *   The SERVER is closing the connection, not the client!
@@ -1082,6 +1088,21 @@ typedef void (*NetImplQuitFunc)(void);
 static NetImplQuitFunc orig_NetImpl_quitFromServer = NULL;
 static BOOL g_quitFromServerHooked = NO;
 
+// v36.97: MSHookFunction variables for heartbeat and disconnect
+typedef void (*HeartbeatFunc)(void);
+typedef void (*DisconnectFunc)(void);
+static HeartbeatFunc orig_heartbeat_func = NULL;
+static DisconnectFunc orig_disconnect_func = NULL;
+
+// v36.97: No-op functions for MSHookFunction
+static void noop_heartbeat(void) {
+    DLOG(@"[NETIMPL-BLOCK] v36.97: HEARTBEAT BLOCKED (no-op)");
+}
+
+static void noop_disconnect(void) {
+    DLOG(@"[NETIMPL-BLOCK] v36.97: DISCONNECT BLOCKED (no-op)");
+}
+
 // v36.57: Server list for rotation/retry
 #define MAX_SERVERS 20
 typedef struct {
@@ -1838,6 +1859,7 @@ typedef ssize_t (*ReadFunc)(int, void *, size_t);
 typedef ssize_t (*RecvfromFunc)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 typedef ssize_t (*RecvmsgFunc)(int, struct msghdr *, int);
 typedef int (*CloseFunc)(int);
+typedef int (*GetsockoptFunc)(int, int, int, void *, socklen_t *);
 
 static ConnectFunc orig_connect = NULL;
 static SendFunc orig_send = NULL;
@@ -1847,6 +1869,7 @@ static RecvmsgFunc orig_recvmsg = NULL;
 static WriteFunc orig_write = NULL;
 static ReadFunc orig_read = NULL;
 static CloseFunc orig_close = NULL;
+static GetsockoptFunc orig_getsockopt = NULL;
 
 #define MAX_TRACKED_FDS 64
 static int g_trackedFds[MAX_TRACKED_FDS];
@@ -2286,8 +2309,32 @@ static BOOL tryNextServer(void) {
     return YES;
 }
 
+// v36.97: Hook getsockopt to prevent heartbeat from detecting dead connection
+// When fake response fd is used, SO_ERROR should return 0 (no error)
+static int hook_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
+    
+    // If this is the fake response fd and checking SO_ERROR, return 0
+    if (g_fakeRespInjected && g_fakeRespFd == fd && level == SOL_SOCKET && optname == SO_ERROR) {
+        if (optval && optlen && *optlen >= sizeof(int)) {
+            *(int *)optval = 0;  // No error
+            *optlen = sizeof(int);
+            DLOG(@"[FAKE-SOCKOPT] v36.97: Returning SO_ERROR=0 for fake resp fd=%d", fd);
+            return 0;
+        }
+    }
+    
+    return orig_getsockopt ? orig_getsockopt(fd, level, optname, optval, optlen) : -1;
+}
+
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    
+    // v36.97: Also block close for fake response fd
+    if (g_fakeRespInjected && g_fakeRespFd == fd) {
+        DLOG(@"[FAKE-CLOSE] v36.97: Blocking close(%d) for fake response fd", fd);
+        return 0;
+    }
     
     // v36.93: Track game server port closures and BLOCK them during login flow
     for (int i = 0; i < g_trackedCount; i++) {
@@ -2445,6 +2492,14 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    
+    // v36.97: If this is the fake response fd, pretend send succeeds
+    // This prevents heartbeat from detecting the dead connection via send()
+    if (g_fakeRespInjected && g_fakeRespFd == fd) {
+        DLOG(@"[FAKE-SEND] v36.97: Simulating send success for fd=%d len=%zu (fake resp fd)", fd, len);
+        return (ssize_t)len;
+    }
+    
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
     
@@ -4546,6 +4601,7 @@ static void installSocketHooks(void) {
     orig_write = NULL;
     orig_read = NULL;
     orig_close = NULL;
+    orig_getsockopt = NULL;
     
     int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
     int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
@@ -4555,6 +4611,7 @@ static void installSocketHooks(void) {
     int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
     int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
     int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
+    int gs = rebindSymbol("_getsockopt", (void *)hook_getsockopt, (void **)&orig_getsockopt);
     
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
@@ -4564,10 +4621,11 @@ static void installSocketHooks(void) {
     if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
     if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
     
-    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d", c, s, r, rf, rm, w, rd, cl);
-    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p", 
-         orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close);
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d getsockopt=%d", c, s, r, rf, rm, w, rd, cl, gs);
+    DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p getsockopt=%p", 
+         orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close, orig_getsockopt);
     
     if (!orig_connect) DLOG(@"[SOCK-ERROR] connect hook failed - network monitoring disabled!");
     if (!orig_send) DLOG(@"[SOCK-ERROR] send hook failed - outgoing data monitoring disabled!");
@@ -6027,12 +6085,12 @@ static void installAllHooks(void) {
                 }
             }
             
-            // === Approach 2: Search ALL images for C++ disconnect functions ===
-            DLOG(@"[NETIMPL-HOOK] v36.96: Searching ALL images for disconnect functions...");
+            // === Approach 2: Search ALL images using dlopen for C++ disconnect functions ===
+            DLOG(@"[NETIMPL-HOOK] v36.97: Searching ALL images using dlopen for C++ functions...");
             int imageCount = _dyld_image_count();
             
-            // List of mangled names to search
-            const char *searchNames[] = {
+            // Lists of mangled names to search
+            const char *disconnectNames[] = {
                 "_ZN7NetImpl14quitFromServerEv",
                 "_ZN7NetImpl13quitFromServerEv",
                 "_ZN7NetImpl14quitFromServerEiv",
@@ -6045,43 +6103,8 @@ static void installAllHooks(void) {
                 NULL
             };
             
-            void *foundFunc = NULL;
-            char foundName[256] = {0};
-            
-            // Search all images
-            for (int idx = 0; idx < imageCount && !foundFunc; idx++) {
-                const struct mach_header *imageHeader = _dyld_get_image_header(idx);
-                if (!imageHeader) continue;
-                void *imageHandle = (void *)imageHeader;
-                
-                for (int n = 0; searchNames[n] != NULL; n++) {
-                    void *sym = dlsym(imageHandle, searchNames[n]);
-                    if (sym) {
-                        foundFunc = sym;
-                        strncpy(foundName, searchNames[n], sizeof(foundName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.96: FOUND %s in image[%d] at %p", 
-                             searchNames[n], idx, foundFunc);
-                        break;
-                    }
-                }
-            }
-            
-            // === Approach 3: Try dlsym with RTLD_DEFAULT for all known names ===
-            if (!foundFunc) {
-                for (int n = 0; searchNames[n] != NULL; n++) {
-                    void *sym = dlsym(RTLD_DEFAULT, searchNames[n]);
-                    if (sym) {
-                        foundFunc = sym;
-                        strncpy(foundName, searchNames[n], sizeof(foundName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.96: FOUND %s via RTLD_DEFAULT at %p", 
-                             searchNames[n], foundFunc);
-                        break;
-                    }
-                }
-            }
-            
-            // === Approach 4: Search for heartbeat-related functions ===
             const char *heartbeatNames[] = {
+                "_ZN7NetImpl9heartbeatEv",
                 "_ZN7NetImpl14sendHeartbeatEv",
                 "_ZN7NetImpl15processHeartbeatEv",
                 "_ZN12SocketClient14sendHeartbeatEv",
@@ -6090,16 +6113,130 @@ static void installAllHooks(void) {
                 NULL
             };
             
+            void *foundDisconnectFunc = NULL;
+            void *foundHeartbeatFunc = NULL;
+            char foundDisconnectName[256] = {0};
+            char foundHeartbeatName[256] = {0};
+            
+            // Search using dlopen (correct way to get symbol from specific image)
             for (int idx = 0; idx < imageCount; idx++) {
-                const struct mach_header *imageHeader = _dyld_get_image_header(idx);
-                if (!imageHeader) continue;
-                void *imageHandle = (void *)imageHeader;
+                const char *imageName = _dyld_get_image_name(idx);
+                if (!imageName) continue;
                 
-                for (int n = 0; heartbeatNames[n] != NULL; n++) {
-                    void *sym = dlsym(imageHandle, heartbeatNames[n]);
+                // Skip our own dylib
+                if (strstr(imageName, "WangXianHook") || strstr(imageName, "lnSignature")) continue;
+                
+                void *handle = dlopen(imageName, RTLD_NOLOAD | RTLD_LAZY);
+                if (!handle) continue;
+                
+                // Search disconnect functions
+                for (int n = 0; disconnectNames[n] != NULL; n++) {
+                    void *sym = dlsym(handle, disconnectNames[n]);
                     if (sym) {
-                        DLOG(@"[NETIMPL-HOOK] v36.96: FOUND heartbeat func: %s at %p", heartbeatNames[n], sym);
-                        // We don't hook heartbeat, just log it for reference
+                        foundDisconnectFunc = sym;
+                        strncpy(foundDisconnectName, disconnectNames[n], sizeof(foundDisconnectName) - 1);
+                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND disconnect: %s in image[%d]: %s at %p", 
+                             disconnectNames[n], idx, imageName, foundDisconnectFunc);
+                        break;
+                    }
+                }
+                
+                // Search heartbeat functions
+                for (int n = 0; heartbeatNames[n] != NULL; n++) {
+                    void *sym = dlsym(handle, heartbeatNames[n]);
+                    if (sym) {
+                        foundHeartbeatFunc = sym;
+                        strncpy(foundHeartbeatName, heartbeatNames[n], sizeof(foundHeartbeatName) - 1);
+                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND heartbeat: %s in image[%d]: %s at %p", 
+                             heartbeatNames[n], idx, imageName, foundHeartbeatFunc);
+                        break;
+                    }
+                }
+                
+                dlclose(handle);
+                
+                if (foundDisconnectFunc && foundHeartbeatFunc) break;
+            }
+            
+            // === Approach 3: Try RTLD_DEFAULT as fallback ===
+            if (!foundDisconnectFunc) {
+                for (int n = 0; disconnectNames[n] != NULL; n++) {
+                    void *sym = dlsym(RTLD_DEFAULT, disconnectNames[n]);
+                    if (sym) {
+                        foundDisconnectFunc = sym;
+                        strncpy(foundDisconnectName, disconnectNames[n], sizeof(foundDisconnectName) - 1);
+                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND disconnect via RTLD_DEFAULT: %s at %p", 
+                             disconnectNames[n], foundDisconnectFunc);
+                        break;
+                    }
+                }
+            }
+            
+            if (!foundHeartbeatFunc) {
+                for (int n = 0; heartbeatNames[n] != NULL; n++) {
+                    void *sym = dlsym(RTLD_DEFAULT, heartbeatNames[n]);
+                    if (sym) {
+                        foundHeartbeatFunc = sym;
+                        strncpy(foundHeartbeatName, heartbeatNames[n], sizeof(foundHeartbeatName) - 1);
+                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND heartbeat via RTLD_DEFAULT: %s at %p", 
+                             heartbeatNames[n], foundHeartbeatFunc);
+                        break;
+                    }
+                }
+            }
+            
+            // === Approach 4: Use rebindSymbol (fishhook) to hook C++ functions ===
+            // This works if the C++ function is referenced through PLT/GOT
+            const char *heartbeatSymbols[] = {
+                "_ZN7NetImpl9heartbeatEv",
+                "_ZN7NetImpl14sendHeartbeatEv",
+                "_ZN7NetImpl15processHeartbeatEv",
+                "_ZN7NetImpl12checkConnectionEv",
+                "_ZN12SocketClient14sendHeartbeatEv",
+                NULL
+            };
+            
+            const char *disconnectSymbols[] = {
+                "_ZN7NetImpl14quitFromServerEv",
+                "_ZN7NetImpl13quitFromServerEv",
+                "_ZN7NetImpl14quitFromServerEiv",
+                "_ZN12SocketClient14quitFromServerEv",
+                "_ZN7NetImpl10disconnectEv",
+                "_ZN7NetImpl9closeGameEv",
+                NULL
+            };
+            
+            // Try to hook heartbeat functions via fishhook
+            for (int n = 0; heartbeatSymbols[n] != NULL; n++) {
+                // rebindSymbol expects symbol name WITHOUT leading underscore
+                const char *symName = heartbeatSymbols[n] + 1;
+                int patched = rebindSymbol(symName, (void *)noop_heartbeat, (void **)&orig_heartbeat_func);
+                if (patched > 0) {
+                    DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked heartbeat %s via fishhook (patched=%d)", symName, patched);
+                    g_quitFromServerHooked = YES;
+                    break;
+                }
+            }
+            
+            // Try to hook disconnect functions via fishhook
+            for (int n = 0; disconnectSymbols[n] != NULL; n++) {
+                const char *symName = disconnectSymbols[n] + 1;
+                int patched = rebindSymbol(symName, (void *)noop_disconnect, (void **)&orig_disconnect_func);
+                if (patched > 0) {
+                    DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked disconnect %s via fishhook (patched=%d)", symName, patched);
+                    g_quitFromServerHooked = YES;
+                    break;
+                }
+            }
+            
+            // Also try to hook via symbol name with underscore (for symbols already loaded)
+            if (!g_quitFromServerHooked) {
+                for (int n = 0; heartbeatSymbols[n] != NULL; n++) {
+                    int patched = rebindSymbol(heartbeatSymbols[n], (void *)noop_heartbeat, (void **)&orig_heartbeat_func);
+                    if (patched > 0) {
+                        DLOG(@"[NETIMPL-HOOK] v36.97: Hooked heartbeat %s (with underscore) via fishhook (patched=%d)", heartbeatSymbols[n], patched);
+                        g_quitFromServerHooked = YES;
+                        break;
                     }
                 }
             }
@@ -6122,10 +6259,10 @@ static void installAllHooks(void) {
                     
                     for (NSString *pattern in methodPatterns) {
                         if ([selName containsString:pattern]) {
-                            DLOG(@"[NETIMPL-HOOK] v36.96: Hooking %@.%@ (matches '%@')", 
+                            DLOG(@"[NETIMPL-HOOK] v36.97: Hooking %@.%@ (matches '%@')", 
                                  clsName, selName, pattern);
                             IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                DLOG(@"[NETIMPL-BLOCK] v36.96: BLOCKED %@.%@ (no-op)", clsName, selName);
+                                DLOG(@"[NETIMPL-BLOCK] v36.97: BLOCKED %@.%@ (no-op)", clsName, selName);
                             });
                             method_setImplementation(methods[i], noopImpl);
                             g_quitFromServerHooked = YES;
@@ -6137,11 +6274,11 @@ static void installAllHooks(void) {
             }
             
             if (!g_quitFromServerHooked) {
-                DLOG(@"[NETIMPL-HOOK] v36.96: INFO - No disconnect function found via ObjC runtime");
-                DLOG(@"[NETIMPL-HOOK] v36.96: This is expected if NetImpl is pure C++ code");
-                DLOG(@"[NETIMPL-HOOK] v36.96: Will rely on FAKE-RESP injection + EAGAIN protection");
+                DLOG(@"[NETIMPL-HOOK] v36.97: INFO - No disconnect function found via ObjC runtime");
+                DLOG(@"[NETIMPL-HOOK] v36.97: This is expected if NetImpl is pure C++ code");
+                DLOG(@"[NETIMPL-HOOK] v36.97: Will rely on FAKE-RESP injection + EAGAIN protection");
             } else {
-                DLOG(@"[NETIMPL-HOOK] v36.96: Successfully hooked disconnect functions!");
+                DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked disconnect functions!");
             }
             
         } @catch (NSException *e) {
