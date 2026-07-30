@@ -1,9 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.102: Inline patch C++ functions + fix double response bug
+ * WangXianHook v36.103: mach_vm_remap to bypass iOS code page protection
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
  *
- * v36.102 FIXES:
+ * v36.103 FIXES:
+ *   1. Use mach_vm_remap to bypass iOS code page write protection (kr=2 fix)
+ *   2. Fallback to mprotect on jailbroken devices
+ *   3. Properly allocate+copy+modify+remap code pages
+ *
+ * v36.103 FIXES:
  *   1. Inline patch C++ functions (quitFromServer/heartbeat) to ret instruction
  *   2. Use dladdr+backtrace to find function addresses when close() is called
  *   3. Proactively search for functions via dlsym at hook installation
@@ -258,7 +263,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.102 loaded ===");
+        _log(@"=== WangXianHook v36.103 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1106,50 +1111,90 @@ static int g_lastGameCmdFd = -1;
 static BOOL g_fakeRespActive = NO;  // v36.100: TRUE when we're in fake response mode
 static BOOL g_fakeRespDelivered = NO;  // v36.101: TRUE after delivering a response, reset on new send
 
-// v36.102: Inline patch system - patch C++ functions to ret using backtrace addresses
+// v36.103: Inline patch system - patch C++ functions to ret using backtrace addresses
 static BOOL g_quitFromServerPatched = NO;
 static BOOL g_heartbeatPatched = NO;
 
-// v36.102: Patch a function's first instruction to ARM64 ret (0xD65F03C0)
+// v36.103: Patch a function's first instruction to ARM64 ret (0xD65F03C0)
+// Uses mach_vm_remap to bypass iOS code page write protection
 static BOOL patchFunctionToReturn(void *funcAddr, const char *funcName) {
     if (!funcAddr) return NO;
     
-    // ARM64 ret instruction
-    uint32_t retInstr = 0xD65F03C0;
+    uint32_t retInstr = 0xD65F03C0;  // ARM64 ret instruction
+    vm_size_t pageSize = vm_page_size;
+    vm_address_t pageAddr = (vm_address_t)funcAddr & ~(pageSize - 1);
+    uint32_t offsetInPage = (uint32_t)((vm_address_t)funcAddr - pageAddr);
     
-    kern_return_t kr;
-    vm_address_t page = (vm_address_t)funcAddr & ~0xFFF;
+    DLOG(@"[INLINE-PATCH] v36.103: Patching %s at %p (page=%p offset=%u)", funcName, funcAddr, (void*)pageAddr, offsetInPage);
     
-    // Change memory protection to allow writing
-    kr = vm_protect(mach_task_self(), page, 0x2000, false,
-                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    // v36.103: Use mach_vm_remap approach
+    // Step 1: Allocate a new page
+    vm_address_t newPage = 0;
+    kern_return_t kr = vm_allocate(mach_task_self(), &newPage, pageSize, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
-        DLOG(@"[INLINE-PATCH] v36.102: Failed to change protection for %s at %p (kr=%d)", funcName, funcAddr, kr);
+        DLOG(@"[INLINE-PATCH] v36.103: vm_allocate failed: %d", kr);
         return NO;
     }
     
-    // Write ret instruction
-    memcpy(funcAddr, &retInstr, sizeof(retInstr));
+    // Step 2: Copy original page content to new page
+    memcpy((void *)newPage, (void *)pageAddr, pageSize);
     
-    // Restore protection to read+execute
-    kr = vm_protect(mach_task_self(), page, 0x2000, false,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
+    // Step 3: Modify the copy - write ret instruction
+    memcpy((void *)(newPage + offsetInPage), &retInstr, sizeof(retInstr));
+    
+    // Step 4: Use mach_vm_remap to map modified page over original
+    // VM_FLAGS_OVERWRITE allows replacing existing mapping
+    vm_address_t remapAddr = pageAddr;
+    vm_prot_t curProt = VM_PROT_READ | VM_PROT_EXECUTE;
+    vm_prot_t maxProt = VM_PROT_READ | VM_PROT_EXECUTE;
+    
+    kr = mach_vm_remap(
+        mach_task_self(),
+        (mach_vm_address_t *)&remapAddr,
+        (mach_vm_size_t)pageSize,
+        0,                                    // mask
+        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,  // flags
+        mach_task_self(),                     // source task
+        (mach_vm_offset_t)newPage,            // source address
+        FALSE,                                // copy (not shared)
+        &curProt,
+        &maxProt,
+        VM_INHERIT_COPY
+    );
+    
+    if (kr != KERN_SUCCESS) {
+        DLOG(@"[INLINE-PATCH] v36.103: mach_vm_remap failed: %d (curProt=%d maxProt=%d)", kr, curProt, maxProt);
+        // Try alternative: mprotect approach (may work on jailbroken devices)
+        if (mprotect((void *)pageAddr, pageSize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            memcpy(funcAddr, &retInstr, sizeof(retInstr));
+            mprotect((void *)pageAddr, pageSize * 2, PROT_READ | PROT_EXEC);
+            sys_icache_invalidate(funcAddr, sizeof(retInstr));
+            vm_deallocate(mach_task_self(), newPage, pageSize);
+            DLOG(@"[INLINE-PATCH] v36.103: Patched %s via mprotect fallback", funcName);
+            return YES;
+        }
+        vm_deallocate(mach_task_self(), newPage, pageSize);
+        return NO;
+    }
     
     // Clear instruction cache
     sys_icache_invalidate(funcAddr, sizeof(retInstr));
     
-    DLOG(@"[INLINE-PATCH] v36.102: Successfully patched %s at %p to ret", funcName, funcAddr);
+    // Free the temporary page (content is now copied to target)
+    vm_deallocate(mach_task_self(), newPage, pageSize);
+    
+    DLOG(@"[INLINE-PATCH] v36.103: Successfully patched %s at %p via mach_vm_remap", funcName, funcAddr);
     return YES;
 }
 
-// v36.102: Find and patch C++ functions using backtrace from close() call
+// v36.103: Find and patch C++ functions using backtrace from close() call
 static void findAndPatchDisconnectFunctions(void) {
     if (g_quitFromServerPatched && g_heartbeatPatched) return;
     
     void *callstack[32];
     int frames = backtrace(callstack, 32);
     
-    DLOG(@"[INLINE-PATCH] v36.102: Scanning %d backtrace frames for C++ functions...", frames);
+    DLOG(@"[INLINE-PATCH] v36.103: Scanning %d backtrace frames for C++ functions...", frames);
     
     for (int i = 0; i < frames; i++) {
         Dl_info info;
@@ -1158,7 +1203,7 @@ static void findAndPatchDisconnectFunctions(void) {
             
             // Check for quitFromServer
             if (!g_quitFromServerPatched && strstr(name, "quitFromServer")) {
-                DLOG(@"[INLINE-PATCH] v36.102: Found %s at addr=%p (frame %d, ret=%p)", 
+                DLOG(@"[INLINE-PATCH] v36.103: Found %s at addr=%p (frame %d, ret=%p)", 
                      name, info.dli_saddr, i, callstack[i]);
                 if (patchFunctionToReturn(info.dli_saddr, name)) {
                     g_quitFromServerPatched = YES;
@@ -1167,7 +1212,7 @@ static void findAndPatchDisconnectFunctions(void) {
             
             // Check for heartbeat
             if (!g_heartbeatPatched && strstr(name, "heartbeat") && strstr(name, "NetImpl")) {
-                DLOG(@"[INLINE-PATCH] v36.102: Found %s at addr=%p (frame %d, ret=%p)", 
+                DLOG(@"[INLINE-PATCH] v36.103: Found %s at addr=%p (frame %d, ret=%p)", 
                      name, info.dli_saddr, i, callstack[i]);
                 if (patchFunctionToReturn(info.dli_saddr, name)) {
                     g_heartbeatPatched = YES;
@@ -1177,15 +1222,15 @@ static void findAndPatchDisconnectFunctions(void) {
     }
     
     if (!g_quitFromServerPatched && !g_heartbeatPatched) {
-        DLOG(@"[INLINE-PATCH] v36.102: No C++ functions found in backtrace");
+        DLOG(@"[INLINE-PATCH] v36.103: No C++ functions found in backtrace");
     }
 }
 
-// v36.102: Proactively search for C++ functions in main binary and patch them
+// v36.103: Proactively search for C++ functions in main binary and patch them
 static void proactivePatchCppFunctions(void) {
     if (g_quitFromServerPatched && g_heartbeatPatched) return;
     
-    DLOG(@"[INLINE-PATCH] v36.102: Proactively searching for C++ functions in main binary...");
+    DLOG(@"[INLINE-PATCH] v36.103: Proactively searching for C++ functions in main binary...");
     
     const char *targetNames[] = {
         "_ZN7NetImpl14quitFromServerEv",
@@ -1201,7 +1246,7 @@ static void proactivePatchCppFunctions(void) {
         // Skip non-main binaries
         if (!strstr(imageName, "wangxian") && !strstr(imageName, "WangXian")) continue;
         
-        DLOG(@"[INLINE-PATCH] v36.102: Searching in main binary: %s (slide=0x%lx)", 
+        DLOG(@"[INLINE-PATCH] v36.103: Searching in main binary: %s (slide=0x%lx)", 
              imageName, (unsigned long)_dyld_get_image_vmaddr_slide(idx));
         
         void *handle = dlopen(imageName, RTLD_NOLOAD | RTLD_LAZY);
@@ -1210,7 +1255,7 @@ static void proactivePatchCppFunctions(void) {
         for (int n = 0; targetNames[n] != NULL; n++) {
             void *sym = dlsym(handle, targetNames[n]);
             if (sym) {
-                DLOG(@"[INLINE-PATCH] v36.102: Found %s at %p via dlsym", targetNames[n], sym);
+                DLOG(@"[INLINE-PATCH] v36.103: Found %s at %p via dlsym", targetNames[n], sym);
                 
                 if (strstr(targetNames[n], "quitFromServer") && !g_quitFromServerPatched) {
                     if (patchFunctionToReturn(sym, targetNames[n])) {
@@ -1234,7 +1279,7 @@ static void proactivePatchCppFunctions(void) {
     if (!g_quitFromServerPatched) {
         void *sym = dlsym(RTLD_DEFAULT, "_ZN7NetImpl14quitFromServerEv");
         if (sym) {
-            DLOG(@"[INLINE-PATCH] v36.102: Found quitFromServer via RTLD_DEFAULT at %p", sym);
+            DLOG(@"[INLINE-PATCH] v36.103: Found quitFromServer via RTLD_DEFAULT at %p", sym);
             if (patchFunctionToReturn(sym, "quitFromServer")) {
                 g_quitFromServerPatched = YES;
             }
@@ -1243,14 +1288,14 @@ static void proactivePatchCppFunctions(void) {
     if (!g_heartbeatPatched) {
         void *sym = dlsym(RTLD_DEFAULT, "_ZN7NetImpl9heartbeatEv");
         if (sym) {
-            DLOG(@"[INLINE-PATCH] v36.102: Found heartbeat via RTLD_DEFAULT at %p", sym);
+            DLOG(@"[INLINE-PATCH] v36.103: Found heartbeat via RTLD_DEFAULT at %p", sym);
             if (patchFunctionToReturn(sym, "heartbeat")) {
                 g_heartbeatPatched = YES;
             }
         }
     }
     
-    DLOG(@"[INLINE-PATCH] v36.102: Proactive search complete: quitFromServer=%d heartbeat=%d", 
+    DLOG(@"[INLINE-PATCH] v36.103: Proactive search complete: quitFromServer=%d heartbeat=%d", 
          g_quitFromServerPatched, g_heartbeatPatched);
 }
 
@@ -2671,8 +2716,8 @@ static int hook_close(int fd) {
     
     // v36.97: Also block close for fake response fd
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
-        DLOG(@"[FAKE-CLOSE] v36.102: Blocking close(%d) for fake response fd", fd);
-        // v36.102: Use this opportunity to find and patch C++ disconnect functions
+        DLOG(@"[FAKE-CLOSE] v36.103: Blocking close(%d) for fake response fd", fd);
+        // v36.103: Use this opportunity to find and patch C++ disconnect functions
         // The backtrace from close() should include quitFromServer and heartbeat
         findAndPatchDisconnectFunctions();
         return 0;
@@ -4011,7 +4056,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     g_fakeRespLen = fakePktLen;
                     g_fakeRespSentCount = 1;  // v36.96: Mark as already sent (we return it immediately)
                     g_fakeRespActive = YES;  // v36.100: Switch to ACTIVE mode for subsequent responses
-                    g_fakeRespDelivered = YES;  // v36.102: Mark as delivered to prevent double response
+                    g_fakeRespDelivered = YES;  // v36.103: Mark as delivered to prevent double response
                     
                     // Copy fake packet to user buffer and return it NOW
                     // Subsequent recv calls will return EAGAIN via the check at hook_recv start
@@ -5724,7 +5769,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.102 - Inline patch C++ functions + fix double response bug");
+    DLOG(@"[VERSION] WangXianHook v36.103 - mach_vm_remap to bypass iOS code page protection");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -5743,7 +5788,7 @@ static void installAllHooks(void) {
     
     installSocketHooks();
     
-    // v36.102: Proactively patch C++ disconnect/heartbeat functions
+    // v36.103: Proactively patch C++ disconnect/heartbeat functions
     proactivePatchCppFunctions();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
