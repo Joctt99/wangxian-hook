@@ -223,8 +223,6 @@ static void installAllHooks(void);
 
 #include <signal.h>
 #include <execinfo.h>
-#include <exception>
-#include <cxxabi.h>
 
 // v36.110: ObjC exception handler
 static void objcExceptionHandler(NSException *exception) {
@@ -249,26 +247,11 @@ static void objcExceptionHandler(NSException *exception) {
     }
 }
 
-// v36.110: C++ terminate handler
-static void cppTerminateHandler() {
+// v36.110: C terminate handler (for SIGABRT with stack trace)
+static void cTerminateHandler() {
     NSMutableString *crashInfo = [NSMutableString string];
-    [crashInfo appendFormat:@"\n=== CPP-TERMINATE ===\n"];
+    [crashInfo appendFormat:@"\n=== C-TERMINATE (SIGABRT) ===\n"];
     
-    // Try to get current exception
-    try {
-        std::exception_ptr eptr = std::current_exception();
-        if (eptr) {
-            try {
-                std::rethrow_exception(eptr);
-            } catch (const std::exception& e) {
-                [crashInfo appendFormat:@"std::exception: %s\n", e.what()];
-            } catch (...) {
-                [crashInfo appendFormat:@"Unknown C++ exception\n"];
-            }
-        }
-    } catch (...) {}
-    
-    // Get stack trace
     void *callstack[128];
     int frames = backtrace(callstack, 128);
     char **strs = backtrace_symbols(callstack, frames);
@@ -290,7 +273,7 @@ static void cppTerminateHandler() {
         } @catch (NSException *e) {}
     }
     
-    std::abort();
+    abort();
 }
 
 static void signalHandler(int sig) {
@@ -342,9 +325,8 @@ static void setupSignalHandlers(void) {
     signal(SIGBUS, signalHandler);
     signal(SIGFPE, signalHandler);
     signal(SIGTRAP, signalHandler);
-    // v36.110: Register ObjC and C++ exception handlers
+    // v36.110: Register ObjC exception handler
     NSSetUncaughtExceptionHandler(&objcExceptionHandler);
-    std::set_terminate(cppTerminateHandler);
 }
 
 static void _log(NSString *msg) {
@@ -384,7 +366,7 @@ static void log_init(void) {
         setupSignalHandlers();
         _log(@"=== WangXianHook v36.110 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
-        _log(@"[CRASH-HANDLER] Signal handlers + ObjC + C++ exception handlers registered");
+        _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
     }
 }
