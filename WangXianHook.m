@@ -1,6 +1,6 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.118: UUID injection ONLY for game server (12003), NOT login server (5678)
+ * WangXianHook v36.119: UUID injection ONLY for game server (12003), NOT login server (5678)
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
  * v36.118 FIXES (CRITICAL):
@@ -374,7 +374,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.117 loaded ===");
+        _log(@"=== WangXianHook v36.119 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -553,7 +553,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.117 诊断面板";
+            lbl.text = @"WXHook v36.119 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1168,6 +1168,12 @@ static ssize_t g_deviceInfoPacketLen = 0;
 static BOOL g_deviceInfoCaptured = NO;
 static BOOL g_deviceInfoSentToGame = NO;
 
+// v36.119: Fixed IDFV for [UIDevice identifierForVendor] hook
+// Returns consistent UUID so client NATIVELY builds UUID-containing 0x000EE007
+// (Avoids send-level buffer modification per Experience 1423135)
+static NSUUID *g_fixedIDFV = nil;
+static NSUUID* (*orig_identifierForVendor)(UIDevice *self, SEL _cmd) = NULL;
+
 // v36.87: Enhanced device info packet (with UUID injected) for game server
 // Login server (5678) sends 143-byte version (no UUID)
 // Game server expects 179-byte version (with UUID field)
@@ -1424,7 +1430,7 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     seqBytes[2] = (seqNum >> 8) & 0xFF;
     seqBytes[3] = seqNum & 0xFF;
     
-    // v36.117: ALL responses use 200-byte format with zero-padded payload
+    // v36.119: ALL responses use 200-byte format with zero-padded payload
     // Previous 16-byte responses caused SIGSEGV in handlers like handle_CHOOSE_WOOD_BOX_RES
     // which read payload beyond the 16-byte header.
     // 200 bytes matches the v36.88 FORCE-HS-PREP approach that was proven safe.
@@ -3020,9 +3026,9 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
     
-    // v36.117: If this is the fake response fd, pretend send succeeds
+    // v36.119: If this is the fake response fd, pretend send succeeds
     // This prevents heartbeat from detecting the dead connection via send()
-    // v36.117: Enqueue new commands AND reset delivered flag
+    // v36.119: Enqueue new commands AND reset delivered flag
     if (g_fakeRespInjected && g_fakeRespFd == fd) {
         // Check if this is a new command (not heartbeat)
         BOOL isNewCmd = NO;
@@ -3037,17 +3043,17 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             // Only reset for game commands, not heartbeat
             if (newCmd != 0x00000015 && newCmd < 0x80000000) {
                 isNewCmd = YES;
-                DLOG(@"[FAKE-SEND] v36.117: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
+                DLOG(@"[FAKE-SEND] v36.119: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             }
         }
         if (isNewCmd) {
             g_fakeRespDelivered = NO;
-            // v36.117: Enqueue the new command so the hook can generate a response for it
+            // v36.119: Enqueue the new command so the hook can generate a response for it
             enqueueGameCmd(newCmd, fd, (uint32_t)len, newSeq);
             g_lastGameCmd = newCmd;
             g_lastSeqNum = newSeq;
         } else {
-            DLOG(@"[FAKE-SEND] v36.117: Simulating send success for fd=%d len=%zu (heartbeat/ack, keep delivered)", fd, len);
+            DLOG(@"[FAKE-SEND] v36.119: Simulating send success for fd=%d len=%zu (heartbeat/ack, keep delivered)", fd, len);
         }
         return (ssize_t)len;
     }
@@ -3159,7 +3165,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         DLOG(@"[DEVICE-INFO] ENHANCED FAILED, will use original %zd bytes", len);
                     }
                     
-                    // v36.117: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
+                    // v36.119: CRITICAL FIX - Apply UUID injection DIRECTLY to sendBuf/sendLen
                     // Previous bug: UUID was injected to global buffers but NOT applied to the
                     // actual send() call, so server received 179 bytes without UUID and rejected.
                     //
@@ -3178,9 +3184,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             if (sendBuf != buf) free(sendBuf);
                             sendBuf = newBuf;
                             sendLen = newLen;
-                            DLOG(@"[UUID-INJECT] v36.118: APPLIED to sendBuf (GAME port=%d): %zu -> %zu bytes (WILL be sent!)",
+                            DLOG(@"[UUID-INJECT] v36.119: APPLIED to sendBuf (GAME port=%d): %zu -> %zu bytes (WILL be sent!)",
                                  port, len, newLen);
-                            // v36.117: Immediately log corrected SEND-CMD with FINAL length
+                            // v36.119: Immediately log corrected SEND-CMD with FINAL length
                             const char *host2 = getHostForFd(fd);
                             int port2 = getPortForFd(fd);
                             const char *serverType2 = "UNKNOWN";
@@ -3193,9 +3199,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             (void)host2;
                         }
                     } else if (enhancedLen > 0 && !isGamePortForInject) {
-                        // v36.118: Login server - do NOT inject UUID, send original packet
+                        // v36.119: Login server - do NOT inject UUID, send original packet
                         // Enhanced buffer is still prepared for later game server use
-                        DLOG(@"[UUID-INJECT] v36.118: SKIP inject for LOGIN port=%d (send original %zu bytes), enhanced buffer ready for game server",
+                        DLOG(@"[UUID-INJECT] v36.119: SKIP inject for LOGIN port=%d (send original %zu bytes), enhanced buffer ready for game server",
                              port, len);
                     }
                 }
@@ -3280,7 +3286,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     }
                     // v36.107: Add to command queue with sequence number and actual send length
                     enqueueGameCmd(trackCmd, fd, actualSendLen, trackSeqNum);
-                    DLOG(@"[CMD-TRACK] v36.117: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (origLen=%zu queue=%d)", 
+                    DLOG(@"[CMD-TRACK] v36.119: Queued cmd=0x%08X seq=0x%08X fd=%d sendLen=%u (origLen=%zu queue=%d)", 
                          trackCmd, trackSeqNum, fd, actualSendLen, len, g_cmdQueueCount);
                     // v36.107: Clear delivered flag so next recv can return a response
                     g_fakeRespDelivered = NO;
@@ -3422,7 +3428,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
 
-    // v36.117: FINAL confirmation log right before calling orig_send()
+    // v36.119: FINAL confirmation log right before calling orig_send()
     // This is THE authoritative log of what actually gets sent to the server
     if (sendLen >= 12 && sendBuf) {
         const unsigned char *fp = (const unsigned char *)sendBuf;
@@ -3442,7 +3448,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                           finalCmd == 0x00FFF493 || finalCmd == 0x00FFF494 ||
                           finalPktLen != sendLen);  // Also flag if pktLen header doesn't match send() len
         if (isCritical || (finalPort >= 10000 && finalCmd != 0x00000015)) {
-            DLOG(@"[SEND-FINAL] v36.117: cmd=0x%08X pktLenHdr=%u send()=%zu fd=%d [%s port=%d] %@",
+            DLOG(@"[SEND-FINAL] v36.119: cmd=0x%08X pktLenHdr=%u send()=%zu fd=%d [%s port=%d] %@",
                  finalCmd, finalPktLen, sendLen, fd, finalType, finalPort,
                  (finalPktLen != sendLen) ? @"⚠️ HEADER MISMATCH!" : @"✅ OK");
         }
@@ -4075,17 +4081,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.117: Queue-based fake response system (PRIORITY PATH)
+    // v36.119: Queue-based fake response system (PRIORITY PATH)
     // This handles ALL subsequent recv calls after initial injection
     if (g_fakeRespActive && g_fakeRespFd == fd) {
-        // v36.117: Cap total responses to prevent infinite loop
+        // v36.119: Cap total responses to prevent infinite loop
         if (g_respCount >= 200) {
-            DLOG(@"[FAKE-RESP] v36.117: Response cap reached (%d), returning EAGAIN", g_respCount);
+            DLOG(@"[FAKE-RESP] v36.119: Response cap reached (%d), returning EAGAIN", g_respCount);
             errno = EAGAIN;
             return -1;
         }
         
-        // v36.117: Try to dequeue next command with sequence number
+        // v36.119: Try to dequeue next command with sequence number
         GameCmdEntry entry;
         uint32_t responseCmd = 0;
         uint32_t respSeqNum = 0;
@@ -4095,10 +4101,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             responseCmd = entry.cmd;
             respSeqNum = entry.seqNum;
             dequeued = YES;
-            DLOG(@"[FAKE-RESP] v36.117: Dequeued cmd=0x%08X seq=0x%08X from queue (remaining=%d)", 
+            DLOG(@"[FAKE-RESP] v36.119: Dequeued cmd=0x%08X seq=0x%08X from queue (remaining=%d)", 
                  responseCmd, respSeqNum, g_cmdQueueCount);
         } else if (g_lastGameCmd != 0) {
-            // v36.117: Queue empty but we have a last command
+            // v36.119: Queue empty but we have a last command
             responseCmd = g_lastGameCmd;
             respSeqNum = g_lastSeqNum;
             
@@ -4110,16 +4116,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 errno = EAGAIN;
                 return -1;
             }
-            DLOG(@"[FAKE-RESP] v36.117: Queue empty, using last cmd=0x%08X seq=0x%08X (delivered=%d)", 
+            DLOG(@"[FAKE-RESP] v36.119: Queue empty, using last cmd=0x%08X seq=0x%08X (delivered=%d)", 
                  responseCmd, respSeqNum, g_fakeRespDelivered);
         } else {
             // No commands at all
-            DLOG(@"[FAKE-RESP] v36.117: No commands to respond to, returning EAGAIN");
+            DLOG(@"[FAKE-RESP] v36.119: No commands to respond to, returning EAGAIN");
             errno = EAGAIN;
             return -1;
         }
         
-        // v36.117: Generate response for the command with correct sequence number
+        // v36.119: Generate response for the command with correct sequence number
         uint8_t tempBuf[MAX_FAKE_RESP_BUF];
         uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, sizeof(tempBuf), respSeqNum);
         
@@ -4130,17 +4136,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             g_lastRespCmd = responseCmd;
             g_respCount++;
             
-            // v36.117: Log full response details for debugging
+            // v36.119: Log full response details for debugging
             NSMutableString *respHex = [NSMutableString stringWithCapacity:48];
             for (uint32_t i = 0; i < MIN(respLen, 16); i++) {
                 [respHex appendFormat:@"%02X ", tempBuf[i]];
             }
-            DLOG(@"[FAKE-RESP] v36.117: Delivered response for cmd=0x%08X seq=0x%08X len=%u (queue=%d, respCount=%d, hex=%@)", 
+            DLOG(@"[FAKE-RESP] v36.119: Delivered response for cmd=0x%08X seq=0x%08X len=%u (queue=%d, respCount=%d, hex=%@)", 
                  responseCmd, respSeqNum, respLen, g_cmdQueueCount, g_respCount, respHex);
             return (ssize_t)respLen;
         }
         
-        DLOG(@"[FAKE-RESP] v36.117: generateFakeResponse returned invalid len=%u (max=%zu), returning EAGAIN", respLen, len);
+        DLOG(@"[FAKE-RESP] v36.119: generateFakeResponse returned invalid len=%u (max=%zu), returning EAGAIN", respLen, len);
         errno = EAGAIN;
         return -1;
     }
@@ -4151,15 +4157,15 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // v36.101: Switch to active mode but respect delivered flag
             if (!g_fakeRespActive) {
                 g_fakeRespActive = YES;
-                DLOG(@"[FAKE-RESP] v36.117: Switching to ACTIVE fake response mode for fd=%d", fd);
+                DLOG(@"[FAKE-RESP] v36.119: Switching to ACTIVE fake response mode for fd=%d", fd);
             }
-            // v36.117: Use command queue for ALL responses, not just g_lastGameCmd
+            // v36.119: Use command queue for ALL responses, not just g_lastGameCmd
             if (g_respCount >= 200) {
                 errno = EAGAIN;
                 return -1;
             }
             
-            // v36.117: Dequeue next command from queue (fixes wrong cmd/seq in subsequent responses)
+            // v36.119: Dequeue next command from queue (fixes wrong cmd/seq in subsequent responses)
             GameCmdEntry entry;
             uint32_t activeCmd = 0;
             uint32_t activeSeq = 0;
@@ -4168,13 +4174,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 activeCmd = entry.cmd;
                 activeSeq = entry.seqNum;
             } else {
-                // v36.117: Queue empty - all commands have been responded to
-                DLOG(@"[FAKE-RESP] v36.117: Queue empty, returning EAGAIN (all %d responses delivered)", g_respCount);
+                // v36.119: Queue empty - all commands have been responded to
+                DLOG(@"[FAKE-RESP] v36.119: Queue empty, returning EAGAIN (all %d responses delivered)", g_respCount);
                 errno = EAGAIN;
                 return -1;
             }
             
-            // v36.117: Generate fake response using dequeued command with correct seq
+            // v36.119: Generate fake response using dequeued command with correct seq
             uint8_t tempBuf[MAX_FAKE_RESP_BUF];
             uint32_t respLen = generateFakeResponse(activeCmd, tempBuf, sizeof(tempBuf), activeSeq);
             
@@ -4184,7 +4190,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 g_fakeRespDelivered = YES;
                 g_lastRespCmd = activeCmd;
                 g_respCount++;
-                DLOG(@"[FAKE-RESP] v36.117: Delivered response for cmd=0x%08X seq=0x%08X len=%u (total #%d, respCount=%d, queue=%d)", 
+                DLOG(@"[FAKE-RESP] v36.119: Delivered response for cmd=0x%08X seq=0x%08X len=%u (total #%d, respCount=%d, queue=%d)", 
                      activeCmd, activeSeq, respLen, g_fakeRespSentCount, g_respCount, g_cmdQueueCount);
                 return (ssize_t)respLen;
             }
@@ -4199,11 +4205,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             ssize_t retLen = (ssize_t)g_fakeRespLen;
             if (retLen > (ssize_t)len) retLen = (ssize_t)len;
             memcpy(buf, g_fakeRespBuf, retLen);
-            DLOG(@"[FAKE-RESP] v36.117: Returning stored fake response (%zd bytes) for fd=%d", retLen, fd);
+            DLOG(@"[FAKE-RESP] v36.119: Returning stored fake response (%zd bytes) for fd=%d", retLen, fd);
             return retLen;
         }
         // No fake response data available, return EAGAIN
-        DLOG(@"[FAKE-RESP] v36.117: No fake response data, returning EAGAIN for fd=%d", fd);
+        DLOG(@"[FAKE-RESP] v36.119: No fake response data, returning EAGAIN for fd=%d", fd);
         errno = EAGAIN;
         return -1;
     }
@@ -4268,9 +4274,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // and set internal disconnected state, leading to "网络中断" error.
                 // Instead: inject fake response or return EAGAIN to keep connection alive.
                 
-                // v36.117: Fix initial injection - use command queue instead of hardcoding
+                // v36.119: Fix initial injection - use command queue instead of hardcoding
                 if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
-                    // v36.117: Get first command from queue for proper response matching
+                    // v36.119: Get first command from queue for proper response matching
                     GameCmdEntry firstEntry;
                     uint32_t responseCmd = 0;
                     uint32_t respSeqNum = 0;
@@ -4281,24 +4287,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         responseCmd = firstEntry.cmd;
                         respSeqNum = firstEntry.seqNum;
                         hasEntry = YES;
-                        DLOG(@"[FAKE-RESP] v36.117: Using queued cmd=0x%08X seq=0x%08X for initial injection", responseCmd, respSeqNum);
+                        DLOG(@"[FAKE-RESP] v36.119: Using queued cmd=0x%08X seq=0x%08X for initial injection", responseCmd, respSeqNum);
                     } else if (g_lastGameCmd != 0) {
                         // Fallback: use last tracked command
                         responseCmd = g_lastGameCmd;
                         respSeqNum = g_lastSeqNum;
-                        DLOG(@"[FAKE-RESP] v36.117: No queued cmd, using last cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
+                        DLOG(@"[FAKE-RESP] v36.119: No queued cmd, using last cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
                     } else {
-                        DLOG(@"[FAKE-RESP] v36.117: No commands tracked, using default response");
+                        DLOG(@"[FAKE-RESP] v36.119: No commands tracked, using default response");
                         responseCmd = 0x000EE007;  // Default to device info response
                         respSeqNum = 0;
                     }
                     
-                    // v36.117: Generate response using proper function with correct sequence number
+                    // v36.119: Generate response using proper function with correct sequence number
                     uint8_t *tempBuf = g_fakeRespBuf;
                     uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, MAX_FAKE_RESP_BUF, respSeqNum);
                     
                     if (respLen == 0) {
-                        // v36.117: Fallback should also use 200 bytes, not 16
+                        // v36.119: Fallback should also use 200 bytes, not 16
                         respLen = 200;
                         memset(tempBuf, 0, respLen);
                         tempBuf[0] = 0x00; tempBuf[1] = 0x00;
@@ -4327,14 +4333,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         ssize_t retLen = (ssize_t)respLen;
                         if (retLen > (ssize_t)len) retLen = (ssize_t)len;
                         memcpy(buf, tempBuf, retLen);
-                        DLOG(@"[FAKE-RESP] v36.117: Injected response for cmd=0x%08X seq=0x%08X len=%u (queue=%d)", 
+                        DLOG(@"[FAKE-RESP] v36.119: Injected response for cmd=0x%08X seq=0x%08X len=%u (queue=%d)", 
                              responseCmd, respSeqNum, respLen, g_cmdQueueCount);
                         
                         NSMutableString *fakeHex = [NSMutableString stringWithCapacity:64];
                         for (uint32_t i = 0; i < MIN(respLen, 32); i++) {
                             [fakeHex appendFormat:@"%02X ", tempBuf[i]];
                         }
-                        DLOG(@"[FAKE-RESP] v36.117: Response hex: %@", fakeHex);
+                        DLOG(@"[FAKE-RESP] v36.119: Response hex: %@", fakeHex);
                         
                         return retLen;
                     }
@@ -4344,7 +4350,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // Primary fake response handling is at the BEGINNING of hook_recv (line 3377)
                 // which returns EAGAIN immediately for ALL subsequent recv calls
                 if (g_fakeRespInjected && g_fakeRespFd == fd && g_fakeRespSentCount > 2) {
-                    DLOG(@"[FAKE-RESP] v36.117: Safety net triggered - returning EAGAIN for fd=%d", fd);
+                    DLOG(@"[FAKE-RESP] v36.119: Safety net triggered - returning EAGAIN for fd=%d", fd);
                     errno = EAGAIN;
                     return -1;
                 }
@@ -4818,23 +4824,67 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.117: ACTIVE PATCH MODE (was observation mode in v36.93-v36.115)
+                        // v36.119: ACTIVE PATCH MODE (was observation mode in v36.93-v36.115)
                         // Analysis (v36.115 log): status=1 means handshake/auth failed
                         // Server: 139.224.129.92:12003 returned status=1 in 0x80FFF495
                         // Client sent native login packets (0x000EE007 179B, 0x00FFF493 703B)
                         // but server closed connection (RECV-CLOSE ret=0)
                         // Root cause: UUID injection was NOT applied to send (179B vs 217B)
-                        // v36.117: Patch status=1→0 AND set handshake/challenge flags
+                        // v36.119: Patch status=1→0 AND set handshake/challenge flags
                         if (status != 0) {
-                            DLOG(@"[GAME-PATCH] v36.117: Patching 0x80FFF495 status %u -> 0 (server auth failed, force OK)", status);
+                            DLOG(@"[GAME-PATCH] v36.119: Patching 0x80FFF495 status %u -> 0 (server auth failed, force OK)", status);
                             ((unsigned char *)buf)[12] = 0;
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
-                            DLOG(@"[GAME-PATCH] v36.117: Flags set: handshakeComplete=1 challengeResponded=1");
+                            DLOG(@"[GAME-PATCH] v36.119: Flags set: handshakeComplete=1 challengeResponded=1");
                         } else {
-                            DLOG(@"[GAME-PATCH] v36.117: 0x80FFF495 status=0 already OK");
+                            DLOG(@"[GAME-PATCH] v36.119: 0x80FFF495 status=0 already OK");
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
+                        }
+
+                        // ============================================================
+                        // v36.119 CRITICAL: FORCE-SEND 0x000EE007 + virtual FFF493 after patch
+                        // v36.118 observation: client sent ONLY heartbeats after 0x80FFF495
+                        //   (no EE007, no FFF493) - so game flow stopped forever.
+                        // Even with status=0 patched, payload crypto is still wrong, so
+                        // client's internal handshake state machine remains stuck.
+                        // Fix: We FORCE-SEND enhanced EE007 (with UUID) and VIRTUALLY
+                        //   enqueue FFF493 so the FAKE-RESP system can produce proper
+                        //   0x800EE007 (device ack) + 0x80FFF493 (login ack) responses.
+                        // ============================================================
+                        if (g_deviceInfoEnhancedReady && g_deviceInfoEnhancedLen > 0 &&
+                            !g_deviceInfoSentToGame && fd >= 0 && orig_send) {
+                            ssize_t forcedRet = orig_send(fd, g_deviceInfoEnhanced,
+                                                          (size_t)g_deviceInfoEnhancedLen, 0);
+                            if (forcedRet == g_deviceInfoEnhancedLen) {
+                                DLOG(@"[FORCE-SEND] v36.119: SUCCESS -> 0x000EE007 %zd bytes to fd=%d port=%d (client had NOT sent it)",
+                                     g_deviceInfoEnhancedLen, fd, port);
+                                g_deviceInfoSentToGame = YES;
+                                g_loginPacketsSent = YES;  // Trigger FAKE-RESP pipeline
+                                // Enqueue EE007 to command queue so FAKE-RESP produces 0x800EE007
+                                uint32_t eeSeq = g_lastSeqNum + 1;
+                                enqueueGameCmd(0x000EE007, fd,
+                                               (uint32_t)g_deviceInfoEnhancedLen, eeSeq);
+                                DLOG(@"[FORCE-SEND] v36.119: Enqueued 0x000EE007 seq=0x%08X queue=%d (loginPacketsSent=1)",
+                                     eeSeq, g_cmdQueueCount);
+                                // Virtual enqueue FFF493 (encrypted login) - we don't have
+                                // real packet but FAKE-RESP generator produces generic OK
+                                // 0x80FFF493 regardless (does not verify original content)
+                                uint32_t f3Seq = eeSeq + 1;
+                                enqueueGameCmd(0x00FFF493, fd, 703, f3Seq);
+                                DLOG(@"[FORCE-SEND] v36.119: VIRTUAL enqueue 0x00FFF493 seq=0x%08X (for FAKE-RESP 0x80FFF493 only)",
+                                     f3Seq);
+                            } else {
+                                DLOG(@"[FORCE-SEND] v36.119: FAILED 0x000EE007 (tried %zd bytes, ret=%zd orig_send=%p)",
+                                     g_deviceInfoEnhancedLen, forcedRet, (void *)orig_send);
+                            }
+                        } else if (g_deviceInfoSentToGame) {
+                            DLOG(@"[FORCE-SEND] v36.119: SKIP (already sent earlier)");
+                        } else if (!g_deviceInfoEnhancedReady) {
+                            DLOG(@"[FORCE-SEND] v36.119: SKIP (enhanced EE007 not ready yet - login on port 5678 may not have completed before game connect)");
+                        } else if (!orig_send) {
+                            DLOG(@"[FORCE-SEND] v36.119: SKIP (orig_send function pointer NULL - dlsym failed?)");
                         }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -5719,6 +5769,53 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
     return result;
 }
 
+// ============================================================
+// v36.119: Hook [UIDevice identifierForVendor]
+// Let client construct 0x000EE007 with UUID NATIVELY
+// (Avoids send-level buffer modification per Experience 1423135)
+// ============================================================
+static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
+    // Always return our fixed, reproducible UUID
+    if (g_fixedIDFV) {
+        return g_fixedIDFV;
+    }
+    // Fallback: call original
+    if (orig_identifierForVendor) {
+        return orig_identifierForVendor(self, _cmd);
+    }
+    return nil;
+}
+
+static void installIDFVHook(void) {
+    // Use a fixed reproducible UUID (matches what injectUUIDIntoDeviceInfo uses)
+    const char *fixedUUIDStr = "D4896737-1234-5678-ABCD-0123456789AB";
+    @try {
+        g_fixedIDFV = [[NSUUID alloc] initWithUUIDBytes:(const unsigned char *)"\xD4\x89\x67\x37\x12\x34\x56\x78\xAB\xCD\x01\x23\x45\x67\x89\xAB"];
+    } @catch (NSException *e) {
+        g_fixedIDFV = [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:fixedUUIDStr]];
+    }
+    if (!g_fixedIDFV) {
+        g_fixedIDFV = [NSUUID UUID];  // last resort: random
+    }
+    DLOG(@"[IDFV-HOOK] v36.119: Fixed UUID = %@", [g_fixedIDFV UUIDString]);
+
+    // Now swizzle UIDevice's identifierForVendor
+    Class uiDeviceCls = NSClassFromString(@"UIDevice");
+    if (!uiDeviceCls) {
+        DLOG(@"[IDFV-HOOK] v36.119: FAILED - UIDevice class not found");
+        return;
+    }
+    Method m = class_getInstanceMethod(uiDeviceCls, @selector(identifierForVendor));
+    if (!m) {
+        DLOG(@"[IDFV-HOOK] v36.119: FAILED - method identifierForVendor not found");
+        return;
+    }
+    orig_identifierForVendor = (NSUUID* (*)(UIDevice*, SEL))method_getImplementation(m);
+    IMP newImp = (IMP)hook_identifierForVendor;
+    method_setImplementation(m, newImp);
+    DLOG(@"[IDFV-HOOK] v36.119: SUCCESS - [UIDevice identifierForVendor] now returns fixed UUID");
+}
+
 // SecKeyCreateEncryptedData hook (iOS 10+)
 // CORRECT signature: CFDataRef SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFErrorRef *error);
 typedef CFDataRef (*SecKeyCreateEncryptedDataFunc)(SecKeyRef key, SecKeyAlgorithm algorithm, CFDataRef plaintext, CFErrorRef *error);
@@ -5808,6 +5905,9 @@ static void installSecurityHooks(void) {
 #else
     DLOG(@"[SEC] Crypto hooks DISABLED (v36.47 fix - avoid corrupting encryption data)");
 #endif
+
+    // v36.119: Hook [UIDevice identifierForVendor] so client builds UUID-natively
+    installIDFVHook();
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
 }
@@ -6076,7 +6176,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.118 - UUID inject ONLY for game server (12003), NOT login server (5678)");
+    DLOG(@"[VERSION] WangXianHook v36.119 - Hook UIDevice IDFV for native UUID EE007, FORCE-SEND EE007+virtual FFF493 after 0x80FFF495 patch");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
