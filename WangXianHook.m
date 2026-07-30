@@ -1,14 +1,12 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.111: Fix DECODE-SEARCH crash by moving to background thread
+ * WangXianHook v36.112: Patch login server response error codes, update game port detection
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.111 FIXES:
- *   1. Move DECODE-SEARCH scan to background thread (dispatch_async low priority)
- *   2. Add @try/@catch protection around all ObjC class enumeration
- *   3. Add @autoreleasepool to prevent memory issues during scan
- *   4. Add nil checks for all class/method accesses
- *   5. Prevent blocking main thread during startup
+ * v36.112 FIXES:
+ *   1. Patch 0x8000E002 and 0x8002A016 login responses (errorCode 5 -> 0)
+ *   2. Add isGameServerPort() function with support for 5679/5680/5681 ports
+ *   3. Fix root cause: login server returns errorCode=5, client won't connect game server
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -364,7 +362,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.111 loaded ===");
+        _log(@"=== WangXianHook v36.112 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -543,7 +541,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.111 诊断面板";
+            lbl.text = @"WXHook v36.112 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -2508,6 +2506,23 @@ static BOOL isGameCmd(uint32_t cmd) {
     return NO;
 }
 
+// v36.112: Unified game port detection function
+static BOOL isGameServerPort(int port) {
+    // Known game server ports
+    if (port == 12003 || port == 58158 || port == 5679 || port == 5680 || port == 5681) {
+        return YES;
+    }
+    // Dynamic detection: if we have a tracked game port, match against it
+    if (g_gameServerPort >= 1024 && port == g_gameServerPort) {
+        return YES;
+    }
+    // Range-based detection for dynamically assigned ports
+    if (port >= 5000 && port <= 65535 && g_gameServerPort >= 1024) {
+        return YES;
+    }
+    return NO;
+}
+
 static void updateFdHostPort(int fd, const char *host, int port) {
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd) {
@@ -4455,6 +4470,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // v36.49: Do NOT truncate ret! Game needs full response including sessionId etc.
             }
         }
+        
+        // v36.112: Patch login server response error codes
+        // 0x8000E002: Handshake response - errorCode at offset 12-15
+        // 0x8002A016: Version response - errorCode at offset 12-15 (was 5, should be 0)
+        if (port == 5678 && ret >= 16) {
+            if (cmd == 0x8000E002 || cmd == 0x8002A016) {
+                uint32_t errorCode = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                                    ((uint32_t)p[14] << 8)  | (uint32_t)p[15];
+                if (errorCode != 0) {
+                    DLOG(@"[LOGIN-PATCH] v36.112: Patching cmd=0x%08X errorCode from 0x%08X to 0x00000000", cmd, errorCode);
+                    ((unsigned char *)buf)[12] = 0;
+                    ((unsigned char *)buf)[13] = 0;
+                    ((unsigned char *)buf)[14] = 0;
+                    ((unsigned char *)buf)[15] = 0;
+                } else {
+                    DLOG(@"[LOGIN-PATCH] v36.112: cmd=0x%08X errorCode already 0, no patch needed", cmd);
+                }
+            }
+        }
     }
     
     // v36.50: ONLY clear '版本过低'/'当前版本' on login server (port 5678) - NOT on game server!
@@ -5999,7 +6033,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.111 - Fix DECODE-SEARCH crash by moving to background thread");
+    DLOG(@"[VERSION] WangXianHook v36.112 - Patch login server responses, fix game port detection");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
