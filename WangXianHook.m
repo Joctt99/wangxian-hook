@@ -1,6 +1,6 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.94 - Fake login success response injection + NetImpl::quitFromServer hook
+ * WangXianHook v36.95 - Fix fake response trigger + NetImpl hook search
  * MODE: PROACTIVE - Inject fake 0x80FFF493 success when server closes, block quitFromServer
  *
  * v36.93 DISCOVERY (TRUE ROOT CAUSE):
@@ -220,7 +220,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.94 loaded ===");
+        _log(@"=== WangXianHook v36.95 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers registered");
         g_isActivated = YES;
@@ -1060,6 +1060,10 @@ static BOOL g_forceHandshakeComplete = NO;
 static int g_forceHandshakeFd = -1;
 static uint8_t g_forceHandshakeBuf[MAX_FORCE_HS_BUF];
 static uint32_t g_forceHandshakeLen = 0;
+
+// v36.95: Track when client sends login packets to game server
+// This replaces g_challengeResponded for fake response injection trigger
+static BOOL g_loginPacketsSent = NO;
 
 // v36.94: Fake login success response injection
 // When server closes connection (recv returns 0) after client sends login packets,
@@ -2595,6 +2599,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 
                 [protoTrace appendFormat:@"[PROTO-TRACE] Client send after handshake: cmd=0x%08X pktLen=%u port=%d\n", trackCmd, trackPktLen, port];
                 
+                // v36.95: Track login packets to game server for fake response injection
+                // 0x000EE007 (device info) and 0x00FFF493 (encrypted login data) are the key login packets
+                BOOL isGamePortOnly = (port == 12003 || port == 58158 ||
+                                      (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+                if (isGamePortOnly && (trackCmd == 0x000EE007 || trackCmd == 0x00FFF493 || 
+                                       trackCmd == 0x80EEE007 || trackCmd == 0x80F493)) {
+                    if (!g_loginPacketsSent) {
+                        g_loginPacketsSent = YES;
+                        DLOG(@"[LOGIN-PACKETS] v36.95: Client sending login packets to game server (cmd=0x%08X port=%d) - FAKE-RESP armed", trackCmd, port);
+                    }
+                }
+                
                 // Categorize the command
                 if (trackCmd == 0x80FFFF02) {
                     [protoTrace appendFormat:@"  [V36.74] Client sent 0x80FFFF02 - responding to 0x00FFFF02 challenge!\n"];
@@ -3413,9 +3429,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             BOOL isGamePort = (port == 12003 || port == 58158 || 
                                (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
             if (isGamePort) {
-                // v36.94: Check if we need to inject fake login success response
-                // When server closes after receiving login packets, inject fake 0x80FFF493
-                if (g_handshakeComplete && g_challengeResponded && !g_fakeRespInjected) {
+                // v36.95: Use g_loginPacketsSent instead of g_challengeResponded
+                // g_challengeResponded is never set because we don't auto-respond to challenges
+                // g_loginPacketsSent is set when client sends 0x000EE007 or 0x00FFF493 to game server
+                if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
                     // v36.94: Construct fake 0x80FFF493 success response packet
                     // This tells client "login successful" and prevents disconnection
                     uint32_t fakePktLen = 32;  // Minimal valid packet
@@ -3456,25 +3473,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     // Copy fake packet to user buffer
                     if (len >= fakePktLen && buf) {
                         memcpy(buf, g_fakeRespBuf, fakePktLen);
-                        DLOG(@"[FAKE-RESP] v36.94: Injected fake 0x80FFF493 SUCCESS response (%u bytes) to fd=%d", fakePktLen, fd);
-                        DLOG(@"[FAKE-RESP] v36.94: Server closed connection, faking login success to prevent disconnect");
+                        DLOG(@"[FAKE-RESP] v36.95: Injected fake 0x80FFF493 SUCCESS response (%u bytes) to fd=%d", fakePktLen, fd);
+                        DLOG(@"[FAKE-RESP] v36.95: Server closed connection after login packets, faking success");
                         
                         // Log the fake packet
                         NSMutableString *fakeHex = [NSMutableString stringWithCapacity:fakePktLen * 3];
                         for (uint32_t i = 0; i < fakePktLen; i++) {
                             [fakeHex appendFormat:@"%02X ", g_fakeRespBuf[i]];
                         }
-                        DLOG(@"[FAKE-RESP] v36.94: Fake packet hex: %@", fakeHex);
+                        DLOG(@"[FAKE-RESP] v36.95: Fake packet hex: %@", fakeHex);
                         
                         return (ssize_t)fakePktLen;
                     }
                 }
                 
-                // v36.94: If fake response already injected and consumed, return error for subsequent recv
+                // v36.95: If fake response already injected and consumed, return error for subsequent recv
                 if (g_fakeRespInjected && g_fakeRespFd == fd) {
                     g_fakeRespSentCount++;
                     if (g_fakeRespSentCount > 1) {
-                        DLOG(@"[FAKE-RESP] v36.94: Fake response consumed, returning EAGAIN for fd=%d", fd);
+                        DLOG(@"[FAKE-RESP] v36.95: Fake response consumed, returning EAGAIN for fd=%d", fd);
                         errno = EAGAIN;
                         g_fakeRespInjected = NO;
                         return -1;
@@ -4015,6 +4032,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (g_handshakeComplete && ret == 0) {
                 g_handshakeComplete = NO;
                 g_heartbeatCount = 0;
+                // v36.95: Reset login packets sent flag
+                g_loginPacketsSent = NO;
+                g_fakeRespInjected = NO;
                 // v36.68: Clear all leftover buffers on disconnect
                 g_stickyLeftoverLen = 0;
                 g_stickyLeftoverFd = -1;
@@ -5148,7 +5168,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.94 - Fake login success injection + NetImpl::quitFromServer hook (prevent disconnect)");
+    DLOG(@"[VERSION] WangXianHook v36.95 - Fix fake response trigger + NetImpl hook search (search ALL images)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -5909,65 +5929,86 @@ static void installAllHooks(void) {
         }
     });
     
-    // === v36.94: Hook NetImpl::quitFromServer to prevent client disconnect ===
+    // === v36.95: Hook NetImpl::quitFromServer to prevent client disconnect ===
     // This C++ method is called when heartbeat detects dead connection
     // Making it a no-op prevents client state machine from entering disconnected state
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try {
-            // v36.94: Find and hook NetImpl::quitFromServer
+            // v36.95: Find and hook NetImpl::quitFromServer
             // Mangled name: _ZN7NetImpl14quitFromServerEv
             const char *mangledName = "_ZN7NetImpl14quitFromServerEv";
             void *funcPtr = dlsym(RTLD_DEFAULT, mangledName);
             
             if (!funcPtr) {
-                // Try searching in all image headers
-                DLOG(@"[NETIMPL-HOOK] v36.94: Searching for NetImpl::quitFromServer...");
+                // v36.95: Search ALL images (not just ones with "wangxian" in name)
+                // The NetImpl class is in the main binary, which may not contain "wangxian" in its path
+                DLOG(@"[NETIMPL-HOOK] v36.95: Searching ALL images for NetImpl::quitFromServer...");
                 int imageCount = _dyld_image_count();
+                DLOG(@"[NETIMPL-HOOK] v36.95: Total images: %d", imageCount);
+                
+                // First pass: check image 0 (main binary) and all images
                 for (int i = 0; i < imageCount; i++) {
                     const char *imageName = _dyld_get_image_name(i);
-                    if (imageName && strstr(imageName, "wangxian")) {
-                        DLOG(@"[NETIMPL-HOOK] v36.94: Checking image: %s", imageName);
-                        const struct mach_header *imageHeader = _dyld_get_image_header(i);
-                        if (imageHeader) {
-                            void *imageHandle = (void *)imageHeader;
-                            funcPtr = dlsym(imageHandle, mangledName);
-                            if (funcPtr) {
-                                DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl::quitFromServer in image %s at %p", imageName, funcPtr);
-                                break;
-                            }
+                    const struct mach_header *imageHeader = _dyld_get_image_header(i);
+                    if (!imageHeader) continue;
+                    
+                    void *imageHandle = (void *)imageHeader;
+                    void *sym = dlsym(imageHandle, mangledName);
+                    if (sym) {
+                        funcPtr = sym;
+                        DLOG(@"[NETIMPL-HOOK] v36.95: Found NetImpl::quitFromServer in image[%d]: %s at %p", 
+                             i, imageName ? imageName : "unknown", funcPtr);
+                        break;
+                    }
+                }
+                
+                if (!funcPtr) {
+                    // v36.95: Try alternative mangled names for different compilers
+                    const char *altNames[] = {
+                        "_ZN7NetImpl14quitFromServerEv",
+                        "_ZN7NetImpl13quitFromServerEv",  // different name length
+                        "_ZN7NetImpl14quitFromServerEiv",  // with dummy parameter
+                        NULL
+                    };
+                    for (int n = 0; altNames[n] != NULL; n++) {
+                        DLOG(@"[NETIMPL-HOOK] v36.95: Trying alternative: %s", altNames[n]);
+                        funcPtr = dlsym(RTLD_DEFAULT, altNames[n]);
+                        if (funcPtr) {
+                            DLOG(@"[NETIMPL-HOOK] v36.95: Found with alt name: %s at %p", altNames[n], funcPtr);
+                            break;
                         }
                     }
                 }
             }
             
             if (!funcPtr) {
-                // v36.94: Alternative - try finding NetImpl class and hooking its method
-                DLOG(@"[NETIMPL-HOOK] v36.94: Trying Objective-C method lookup for NetImpl...");
+                // v36.95: Alternative - try finding NetImpl class and hooking its method
+                DLOG(@"[NETIMPL-HOOK] v36.95: Trying Objective-C method lookup for NetImpl...");
                 Class netImplCls = NSClassFromString(@"NetImpl");
                 if (netImplCls) {
-                    DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl class");
+                    DLOG(@"[NETIMPL-HOOK] v36.95: Found NetImpl class");
                     
                     unsigned int mcount = 0;
                     Method *methods = class_copyMethodList(netImplCls, &mcount);
                     for (unsigned int i = 0; i < mcount; i++) {
                         SEL sel = method_getName(methods[i]);
                         NSString *selName = NSStringFromSelector(sel);
-                        DLOG(@"[NETIMPL-HOOK] v36.94: NetImpl method: -[%@ %@]", NSStringFromClass(netImplCls), selName);
+                        DLOG(@"[NETIMPL-HOOK] v36.95: NetImpl method: -[%@ %@]", NSStringFromClass(netImplCls), selName);
                         
                         if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"] ||
                             [selName containsString:@"disconnect"] || [selName containsString:@"closeServer"]) {
-                            DLOG(@"[NETIMPL-HOOK] v36.94: Hooking method: %@", selName);
+                            DLOG(@"[NETIMPL-HOOK] v36.95: Hooking method: %@", selName);
                             IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED NetImpl::quitFromServer (no-op)");
+                                DLOG(@"[NETIMPL-QUIT] v36.95: BLOCKED NetImpl::quitFromServer (no-op)");
                             });
                             method_setImplementation(methods[i], noopImpl);
                             g_quitFromServerHooked = YES;
-                            DLOG(@"[NETIMPL-HOOK] v36.94: Successfully hooked %@ as no-op!", selName);
+                            DLOG(@"[NETIMPL-HOOK] v36.95: Successfully hooked %@ as no-op!", selName);
                         }
                     }
                     if (methods) free(methods);
                 } else {
-                    DLOG(@"[NETIMPL-HOOK] v36.94: NetImpl class NOT found");
+                    DLOG(@"[NETIMPL-HOOK] v36.95: NetImpl class NOT found as Objective-C class (expected - it's C++)");
                 }
                 
                 // Also try other common class names
@@ -5982,21 +6023,21 @@ static void installAllHooks(void) {
                             NSString *selName = NSStringFromSelector(sel);
                             if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"] ||
                                 [selName containsString:@"disconnect"]) {
-                                DLOG(@"[NETIMPL-HOOK] v36.94: Found %@.%@ - hooking!", clsName, selName);
+                                DLOG(@"[NETIMPL-HOOK] v36.95: Found %@.%@ - hooking!", clsName, selName);
                                 IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                    DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED %@.%@ (no-op)", clsName, selName);
+                                    DLOG(@"[NETIMPL-QUIT] v36.95: BLOCKED %@.%@ (no-op)", clsName, selName);
                                 });
                                 method_setImplementation(methods2[i], noopImpl);
                                 g_quitFromServerHooked = YES;
-                                DLOG(@"[NETIMPL-HOOK] v36.94: Successfully hooked %@.%@!", clsName, selName);
+                                DLOG(@"[NETIMPL-HOOK] v36.95: Successfully hooked %@.%@!", clsName, selName);
                             }
                         }
                         if (methods2) free(methods2);
                     }
                 }
             } else {
-                // v36.94: Direct C++ function found
-                DLOG(@"[NETIMPL-HOOK] v36.94: Found NetImpl::quitFromServer at %p", funcPtr);
+                // v36.95: Direct C++ function found
+                DLOG(@"[NETIMPL-HOOK] v36.95: Found NetImpl::quitFromServer at %p", funcPtr);
                 
                 // Try to find and hook the Objective-C wrapper
                 Class netImplCls = NSClassFromString(@"NetImpl");
@@ -6007,9 +6048,9 @@ static void installAllHooks(void) {
                         SEL sel = method_getName(methods[i]);
                         NSString *selName = NSStringFromSelector(sel);
                         if ([selName containsString:@"quitFromServer"] || [selName containsString:@"quit"]) {
-                            DLOG(@"[NETIMPL-HOOK] v36.94: Hooking Objective-C method: %@", selName);
+                            DLOG(@"[NETIMPL-HOOK] v36.95: Hooking Objective-C method: %@", selName);
                             IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                DLOG(@"[NETIMPL-QUIT] v36.94: BLOCKED NetImpl::quitFromServer (no-op)");
+                                DLOG(@"[NETIMPL-QUIT] v36.95: BLOCKED NetImpl::quitFromServer (no-op)");
                             });
                             method_setImplementation(methods[i], noopImpl);
                             g_quitFromServerHooked = YES;
