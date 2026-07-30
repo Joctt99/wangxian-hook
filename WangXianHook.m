@@ -146,7 +146,8 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
-#include <mach/vm_protect.h>
+#include <mach/mach_init.h>
+#include <mach/vm_map.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <sys/mman.h>
