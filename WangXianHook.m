@@ -1,13 +1,13 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.114: Patch 0x802EE118 sticky packet status, fix login server TCP sticky detection
+ * WangXianHook v36.115: Fix SIGSEGV by using 200-byte padded responses for all fake responses
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.114 FIXES:
- *   1. Patch 0x802EE118/0x802EE120 status byte (was only patching 0x802EE121)
- *   2. Add TCP sticky packet detection for login server (port 5678)
- *   3. Patch sticky sub-packets containing 0x802EE118 with status=1 -> 0
- *   4. ROOT CAUSE: 0x802EE118 status=1 in sticky packet prevented game server connection
+ * v36.115 FIXES:
+ *   1. ALL fake responses now use 200-byte zero-padded format (was 16 bytes)
+ *   2. Fixes SIGSEGV in handle_CHOOSE_WOOD_BOX_RES which reads payload beyond 16-byte header
+ *   3. 0x80FFF495 response includes 0x88 format flag at byte 13 (from v36.88 FORCE-HS-PREP)
+ *   4. Simplified generateFakeResponse - all commands use same safe 200-byte format
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -363,7 +363,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.114 loaded ===");
+        _log(@"=== WangXianHook v36.115 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -542,7 +542,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.114 诊断面板";
+            lbl.text = @"WXHook v36.115 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1405,7 +1405,6 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     if (!respBuf || bufSize < 16) return 0;
     
     uint32_t respCmd = requestCmd | 0x80000000;  // Response cmd = request cmd | 0x80000000
-    uint32_t respLen = 0;
     
     // v36.107: Extract sequence number bytes for reuse
     uint8_t seqBytes[4];
@@ -1414,127 +1413,39 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     seqBytes[2] = (seqNum >> 8) & 0xFF;
     seqBytes[3] = seqNum & 0xFF;
     
-    switch (requestCmd) {
-        case 0x00FFF494: {  // v36.107: Protocol init/small request
-            respLen = 16;
-            memset(respBuf, 0, respLen);
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            // v36.107: Preserve sequence number from request
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;
-            break;
-        }
-            
-        case 0x00FFF495: {  // v36.109: CHOOSE_WOOD_BOX_RES - minimal header only to prevent crash
-            // v36.108 CRASH FIX: 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES(string)
-            // Any payload data causes string parsing crash. Use 16-byte header only.
-            respLen = 16;
-            memset(respBuf, 0, respLen);
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;
-            break;
-        }
-            
-        case 0x00FFF493:  // Login data request -> success response
-        case 0x000EE007:  // Device info request -> success response
-        case 0x000EE121: {  // Auth request -> success response
-            // v36.109: Minimal 16-byte header only to prevent payload parsing crashes
-            respLen = 16;
-            memset(respBuf, 0, respLen);
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Status = 0 (success)
-            break;
-        }
-            
-        case 0x00000015:  // Heartbeat request -> heartbeat response
-        case 0x00FFFF01:  // Challenge response -> echo
-        case 0x00FFFF02: {
-            respLen = 16;  // Minimal response
-            memset(respBuf, 0, respLen);
-            
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            
-            // v36.107: Preserve sequence number
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;
-            break;
-        }
-            
-        case 0x0000F013: {  // v36.110: Server select request -> minimal 16-byte header
-            // Server list payload can cause parsing crash, use header only
-            respLen = 16;
-            memset(respBuf, 0, respLen);
-            
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
-            break;
-        }
-            
-        default: {
-            // Unknown command: generate generic success response
-            respLen = 16;
-            memset(respBuf, 0, respLen);
-            
-            respBuf[0] = 0x00; respBuf[1] = 0x00;
-            respBuf[2] = 0x00; respBuf[3] = respLen;
-            
-            respBuf[4] = (respCmd >> 24) & 0xFF;
-            respBuf[5] = (respCmd >> 16) & 0xFF;
-            respBuf[6] = (respCmd >> 8) & 0xFF;
-            respBuf[7] = respCmd & 0xFF;
-            
-            // v36.107: Preserve sequence number
-            respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
-            respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
-            
-            respBuf[12] = 0x00; respBuf[13] = 0x00;
-            respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
-            break;
-        }
+    // v36.115: ALL responses use 200-byte format with zero-padded payload
+    // Previous 16-byte responses caused SIGSEGV in handlers like handle_CHOOSE_WOOD_BOX_RES
+    // which read payload beyond the 16-byte header.
+    // 200 bytes matches the v36.88 FORCE-HS-PREP approach that was proven safe.
+    uint32_t respLen = (bufSize >= 200) ? 200 : bufSize;
+    
+    memset(respBuf, 0, respLen);
+    
+    // Header (bytes 0-3): packet length (big-endian)
+    respBuf[0] = (respLen >> 24) & 0xFF;
+    respBuf[1] = (respLen >> 16) & 0xFF;
+    respBuf[2] = (respLen >> 8) & 0xFF;
+    respBuf[3] = respLen & 0xFF;
+    
+    // Header (bytes 4-7): response cmd
+    respBuf[4] = (respCmd >> 24) & 0xFF;
+    respBuf[5] = (respCmd >> 16) & 0xFF;
+    respBuf[6] = (respCmd >> 8) & 0xFF;
+    respBuf[7] = respCmd & 0xFF;
+    
+    // Header (bytes 8-11): sequence number
+    respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
+    respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
+    
+    // Status (byte 12): 0 = success for ALL responses
+    respBuf[12] = 0x00;
+    
+    // For 0x80FFF495 (handle_CHOOSE_WOOD_BOX_RES), byte 13 = 0x88 format flag
+    if (requestCmd == 0x00FFF495) {
+        respBuf[13] = 0x88;  // Format flag from v36.88 FORCE-HS-PREP
     }
+    
+    // Bytes 14-199: zero-padded payload (safe for all handlers)
     
     return respLen;
 }
@@ -6047,7 +5958,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.114 - Patch 0x802EE118 sticky packet status, login server TCP sticky detection");
+    DLOG(@"[VERSION] WangXianHook v36.115 - Fix SIGSEGV with 200-byte padded fake responses");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
