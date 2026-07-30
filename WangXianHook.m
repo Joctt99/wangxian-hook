@@ -1,12 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.109: Fix SIGSEGV crash - all responses minimal 16-byte header only
+ * WangXianHook v36.110: Add C++/ObjC exception handlers, fix all responses to 16-byte header
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.109 FIXES:
- *   1. Fix SIGSEGV crash: 0x80FFF495 maps to handle_CHOOSE_WOOD_BOX_RES(string)
- *   2. ALL fake responses now use 16-byte header only (no payload) to prevent parsing crashes
- *   3. Remove all fabricated payload data that caused string parsing crashes
+ * v36.110 FIXES:
+ *   1. Add NSSetUncaughtExceptionHandler for ObjC exceptions
+ *   2. Add std::set_terminate for C++ exceptions
+ *   3. Fix 0x0000F013 (server select) response to 16-byte header only
+ *   4. Fix hardcoded version string on load
+ *   5. Add synchronizeFile for log flush before crash
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -221,6 +223,75 @@ static void installAllHooks(void);
 
 #include <signal.h>
 #include <execinfo.h>
+#include <exception>
+#include <cxxabi.h>
+
+// v36.110: ObjC exception handler
+static void objcExceptionHandler(NSException *exception) {
+    NSMutableString *crashInfo = [NSMutableString string];
+    [crashInfo appendFormat:@"\n=== OBJC-EXCEPTION ===\n"];
+    [crashInfo appendFormat:@"Name: %@\n", [exception name]];
+    [crashInfo appendFormat:@"Reason: %@\n", [exception reason]];
+    [crashInfo appendFormat:@"UserInfo: %@\n", [exception userInfo]];
+    [crashInfo appendFormat:@"CallStack:\n"];
+    NSArray *callStack = [exception callStackSymbols];
+    for (int i = 0; i < MIN((int)[callStack count], 30); i++) {
+        [crashInfo appendFormat:@"  #%d: %@\n", i, callStack[i]];
+    }
+    [crashInfo appendFormat:@"====================\n"];
+    
+    if (g_logPath) {
+        @try {
+            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+        } @catch (NSException *e) {}
+    }
+}
+
+// v36.110: C++ terminate handler
+static void cppTerminateHandler() {
+    NSMutableString *crashInfo = [NSMutableString string];
+    [crashInfo appendFormat:@"\n=== CPP-TERMINATE ===\n"];
+    
+    // Try to get current exception
+    try {
+        std::exception_ptr eptr = std::current_exception();
+        if (eptr) {
+            try {
+                std::rethrow_exception(eptr);
+            } catch (const std::exception& e) {
+                [crashInfo appendFormat:@"std::exception: %s\n", e.what()];
+            } catch (...) {
+                [crashInfo appendFormat:@"Unknown C++ exception\n"];
+            }
+        }
+    } catch (...) {}
+    
+    // Get stack trace
+    void *callstack[128];
+    int frames = backtrace(callstack, 128);
+    char **strs = backtrace_symbols(callstack, frames);
+    [crashInfo appendFormat:@"Backtrace (%d frames):\n", frames];
+    for (int i = 0; i < frames && i < 30; i++) {
+        if (strs[i]) {
+            [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
+        }
+    }
+    [crashInfo appendFormat:@"====================\n"];
+    
+    if (strs) free(strs);
+    
+    if (g_logPath) {
+        @try {
+            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+        } @catch (NSException *e) {}
+    }
+    
+    std::abort();
+}
 
 static void signalHandler(int sig) {
     NSString *sigName = nil;
@@ -271,6 +342,9 @@ static void setupSignalHandlers(void) {
     signal(SIGBUS, signalHandler);
     signal(SIGFPE, signalHandler);
     signal(SIGTRAP, signalHandler);
+    // v36.110: Register ObjC and C++ exception handlers
+    NSSetUncaughtExceptionHandler(&objcExceptionHandler);
+    std::set_terminate(cppTerminateHandler);
 }
 
 static void _log(NSString *msg) {
@@ -291,7 +365,12 @@ static void _log(NSString *msg) {
         NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
         if (data) {
             NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
+            if (fh) {
+                [fh seekToEndOfFile];
+                [fh writeData:data];
+                [fh synchronizeFile];  // v36.110: Ensure data flushed to disk
+                [fh closeFile];
+            }
         }
         NSLog(@"[WXHook] %@", msg);
     } @catch (NSException *e) {}
@@ -303,9 +382,9 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.107 loaded ===");
+        _log(@"=== WangXianHook v36.110 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
-        _log(@"[CRASH-HANDLER] Signal handlers registered");
+        _log(@"[CRASH-HANDLER] Signal handlers + ObjC + C++ exception handlers registered");
         g_isActivated = YES;
     }
 }
@@ -482,7 +561,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.109 诊断面板";
+            lbl.text = @"WXHook v36.110 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1432,8 +1511,9 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             break;
         }
             
-        case 0x0000F013: {  // Server select request -> success response
-            respLen = 32;
+        case 0x0000F013: {  // v36.110: Server select request -> minimal 16-byte header
+            // Server list payload can cause parsing crash, use header only
+            respLen = 16;
             memset(respBuf, 0, respLen);
             
             respBuf[0] = 0x00; respBuf[1] = 0x00;
@@ -1444,28 +1524,11 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
             respBuf[6] = (respCmd >> 8) & 0xFF;
             respBuf[7] = respCmd & 0xFF;
             
-            // v36.107: Preserve sequence number
             respBuf[8] = seqBytes[0]; respBuf[9] = seqBytes[1];
             respBuf[10] = seqBytes[2]; respBuf[11] = seqBytes[3];
             
             respBuf[12] = 0x00; respBuf[13] = 0x00;
             respBuf[14] = 0x00; respBuf[15] = 0x00;  // Success
-            
-            // Server list data (minimal)
-            respBuf[16] = 0x00; respBuf[17] = 0x00;
-            respBuf[18] = 0x00; respBuf[19] = 0x01;  // 1 server
-            
-            // IP: 127.0.0.1
-            respBuf[20] = 127; respBuf[21] = 0;
-            respBuf[22] = 0; respBuf[23] = 1;
-            
-            // Port: 12003
-            respBuf[24] = 0x2EE9 >> 8; respBuf[25] = 0x2EE9 & 0xFF;
-            respBuf[26] = 0x00; respBuf[27] = 0x00;
-            
-            for (uint32_t i = 28; i < respLen; i++) {
-                respBuf[i] = 0x00;
-            }
             break;
         }
             
@@ -5954,7 +6017,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.109 - Fix SIGSEGV crash, all responses minimal 16-byte header only");
+    DLOG(@"[VERSION] WangXianHook v36.110 - Add C++/ObjC exception handlers, fix all responses to 16-byte header");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
