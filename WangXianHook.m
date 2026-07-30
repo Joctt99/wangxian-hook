@@ -1,14 +1,14 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.110: Add C++/ObjC exception handlers, fix all responses to 16-byte header
+ * WangXianHook v36.111: Fix DECODE-SEARCH crash by moving to background thread
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
- * v36.110 FIXES:
- *   1. Add NSSetUncaughtExceptionHandler for ObjC exceptions
- *   2. Add std::set_terminate for C++ exceptions
- *   3. Fix 0x0000F013 (server select) response to 16-byte header only
- *   4. Fix hardcoded version string on load
- *   5. Add synchronizeFile for log flush before crash
+ * v36.111 FIXES:
+ *   1. Move DECODE-SEARCH scan to background thread (dispatch_async low priority)
+ *   2. Add @try/@catch protection around all ObjC class enumeration
+ *   3. Add @autoreleasepool to prevent memory issues during scan
+ *   4. Add nil checks for all class/method accesses
+ *   5. Prevent blocking main thread during startup
  *
  * v36.107 FIXES:
  *   1. Filter heartbeat (0x00000015) and challenge cmds from command queue
@@ -364,7 +364,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.110 loaded ===");
+        _log(@"=== WangXianHook v36.111 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -543,7 +543,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.110 诊断面板";
+            lbl.text = @"WXHook v36.111 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -5999,7 +5999,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.110 - Add C++/ObjC exception handlers, fix all responses to 16-byte header");
+    DLOG(@"[VERSION] WangXianHook v36.111 - Fix DECODE-SEARCH crash by moving to background thread");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -6342,67 +6342,117 @@ static void installAllHooks(void) {
     }
     
     // === DECODE-SEARCH: Search for decode/decrypt/parse methods ===
-    // This helps find where protocol data is decoded after receiving
-    DLOG(@"[DECODE-SEARCH] Starting scan for decode/decrypt/parse methods...");
+    // v36.111: Move to background thread to avoid blocking main thread
+    DLOG(@"[DECODE-SEARCH] Deferred scan to background thread...");
     
-    unsigned int classCount = 0;
-    Class *allClasses = objc_copyClassList(&classCount);
-    if (allClasses) {
-        NSArray *decodeKeywords = @[
-            @"decrypt", @"Decrypt", @"DECRYPT",
-            @"decode", @"Decode", @"DECODE",
-            @"parse", @"Parse", @"PARSE",
-            @"unpack", @"Unpack", @"UNPACK",
-            @"decompress", @"Decompress", @"DECOMPRESS",
-            @"decipher", @"Decipher", @"DECIPHER",
-            @"decodePacket", @"decodeData", @"parsePacket",
-            @"processPacket", @"handlePacket", @"readPacket",
-            @"decodeServer", @"parseServer", @"serverList"
-        ];
-        
-        for (unsigned int i = 0; i < classCount; i++) {
-            Class cls = allClasses[i];
-            NSString *clsName = NSStringFromClass(cls);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @try {
+            DLOG(@"[DECODE-SEARCH] Starting scan for decode/decrypt/parse methods...");
             
-            unsigned int mcount = 0;
-            Method *methods = class_copyMethodList(cls, &mcount);
-            if (methods) {
-                for (unsigned int j = 0; j < mcount; j++) {
-                    SEL sel = method_getName(methods[j]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    
-                    for (NSString *keyword in decodeKeywords) {
-                        if ([selName containsString:keyword]) {
-                            DLOG(@"[DECODE-FOUND] Class: %@, Method: -[%@ %@]", 
-                                 clsName, clsName, selName);
-                            break;
+            unsigned int classCount = 0;
+            Class *allClasses = objc_copyClassList(&classCount);
+            if (allClasses) {
+                NSArray *decodeKeywords = @[
+                    @"decrypt", @"Decrypt", @"DECRYPT",
+                    @"decode", @"Decode", @"DECODE",
+                    @"parse", @"Parse", @"PARSE",
+                    @"unpack", @"Unpack", @"UNPACK",
+                    @"decompress", @"Decompress", @"DECOMPRESS",
+                    @"decipher", @"Decipher", @"DECIPHER",
+                    @"decodePacket", @"decodeData", @"parsePacket",
+                    @"processPacket", @"handlePacket", @"readPacket",
+                    @"decodeServer", @"parseServer", @"serverList"
+                ];
+                
+                for (unsigned int i = 0; i < classCount; i++) {
+                    @autoreleasepool {
+                        Class cls = allClasses[i];
+                        if (!cls) continue;
+                        
+                        NSString *clsName = nil;
+                        @try {
+                            clsName = NSStringFromClass(cls);
+                        } @catch (NSException *e) {
+                            continue;
+                        }
+                        if (!clsName || clsName.length == 0) continue;
+                        
+                        unsigned int mcount = 0;
+                        Method *methods = NULL;
+                        @try {
+                            methods = class_copyMethodList(cls, &mcount);
+                        } @catch (NSException *e) {}
+                        
+                        if (methods && mcount > 0) {
+                            for (unsigned int j = 0; j < mcount; j++) {
+                                @autoreleasepool {
+                                    @try {
+                                        SEL sel = method_getName(methods[j]);
+                                        if (!sel) continue;
+                                        NSString *selName = NSStringFromSelector(sel);
+                                        if (!selName) continue;
+                                        
+                                        for (NSString *keyword in decodeKeywords) {
+                                            if ([selName containsString:keyword]) {
+                                                DLOG(@"[DECODE-FOUND] Class: %@, Method: -[%@ %@]", 
+                                                     clsName, clsName, selName);
+                                                break;
+                                            }
+                                        }
+                                    } @catch (NSException *e) {
+                                        break;
+                                    }
+                                }
+                            }
+                            free(methods);
+                        }
+                        
+                        Class metaCls = NULL;
+                        @try {
+                            metaCls = object_getClass(cls);
+                        } @catch (NSException *e) {
+                            continue;
+                        }
+                        
+                        Method *classMethods = NULL;
+                        @try {
+                            classMethods = class_copyMethodList(metaCls, &mcount);
+                        } @catch (NSException *e) {}
+                        
+                        if (classMethods && mcount > 0) {
+                            for (unsigned int j = 0; j < mcount; j++) {
+                                @autoreleasepool {
+                                    @try {
+                                        SEL sel = method_getName(classMethods[j]);
+                                        if (!sel) continue;
+                                        NSString *selName = NSStringFromSelector(sel);
+                                        if (!selName) continue;
+                                        
+                                        for (NSString *keyword in decodeKeywords) {
+                                            if ([selName containsString:keyword]) {
+                                                DLOG(@"[DECODE-FOUND] Class: %@, Method: +[%@ %@]", 
+                                                     clsName, clsName, selName);
+                                                break;
+                                            }
+                                        }
+                                    } @catch (NSException *e) {
+                                        break;
+                                    }
+                                }
+                            }
+                            free(classMethods);
                         }
                     }
                 }
-                free(methods);
+                free(allClasses);
+                DLOG(@"[DECODE-SEARCH] Scan completed.");
             }
-            
-            Class metaCls = object_getClass(cls);
-            Method *classMethods = class_copyMethodList(metaCls, &mcount);
-            if (classMethods) {
-                for (unsigned int j = 0; j < mcount; j++) {
-                    SEL sel = method_getName(classMethods[j]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    
-                    for (NSString *keyword in decodeKeywords) {
-                        if ([selName containsString:keyword]) {
-                            DLOG(@"[DECODE-FOUND] Class: %@, Method: +[%@ %@]", 
-                                 clsName, clsName, selName);
-                            break;
-                        }
-                    }
-                }
-                free(classMethods);
-            }
+        } @catch (NSException *e) {
+            DLOG(@"[DECODE-SEARCH] Exception during scan: %@", [e reason]);
+        } @catch (...) {
+            DLOG(@"[DECODE-SEARCH] Unknown exception during scan");
         }
-        free(allClasses);
-    }
-    DLOG(@"[DECODE-SEARCH] Scan completed.");
+    });
     
     // === DEFERRED: Create UI button with retry ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
