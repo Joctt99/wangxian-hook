@@ -1,6 +1,38 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.147: EXTEND POST-BURST TO INCLUDE RECV #22/#23/#24
+ *
+ * v36.147 CHANGES:
+ *   1. NEW: Added RECV #22 (27B, cmd=0x80FFF490), RECV #23 (273B,
+ *      cmd=0x16000080), and RECV #24 (63B, multiple cmd=0x80FFF161) data
+ *      arrays extracted from real hook.txt capture lines 1082-1137.
+ *   2. EXTENDED post-BURST state machine: 1→#20 → 2→#21 → 3→#22 →
+ *      4→#23 → 5→#24 → 0 (done). Previously stopped at #21.
+ *      v36.146 stopped at state=0 after #21, leaving client with no
+ *      enter-game ACK (#22), scene entities (#23), or role attrs (#24).
+ *      Client's 0x00FFF493 (seq=0x23-0x26) got no response → stuck.
+ *      v36.147 injects all 5 post-BURST responses in sequence via the
+ *      existing poll/select POLLIN → recv() loop.
+ *   3. KEEP: g_postBurstDone set after #24, prevents reactivation.
+ *   4. KEEP: v36.146 - g_postBurstDone prevents hook_send/hook_recv
+ *      from reactivating fake responses.
+ *   5. KEEP: v36.145 - reset state to 0 after final injection.
+ *   6. KEEP: v36.144 - poll/select SET POLLIN when post-BURST active.
+ *   7. KEEP: v36.143 - whitelist BURST (only 0x00FFF493).
+ *
+ * PROBLEM ANALYSIS (v36.146 log):
+ *   - RECV #20 + #21 injected successfully. No quitFromServer.
+ *   - Client sent 0x00FFF493 (seq=0x23-0x26) but got NO response
+ *     (g_postBurstDone=YES → recv returned EAGAIN forever).
+ *   - Missing from v36.146: server still sends RECV #22, #23, #24
+ *     AFTER RECV #21 in real capture. These are required for the
+ *     client to enter the map scene:
+ *       RECV #22 (27B) = enter-game ACK "kk994"
+ *       RECV #23 (273B) = scene entity data (活动, 日常, etc.)
+ *       RECV #24 (63B) = 3× role attr notifications
+ *   - Total post-BURST flow now: #20→#21→#22→#23→#24→done
+ *
  * WangXianHook v36.146: PREVENT FAKE RESPONSE REACTIVATION AFTER POST-BURST
  *
  * v36.146 CHANGES:
@@ -677,7 +709,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.146 loaded ===");
+        _log(@"=== WangXianHook v36.147 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2024,6 +2056,47 @@ static const struct { uint16_t off; uint8_t val; } kRecv21Sparse[] = {
     { 0x265, 0x14 },  // byte 613
     { 0x2E0, 0x28 },  // byte 736
     { 0, 0 }          // sentinel
+};
+
+// v36.147: RECV #22 (27 bytes) from hook.txt line 1082.
+// cmd=0x80FFF490 (wire: 80 FF F4 90). Enter-game ACK/response.
+// Format flag 0x08 0x88, payload = "kk994" + zero padding.
+static const uint8_t kRecv22Data[27] = {
+    0x00,0x00,0x00,0x1B, 0x80,0xFF,0xF4,0x90, 0x08,0x88,0x7F,0xA1, 0x00,0x05,0x6B,0x6B,
+    0x39,0x39,0x34,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+// v36.147: RECV #23 (273 bytes) from hook.txt lines 1112-1129.
+// cmd=0x16000080 (wire: 80 00 00 16). Scene/entity data.
+// Contains multiple sub-packets: scene state, 活动通知, 日常, etc.
+static const uint8_t kRecv23Data[273] = {
+    0x00,0x00,0x00,0xB4, 0x80,0x00,0x00,0x16, 0x00,0x00,0x00,0x1E, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x01,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x01,0x00, 0x00,0x00,0x00,0x05, 0x00,0x00,0x00,0x05, 0x00,0x00,0x02,0x43,
+    0x00,0x00,0x00,0xFA, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x07, 0x00,0x00,0x00,0x02, 0x00,0x00,0x00,0x01,
+    0x00,0x00,0x00,0x18, 0x00,0x00,0x00,0x23, 0x00,0x00,0x00,0x05, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x06, 0x00,0x00,0x00,0x06, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x04,0x93,0xE0, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x0F,0x42,0x40, 0x00,0x00,0x00,0x10, 0x0F,0x10,0x00,0x08, 0x08,0x88,0x88,0x04,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x18, 0x80,0xF0,0xEF,0x83, 0x08,0x88,0x88,0x05,
+    0x00,0x06,0xE6,0xB4, 0xBB,0xE5,0x8A,0xA8, 0x00,0x00,0x00,0x01, 0x00,0x00,0x00,0x18,
+    0x80,0xF0,0xEF,0x83, 0x08,0x88,0x88,0x06, 0x00,0x06,0xE6,0x97, 0xA5,0xE5,0xB8,0xB8,
+    0x00,0x00,0x00,0x01, 0x00,0x00,0x00,0x10, 0x80,0xFF,0xF0,0x08, 0x08,0x88,0x88,0x07,
+    0x00,0x00,0x00,0x02, 0x00,0x00,0x00,0x0D, 0x80,0xFF,0xF0,0x06, 0x08,0x88,0x88,0x08,
+    0x00
+};
+
+// v36.147: RECV #24 (63 bytes) from hook.txt lines 1134-1137.
+// Contains 3 concatenated 0x80FFF161 (attr notifications) + 0x01AE0E80.
+static const uint8_t kRecv24Data[63] = {
+    0x00,0x00,0x00,0x11, 0x80,0xFF,0xF1,0x61, 0x08,0x88,0x88,0x09, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x11,0x80,0xFF,0xF1, 0x61,0x08,0x88,0x88, 0x0A,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x11,0x80,0xFF, 0xF1,0x61,0x08,0x88, 0x88,0x0B,0x00,0x00,
+    0x00,0x03,0x00,0x00, 0x00,0x00,0x0C,0x80, 0x0E,0xAE,0x01,0x00, 0x28,0xB3,0x43
 };
 
 // v36.125: NEW — Force valid decryption mode for game server responses
@@ -4915,13 +4988,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     // client sends an ACK then expects:
     //   RECV #20: cmd=0x12F00080 (71 bytes) — session token
     //   RECV #21: cmd=0x13000080 (840 bytes) — map/scene data
+    //   RECV #22: cmd=0x80FFF490 (27 bytes) — enter-game ACK
+    //   RECV #23: cmd=0x16000080 (273 bytes) — scene entity data
+    //   RECV #24: cmd=0x80FFF161 (63 bytes) — role attr notifications
     // Without these the client enters heartbeat mode and stays at "正在进入...".
-    // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21, 0=done (reset)
-    // v36.145: After RECV #21, reset to 0 (not 4) to stop poll/select from
-    // signaling POLLIN. Previously state=4 kept triggering FAKE-SELECT,
-    // causing the client to call recv() in a busy loop. The recv() then
-    // fell through to g_fakeRespActive which generated DUPLICATE 0x0CB0A300
-    // responses, confusing the client and triggering quitFromServer.
+    // State: 0=idle, 1=RECV#20, 2=RECV#21, 3=RECV#22, 4=RECV#23, 5=RECV#24, 0=done
+    // v36.147: Extended from 2 states to 6 (add RECV #22-24).
     if (g_postBurstState >= 1 && g_postBurstFd == fd) {
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
@@ -4936,12 +5008,29 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
-            // v36.145: Reset to 0 (not 4) to stop poll/select POLLIN signaling
-            g_postBurstState = 0;
-            g_fakeRespActive = NO;  // Stop queue-based response generation
-            g_postBurstDone = YES;  // v36.146: Prevent reactivation by new sends
-            DLOG(@"[POST-BURST] v36.145: Injected RECV #21 (840B map data) fd=%d state=0 (done, poll/select stopped)", fd);
+            g_postBurstState = 3;  // v36.147: was 0, now go to state 3 for RECV #22
+            DLOG(@"[POST-BURST] v36.147: Injected RECV #21 (840B map data) fd=%d state=3", fd);
             return 840;
+        }
+        if (g_postBurstState == 3 && len >= 27) {
+            memcpy(buf, kRecv22Data, 27);
+            g_postBurstState = 4;
+            DLOG(@"[POST-BURST] v36.147: Injected RECV #22 (27B enter-game ack) fd=%d state=4", fd);
+            return 27;
+        }
+        if (g_postBurstState == 4 && len >= 273) {
+            memcpy(buf, kRecv23Data, 273);
+            g_postBurstState = 5;
+            DLOG(@"[POST-BURST] v36.147: Injected RECV #23 (273B scene data) fd=%d state=5", fd);
+            return 273;
+        }
+        if (g_postBurstState == 5 && len >= 63) {
+            memcpy(buf, kRecv24Data, 63);
+            g_postBurstState = 0;
+            g_fakeRespActive = NO;
+            g_postBurstDone = YES;
+            DLOG(@"[POST-BURST] v36.147: Injected RECV #24 (63B attrs) fd=%d state=0 (done)", fd);
+            return 63;
         }
     }
 
@@ -7415,7 +7504,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.146 - PREVENT FAKE RESPONSE REACTIVATION AFTER POST-BURST");
+    DLOG(@"[VERSION] WangXianHook v36.147 - EXTEND POST-BURST TO INCLUDE RECV #22/#23/#24");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
