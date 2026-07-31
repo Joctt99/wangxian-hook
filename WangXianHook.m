@@ -1,20 +1,27 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.128: SIMPLE status patch (REVERT TO v36.126 approach, remove EncryptUtils Hook)
- *                        Send-intercept approach: wait for client's native commands with
- *                        REAL seq numbers, intercept in hook_send, generate matching fake responses.
- * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
+ * WangXianHook v36.130: SIMPLE status patch + EncryptUtils Hook (FIXED RECURSION BUG)
  *
- * v36.128 FIX (CRITICAL REVERT):
- *   EncryptUtils Hook caused CRASH during login cert verification (judgeAppInfoSignApi).
- *   EncryptUtils/RSA is used by the login flow itself — hooking it breaks cert validation.
- *   CORRECT APPROACH: Client decrypts original encrypted 0x80FFF495 packet with its OWN
- *   RSA private key via EncryptUtils. No Crypto Bypass needed. Only patch status byte 1→0.
- *   Keep original 365-byte packet intact so client can decrypt it correctly.
+ * v36.130 CRITICAL FIX (RECURSION BUG):
+ *   v36.129 had INFINITE RECURSION in non-bypass path: method_getImplementation()
+ *   returned the REPLACED hook function instead of original, causing stack overflow.
+ *   FIX: Save original IMPs at install time (g_orig_rsaDecryptData etc),
+ *   use saved IMPs directly in non-bypass path — NO recursion possible.
+ *
+ * v36.130 IMPROVEMENT:
+ *   Bypass counter (5 max) instead of one-shot flag, handles multi-step decryption.
+ *
+ * CORE INSIGHT: Client decrypts 0x80FFF495 payload via EncryptUtils (BoringSSL).
+ *   The decrypted content says "error" even though header status=0.
+ *   We MUST bypass decryption to return fake success plaintext.
  *
  * v36.126 APPROACH (RESTORED):
  *   SIMPLE STATUS PATCH: Original 365-byte 0x80FFF495 packet, only change status 1→0.
- *   Client decrypts original data with its own RSA key — no bypass needed.
+ *   Client decrypts original data with its own RSA key — we bypass decryption.
+ *
+ * v36.128 REVERT:
+ *   Removed EncryptUtils Hook (crashed during login cert verification).
+ *   But status patch alone is INSUFFICIENT — client checks decrypted payload content.
  *
  * v36.123 FIXES (CRITICAL):
  *   1. IMMEDIATE burst injection: After patching 0x80FFF495 status=1->0, append all 4 fake
@@ -5023,13 +5030,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.126: SIMPLE STATUS PATCH + CRYPTO BYPASS
+                        // v36.130: SIMPLE STATUS PATCH + CRYPTO BYPASS (FIXED RECURSION)
                         //
-                        // v36.125 BUG: Crypto bypass still called orig_SecKeyCreateDecryptedData() first.
-                        // RSA decryption with wrong key often "succeeds" (no error) producing garbage,
-                        // so the bypass path was NEVER taken.
+                        // v36.130 CRITICAL FIX:
+                        //   EncryptUtils Hooks now save original IMPs, avoiding infinite recursion.
+                        //   Bypass counter (5 max) handles multi-step decryption.
                         //
-                        // v36.126 FIX:
+                        // v36.126 FIX (kept):
                         // 1. Keep ORIGINAL packet structure (365 bytes, Base64 payload intact)
                         //    Only patch status byte: 1→0
                         // 2. In crypto hooks: when forceValidDecrypt=YES, SKIP orig call entirely
@@ -5045,21 +5052,24 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         // STEP 1: Simple status patch (1→0)
                         if (status != 0) {
                             ((unsigned char *)buf)[12] = 0;
-                            DLOG(@"[GAME-PATCH] v36.126: Patched 0x80FFF495 status %u→0 (seq=0x%08X, ret=%zd bytes)",
+                            DLOG(@"[GAME-PATCH] v36.130: Patched 0x80FFF495 status %u→0 (seq=0x%08X, ret=%zd bytes)",
                                  status, origSeq, ret);
+                            // v36.130: VERIFY the patch was applied to the ACTUAL buffer
+                            DLOG(@"[VERIFY] v36.130: buf[12] after patch = %u (should be 0)", ((unsigned char *)buf)[12]);
                         } else {
-                            DLOG(@"[GAME-PATCH] v36.126: 0x80FFF495 status already=0 (seq=0x%08X)", origSeq);
+                            DLOG(@"[GAME-PATCH] v36.130: 0x80FFF495 status already=0 (seq=0x%08X)", origSeq);
                         }
                         
                         g_handshakeComplete = YES;
                         g_challengeResponded = YES;
                         
-                        // STEP 2: Enable crypto bypass (forceValidDecrypt)
+                        // STEP 2: Enable crypto bypass (forceValidDecrypt + bypass counter)
                         // When client decrypts this response, hooks will SKIP real decryption
                         // and return a valid fake plaintext instead
                         g_forceValidDecrypt = YES;
+                        g_bypassRemaining = 5;  // Allow up to 5 bypasses for multi-step decryption
                         g_forceValidDecryptFd = fd;
-                        DLOG(@"[CRYPTO-BYPASS] v36.126: forceValidDecrypt=YES for fd=%d — ALL decrypt calls will get fake valid plaintext", fd);
+                        DLOG(@"[CRYPTO-BYPASS] v36.130: forceValidDecrypt=YES bypassRemaining=5 for fd=%d — EncryptUtils hooks will return fake plaintext", fd);
                         
                         // STEP 3: Enter intercept mode
                         if (!g_fakeRespInjected && fd >= 0) {
@@ -5069,7 +5079,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             g_fakeRespActive = YES;
                             g_waitingForClientCmds = YES;
                             g_waitingFd = fd;
-                            DLOG(@"[VIRTUAL-QUEUE] v36.126: Waiting for client EE007/FFF493 (crypto bypass active)");
+                            DLOG(@"[VIRTUAL-QUEUE] v36.130: Waiting for client EE007/FFF493 (encrypt bypass active)");
                         }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -6392,6 +6402,141 @@ static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
 }
 
 // ============================================================
+#pragma mark - EncryptUtils Hook (v36.130 - FIXED RECURSION BUG)
+// ============================================================
+// Client uses EncryptUtils (BoringSSL) for RSA/AES decryption.
+// We hook these class methods to return valid plaintext when forceValidDecrypt=YES.
+//
+// v36.130 CRITICAL FIX:
+//   v36.129 had infinite recursion bug: non-bypass path used method_getImplementation()
+//   which returns the REPLACED implementation (our hook), causing infinite recursion → crash.
+//   FIX: Save original IMPs at install time, use saved IMPs in non-bypass path.
+//
+// v36.130 IMPROVEMENT:
+//   Use bypass counter (up to 5) instead of one-shot flag, to handle multi-step decryption.
+
+static BOOL g_encryptUtilsHooksInstalled = NO;
+static int g_bypassRemaining = 0;  // Number of bypasses remaining
+static IMP g_orig_rsaDecryptData = NULL;
+static IMP g_orig_rsaDecryptLarge = NULL;
+static IMP g_orig_aesDecryptData = NULL;
+
+// Hook for +rsaDecryptData:withKeyRef:
+static NSData* hooked_rsaDecryptData(Class self, SEL _cmd, NSData *data, id keyRef) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_bypassRemaining--;
+        DLOG(@"[ENCRYPT-BYPASS] v36.130: rsaDecryptData: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        if (g_bypassRemaining <= 0) {
+            g_forceValidDecrypt = NO;
+            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+        }
+        return fakeData;
+    }
+    // Non-bypass: use saved original IMP (no recursion!)
+    if (g_orig_rsaDecryptData) {
+        typedef NSData* (*OriginalFunc)(Class, SEL, NSData*, id);
+        return ((OriginalFunc)g_orig_rsaDecryptData)(self, _cmd, data, keyRef);
+    }
+    return nil;
+}
+
+// Hook for +rsaDecryptLarge:withPrivateKey:
+static NSData* hooked_rsaDecryptLarge(Class self, SEL _cmd, NSData *data, NSData *privateKey) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_bypassRemaining--;
+        DLOG(@"[ENCRYPT-BYPASS] v36.130: rsaDecryptLarge: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        if (g_bypassRemaining <= 0) {
+            g_forceValidDecrypt = NO;
+            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+        }
+        return fakeData;
+    }
+    if (g_orig_rsaDecryptLarge) {
+        typedef NSData* (*OriginalFunc)(Class, SEL, NSData*, NSData*);
+        return ((OriginalFunc)g_orig_rsaDecryptLarge)(self, _cmd, data, privateKey);
+    }
+    return nil;
+}
+
+// Hook for +aesDecryptData:key:iv:
+static NSData* hooked_aesDecryptData(Class self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_bypassRemaining--;
+        DLOG(@"[ENCRYPT-BYPASS] v36.130: aesDecryptData: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        if (g_bypassRemaining <= 0) {
+            g_forceValidDecrypt = NO;
+            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+        }
+        return fakeData;
+    }
+    if (g_orig_aesDecryptData) {
+        typedef NSData* (*OriginalFunc)(Class, SEL, NSData*, NSData*, NSData*);
+        return ((OriginalFunc)g_orig_aesDecryptData)(self, _cmd, data, key, iv);
+    }
+    return nil;
+}
+
+// Install EncryptUtils hooks
+static void installEncryptUtilsHooks_v130(void) {
+    @try {
+        if (g_encryptUtilsHooksInstalled) return;
+        
+        Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
+        if (!encryptUtilsCls) {
+            DLOG(@"[ENCRYPT-HOOK] v36.130: EncryptUtils class NOT found");
+            return;
+        }
+        
+        Class metaCls = object_getClass(encryptUtilsCls);
+        DLOG(@"[ENCRYPT-HOOK] v36.130: EncryptUtils found, metaCls=%p", metaCls);
+        
+        // Hook +rsaDecryptData:withKeyRef:
+        SEL sel1 = NSSelectorFromString(@"rsaDecryptData:withKeyRef:");
+        if ([metaCls instancesRespondToSelector:sel1]) {
+            Method m = class_getInstanceMethod(metaCls, sel1);
+            if (m) {
+                g_orig_rsaDecryptData = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hooked_rsaDecryptData);
+                DLOG(@"[ENCRYPT-HOOK] v36.130: OK - Hooked +rsaDecryptData:withKeyRef: (orig=%p)", g_orig_rsaDecryptData);
+            }
+        }
+        
+        // Hook +rsaDecryptLarge:withPrivateKey:
+        SEL sel2 = NSSelectorFromString(@"rsaDecryptLarge:withPrivateKey:");
+        if ([metaCls instancesRespondToSelector:sel2]) {
+            Method m = class_getInstanceMethod(metaCls, sel2);
+            if (m) {
+                g_orig_rsaDecryptLarge = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hooked_rsaDecryptLarge);
+                DLOG(@"[ENCRYPT-HOOK] v36.130: OK - Hooked +rsaDecryptLarge:withPrivateKey: (orig=%p)", g_orig_rsaDecryptLarge);
+            }
+        }
+        
+        // Hook +aesDecryptData:key:iv:
+        SEL sel3 = NSSelectorFromString(@"aesDecryptData:key:iv:");
+        if ([metaCls instancesRespondToSelector:sel3]) {
+            Method m = class_getInstanceMethod(metaCls, sel3);
+            if (m) {
+                g_orig_aesDecryptData = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hooked_aesDecryptData);
+                DLOG(@"[ENCRYPT-HOOK] v36.130: OK - Hooked +aesDecryptData:key:iv: (orig=%p)", g_orig_aesDecryptData);
+            }
+        }
+        
+        g_encryptUtilsHooksInstalled = YES;
+        DLOG(@"[ENCRYPT-HOOK] v36.130: All EncryptUtils hooks installed (orig IMPs saved, non-bypass = safe)");
+    } @catch (NSException *e) {
+        DLOG(@"[ENCRYPT-HOOK] v36.130: Exception: %@", e.reason);
+    }
+}
+
+// ============================================================
 #pragma mark - Constructor - MINIMAL + observer hooks
 // ============================================================
 
@@ -6413,13 +6558,17 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.128 - SIMPLE status patch (removed EncryptUtils Hook, client decrypts with own RSA key)");
+    DLOG(@"[VERSION] WangXianHook v36.130 - SIMPLE status patch + EncryptUtils Hook (FIXED RECURSION BUG)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
     installSecurityHooks();
 #endif
     installKeyboardProtection();
+    
+    // v36.130: Install EncryptUtils hooks (FIXED RECURSION BUG - save orig IMPs)
+    // CRITICAL: Client uses EncryptUtils for RSA/AES decryption of 0x80FFF495 response
+    installEncryptUtilsHooks_v130();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
