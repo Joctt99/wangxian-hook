@@ -6632,8 +6632,8 @@ static void cpp_stub_force(void* output_buf, void* self, void* data, void* key) 
         //   x3 = key (second arg)
         // These match the original function's expected ABI perfectly!
         "ldp x29, x30, [sp], #16\n"
-        "braa x9, x15\n"  // Branch with pointer auth to original (tail call)
-        // NOTE: We restored frame and braa, so original function will
+        "br x9\n"  // Branch to original function (tail call, no link needed)
+        // NOTE: We restored frame and br, so original function will
         // execute with our caller's stack frame. x0-x3 are unchanged.
         
         // === BYPASS PATH: return success std::string ===
@@ -6651,7 +6651,7 @@ static void cpp_stub_force(void* output_buf, void* self, void* data, void* key) 
         "ret\n"
         :
         : 
-        : "x0", "x1", "x2", "x3", "x4", "x9", "x29", "x30", "memory"
+        : "x0", "x1", "x2", "x3", "x4", "x9", "x30", "memory"
     );
 }
 
