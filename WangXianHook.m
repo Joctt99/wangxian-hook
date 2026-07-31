@@ -1,31 +1,37 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.133: OBSERVATION MODE - Based on Real Capture Data (hook.txt)
+ * WangXianHook v36.134: FIX UUID INJECTION POSITION (Based on Real Capture Data)
  *
- * v36.133 BREAKTHROUGH FIX (based on real Frida capture of working client):
- *   ROOT CAUSE FOUND: We incorrectly treated 0x80FFF495 offset[12] as "status" field.
- *   Real capture shows offset[12]=0x01 is the FORMAT FLAG (0x01=response, 0x02=request),
- *   NOT an error status! Real client receives 0x01 and proceeds naturally.
+ * v36.134 FIX: UUID injection position was WRONG!
+ *   Previous versions (v36.87-v36.133) injected UUID at offset 34 (after device ID)
+ *   with format: 2-byte len + UUID string.
+ *   REAL CAPTURE (hook.txt SEND #29) shows UUID is AFTER GPU field with format:
+ *     7 bytes zero (reserved) + 1 byte len(0x24) + 36 bytes UUID + 1 byte zero
  *
- *   PREVIOUS BUG (v36.124-v36.132): Patching offset[12] 1→0 CORRUPTED the response
- *   format, causing client to fail parsing and get stuck at "正在进入...".
+ *   Our 143B packet had 9 bytes zero after GPU field (missing UUID).
+ *   Normal 178B packet has 7 zero + 1 len + 36 UUID + 1 zero = 45 bytes after GPU.
+ *   v36.134: Replace 9 zero bytes with correct UUID TLV (45 bytes) -> 179 bytes total.
  *
- *   v36.133 CHANGES:
- *     1. DO NOT patch 0x80FFF495 offset[12] — preserve real format flag
- *     2. DO NOT enable crypto bypass — client decrypts natively via BoringSSL
- *     3. DO NOT inject fake responses — client sends 0x000EE007 + 0x00FFF493 naturally
- *     4. Keep close() hook — prevent client disconnect during heartbeat detection
- *     5. Keep UUID injection — ensure challenge response contains valid UUID
+ * v36.133 BREAKTHROUGH FIX (kept): Do NOT patch 0x80FFF495 offset[12].
+ *   offset[12]=0x01 is FORMAT FLAG (0x01=response), NOT error status.
+ *   Previous v36.124-v36.132 patched 1->0 CORRUPTING response format.
+ *
+ * v36.134 CHANGES:
+ *   1. KEEP: Do NOT patch 0x80FFF495 offset[12] (v36.133 fix)
+ *   2. KEEP: Do NOT enable crypto bypass (v36.133 fix)
+ *   3. FIX: UUID injection position - now AFTER GPU field (not after device ID)
+ *   4. FIX: UUID TLV format - 7 zero + 1 len + UUID + 1 zero (not 2 len + UUID)
+ *   5. KEEP: close() hook to prevent disconnect
  *
  * REAL PROTOCOL FLOW (from hook.txt):
- *   1. Client→Server: 0x00FFF495 (703B, encrypted challenge response)
- *   2. Server→Client: 0x80FFF495 (365B, offset[12]=0x01, encrypted payload)
- *   3. Client→Server: 0x000EE007 (178B, PLAINTEXT device info)
- *   4. Client→Server: 0x00FFF493 (472B, encrypted role request)
- *   5. Server→Client: 0x0CB0A300 (1632B) → 0x12F00080 (71B, token)
- *   6. Server→Client: 0x13000080 (840B, role info "luoyueshangu")
- *   7. Server→Client: 0x80FFF490 (27B, account "kk994")
+ *   1. Client->Server: 0x00FFF495 (703B, encrypted challenge response)
+ *   2. Server->Client: 0x80FFF495 (365B, offset[12]=0x01, encrypted payload)
+ *   3. Client->Server: 0x000EE007 (178B, PLAINTEXT device info with UUID)
+ *   4. Client->Server: 0x00FFF493 (472B, encrypted role request)
+ *   5. Server->Client: 0x0CB0A300 (1632B) -> 0x12F00080 (71B, token)
+ *   6. Server->Client: 0x13000080 (840B, role info "luoyueshangu")
+ *   7. Server->Client: 0x80FFF490 (27B, account "kk994")
  *
  * v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
@@ -436,7 +442,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.127 loaded ===");
+        _log(@"=== WangXianHook v36.134 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2481,21 +2487,30 @@ static int getPortForFd(int fd) {
     return 0;
 }
 
-// v36.87: Inject UUID into 0x000EE007 device info packet for game server
+// v36.134: Inject UUID into 0x000EE007 device info packet for game server
 // Login server (5678) sends 143-byte packet without UUID field
-// Game server expects 179-byte packet with 36-byte UUID TLV (len=0x0024 + 36 char UUID)
-// UUID field is inserted after first field (account/ticket: 0x0014 + 20 bytes) at offset 12+2+20 = 34
+// Game server expects 179-byte packet with UUID TLV after GPU field
+//
+// REAL CAPTURE FORMAT (hook.txt SEND #29, 178 bytes):
+//   ...GPU TLV (2-byte len + data)...
+//   00 00 00 00 00 00 00  - 7 bytes reserved (zero)
+//   24                    - 1 byte UUID length (0x24 = 36)
+//   [36-byte UUID string]
+//   00                    - 1 byte suffix (zero)
+//   01 00                 - 2 bytes trailer
+//
+// v36.134 FIX: Previous versions injected UUID at offset 34 (after device ID)
+//   with wrong format (2-byte len + UUID). Correct position is AFTER GPU field,
+//   with format: 7-byte zero + 1-byte len + UUID + 1-byte zero.
 static ssize_t injectUUIDIntoDeviceInfo(const uint8_t *src, size_t srcLen,
                                          uint8_t *dst, size_t dstMaxLen) {
     if (!src || srcLen < 36 || !dst || dstMaxLen < srcLen + 40) {
         DLOG(@"[UUID-INJECT] Invalid params: srcLen=%zu dstMaxLen=%zu", srcLen, dstMaxLen);
         return -1;
     }
-    
-    // Generate a consistent fake UUID using NSUserDefaults or derive from UDID/IDFV
-    // Use a hardcoded UUID for reproducibility across sessions (server may bind UUID)
+
+    // Get UUID (prefer IDFV, fallback to fixed)
     const char *fakeUUID = "00000000-0000-0000-0000-000000000001";
-    // Prefer device's IDFV if available
     @try {
         UIDevice *device = [UIDevice currentDevice];
         if (device && [device respondsToSelector:@selector(identifierForVendor)]) {
@@ -2508,52 +2523,114 @@ static ssize_t injectUUIDIntoDeviceInfo(const uint8_t *src, size_t srcLen,
             }
         }
     } @catch (NSException *e) {}
-    
-    size_t uuidStrLen = strlen(fakeUUID);
-    
-    // Find insertion point: header(12) + first TLV (2-byte len + N bytes)
-    // First field starts at offset 12 with 2-byte length prefix
-    if (srcLen < 14) return -1;
-    uint16_t firstFieldLen = ((uint16_t)src[12] << 8) | (uint16_t)src[13];
-    if (firstFieldLen > 200 || 14 + firstFieldLen > srcLen) {
-        DLOG(@"[UUID-INJECT] First field invalid: len=%u srcLen=%zu", firstFieldLen, srcLen);
+
+    size_t uuidStrLen = strlen(fakeUUID);  // 36
+
+    // v36.134: Parse all TLV fields to find GPU field
+    // Header: 4(pktLen) + 4(cmd) + 4(seq) = 12 bytes
+    // Then: sequence of TLV fields (2-byte big-endian len + N bytes data)
+    size_t offset = 12;
+    int fieldCount = 0;
+    size_t gpuFieldEnd = 0;
+
+    while (offset + 2 <= srcLen && fieldCount < 30) {
+        uint16_t fieldLen = ((uint16_t)src[offset] << 8) | (uint16_t)src[offset + 1];
+        if (fieldLen > 200 || offset + 2 + fieldLen > srcLen) {
+            DLOG(@"[UUID-INJECT] v36.134: Invalid field at offset %zu: len=%u srcLen=%zu",
+                 offset, fieldLen, srcLen);
+            break;
+        }
+
+        // Check if this is GPU field (contains "GPU" substring)
+        if (fieldLen >= 3 && offset + 2 + fieldLen <= srcLen) {
+            const uint8_t *fieldData = src + offset + 2;
+            for (uint16_t i = 0; i + 3 <= fieldLen; i++) {
+                if (fieldData[i] == 'G' && fieldData[i+1] == 'P' && fieldData[i+2] == 'U') {
+                    gpuFieldEnd = offset + 2 + fieldLen;
+                    DLOG(@"[UUID-INJECT] v36.134: Found GPU field at offset %zu, ends at %zu (len=%u)",
+                         offset, gpuFieldEnd, fieldLen);
+                    break;
+                }
+            }
+            if (gpuFieldEnd > 0) break;
+        }
+
+        offset += 2 + fieldLen;
+        fieldCount++;
+    }
+
+    if (gpuFieldEnd == 0) {
+        DLOG(@"[UUID-INJECT] v36.134: GPU field NOT found, falling back to old logic");
+        // Fallback: old logic (inject after first TLV field)
+        uint16_t firstFieldLen = ((uint16_t)src[12] << 8) | (uint16_t)src[13];
+        if (firstFieldLen > 200 || 14 + firstFieldLen > srcLen) return -1;
+        size_t insertOffset = 12 + 2 + firstFieldLen;
+        size_t newPayloadSize = srcLen + 2 + uuidStrLen;
+        if (newPayloadSize > dstMaxLen) return -1;
+        memcpy(dst, src, insertOffset);
+        dst[insertOffset] = (uuidStrLen >> 8) & 0xFF;
+        dst[insertOffset + 1] = uuidStrLen & 0xFF;
+        memcpy(dst + insertOffset + 2, fakeUUID, uuidStrLen);
+        memcpy(dst + insertOffset + 2 + uuidStrLen, src + insertOffset, srcLen - insertOffset);
+        uint32_t newTotalLen = (uint32_t)newPayloadSize;
+        dst[0] = (newTotalLen >> 24) & 0xFF;
+        dst[1] = (newTotalLen >> 16) & 0xFF;
+        dst[2] = (newTotalLen >> 8) & 0xFF;
+        dst[3] = newTotalLen & 0xFF;
+        return (ssize_t)newPayloadSize;
+    }
+
+    // v36.134: Check trailing structure after GPU field
+    // Expected: 9 bytes zero + 01 00 (trailer)
+    // Target:   7 bytes zero + 1 byte len(0x24) + 36 bytes UUID + 1 byte zero + 01 00
+    size_t tailStart = srcLen - 2;  // position of "01 00"
+    if (srcLen < 2 || src[tailStart] != 0x01 || src[tailStart + 1] != 0x00) {
+        DLOG(@"[UUID-INJECT] v36.134: Trailer 01 00 not found at end (srcLen=%zu)", srcLen);
         return -1;
     }
-    
-    size_t insertOffset = 12 + 2 + firstFieldLen;  // after header + first TLV
-    DLOG(@"[UUID-INJECT] Inserting UUID at offset %zu (firstFieldLen=%u, srcLen=%zu)",
-         insertOffset, firstFieldLen, srcLen);
-    
-    // Build new packet
-    size_t newPayloadSize = srcLen + 2 + uuidStrLen;  // +2 for TLV length prefix
-    if (newPayloadSize > dstMaxLen) {
-        DLOG(@"[UUID-INJECT] Output too large: need %zu max %zu", newPayloadSize, dstMaxLen);
+
+    size_t midLen = tailStart - gpuFieldEnd;  // bytes between GPU end and trailer
+    DLOG(@"[UUID-INJECT] v36.134: midLen=%zu (between GPU end and trailer)", midLen);
+
+    // Build new packet:
+    // [header + TLV fields up to GPU end] + [7 zero + 1 len + 36 UUID + 1 zero] + [01 00]
+    size_t uuidBlockLen = 7 + 1 + uuidStrLen + 1;  // 7+1+36+1 = 45
+    size_t newLen = gpuFieldEnd + uuidBlockLen + 2;  // +2 for trailer
+    if (newLen > dstMaxLen) {
+        DLOG(@"[UUID-INJECT] v36.134: Output too large: need %zu max %zu", newLen, dstMaxLen);
         return -1;
     }
-    
-    // Copy bytes before insertion point
-    memcpy(dst, src, insertOffset);
-    
-    // Insert UUID TLV: length (2 bytes, big-endian) + UUID string
-    dst[insertOffset] = (uuidStrLen >> 8) & 0xFF;
-    dst[insertOffset + 1] = uuidStrLen & 0xFF;
-    memcpy(dst + insertOffset + 2, fakeUUID, uuidStrLen);
-    
-    // Copy remaining bytes after insertion point
-    size_t remaining = srcLen - insertOffset;
-    memcpy(dst + insertOffset + 2 + uuidStrLen, src + insertOffset, remaining);
-    
-    // Update total packet length in header (bytes 0-3, big-endian)
-    uint32_t newTotalLen = (uint32_t)newPayloadSize;
+
+    // Copy [header + TLV fields up to GPU end]
+    memcpy(dst, src, gpuFieldEnd);
+
+    // Write 7 bytes zero (reserved)
+    memset(dst + gpuFieldEnd, 0, 7);
+
+    // Write 1 byte UUID length (0x24 = 36)
+    dst[gpuFieldEnd + 7] = (uint8_t)uuidStrLen;
+
+    // Write UUID string (36 bytes)
+    memcpy(dst + gpuFieldEnd + 8, fakeUUID, uuidStrLen);
+
+    // Write 1 byte zero (suffix)
+    dst[gpuFieldEnd + 8 + uuidStrLen] = 0;
+
+    // Write trailer (01 00)
+    dst[gpuFieldEnd + 8 + uuidStrLen + 1] = 0x01;
+    dst[gpuFieldEnd + 8 + uuidStrLen + 2] = 0x00;
+
+    // Update packet length in header (bytes 0-3, big-endian)
+    uint32_t newTotalLen = (uint32_t)newLen;
     dst[0] = (newTotalLen >> 24) & 0xFF;
     dst[1] = (newTotalLen >> 16) & 0xFF;
     dst[2] = (newTotalLen >> 8) & 0xFF;
     dst[3] = newTotalLen & 0xFF;
-    
-    DLOG(@"[UUID-INJECT] SUCCESS: %zu -> %u bytes (added UUID=%.*s)",
-         srcLen, newTotalLen, 8, fakeUUID);
-    
-    return (ssize_t)newTotalLen;
+
+    DLOG(@"[UUID-INJECT] v36.134: SUCCESS %zu -> %zu bytes (UUID at GPU+7, midLen was %zu, UUID=%.*s)",
+         srcLen, newLen, midLen, 8, fakeUUID);
+
+    return (ssize_t)newLen;
 }
 
 // v36.71: Check if a command is from game server protocol (not login server)
@@ -4520,7 +4597,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 //   If server closes connection, it means our challenge response was rejected.
                 //   Injecting fake responses at this point corrupts the protocol flow.
                 //   Just return EAGAIN to keep client waiting, close() hook prevents disconnect.
-                DLOG(@"[RECV-CLOSE] v36.133: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
+                DLOG(@"[RECV-CLOSE] v36.134: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
                 
                 // v36.61: Original rotation logic
                 DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
@@ -5014,9 +5091,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                            ((unsigned char *)buf)[11];
                         uint8_t origFmtFlag = ((unsigned char *)buf)[12];
 
-                        DLOG(@"[GAME-OBSERVE] v36.133: 0x80FFF495 received — NOT PATCHING (seq=0x%08X, fmtFlag=%u, ret=%zd bytes)",
+                        DLOG(@"[GAME-OBSERVE] v36.134: 0x80FFF495 received — NOT PATCHING (seq=0x%08X, fmtFlag=%u, ret=%zd bytes)",
                              origSeq, origFmtFlag, ret);
-                        DLOG(@"[GAME-OBSERVE] v36.133: Real client flow: recv 0x80FFF495 -> send 0x000EE007 -> send 0x00FFF493");
+                        DLOG(@"[GAME-OBSERVE] v36.134: Real client flow: recv 0x80FFF495 -> send 0x000EE007 -> send 0x00FFF493");
 
                         g_handshakeComplete = YES;
                         g_challengeResponded = YES;
@@ -5025,12 +5102,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         //   Real client decrypts 0x80FFF495 payload successfully on its own.
                         //   Enabling bypass returns fake JSON which client may reject.
                         // g_forceValidDecrypt = NO;  (already NO by default)
-                        DLOG(@"[GAME-OBSERVE] v36.133: Crypto bypass DISABLED — client will decrypt natively");
+                        DLOG(@"[GAME-OBSERVE] v36.134: Crypto bypass DISABLED — client will decrypt natively");
 
                         // v36.133: DO NOT inject fake responses!
                         //   Real client sends 0x000EE007 + 0x00FFF493 naturally after 0x80FFF495.
                         //   Fake response injection corrupts the protocol flow.
-                        DLOG(@"[GAME-OBSERVE] v36.133: Virtual queue DISABLED — client will send native packets");
+                        DLOG(@"[GAME-OBSERVE] v36.134: Virtual queue DISABLED — client will send native packets");
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
@@ -6770,7 +6847,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.132 - FIX ABI (OUTPUT BUFFER) + C++ Crypto Hook");
+    DLOG(@"[VERSION] WangXianHook v36.134 - FIX UUID INJECTION POSITION (AFTER GPU FIELD)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
