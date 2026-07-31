@@ -1,6 +1,33 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.144: POLL/SELECT SIGNAL POLLIN FOR POST-BURST
+ *
+ * v36.144 CHANGES:
+ *   1. FIX: hook_poll and hook_select now actively SET POLLIN/readfds when
+ *      g_postBurstState >= 1, so the client calls recv() to receive
+ *      RECV #20 (session token) and RECV #21 (map data).
+ *      v36.143 BURST was clean (1632 bytes), g_postBurstState=1 was set,
+ *      but the client NEVER called recv() again. Root cause: after BURST,
+ *      g_fakeRespDelivered=YES, and the poll/select hooks CLEARED POLLIN
+ *      (line "if (g_fakeRespDelivered) fds[i].revents &= ~POLLIN"). This
+ *      told the client "no data available", so it never called recv(),
+ *      and the post-BURST state machine never triggered.
+ *      v36.144: When g_postBurstState >= 1, SET POLLIN/readfds for the
+ *      post-BURST fd BEFORE the delivered-check. Skip the delivered-clear
+ *      when post-BURST is active.
+ *   2. KEEP: v36.143 - whitelist BURST (only 0x00FFF493)
+ *   3. KEEP: v36.142 - post-BURST state machine (RECV #20 + #21)
+ *   4. KEEP: v36.141 - single 0x0CB0A300, skip duplicate FFF493
+ *
+ * PROBLEM ANALYSIS (v36.143 log):
+ *   - BURST = clean 1632 bytes (whitelist worked, no garbage).
+ *   - g_postBurstState=1 was set correctly.
+ *   - Client sent ACK (20B) + heartbeats (22B×3) via FAKE-SEND.
+ *   - Client NEVER called recv() — no [POST-BURST] Injected RECV #20 log.
+ *   - Root cause: poll() cleared POLLIN because g_fakeRespDelivered=YES.
+ *     Client saw "no data" → didn't call recv() → state machine stuck.
+ *
  * WangXianHook v36.143: WHITELIST BURST + POST-BURST STATE MACHINE
  *
  * v36.143 CHANGES:
@@ -601,7 +628,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.143 loaded ===");
+        _log(@"=== WangXianHook v36.144 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3335,6 +3362,22 @@ static int hook_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     if (!orig_poll || !fds) return -1;
     
     int result = orig_poll(fds, nfds, timeout);
+
+    // v36.144: Post-BURST state machine — actively signal POLLIN so the
+    // client calls recv() to receive RECV #20/#21. Without this, the
+    // g_fakeRespDelivered check below clears POLLIN, and the client never
+    // calls recv() again (stuck at "正在进入...").
+    if (g_postBurstState >= 1 && g_postBurstFd >= 0) {
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd == g_postBurstFd) {
+                fds[i].revents |= POLLIN;
+                fds[i].revents &= ~(POLLHUP | POLLERR);
+                if (result <= 0) result = 1;
+                DLOG(@"[FAKE-POLL] v36.144: SET POLLIN for post-BURST fd=%d state=%d", fds[i].fd, g_postBurstState);
+                break;
+            }
+        }
+    }
     
     // v36.104: If fake response fd is in the poll set, clear error flags
     // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so flags are cleared
@@ -3354,7 +3397,8 @@ static int hook_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
                     }
                 }
                 // Clear POLLIN for fake response fd if response already delivered
-                if (g_fakeRespDelivered) {
+                // v36.144: Skip this if post-BURST state machine is active (handled above)
+                if (g_fakeRespDelivered && g_postBurstState < 1) {
                     fds[i].revents &= ~POLLIN;
                 }
             }
@@ -3375,6 +3419,21 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
     if (!orig_select) return -1;
     
     int result = orig_select(nfds, readfds, writefds, exceptfds, timeout);
+
+    // v36.144: Post-BURST state machine — actively set readfds so the
+    // client calls recv() to receive RECV #20/#21. Without this, the
+    // g_fakeRespDelivered check below clears readfds, and the client
+    // never calls recv() again (stuck at "正在进入...").
+    if (g_postBurstState >= 1 && g_postBurstFd >= 0) {
+        if (readfds && g_postBurstFd < nfds) {
+            FD_SET(g_postBurstFd, readfds);
+        }
+        if (exceptfds && g_postBurstFd < nfds) {
+            FD_CLR(g_postBurstFd, exceptfds);
+        }
+        if (result <= 0) result = 1;
+        DLOG(@"[FAKE-SELECT] v36.144: SET readfds for post-BURST fd=%d state=%d", g_postBurstFd, g_postBurstState);
+    }
     
     // v36.104: If fake response fd is in the except set, clear it
     // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so exception is cleared
@@ -3397,7 +3456,8 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
             }
         }
         // Also clear readfds for fake response fd if response already delivered
-        if (readfds && g_fakeRespDelivered && FD_ISSET(g_fakeRespFd, readfds)) {
+        // v36.144: Skip this if post-BURST state machine is active (handled above)
+        if (readfds && g_fakeRespDelivered && g_postBurstState < 1 && FD_ISSET(g_fakeRespFd, readfds)) {
             FD_CLR(g_fakeRespFd, readfds);
         }
     }
@@ -7285,7 +7345,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.143 - WHITELIST BURST + POST-BURST STATE MACHINE");
+    DLOG(@"[VERSION] WangXianHook v36.144 - POLL/SELECT SIGNAL POLLIN FOR POST-BURST");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
