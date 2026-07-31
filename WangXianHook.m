@@ -1,6 +1,29 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.145: RESET POST-BURST STATE + STOP DUPLICATE RESPONSES
+ *
+ * v36.145 CHANGES:
+ *   1. FIX: After injecting RECV #21, reset g_postBurstState=0 (was 4)
+ *      and g_fakeRespActive=NO. v36.144 left state=4, which caused
+ *      poll/select to keep signaling POLLIN forever. Client called recv()
+ *      in a busy loop → fell through to g_fakeRespActive → generated
+ *      DUPLICATE 0x0CB0A300 (1632B) for the last queued 0x00FFF493 →
+ *      client confused → called quitFromServer → "连接异常中断".
+ *      v36.145: state=0 stops poll/select POLLIN. g_fakeRespActive=NO
+ *      stops the queue-based response generator. Client sees "no more
+ *      data" and processes what it has (RECV #20 + #21).
+ *   2. KEEP: v36.144 - poll/select SET POLLIN when post-BURST active
+ *   3. KEEP: v36.143 - whitelist BURST (only 0x00FFF493)
+ *   4. KEEP: v36.142 - post-BURST state machine (RECV #20 + #21)
+ *
+ * PROBLEM ANALYSIS (v36.144 log):
+ *   - RECV #20 (71B) and RECV #21 (840B) BOTH injected successfully! ✓
+ *   - But state=4 kept triggering FAKE-SELECT → client called recv() again
+ *   - recv() fell through to g_fakeRespActive → queue empty, used last cmd
+ *     0x00FFF493 → generated DUPLICATE 0x0CB0A300 (1632B)
+ *   - Client received unexpected duplicate → quitFromServer → reconnect
+ *
  * WangXianHook v36.144: POLL/SELECT SIGNAL POLLIN FOR POST-BURST
  *
  * v36.144 CHANGES:
@@ -628,7 +651,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.144 loaded ===");
+        _log(@"=== WangXianHook v36.145 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4857,7 +4880,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     //   RECV #20: cmd=0x12F00080 (71 bytes) — session token
     //   RECV #21: cmd=0x13000080 (840 bytes) — map/scene data
     // Without these the client enters heartbeat mode and stays at "正在进入...".
-    // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21, 4=done
+    // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21, 0=done (reset)
+    // v36.145: After RECV #21, reset to 0 (not 4) to stop poll/select from
+    // signaling POLLIN. Previously state=4 kept triggering FAKE-SELECT,
+    // causing the client to call recv() in a busy loop. The recv() then
+    // fell through to g_fakeRespActive which generated DUPLICATE 0x0CB0A300
+    // responses, confusing the client and triggering quitFromServer.
     if (g_postBurstState >= 1 && g_postBurstFd == fd) {
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
@@ -4872,8 +4900,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
-            g_postBurstState = 4;
-            DLOG(@"[POST-BURST] v36.142: Injected RECV #21 (840B map data) fd=%d state=4 (done)", fd);
+            // v36.145: Reset to 0 (not 4) to stop poll/select POLLIN signaling
+            g_postBurstState = 0;
+            g_fakeRespActive = NO;  // Stop queue-based response generation
+            DLOG(@"[POST-BURST] v36.145: Injected RECV #21 (840B map data) fd=%d state=0 (done, poll/select stopped)", fd);
             return 840;
         }
     }
@@ -7345,7 +7375,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.144 - POLL/SELECT SIGNAL POLLIN FOR POST-BURST");
+    DLOG(@"[VERSION] WangXianHook v36.145 - RESET POST-BURST STATE + STOP DUPLICATE RESPONSES");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
