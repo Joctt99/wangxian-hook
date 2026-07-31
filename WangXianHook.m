@@ -1,4 +1,5 @@
 #import "ProtocolPatcher.h"
+#import "fishhook.h"
 /**
  * WangXianHook v36.131: C++ CCFileUtils::rsaDecryptLarge Hook (FIX CRASH)
  *
@@ -6636,7 +6637,7 @@ static void installCppCryptoHooks_v131(void) {
     const char* mangledName = "_ZN7cocos2d11CCFileUtils15rsaDecryptLargeENSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_";
     
     void* sym = NULL;
-    int imageCount = (int)_dyld_get_image_count();
+    int imageCount = (int)_dyld_image_count();
     
     // Search in game binary and dylibs
     for (int i = 0; i < imageCount; i++) {
@@ -6711,8 +6712,8 @@ static void installCppCryptoHooks_v131(void) {
         if (mainHeader) {
             DLOG(@"[CPP-CRYPTO] Main header: %p, rebinding...", mainHeader);
             
-            struct rebind_symbol rebinds[] = {
-                { mangledName, cpp_stub_force }
+            struct rebinding rebinds[] = {
+                { mangledName, cpp_stub_force, NULL }
             };
             
             int result = rebind_symbols_image(mainHeader, NULL, rebinds, 1);
@@ -6727,8 +6728,8 @@ static void installCppCryptoHooks_v131(void) {
                 // Alternative: dlopen and use rebind_symbols on that handle
                 void* mainHandle = dlopen(NULL, RTLD_LAZY);
                 if (mainHandle) {
-                    struct rebind_symbol rebinds2[] = {
-                        { mangledName, cpp_stub_force }
+                    struct rebinding rebinds2[] = {
+                        { mangledName, cpp_stub_force, NULL }
                     };
                     int result2 = rebind_symbols_image(
                         (const mach_header*)_dyld_get_image_header(0),
