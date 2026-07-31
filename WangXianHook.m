@@ -6713,10 +6713,10 @@ static void installCppCryptoHooks_v131(void) {
             DLOG(@"[CPP-CRYPTO] Main header: %p, rebinding...", mainHeader);
             
             struct rebinding rebinds[] = {
-                { mangledName, cpp_stub_force, NULL }
+                { mangledName, (void*)cpp_stub_force, NULL }
             };
             
-            int result = rebind_symbols_image(mainHeader, NULL, rebinds, 1);
+            int result = rebind_symbols_image((void*)mainHeader, NULL, rebinds, 1);
             DLOG(@"[CPP-CRYPTO] rebind_symbols_image result: %d", result);
             
             if (result == 0) {
@@ -6729,10 +6729,10 @@ static void installCppCryptoHooks_v131(void) {
                 void* mainHandle = dlopen(NULL, RTLD_LAZY);
                 if (mainHandle) {
                     struct rebinding rebinds2[] = {
-                        { mangledName, cpp_stub_force, NULL }
+                        { mangledName, (void*)cpp_stub_force, NULL }
                     };
                     int result2 = rebind_symbols_image(
-                        (const mach_header*)_dyld_get_image_header(0),
+                        (void*)_dyld_get_image_header(0),
                         NULL,
                         rebinds2,
                         1
