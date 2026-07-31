@@ -1575,8 +1575,6 @@ static int g_burstInjectFd = -1;
 // NOTE: g_forceValidDecrypt must NOT be static because it's referenced from
 // inline ARM64 assembly in cpp_stub_force() (linker needs external symbol)
 BOOL g_forceValidDecrypt = NO;
-__asm__(".globl g_forceValidDecrypt");
-__asm__(".type g_forceValidDecrypt, %object");
 static int g_forceValidDecryptFd = -1;
 
 // v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
