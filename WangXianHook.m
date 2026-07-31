@@ -6426,6 +6426,9 @@ static BOOL g_encryptUtilsHooksInstalled = NO;
 // Note: g_bypassRemaining, g_orig_rsaDecryptData, g_orig_rsaDecryptLarge, g_orig_aesDecryptData
 // are defined earlier (near g_forceValidDecrypt) for forward access in hook_recv logic.
 
+// Forward declaration for C++ Crypto Hook flag (defined later in C++ Crypto Hook section)
+static BOOL g_cppCryptoHooksInstalled;
+
 // Hook for +rsaDecryptData:withKeyRef:
 // v36.132: ENCRYPT-BYPASS only triggers when C++ Crypto Hook is NOT installed
 //          If C++ Hook is active, bypass is handled at C++ level (returning std::string)
@@ -6576,8 +6579,7 @@ static void installEncryptUtilsHooks_v130(void) {
 //   Fixed: Write empty string directly to x0 buffer, keep all args unchanged
 //   For original call: restore frame, BR to original (not BL, no new frame)
 
-static BOOL g_cppCryptoHooksInstalled = NO;
-
+// g_cppCryptoHooksInstalled is defined as static BOOL above (line ~6430), initialized to 0 (= NO)
 // Saved original C++ function pointers
 typedef struct {
     void *orig_rsaDecryptLarge;
