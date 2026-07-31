@@ -1,25 +1,30 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.135: DUMP DECRYPTED PLAINTEXT + Re-enable fake response injection
+ * WangXianHook v36.136: RE-ENABLE FAKE RESP INJECTION + DISABLE SERVER-ROTATE
  *
- * v36.135 CHANGES:
- *   1. ADD: Dump SecKeyCreateDecryptedData plaintext to see server error in 0x80FFF495
- *   2. RE-ENABLE: Fake response injection on recv-close (server closes connection)
- *   3. KEEP: v36.133 fix - do NOT patch 0x80FFF495 offset[12] (format flag 0x01)
- *   4. KEEP: v36.134 fix - UUID injection after GPU field
+ * v36.136 CHANGES:
+ *   1. FIX: Set g_triggerFakeNextRecv=YES on RECV-CLOSE to trigger BURST fake resp injection
+ *      (v36.135 bug: g_triggerFakeNextRecv was NEVER set to YES, so fake resp never fired)
+ *   2. DISABLE: SERVER-ROTATE logic (rotation caused client reconnect loop + "连接异常中断")
+ *   3. ADD: Force poll/select/getsockopt to return OK for game fd before fake resp injected
+ *   4. KEEP: v36.133 fix - do NOT patch 0x80FFF495 offset[12] (format flag 0x01)
+ *   5. KEEP: v36.134 fix - UUID injection after GPU field
+ *   6. KEEP: v36.135 - SecKeyCreateDecryptedData plaintext dump
  *
- * PROBLEM ANALYSIS (v36.134 log):
- *   - UUID injection CORRECT (179 bytes with UUID)
- *   - Client sends 0x000EE007(179B) + 0x00FFF493(492B) + 0x00FFF493(876B)
- *   - BUT server STILL closes connection
- *   - SecKeyCreateDecryptedData: plainLen=40 (may be error message)
- *   - Need to see decrypted content to determine server error
+ * PROBLEM ANALYSIS (v36.135 log):
+ *   - Login OK, server click OK, client sends 0x000EE007(179B)+0x00FFF493(472B)+0x00FFF493(876B)
+ *   - SEC-PLAIN shows session key decrypted OK: "FcQeZ8EBNrnZybxv@$_pSen4Y9Ly2GKcOqv@$_21"
+ *   - Challenge response ACCEPTED, but server closes connection after 0x00FFF493
+ *   - RECV-CLOSE returns EAGAIN but NO fake response injected (g_triggerFakeNextRecv never set)
+ *   - SERVER-ROTATE triggers reconnect to 101.132.180.110:12003, which ALSO closes connection
+ *   - Client heartbeat detects disconnection -> quitFromServer -> "连接异常中断"
  *
  * STRATEGY:
- *   - If server returns error in 0x80FFF495, cannot fix challenge response (RSA encrypted)
- *   - Fallback: inject fake responses after server closes connection
- *   - Fake responses based on hook.txt real capture format
+ *   - On RECV-CLOSE: arm g_triggerFakeNextRecv so next recv() fires BURST fake resp injection
+ *   - Disable SERVER-ROTATE to keep client on current fd (no reconnect loop)
+ *   - Fake responses from command queue: 0x80EEE007, 0x80FFF493, 0x80FFF493
+ *   - close() hook already blocks quitFromServer; poll/select/getsockopt hooks mask error
  *
  * v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
@@ -430,7 +435,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.135 loaded ===");
+        _log(@"=== WangXianHook v36.136 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2956,12 +2961,14 @@ static BOOL tryNextServer(void) {
 static int hook_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
     if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
     
+    // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so SO_ERROR=0 is returned
+    // even BEFORE fake response is injected (between RECV-CLOSE and BURST injection).
     // If this is the fake response fd and checking SO_ERROR, return 0
-    if (g_fakeRespInjected && g_fakeRespFd == fd && level == SOL_SOCKET && optname == SO_ERROR) {
+    if (g_fakeRespFd == fd && level == SOL_SOCKET && optname == SO_ERROR) {
         if (optval && optlen && *optlen >= sizeof(int)) {
             *(int *)optval = 0;  // No error
             *optlen = sizeof(int);
-            DLOG(@"[FAKE-SOCKOPT] v36.97: Returning SO_ERROR=0 for fake resp fd=%d", fd);
+            DLOG(@"[FAKE-SOCKOPT] v36.136: Returning SO_ERROR=0 for fake resp fd=%d (injected=%d)", fd, g_fakeRespInjected);
             return 0;
         }
     }
@@ -2979,13 +2986,15 @@ static int hook_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     int result = orig_poll(fds, nfds, timeout);
     
     // v36.104: If fake response fd is in the poll set, clear error flags
-    if (g_fakeRespInjected && g_fakeRespFd >= 0 && result > 0) {
+    // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so flags are cleared
+    // even BEFORE fake response is injected (between RECV-CLOSE and BURST injection).
+    if (g_fakeRespFd >= 0 && result > 0) {
         for (nfds_t i = 0; i < nfds; i++) {
             if (fds[i].fd == g_fakeRespFd) {
                 // Clear POLLHUP and POLLERR flags - pretend connection is alive
                 if (fds[i].revents & (POLLHUP | POLLERR)) {
-                    DLOG(@"[FAKE-POLL] v36.104: Clearing POLLHUP/POLLERR for fake resp fd=%d (was 0x%x)", 
-                         fds[i].fd, fds[i].revents);
+                    DLOG(@"[FAKE-POLL] v36.136: Clearing POLLHUP/POLLERR for fake resp fd=%d (was 0x%x injected=%d)", 
+                         fds[i].fd, fds[i].revents, g_fakeRespInjected);
                     fds[i].revents &= ~(POLLHUP | POLLERR);
                     // If only error flags were set, set POLLIN instead so recv can return EAGAIN
                     if (fds[i].revents == 0) {
@@ -3017,9 +3026,11 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
     int result = orig_select(nfds, readfds, writefds, exceptfds, timeout);
     
     // v36.104: If fake response fd is in the except set, clear it
-    if (g_fakeRespInjected && g_fakeRespFd >= 0 && result >= 0) {
+    // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so exception is cleared
+    // even BEFORE fake response is injected (between RECV-CLOSE and BURST injection).
+    if (g_fakeRespFd >= 0 && result >= 0) {
         if (exceptfds && FD_ISSET(g_fakeRespFd, exceptfds)) {
-            DLOG(@"[FAKE-SELECT] v36.104: Clearing exception for fake resp fd=%d", g_fakeRespFd);
+            DLOG(@"[FAKE-SELECT] v36.136: Clearing exception for fake resp fd=%d (injected=%d)", g_fakeRespFd, g_fakeRespInjected);
             FD_CLR(g_fakeRespFd, exceptfds);
             // Recalculate result
             result = 0;
@@ -3047,8 +3058,10 @@ static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
     
     // v36.97: Also block close for fake response fd
-    if (g_fakeRespInjected && g_fakeRespFd == fd) {
-        DLOG(@"[FAKE-CLOSE] v36.103: Blocking close(%d) for fake response fd", fd);
+    // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so close is blocked
+    // even BEFORE fake response is injected (between RECV-CLOSE and BURST injection).
+    if (g_fakeRespFd == fd) {
+        DLOG(@"[FAKE-CLOSE] v36.136: Blocking close(%d) for fake resp fd (injected=%d)", fd, g_fakeRespInjected);
         // v36.103: Use this opportunity to find and patch C++ disconnect functions
         // The backtrace from close() should include quitFromServer and heartbeat
         findAndPatchDisconnectFunctions();
@@ -3232,7 +3245,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // v36.123: If this is the fake response fd, pretend send succeeds
     // This prevents heartbeat from detecting the dead connection via send()
     // v36.123: Enqueue new commands AND reset delivered flag
-    if (g_fakeRespInjected && g_fakeRespFd == fd) {
+    // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so send succeeds
+    // even BEFORE fake response is injected (between RECV-CLOSE and BURST injection).
+    if (g_fakeRespFd == fd) {
         // Check if this is a new command (not heartbeat)
         BOOL isNewCmd = NO;
         uint32_t newCmd = 0;
@@ -4580,23 +4595,41 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // and set internal disconnected state, leading to "网络中断" error.
                 // Instead: return EAGAIN to keep connection alive.
                 
-                // v36.133: DISABLED fake response injection on recv-close!
-                //   Real capture shows server does NOT close connection after 0x80FFF495.
-                //   If server closes connection, it means our challenge response was rejected.
-                //   Injecting fake responses at this point corrupts the protocol flow.
-                //   Just return EAGAIN to keep client waiting, close() hook prevents disconnect.
-                DLOG(@"[RECV-CLOSE] v36.135: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
-                
-                // v36.61: Original rotation logic
-                DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
-                @try {
-                    BOOL rotated = tryNextServer();
-                    if (rotated) {
-                        DLOG(@"[SERVER-ROTATE] Rotated to %s:%d, game should retry connection", g_gameServerIP, g_gameServerPort);
-                    }
-                } @catch (NSException *e) {
-                    DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
+                // v36.136: RE-ENABLE fake response injection on recv-close!
+                //   v36.135 bug: g_triggerFakeNextRecv was NEVER set to YES, so BURST
+                //   fake response injection in hook_recv (line ~4298) never fired.
+                //   Server closes connection after 0x000EE007+0x00FFF493 (challenge accepted
+                //   per SEC-PLAIN session key, but login packets rejected).
+                //   Fix: arm g_triggerFakeNextRecv so next recv() fires BURST injection
+                //   using commands from the command queue (0x80EEE007, 0x80FFF493, ...).
+                if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
+                    DLOG(@"[RECV-CLOSE] v36.136: Game server closed connection (fd=%d). ARMING fake-resp injection (handshake=%d loginSent=%d).",
+                         fd, g_handshakeComplete, g_loginPacketsSent);
+                    g_triggerFakeNextRecv = YES;
+                    g_triggerFakeFd       = fd;
+                    // Mark fd as fake-resp pending so poll/select/getsockopt return OK
+                    g_fakeRespFd          = fd;
+                } else {
+                    DLOG(@"[RECV-CLOSE] v36.136: Game server closed connection (fd=%d). EAGAIN only (handshake=%d loginSent=%d fakeInjected=%d).",
+                         fd, g_handshakeComplete, g_loginPacketsSent, g_fakeRespInjected);
                 }
+                
+                // v36.136: DISABLED SERVER-ROTATE!
+                //   Rotation caused client to reconnect to next server (101.132.180.110),
+                //   which ALSO closes connection, creating an infinite reconnect loop.
+                //   This led to "连接异常中断" error because client heartbeat detected
+                //   the disconnection during rotation.
+                //   Instead: keep client on current fd and inject fake responses.
+                // [SERVER-ROTATE DISABLED in v36.136]
+                // DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
+                // @try {
+                //     BOOL rotated = tryNextServer();
+                //     if (rotated) {
+                //         DLOG(@"[SERVER-ROTATE] Rotated to %s:%d, game should retry connection", g_gameServerIP, g_gameServerPort);
+                //     }
+                // } @catch (NSException *e) {
+                //     DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
+                // }
                 
                 errno = EAGAIN;
                 return -1;
@@ -6848,7 +6881,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.135 - DUMP PLAINTEXT + RE-ENABLE FAKE RESP INJECTION");
+    DLOG(@"[VERSION] WangXianHook v36.136 - RE-ENABLE FAKE RESP INJECTION + DISABLE SERVER-ROTATE");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
