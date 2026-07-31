@@ -1,6 +1,40 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.142: POST-BURST STATE MACHINE (RECV #20 + #21)
+ *
+ * v36.142 CHANGES:
+ *   1. NEW: Post-BURST state machine in hook_recv. After BURST injects
+ *      0x0CB0A300 (role data, 1632 bytes), the client sends an ACK and
+ *      expects two more server responses (hook.txt RECV #20 + #21):
+ *        RECV #20: cmd=0x12F00080 (71 bytes) — session token
+ *        RECV #21: cmd=0x13000080 (840 bytes) — map/scene data
+ *      v36.141 only injected the BURST; subsequent recv() returned EAGAIN
+ *      (g_fakeRespActive + empty queue + delivered), so the client never
+ *      received RECV #20/#21 and stayed at "正在进入...".
+ *      v36.142 adds g_postBurstState (0=idle, 1=inject#20, 2=inject#21,
+ *      4=done). doBurstFakeInject sets state=1; hook_recv injects the
+ *      captured bytes on the next two recv() calls.
+ *   2. KEEP: v36.141 - skip 0x000EE007, single 0x0CB0A300
+ *   3. KEEP: v36.140 - complete 1632-byte 0x0CB0A300, skip 0x48736343
+ *   4. KEEP: v36.138 - skip stale cmds (0x00FFF495, 0x50584666, ...)
+ *   5. KEEP: v36.137 - direct BURST inject on RECV-CLOSE
+ *   6. KEEP: v36.136 - poll/select/getsockopt/close/send check g_fakeRespFd
+ *
+ * PROBLEM ANALYSIS (v36.141 log):
+ *   - BURST inject returned 1632 bytes (single 0x0CB0A300) — correct.
+ *   - Client sent ACK (20B) + 2 heartbeats (22B each) via FAKE-SEND.
+ *   - Then client called recv() for RECV #20 but got EAGAIN (g_fakeRespActive
+ *     block: queue empty, g_lastGameCmd==g_lastRespCmd, delivered=YES).
+ *   - Without RECV #20 (session token) + RECV #21 (map data), client cannot
+ *     proceed past "正在进入...".
+ *
+ * STRATEGY:
+ *   - BURST injects 0x0CB0A300 (1632 bytes) as before.
+ *   - g_postBurstState=1: next recv() returns RECV #20 (71 bytes).
+ *   - g_postBurstState=2: next recv() returns RECV #21 (840 bytes).
+ *   - g_postBurstState=4: done, fall through to normal EAGAIN handling.
+ *
  * WangXianHook v36.141: MATCH REAL PROTOCOL FLOW (skip EE007, single 0x0CB0A300)
  *
  * v36.141 CHANGES:
@@ -537,7 +571,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.141 loaded ===");
+        _log(@"=== WangXianHook v36.142 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1821,6 +1855,65 @@ static int g_triggerFakeFd = -1;
 // append all fake responses to the CURRENT return as a TCP sticky buffer.
 static BOOL g_burstInjectAfterPatch = NO;
 static int g_burstInjectFd = -1;
+
+// v36.142: Post-BURST protocol continuation.
+// Real capture (hook.txt) shows that after receiving 0x0CB0A300 (role data),
+// the client sends an ACK (0x80A3B00C, 20 bytes), then the server sends:
+//   RECV #20: cmd=0x1200F080 (71 bytes) — session token notification
+//   RECV #21: cmd=0x13000080 (840 bytes) — map/scene data with file paths
+// Without these, the client enters heartbeat mode and stays at "正在进入...".
+// State machine:
+//   0 = idle
+//   1 = BURST injected, next recv() should return RECV #20
+//   2 = RECV #20 injected, waiting for client to send 0x00FFF493 (enter game)
+//   3 = Client sent 0x00FFF493, next recv() should return RECV #21
+//   4 = RECV #21 injected, done
+static int g_postBurstState = 0;
+static int g_postBurstFd = -1;
+
+// RECV #20 data (71 bytes) from hook.txt line 944.
+// cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
+static const uint8_t kRecv20Data[71] = {
+    0x00,0x00,0x00,0x47, 0x80,0x00,0xF0,0x12, 0x00,0x00,0x00,0x1A, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x20,0x31, 0x32,0x30,0x66,0x62, 0x35,0x64,0x39,0x65,
+    0x35,0x66,0x62,0x30, 0x31,0x36,0x65,0x32, 0x32,0x35,0x65,0x61, 0x66,0x64,0x38,0x64,
+    0x65,0x37,0x32,0x32, 0x31,0x31,0x38
+};
+
+// RECV #21 data (840 bytes) from hook.txt lines 1002-1054.
+// cmd=0x13000080 (wire: 80 00 00 13), seq=0x1C.
+// Contains role name "luoyueshangu", map info, and .xtl file paths.
+// First 288 bytes are meaningful; rest is zero-padded with sparse non-zero values.
+static const uint8_t kRecv21Head[288] = {
+    0x00,0x00,0x03,0x48, 0x80,0x00,0x00,0x13, 0x00,0x00,0x00,0x1C, 0x00,0x00,0x00,0x01,
+    0x00,0x0C,0x6C,0x75, 0x6F,0x79,0x75,0x65, 0x73,0x68,0x61,0x6E, 0x67,0x75,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0xFF,
+    0x00,0x00,0x00,0x00, 0x00,0x01,0x49,0x00, 0x00,0x01,0x49,0x00, 0x00,0x00,0xFA,0x00,
+    0x00,0x00,0xFA,0x24, 0x3F,0xB0,0x29,0x39, 0x53,0x40,0x10,0x00, 0x06,0xE7,0x9C,0x8B,
+    0xE7,0x9C,0x8B,0x00, 0x02,0xFF,0xFF,0xFF, 0xFF,0x05,0x00,0x00, 0x00,0x05,0x00,0x00,
+    0x00,0x05,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0xC3,0x50, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x01,0x5A, 0x00,0x00,0x00,0x00, 0x00,0x00,0x05,0x10, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x32,0xA0, 0x09,0x00,0x02,0x00, 0x02,0x5A,0x4A,0x00, 0x00,0x00,0x04,0x00,
+    0x14,0x2F,0x70,0x61, 0x72,0x74,0x2F,0x5A, 0x4A,0x5F,0x73,0x68, 0x6F,0x75,0x6B,0x75,
+    0x69,0x2E,0x78,0x74, 0x6C,0x00,0x1E,0x2F, 0x70,0x61,0x72,0x74, 0x2F,0x6C,0x69,0x61,
+    0x6E,0x64,0x61,0x6F, 0x30,0x36,0x5F,0x5A, 0x4A,0x5F,0x73,0x68, 0x6F,0x75,0x6B,0x75,
+    0x69,0x2E,0x78,0x74, 0x6C,0x00,0x1B,0x2F, 0x70,0x61,0x72,0x74, 0x2F,0x79,0x69,0x66,
+    0x75,0x30,0x30,0x5F, 0x5A,0x4A,0x5F,0x73, 0x68,0x6F,0x75,0x6B, 0x75,0x69,0x2E,0x78,
+    0x74,0x6C,0x00,0x1C, 0x2F,0x70,0x61,0x72, 0x74,0x2F,0x6C,0x69, 0x61,0x6E,0x64,0x61,
+    0x6F,0x5F,0x5A,0x4A, 0x5F,0x73,0x68,0x6F, 0x75,0x6B,0x75,0x69, 0x2E,0x78,0x74,0x6C,
+    0x00,0x00,0x00,0x04, 0x00,0x01,0x02,0x0D, 0xFF,0x00,0x00,0x07, 0xD0,0x00,0x00,0x00
+};
+// Sparse non-zero bytes in the zero-padded tail (offset, value pairs).
+static const struct { uint16_t off; uint8_t val; } kRecv21Sparse[] = {
+    { 0x120, 0x96 },  // byte 288
+    { 0x1F6, 0x36 },  // byte 502
+    { 0x1FC, 0x14 },  // byte 508
+    { 0x265, 0x14 },  // byte 613
+    { 0x2E0, 0x28 },  // byte 736
+    { 0, 0 }          // sentinel
+};
 
 // v36.125: NEW — Force valid decryption mode for game server responses
 // When client decrypts 0x80FFF495 payload, return valid plaintext
@@ -4646,6 +4739,16 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     g_lastRespCmd       = batch[respCount > 0 ? respCount - 1 : 0].cmd;
     g_respCount         = respCount;
 
+    // v36.142: Arm post-BURST state machine. After the client processes the
+    // 0x0CB0A300 role data and sends an ACK, it expects RECV #20 (session
+    // token) from the server. Without this, the client enters heartbeat mode
+    // and stays at "正在进入...".
+    if (totalLen > 0) {
+        g_postBurstState = 1;
+        g_postBurstFd = fd;
+        DLOG(@"[POST-BURST] v36.142: State=1 (inject RECV #20 on next recv)");
+    }
+
     if (totalLen > 0) {
         DLOG(@"[FAKE-RESP] v36.137: BURST-INJECT returned %u bytes (%d responses, %zu left in recv buffer)",
              totalLen, respCount, remaining);
@@ -4674,7 +4777,34 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         errno = EAGAIN;
         return -1;
     }
-    
+
+    // v36.142: Post-BURST state machine — inject RECV #20 and #21.
+    // Real protocol (hook.txt): after 0x0CB0A300 (role data, our BURST), the
+    // client sends an ACK then expects:
+    //   RECV #20: cmd=0x12F00080 (71 bytes) — session token
+    //   RECV #21: cmd=0x13000080 (840 bytes) — map/scene data
+    // Without these the client enters heartbeat mode and stays at "正在进入...".
+    // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21, 4=done
+    if (g_postBurstState >= 1 && g_postBurstFd == fd) {
+        if (g_postBurstState == 1 && len >= 71) {
+            memcpy(buf, kRecv20Data, 71);
+            g_postBurstState = 2;
+            DLOG(@"[POST-BURST] v36.142: Injected RECV #20 (71B session token) fd=%d state=2", fd);
+            return 71;
+        }
+        if (g_postBurstState == 2 && len >= 840) {
+            memcpy(buf, kRecv21Head, 288);
+            memset((uint8_t *)buf + 288, 0, 840 - 288);
+            for (int i = 0; kRecv21Sparse[i].off != 0 || kRecv21Sparse[i].val != 0; i++) {
+                if (kRecv21Sparse[i].off < 840)
+                    ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
+            }
+            g_postBurstState = 4;
+            DLOG(@"[POST-BURST] v36.142: Injected RECV #21 (840B map data) fd=%d state=4 (done)", fd);
+            return 840;
+        }
+    }
+
     // v36.123: Queue-based fake response system (PRIORITY PATH)
     // This handles ALL subsequent recv calls after initial injection
     if (g_fakeRespActive && g_fakeRespFd == fd) {
@@ -7142,7 +7272,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.141 - MATCH REAL PROTOCOL FLOW (skip EE007, single 0x0CB0A300)");
+    DLOG(@"[VERSION] WangXianHook v36.142 - POST-BURST STATE MACHINE (RECV #20 + #21)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
