@@ -1,10 +1,8 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.123: IMMEDIATE burst injection after 0x80FFF495 patch
- *                        Instead of waiting for next recv() (which is for heartbeat ACK - wrong context),
- *                        append ALL 4 fake responses (800EE007+80FFF493+80FFF49F+80FFF4A1) as TCP sticky buffer
- *                        to the CURRENT return. Client sees 4 responses in ONE logical tick.
- *                        + 0x80FFF49F includes 1 role entry (玩家001 Lv.1), 0x80FFF4A1 includes enter-game coords.
+ * WangXianHook v36.124: Complete 0x80FFF495 response patch (status+format+payload) +
+ *                        Send-intercept approach: wait for client's native commands with
+ *                        REAL seq numbers, intercept in hook_send, generate matching fake responses.
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
  *
  * v36.123 FIXES (CRITICAL):
@@ -393,7 +391,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.123 loaded ===");
+        _log(@"=== WangXianHook v36.124 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -572,7 +570,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.123 诊断面板";
+            lbl.text = @"WXHook v36.124 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1546,11 +1544,17 @@ static int g_fakeRespSentCount = 0;  // Track how many fake responses sent
 static BOOL g_triggerFakeNextRecv = NO;
 static int g_triggerFakeFd = -1;
 
-// v36.123: New flag for IMMEDIATE burst injection after patch
+// v36.124: New flag for IMMEDIATE burst injection after patch
 // Instead of waiting for the next client recv() call (which may be for heartbeat ACK),
 // append all fake responses to the CURRENT return as a TCP sticky buffer.
 static BOOL g_burstInjectAfterPatch = NO;
 static int g_burstInjectFd = -1;
+
+// v36.124: NEW — Wait for client to send native commands with REAL seq numbers
+// Instead of pre-generating responses with wrong seq (0x10000+), wait for the
+// client to send EE007/FFF493 etc., capture the REAL seq, and use it for responses.
+static BOOL g_waitingForClientCmds = NO;
+static int g_waitingFd = -1;
 
 // Forward declaration (actual definition is after hook_recv closesocket logic,
 // we will pull it above here as an independent reusable block).
@@ -5002,103 +5006,100 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.123: ACTIVE PATCH MODE (was FORCE-SEND plaintext in v36.123, which was
-                        //          IGNORED by game server because EE007 must be AES-encrypted on the
-                        //          already-negotiated game session key, not sent as plaintext!)
-                        // Analysis (v36.123 log): After patch status=1→0, client internal state
-                        //   machine never progressed because it had no valid AES session key.
-                        //   It sent ONLY heartbeats and never produced encrypted EE007/FFF493.
-                        //   Worse, the game server on 12003 never closed the TCP connection
-                        //   (heartbeat kept it alive), so FAKE-RESP initial inject NEVER fired
-                        //   (which requires RECV-CLOSE ret==0).
-                        // Fix v36.123:
-                        //   1. Still patch status=1→0 (so client doesn't popup auth-error UI)
-                        //   2. NO MORE FORCE-SEND plaintext EE007 (causes encrypted-session desync)
-                        //   3. VIRTUALLY enqueue the FULL game-login protocol sequence
-                        //      (EE007 → FFF493 → FFF49E role list → FFF4A0 enter-game) so the
-                        //      FAKE-RESP generator can produce 0x80xxx responses for each.
-                        //   4. Set g_loginPacketsSent=YES + g_triggerFakeNextRecv=YES so that on
-                        //      the CLIENT'S NEXT recv() call, the FAKE-RESP initial-inject block
-                        //      fires IMMEDIATELY — no longer waiting for RECV-CLOSE.
+                        // v36.124: COMPLETE RESPONSE PATCH — not just status byte!
+                        // Based on FORCE-HS-PREP (v36.88) success pattern:
+                        //   Byte[12] = 0x00 (status SUCCESS)
+                        //   Byte[13] = 0x88 (format flag — CRITICAL for handler parsing)
+                        //   Bytes[14..] = Base64 padding (prevents SIGSEGV in handler)
+                        //   Keep original seq number (client uses it to match response)
+                        //
+                        // v36.123 problem analysis:
+                        //   - We only patched status 1→0 at byte[12], but left byte[13]
+                        //     as the ORIGINAL payload byte (e.g. 0x5F from base64 data)
+                        //   - Client's handle_CHOOSE_WOOD_BOX_RES checks byte[13] for
+                        //     format flag 0x88 — without it, the response is treated
+                        //     as malformed or rejected
+                        //   - We also kept the ERROR payload (encrypted failure data)
+                        //     which the client can't decrypt (no AES key)
+                        //
+                        // v36.124 fix: FULL replacement of response body
                         if (status != 0) {
-                            DLOG(@"[GAME-PATCH] v36.123: Patching 0x80FFF495 status %u -> 0 (server auth failed, force OK)", status);
+                            DLOG(@"[GAME-PATCH] v36.124: Patching 0x80FFF495: status %u->0, format->0x88, padding->Base64", status);
+                            
+                            // Patch status byte
                             ((unsigned char *)buf)[12] = 0;
+                            
+                            // CRITICAL: Set format flag byte (like FORCE-HS-PREP)
+                            // Client's handler checks this to know how to parse payload
+                            ((unsigned char *)buf)[13] = 0x88;
+                            
+                            // Replace error payload with Base64 padding
+                            // This prevents SIGSEGV when handler parses bytes[14+]
+                            const char *padding = 
+                                "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzOJwUMBZ0a1FZkot1lJ"
+                                "+LB4rodylyGvUbq7sOO6nHgBqeqT2bp/mCShyDsVKdGGruFM8TY1cKlrHHhukEHV"
+                                "vr2+5zTL7Pg+ywmn+53vB4azfuaetHwVctLFmTyqrENWsTiL0uyl5w4k52TSvX7sC"
+                                "tuMx2grh6f1Hhb0/LqsFNjPobudwS00ypDtBG0Ung3T32DO2eFQ4JI0hXKkbCp0cyBT";
+                            size_t padLen = strlen(padding);
+                            ssize_t payloadLen = ret - 14;
+                            size_t copyLen = (padLen < (size_t)payloadLen) ? padLen : (size_t)payloadLen;
+                            memcpy(((unsigned char *)buf) + 14, padding, copyLen);
+                            // Zero out remaining payload bytes beyond the padding
+                            if ((ssize_t)copyLen < payloadLen) {
+                                memset(((unsigned char *)buf) + 14 + copyLen, 0, payloadLen - (ssize_t)copyLen);
+                            }
+                            
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
-                            DLOG(@"[GAME-PATCH] v36.123: Flags set: handshakeComplete=1 challengeResponded=1");
+                            DLOG(@"[GAME-PATCH] v36.124: FULL PATCH done: status=0 format=0x88 payload=Base64(%zu bytes)", copyLen);
+                            
+                            // Log the patched response header
+                            NSMutableString *patchedHex = [NSMutableString stringWithCapacity:64];
+                            unsigned char *pb = (unsigned char *)buf;
+                            for (int i = 0; i < MIN(20, (int)ret); i++) {
+                                [patchedHex appendFormat:@"%02X ", pb[i]];
+                            }
+                            DLOG(@"[GAME-PATCH] v36.124: Patched response first 20 bytes: %@", patchedHex);
                         } else {
-                            DLOG(@"[GAME-PATCH] v36.123: 0x80FFF495 status=0 already OK");
+                            DLOG(@"[GAME-PATCH] v36.124: 0x80FFF495 status=0 already OK, patching format flag");
+                            ((unsigned char *)buf)[13] = 0x88;
                             g_handshakeComplete = YES;
                             g_challengeResponded = YES;
                         }
 
-                        // ============================================================
-                        // v36.123: VIRTUAL-ENQUEUE full login-flow protocol sequence
-                        // (NO MORE FORCE-SEND — plaintext EE007 was IGNORED by game server)
-                        // KEY FIX v36.123→v36.123:
-                        //   - Call resetCmdQueue() FIRST to drop any pre-queued commands
-                        //     (e.g. 0x00FFF495 which already got its real 0x80FFF495
-                        //      response from the patched real packet). v36.123 did NOT
-                        //      clear the queue, so initial injection picked FFF495 and
-                        //      produced a DUP 0x80FFF495 instead of 0x800EE007.
-                        //   - Use clean base sequence 0x00010000 instead of last real seq,
-                        //     so handshake-phase seq numbers do not pollute the login flow.
-                        // ============================================================
-                        if (!g_fakeRespInjected && !g_triggerFakeNextRecv && fd >= 0) {
-                            // CRITICAL: DROP ALL PREVIOUSLY QUEUED CMDS (handshake phase
-                            // cmds like 0x00FFF495 already received their real responses).
+                        // v36.124: NEW STRATEGY — DO NOT inject fake responses immediately!
+                        // Let the client's state machine process the patched response NATURALLY.
+                        // The client should now send 0x000EE007 (device info) because:
+                        //   - status=0 (no auth error)
+                        //   - format=0x88 (handler can parse the response)
+                        //   - payload has valid-looking Base64 data
+                        //
+                        // Instead of pre-generating responses with WRONG seq numbers (0x10000+),
+                        // wait for the client to ACTUALLY send EE007/FFF493/etc.
+                        // Then intercept in hook_send, capture the REAL seq number,
+                        // and generate a MATCHING fake response on the next recv().
+                        //
+                        // This mirrors the FORCE-HS-PREP approach which successfully
+                        // triggered the client to send native (encrypted) commands.
+                        
+                        if (!g_fakeRespInjected && fd >= 0) {
+                            // Clear any previously queued commands (they have wrong seq numbers)
                             resetCmdQueue();
-                            DLOG(@"[VIRTUAL-QUEUE] v36.123: resetCmdQueue() called — cleared stale handshake-phase cmds");
-
-                            // Clean base sequence for login-flow virtual packets:
-                            // start at 0x00010000 (far from handshake-phase seq 0x00000020)
-                            uint32_t baseSeq = 0x00010000u;
-                            uint32_t lenEE   = g_deviceInfoEnhancedReady ? (uint32_t)g_deviceInfoEnhancedLen : 181u;
-                            uint32_t lenF3   = 703u;   // encrypted 0x00FFF493 login payload size
-                            uint32_t lenRole = 64u;    // 0x00FFF49E = request role list (estimate)
-                            uint32_t lenEnt  = 64u;    // 0x00FFF4A0 = enter game / select role
-
-                            // 1. Device info 0x000EE007
-                            uint32_t seq0 = baseSeq;
-                            enqueueGameCmd(0x000EE007, fd, lenEE, seq0);
-
-                            // 2. Encrypted login 0x00FFF493
-                            uint32_t seq1 = baseSeq + 1;
-                            enqueueGameCmd(0x00FFF493, fd, lenF3, seq1);
-
-                            // 3. Role list request 0x00FFF49E
-                            uint32_t seq2 = baseSeq + 2;
-                            enqueueGameCmd(0x00FFF49E, fd, lenRole, seq2);
-
-                            // 4. Enter game / select role 0x00FFF4A0
-                            uint32_t seq3 = baseSeq + 3;
-                            enqueueGameCmd(0x00FFF4A0, fd, lenEnt, seq3);
-
-                            DLOG(@"[VIRTUAL-QUEUE] v36.123: Enqueued CLEAN 4-step flow (seq=0x10000..0x10003): EE007(0x%08X len=%u) -> FFF493(0x%08X len=%u) -> FFF49E(0x%08X len=%u) -> FFF4A0(0x%08X len=%u) queue=%d (expect first inject=EE007->800EE007)",
-                                 seq0, lenEE, seq1, lenF3, seq2, lenRole, seq3, lenEnt, g_cmdQueueCount);
-
-                            // Mark login-packets as "sent" (required by FAKE-RESP inject guard)
-                            g_deviceInfoSentToGame = YES;
-                            g_loginPacketsSent     = YES;
-
-                            // v36.123: Force IMMEDIATE burst injection AFTER this patch,
-                            // not waiting for the next client recv() call.
-                            // Reason (v36.123 log analysis): After patching 0x80FFF495
-                            // status 1->0, client does NOT send 0x000EE007 as expected
-                            // (it sends heartbeat instead). Waiting for next recv()
-                            // means the fake responses are returned for a HEARTBEAT-ACK
-                            // recv() — wrong context, client discards them.
-                            // Fix: Construct ALL 4 fake responses NOW and append them
-                            // as a TCP sticky buffer to the CURRENT return value.
-                            g_triggerFakeNextRecv = YES;
-                            g_triggerFakeFd       = fd;
-                            g_burstInjectAfterPatch = YES;  // v36.123: NEW FLAG
-                            g_burstInjectFd        = fd;
-                            DLOG(@"[FORCE-FAKE] v36.123: burstInjectAfterPatch=YES — will append 4 responses to THIS recv() return");
+                            DLOG(@"[VIRTUAL-QUEUE] v36.124: resetCmdQueue() — cleared stale cmds with wrong seq numbers");
+                            
+                            // Enter "waiting for client commands" mode
+                            g_waitingForClientCmds = YES;
+                            g_waitingFd = fd;
+                            g_fakeRespInjected = YES;  // Mark as active to intercept sends
+                            g_fakeRespFd = fd;
+                            g_fakeRespActive = YES;
+                            
+                            DLOG(@"[VIRTUAL-QUEUE] v36.124: Waiting for client to send EE007/FFF493 with REAL seq numbers");
+                            DLOG(@"[VIRTUAL-QUEUE] v36.124: Original response seq=0x%02X%02X%02X%02X (client will use next seq for EE007)",
+                                 ((unsigned char *)buf)[8], ((unsigned char *)buf)[9],
+                                 ((unsigned char *)buf)[10], ((unsigned char *)buf)[11]);
                         } else if (g_fakeRespInjected) {
-                            DLOG(@"[VIRTUAL-QUEUE] v36.123: SKIP (fake-resp already active/injected)");
-                        } else if (g_triggerFakeNextRecv) {
-                            DLOG(@"[VIRTUAL-QUEUE] v36.123: SKIP (trigger already armed for fd=%d)", g_triggerFakeFd);
+                            DLOG(@"[VIRTUAL-QUEUE] v36.124: SKIP (fake-resp already active for fd=%d)", fd);
                         }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -5332,78 +5333,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             DLOG(@"[GAME-RECV] Exception during analysis: %@", e.reason);
         }
         
-        // v36.123: IMMEDIATE burst injection after 0x80FFF495 patch
-        // Append all 4 fake responses (EE007/FFF493/FFF49E/FFF4A0) as TCP sticky data
-        // This is triggered when patch 0x80FFF495 status=1->0 succeeds
-        if (g_burstInjectAfterPatch && g_burstInjectFd == fd && ret > 0) {
-            DLOG(@"[V36.123-BURST] burstInjectAfterPatch triggered: ret=%zd bufFreespace=%zu", ret, len - ret);
-            
-            // Need enough space for 4 responses (4 * 200 = 800 bytes)
-            size_t neededSpace = 4 * MAX_FAKE_RESP_BUF;  // 4 * 256 = 1024 bytes
-            if (len - ret >= neededSpace) {
-                uint8_t *dst = (uint8_t *)buf + ret;
-                uint32_t offset = 0;
-                uint32_t respCount = 0;
-                
-                // Drain entire virtual queue
-                GameCmdEntry batch[16];
-                int batchCount = 0;
-                for (int i = 0; i < 16; i++) {
-                    GameCmdEntry e;
-                    if (!dequeueGameCmd(&e)) break;
-                    batch[batchCount++] = e;
-                    DLOG(@"[V36.123-BURST] Collected [%d] cmd=0x%08X seq=0x%08X", batchCount-1, e.cmd, e.seqNum);
-                }
-                
-                if (batchCount == 0) {
-                    // Fallback: generate default responses
-                    batch[0].cmd = 0x000EE007; batch[0].seqNum = 0x00010000; batch[0].fd = fd; batch[0].sendLen = 181;
-                    batch[1].cmd = 0x00FFF493; batch[1].seqNum = 0x00010001; batch[1].fd = fd; batch[1].sendLen = 703;
-                    batch[2].cmd = 0x00FFF49E; batch[2].seqNum = 0x00010002; batch[2].fd = fd; batch[2].sendLen = 64;
-                    batch[3].cmd = 0x00FFF4A0; batch[3].seqNum = 0x00010003; batch[3].fd = fd; batch[3].sendLen = 64;
-                    batchCount = 4;
-                    DLOG(@"[V36.123-BURST] Fallback: using hardcoded 4-step sequence");
-                }
-                
-                for (int i = 0; i < batchCount; i++) {
-                    uint32_t rLen = generateFakeResponse(batch[i].cmd, dst + offset, MAX_FAKE_RESP_BUF, batch[i].seqNum);
-                    if (rLen == 0) rLen = 200;
-                    offset += rLen;
-                    respCount++;
-                    DLOG(@"[V36.123-BURST] [%d] appended cmd=0x%08X -> 0x%08X seq=0x%08X len=%u (cum=%u)", 
-                         i, batch[i].cmd, batch[i].cmd | 0x80000000u, batch[i].seqNum, rLen, offset);
-                }
-                
-                uint32_t newRet = (uint32_t)ret + offset;
-                DLOG(@"[V36.123-BURST] SUCCESS: Original %zd + %u fake bytes = %u total (%d responses)", 
-                     ret, offset, newRet, respCount);
-                
-                // Log first 64 bytes of the burst buffer
-                NSMutableString *burstHex = [NSMutableString stringWithCapacity:128];
-                for (uint32_t i = 0; i < MIN(offset, 64u); i++) {
-                    [burstHex appendFormat:@"%02X ", dst[i]];
-                }
-                DLOG(@"[V36.123-BURST] Burst first 64 bytes: %@", burstHex);
-                
-                ret = (ssize_t)newRet;
-                
-                g_fakeRespInjected = YES;
-                g_fakeRespFd = fd;
-                g_fakeRespLen = offset;
-                g_fakeRespSentCount = respCount;
-                g_fakeRespActive = YES;
-                g_fakeRespDelivered = YES;
-                g_respCount = respCount;
-                
-                // Clear burst flags after injection
-                g_burstInjectAfterPatch = NO;
-                g_burstInjectFd = -1;
-            } else {
-                DLOG(@"[V36.123-BURST] FAIL: Not enough space (need %zu, have %zu)", neededSpace, len - ret);
-                g_burstInjectAfterPatch = NO;
-                g_burstInjectFd = -1;
-            }
-        }
+        // v36.124: BURST injection REMOVED — using send-intercept approach instead
+        // (client sends commands with real seq, we intercept in hook_send,
+        //  generate matching responses in hook_recv)
     }
 #endif
     
@@ -6463,7 +6395,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.123 - Hook UIDevice IDFV for native UUID EE007, FORCE-SEND EE007+virtual FFF493 after 0x80FFF495 patch");
+    DLOG(@"[VERSION] WangXianHook v36.124 - Complete 0x80FFF495 patch (status+format+payload) + send-intercept with REAL seq numbers");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
