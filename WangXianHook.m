@@ -1,34 +1,45 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.147: EXTEND POST-BURST TO INCLUDE RECV #22/#23/#24
+ * WangXianHook v36.151: FIX PHASE 2 IN-PROGRESS ENQUEUE BUG
  *
- * v36.147 CHANGES:
- *   1. NEW: Added RECV #22 (27B, cmd=0x80FFF490), RECV #23 (273B,
- *      cmd=0x16000080), and RECV #24 (63B, multiple cmd=0x80FFF161) data
- *      arrays extracted from real hook.txt capture lines 1082-1137.
- *   2. EXTENDED post-BURST state machine: 1→#20 → 2→#21 → 3→#22 →
- *      4→#23 → 5→#24 → 0 (done). Previously stopped at #21.
- *      v36.146 stopped at state=0 after #21, leaving client with no
- *      enter-game ACK (#22), scene entities (#23), or role attrs (#24).
- *      Client's 0x00FFF493 (seq=0x23-0x26) got no response → stuck.
- *      v36.147 injects all 5 post-BURST responses in sequence via the
- *      existing poll/select POLLIN → recv() loop.
- *   3. KEEP: g_postBurstDone set after #24, prevents reactivation.
- *   4. KEEP: v36.146 - g_postBurstDone prevents hook_send/hook_recv
- *      from reactivating fake responses.
- *   5. KEEP: v36.145 - reset state to 0 after final injection.
- *   6. KEEP: v36.144 - poll/select SET POLLIN when post-BURST active.
- *   7. KEEP: v36.143 - whitelist BURST (only 0x00FFF493).
+ * v36.151 CHANGES (fixes v36.150 Phase 2 corruption):
+ *   1. BUG: v36.150 Phase 2 trigger set g_postBurstDone=NO, g_postBurstState=3.
+ *      When client sent a SECOND 0x00FFF493 during Phase 2 (before RECV #22-#24
+ *      completed), hook_send fell into the isNewCmd=YES branch (because
+ *      !g_postBurstDone was true), enqueued the command, reset
+ *      g_fakeRespDelivered=NO, and generated spurious 0x0CB0A300/0x80FFF490
+ *      responses. This corrupted the RECV #22-#24 injection sequence.
+ *   2. FIX: Added g_postBurstState < 3 guard to the isNewCmd branch. While
+ *      Phase 2 is in progress (state >= 3), 0x00FFF493 requests are send-only
+ *      (no enqueue, no response generation). RECV #22-#24 are driven entirely
+ *      by g_postBurstState.
+ *   3. FIX: Moved g_phase2TriggerCount from static local to global, reset to 0
+ *      on BURST inject. Previously the static local never reset, breaking
+ *      re-login.
+ *   4. KEEP: v36.150 two-phase injection design.
+ *      Phase 1: BURST→RECV#20→RECV#21→[role UI] (g_postBurstDone=YES)
+ *      Phase 2: client sends 0x00FFF493→RECV#22→RECV#23→RECV#24→[game scene]
  *
- * PROBLEM ANALYSIS (v36.146 log):
- *   - RECV #20 + #21 injected successfully. No quitFromServer.
- *   - Client sent 0x00FFF493 (seq=0x23-0x26) but got NO response
- *     (g_postBurstDone=YES → recv returned EAGAIN forever).
- *   - Missing from v36.146: server still sends RECV #22, #23, #24
- *     AFTER RECV #21 in real capture. These are required for the
- *     client to enter the map scene:
- *       RECV #22 (27B) = enter-game ACK "kk994"
+ * v36.150 CHANGES (two-phase injection, fixes v36.149 skip role select):
+ *   1. Phase 1: inject RECV #20+#21 only, then g_postBurstDone=YES.
+ *      This reproduces v36.146 behavior (client shows role selection UI).
+ *   2. Phase 2: when client sends FIRST 0x00FFF493 (role select), restart
+ *      post-BURST state=3, inject RECV #22-#24.
+ *   3. After Phase 2 done, subsequent 0x00FFF493 requests return EAGAIN.
+ *   4. Removed v36.149 0x80FFF490 auto-response for post-BURST requests.
+ *
+ * v36.149 PROBLEM: injected RECV #22-#24 immediately after #21, causing
+ *   client to skip role selection and get stuck at "进入角色界面".
+ * v36.146 PROBLEM: only injected RECV #20+#21, client showed role UI but
+ *   0x00FFF493 (enter game) got no response → couldn't enter game scene.
+ *
+ * v36.147/146/145/144/143/142/141/140/139/138/137/136/133/134/135 fixes kept.
+ */
+
+/**
+ * Historical version notes (v36.146-v36.147):
+ *   RECV #22 (27B) = enter-game ACK "kk994"
  *       RECV #23 (273B) = scene entity data (活动, 日常, etc.)
  *       RECV #24 (63B) = 3× role attr notifications
  *   - Total post-BURST flow now: #20→#21→#22→#23→#24→done
@@ -709,7 +720,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.150 loaded ===");
+        _log(@"=== WangXianHook v36.151 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2013,6 +2024,10 @@ static int g_postBurstFd = -1;
 // Without this, each new 0x00FFF493 resets g_fakeRespDelivered=NO, reactivating
 // the fake response system and generating DUPLICATE 0x0CB0A300 responses.
 static BOOL g_postBurstDone = NO;
+// v36.150: Phase 2 trigger counter. 0=not triggered, 1=first 0x00FFF493 (role
+// select) triggers Phase 2, >1=subsequent requests return EAGAIN.
+// Reset to 0 on BURST inject so re-login works.
+static int g_phase2TriggerCount = 0;
 
 // RECV #20 data (71 bytes) from hook.txt line 944.
 // cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
@@ -3804,14 +3819,17 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             // v36.146: After post-BURST completion, don't reactivate fake
             // response system. Client's new 0x00FFF493 requests should be
             // FAKE-SEND'd without generating duplicate 0x0CB0A300 responses.
-            if (newCmd != 0x00000015 && newCmd < 0x80000000 && !g_postBurstDone) {
+            // v36.150: Phase 2 in progress (g_postBurstState >= 3) must NOT
+            // enqueue — otherwise duplicate 0x00FFF493 generates spurious
+            // 0x0CB0A300/0x80FFF490 responses that corrupt the RECV #22-#24
+            // injection sequence.
+            if (newCmd != 0x00000015 && newCmd < 0x80000000 && !g_postBurstDone && g_postBurstState < 3) {
                 isNewCmd = YES;
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
                 // v36.150: Phase 2 trigger. When client sends 0x00FFF493 after
                 // seeing role UI (Phase 1 done), start injecting RECV #22-#24.
                 // Use a counter to only trigger on the FIRST request (role select).
-                static int g_phase2TriggerCount = 0;
                 g_phase2TriggerCount++;
                 if (g_phase2TriggerCount == 1) {
                     // First 0x00FFF493 after Phase 1 = role select / enter game
@@ -3822,6 +3840,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // Subsequent requests: return EAGAIN (no response)
                     DLOG(@"[FAKE-SEND] v36.150: Post-Phase2 cmd=0x%08X seq=0x%08X send-only (count=%d)", newCmd, newSeq, g_phase2TriggerCount);
                 }
+            } else if (!g_postBurstDone && g_postBurstState >= 3 && newCmd != 0x00000015 && newCmd < 0x80000000) {
+                // v36.150: Phase 2 in progress — don't enqueue, don't generate
+                // responses. RECV #22-#24 are driven by g_postBurstState.
+                DLOG(@"[FAKE-SEND] v36.150: Phase 2 IN PROGRESS, cmd=0x%08X seq=0x%08X send-only (state=%d)", newCmd, newSeq, g_postBurstState);
             }
         }
         if (isNewCmd) {
@@ -4968,6 +4990,9 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     if (totalLen > 0) {
         g_postBurstState = 1;
         g_postBurstFd = fd;
+        // v36.150: Reset Phase 2 trigger counter so re-login can trigger
+        // Phase 2 again (first 0x00FFF493 after role UI).
+        g_phase2TriggerCount = 0;
         DLOG(@"[POST-BURST] v36.142: State=1 (inject RECV #20 on next recv)");
     }
 
@@ -7529,7 +7554,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.150 - TWO-PHASE: RECV#20+#21 FIRST, RECV#22-#24 ON ROLE SELECT");
+    DLOG(@"[VERSION] WangXianHook v36.151 - FIX PHASE 2 IN-PROGRESS ENQUEUE BUG");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
