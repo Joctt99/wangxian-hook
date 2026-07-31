@@ -1,6 +1,32 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.146: PREVENT FAKE RESPONSE REACTIVATION AFTER POST-BURST
+ *
+ * v36.146 CHANGES:
+ *   1. NEW: g_postBurstDone flag. Set to YES after RECV #21 injection.
+ *      Prevents hook_send from resetting g_fakeRespDelivered=NO when the
+ *      client sends new 0x00FFF493 requests. Prevents hook_recv from
+ *      reactivating g_fakeRespActive via the g_fakeRespInjected check.
+ *      v36.145: after RECV #21, client sent new 0x00FFF493 (seq=0x24-0x27)
+ *      which reactivated the fake response system, generating DUPLICATE
+ *      0x0CB0A300 (1632B) responses in an infinite loop. Client stuck.
+ *      v36.146: post-BURST done → sends are FAKE-SEND'd (simulated success)
+ *      but NO fake responses generated. recv() returns EAGAIN. Client
+ *      processes the data it has (BURST + RECV #20 + #21).
+ *   2. KEEP: v36.145 - reset g_postBurstState=0 after RECV #21
+ *   3. KEEP: v36.144 - poll/select SET POLLIN when post-BURST active
+ *   4. KEEP: v36.143 - whitelist BURST (only 0x00FFF493)
+ *   5. KEEP: v36.142 - post-BURST state machine (RECV #20 + #21)
+ *
+ * PROBLEM ANALYSIS (v36.145 log):
+ *   - RECV #20 + #21 injected successfully, no quitFromServer! ✓
+ *   - But client sent new 0x00FFF493 (seq=0x24-0x27) after RECV #21.
+ *   - hook_send reset g_fakeRespDelivered=NO → reactivated g_fakeRespActive.
+ *   - hook_recv set g_fakeRespActive=YES (g_fakeRespInjected still YES).
+ *   - Generated DUPLICATE 0x0CB0A300 (1632B) for each new 0x00FFF493.
+ *   - Client received unexpected duplicates → stuck in loop.
+ *
  * WangXianHook v36.145: RESET POST-BURST STATE + STOP DUPLICATE RESPONSES
  *
  * v36.145 CHANGES:
@@ -651,7 +677,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.145 loaded ===");
+        _log(@"=== WangXianHook v36.146 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1950,6 +1976,11 @@ static int g_burstInjectFd = -1;
 //   4 = RECV #21 injected, done
 static int g_postBurstState = 0;
 static int g_postBurstFd = -1;
+// v36.146: Set to YES after RECV #21 is injected. Prevents hook_send from
+// reactivating g_fakeRespActive when the client sends new 0x00FFF493 requests.
+// Without this, each new 0x00FFF493 resets g_fakeRespDelivered=NO, reactivating
+// the fake response system and generating DUPLICATE 0x0CB0A300 responses.
+static BOOL g_postBurstDone = NO;
 
 // RECV #20 data (71 bytes) from hook.txt line 944.
 // cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
@@ -3693,9 +3724,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             newSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                      ((uint32_t)p[10] << 8)  | (uint32_t)p[11];
             // Only reset for game commands, not heartbeat
-            if (newCmd != 0x00000015 && newCmd < 0x80000000) {
+            // v36.146: After post-BURST completion, don't reactivate fake
+            // response system. Client's new 0x00FFF493 requests should be
+            // FAKE-SEND'd without generating duplicate 0x0CB0A300 responses.
+            if (newCmd != 0x00000015 && newCmd < 0x80000000 && !g_postBurstDone) {
                 isNewCmd = YES;
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
+            } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
+                DLOG(@"[FAKE-SEND] v36.146: Post-BURST done, cmd=0x%08X seq=0x%08X send-only (no fake response)", newCmd, newSeq);
             }
         }
         if (isNewCmd) {
@@ -4903,6 +4939,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // v36.145: Reset to 0 (not 4) to stop poll/select POLLIN signaling
             g_postBurstState = 0;
             g_fakeRespActive = NO;  // Stop queue-based response generation
+            g_postBurstDone = YES;  // v36.146: Prevent reactivation by new sends
             DLOG(@"[POST-BURST] v36.145: Injected RECV #21 (840B map data) fd=%d state=0 (done, poll/select stopped)", fd);
             return 840;
         }
@@ -4979,7 +5016,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     
     // v36.96: Check for fake response state FIRST - before any real recv call
-    if (g_fakeRespInjected && g_fakeRespFd == fd) {
+    // v36.146: Skip entirely if post-BURST is done — client has received all
+    // needed fake responses (BURST + RECV #20 + #21). Further recv() calls
+    // should return EAGAIN, not generate duplicate 0x0CB0A300 responses.
+    if (g_fakeRespInjected && g_fakeRespFd == fd && !g_postBurstDone) {
         if (g_fakeRespSentCount >= 1) {
             // v36.101: Switch to active mode but respect delivered flag
             if (!g_fakeRespActive) {
@@ -7375,7 +7415,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.145 - RESET POST-BURST STATE + STOP DUPLICATE RESPONSES");
+    DLOG(@"[VERSION] WangXianHook v36.146 - PREVENT FAKE RESPONSE REACTIVATION AFTER POST-BURST");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
