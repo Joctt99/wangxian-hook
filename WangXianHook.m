@@ -1,7 +1,7 @@
-#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.151: FIX PHASE 2 IN-PROGRESS ENQUEUE BUG
+ * WangXianHook v36.152: DELAY PHASE 2 TRIGGER UNTIL COUNT=3
  *
  * v36.151 CHANGES (fixes v36.150 Phase 2 corruption):
  *   1. BUG: v36.150 Phase 2 trigger set g_postBurstDone=NO, g_postBurstState=3.
@@ -720,7 +720,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.151 loaded ===");
+        _log(@"=== WangXianHook v36.152 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3827,18 +3827,26 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 isNewCmd = YES;
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
-                // v36.150: Phase 2 trigger. When client sends 0x00FFF493 after
-                // seeing role UI (Phase 1 done), start injecting RECV #22-#24.
-                // Use a counter to only trigger on the FIRST request (role select).
+                // v36.152: Phase 2 trigger with DELAYED start.
+                // The FIRST 1-2 0x00FFF493 requests after Phase 1 are CLIENT
+                // AUTO-REQUESTS (load-complete ACK), NOT user role-select clicks.
+                // v36.151 triggered on count=1, causing Phase 2 to fire within
+                // ~100ms of Phase 1 completion — role UI never rendered,
+                // client stuck at "进入角色界面".
+                // v36.146 behavior (client shows role UI) is reproduced by
+                // keeping g_postBurstDone=YES for the first N-1 requests, so
+                // recv() returns EAGAIN and client has time to render role UI.
+                // TRIGGER on count=3 (2× auto + 1× user-click = safe window).
                 g_phase2TriggerCount++;
-                if (g_phase2TriggerCount == 1) {
-                    // First 0x00FFF493 after Phase 1 = role select / enter game
+                if (g_phase2TriggerCount == 3) {
+                    // Third 0x00FFF493 after Phase 1 = user clicked role
                     g_postBurstDone = NO;
                     g_postBurstState = 3;  // Start Phase 2: inject RECV #22
-                    DLOG(@"[POST-BURST] v36.150: Phase 2 TRIGGERED by cmd=0x%08X seq=0x%08X (role select), state=3", newCmd, newSeq);
+                    DLOG(@"[POST-BURST] v36.152: Phase 2 TRIGGERED (count=3) by cmd=0x%08X seq=0x%08X (user selected role), state=3", newCmd, newSeq);
                 } else {
-                    // Subsequent requests: return EAGAIN (no response)
-                    DLOG(@"[FAKE-SEND] v36.150: Post-Phase2 cmd=0x%08X seq=0x%08X send-only (count=%d)", newCmd, newSeq, g_phase2TriggerCount);
+                    // First two requests: auto-load ACK. Keep g_postBurstDone=YES,
+                    // no response, let client render role UI (v36.146 behavior).
+                    DLOG(@"[FAKE-SEND] v36.152: Phase 2 PRE-TRIGGER (count=%d) cmd=0x%08X seq=0x%08X — auto-load ACK, returning EAGAIN for role UI render", g_phase2TriggerCount, newCmd, newSeq);
                 }
             } else if (!g_postBurstDone && g_postBurstState >= 3 && newCmd != 0x00000015 && newCmd < 0x80000000) {
                 // v36.150: Phase 2 in progress — don't enqueue, don't generate
@@ -7554,7 +7562,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.151 - FIX PHASE 2 IN-PROGRESS ENQUEUE BUG");
+    DLOG(@"[VERSION] WangXianHook v36.152 - DELAY PHASE 2 TRIGGER TO COUNT=3");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
