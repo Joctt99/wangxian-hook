@@ -435,7 +435,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.137 loaded ===");
+        _log(@"=== WangXianHook v36.138 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4328,6 +4328,22 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     }
 
     for (int i = 0; i < batchCount && remaining >= 16u; i++) {
+        // v36.138: SKIP commands that should NOT get fake responses:
+        //   1. 0x00FFF495 (challenge response) - already handled by real server 0x80FFF495.
+        //      Injecting a fake 0x80FFF495 with empty payload causes client to RSA-decrypt
+        //      garbage data, stalling the state machine at "正在进入...".
+        //   2. 0x50584666 / 0x66666669 / 0x07777777 / 0x66465850 - heartbeat/logging cmds,
+        //      no response expected. Injecting fake responses pollutes protocol flow.
+        uint32_t skipCmd = batch[i].cmd;
+        if (skipCmd == 0x00FFF495 ||     // Challenge response - already processed
+            skipCmd == 0x50584666 ||     // Unknown file-transfer cmd
+            skipCmd == 0x66666669 ||     // Heartbeat/logging cmd (fffi)
+            skipCmd == 0x07777777 ||     // Login module cmd
+            skipCmd == 0x66465850) {     // Unknown cmd
+            DLOG(@"[FORCE-FAKE] v36.138: SKIP cmd=0x%08X seq=0x%08X (already processed or no resp needed)",
+                 skipCmd, batch[i].seqNum);
+            continue;
+        }
         uint32_t rLen = generateFakeResponse(batch[i].cmd,
                                              burstBuf + totalLen,
                                              (uint32_t)MIN(MAX_FAKE_RESP_BUF, (int)remaining),
@@ -6870,7 +6886,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.137 - DIRECT BURST INJECT ON RECV-CLOSE");
+    DLOG(@"[VERSION] WangXianHook v36.138 - SKIP STALE CMDS IN BURST INJECT");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
