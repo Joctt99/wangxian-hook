@@ -1572,7 +1572,9 @@ static int g_burstInjectFd = -1;
 // v36.125: NEW — Force valid decryption mode for game server responses
 // When client decrypts 0x80FFF495 payload, return valid plaintext
 // instead of letting decryption fail (no AES key available)
-static BOOL g_forceValidDecrypt = NO;
+// NOTE: g_forceValidDecrypt must NOT be static because it's referenced from
+// inline ARM64 assembly in cpp_stub_force() (linker needs external symbol)
+BOOL g_forceValidDecrypt = NO;
 static int g_forceValidDecryptFd = -1;
 
 // v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
@@ -6581,18 +6583,22 @@ static void installEncryptUtilsHooks_v130(void) {
 
 // g_cppCryptoHooksInstalled is defined as static BOOL above (line ~6430), initialized to 0 (= NO)
 // Saved original C++ function pointers
+// NOTE: g_cppOrig must NOT be static because it's referenced from
+// inline ARM64 assembly in cpp_stub_force()
 typedef struct {
     void *orig_rsaDecryptLarge;
     void *orig_rsaDecryptData;
 } CppCryptoOrig;
 
-static CppCryptoOrig g_cppOrig = {NULL, NULL};
+CppCryptoOrig g_cppOrig = {NULL, NULL};
 
 // Empty string constant
 static const char g_cppEmptyStr[] = "";
 
 // Success response string for bypass
-static const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+// NOTE: g_cppSuccessStr must NOT be static because it's referenced from
+// inline ARM64 assembly in cpp_stub_force()
+const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
 
 // ARM64 assembly stub for CCFileUtils::rsaDecryptLarge
 // C++ member function ABI (ARM64) - CRITICAL for large return:
