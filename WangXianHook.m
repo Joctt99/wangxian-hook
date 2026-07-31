@@ -709,7 +709,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.149 loaded ===");
+        _log(@"=== WangXianHook v36.150 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3808,14 +3808,20 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 isNewCmd = YES;
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
-                DLOG(@"[FAKE-SEND] v36.149: Post-BURST done, cmd=0x%08X seq=0x%08X -> generate 0x80FFF490 response", newCmd, newSeq);
-                // v36.149: Generate 0x80FFF490 response for client's post-BURST requests.
-                // v36.147 had 43 unanswered 0x00FFF493 requests. Now each gets a 27B
-                // 0x80FFF490 (enter-game ACK) response, matching RECV #22 format.
-                g_fakeRespDelivered = NO;
-                g_fakeRespActive = YES;
-                g_fakeRespFd = fd;
-                enqueueGameCmd(newCmd, fd, (uint32_t)len, newSeq);
+                // v36.150: Phase 2 trigger. When client sends 0x00FFF493 after
+                // seeing role UI (Phase 1 done), start injecting RECV #22-#24.
+                // Use a counter to only trigger on the FIRST request (role select).
+                static int g_phase2TriggerCount = 0;
+                g_phase2TriggerCount++;
+                if (g_phase2TriggerCount == 1) {
+                    // First 0x00FFF493 after Phase 1 = role select / enter game
+                    g_postBurstDone = NO;
+                    g_postBurstState = 3;  // Start Phase 2: inject RECV #22
+                    DLOG(@"[POST-BURST] v36.150: Phase 2 TRIGGERED by cmd=0x%08X seq=0x%08X (role select), state=3", newCmd, newSeq);
+                } else {
+                    // Subsequent requests: return EAGAIN (no response)
+                    DLOG(@"[FAKE-SEND] v36.150: Post-Phase2 cmd=0x%08X seq=0x%08X send-only (count=%d)", newCmd, newSeq, g_phase2TriggerCount);
+                }
             }
         }
         if (isNewCmd) {
@@ -5002,15 +5008,19 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     //   RECV #22: cmd=0x80FFF490 (27 bytes) — enter-game ACK
     //   RECV #23: cmd=0x16000080 (273 bytes) — scene entity data
     //   RECV #24: cmd=0x80FFF161 (63 bytes) — role attr notifications
-    // v36.149: Reverted v36.148 wait states (caused quitFromServer). Back to
-    // v36.147 continuous injection. After RECV #24, generate 0x80FFF490
-    // responses for client's subsequent 0x00FFF493 requests.
+    // v36.150: TWO-PHASE injection. Phase 1: RECV #20+#21 → client shows
+    // role selection UI (v36.146 verified). Phase 2: when client sends
+    // 0x00FFF493 (select role / enter game), inject RECV #22-#24.
+    // v36.149 injected #22-#24 immediately after #21, causing client to
+    // skip role selection and get stuck at "进入角色界面".
     // State: 0=idle, 1=RECV#20, 2=RECV#21, 3=RECV#22, 4=RECV#23, 5=RECV#24, 0=done
+    //   Phase 1: state 1→2→0 (done, wait for role select)
+    //   Phase 2: state 3→4→5→0 (done, game entered)
     if (g_postBurstState >= 1 && g_postBurstFd == fd) {
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
             g_postBurstState = 2;
-            DLOG(@"[POST-BURST] v36.149: Injected RECV #20 (71B) fd=%d state=2", fd);
+            DLOG(@"[POST-BURST] v36.150: Injected RECV #20 (71B) fd=%d state=2", fd);
             return 71;
         }
         if (g_postBurstState == 2 && len >= 840) {
@@ -5020,27 +5030,31 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
-            g_postBurstState = 3;
-            DLOG(@"[POST-BURST] v36.149: Injected RECV #21 (840B) fd=%d state=3", fd);
+            // v36.150: Phase 1 done. Stop here, let client show role UI.
+            // Phase 2 (RECV #22-#24) starts when client sends 0x00FFF493.
+            g_postBurstState = 0;
+            g_postBurstDone = YES;  // Blocks further injection until role select
+            DLOG(@"[POST-BURST] v36.150: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, wait for role select)", fd);
             return 840;
         }
+        // Phase 2: RECV #22-#24 (triggered by hook_send on role select)
         if (g_postBurstState == 3 && len >= 27) {
             memcpy(buf, kRecv22Data, 27);
             g_postBurstState = 4;
-            DLOG(@"[POST-BURST] v36.149: Injected RECV #22 (27B) fd=%d state=4", fd);
+            DLOG(@"[POST-BURST] v36.150: Injected RECV #22 (27B) fd=%d state=4 (Phase 2)", fd);
             return 27;
         }
         if (g_postBurstState == 4 && len >= 273) {
             memcpy(buf, kRecv23Data, 273);
             g_postBurstState = 5;
-            DLOG(@"[POST-BURST] v36.149: Injected RECV #23 (273B) fd=%d state=5", fd);
+            DLOG(@"[POST-BURST] v36.150: Injected RECV #23 (273B) fd=%d state=5", fd);
             return 273;
         }
         if (g_postBurstState == 5 && len >= 63) {
             memcpy(buf, kRecv24Data, 63);
             g_postBurstState = 0;
             g_postBurstDone = YES;
-            DLOG(@"[POST-BURST] v36.149: Injected RECV #24 (63B) fd=%d state=0 (done)", fd);
+            DLOG(@"[POST-BURST] v36.150: Injected RECV #24 (63B) fd=%d state=0 (Phase 2 done)", fd);
             return 63;
         }
     }
@@ -5091,23 +5105,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         
         // v36.123: Generate response for the command with correct sequence number
         uint8_t tempBuf[MAX_FAKE_RESP_BUF];
-        uint32_t respLen;
-
-        // v36.149: After post-BURST completion, generate 0x80FFF490 (27B) for
-        // all client requests. v36.147 had 43 unanswered 0x00FFF493 requests.
-        // Each now gets a 27B enter-game ACK response (RECV #22 format).
-        if (g_postBurstDone) {
-            memcpy(tempBuf, kRecv22Data, 27);
-            // Patch seq to match client's request
-            tempBuf[8] = (respSeqNum >> 24) & 0xFF;
-            tempBuf[9] = (respSeqNum >> 16) & 0xFF;
-            tempBuf[10] = (respSeqNum >> 8) & 0xFF;
-            tempBuf[11] = respSeqNum & 0xFF;
-            respLen = 27;
-            DLOG(@"[FAKE-RESP] v36.149: Post-BURST 0x80FFF490 (27B) for cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
-        } else {
-            respLen = generateFakeResponse(responseCmd, tempBuf, sizeof(tempBuf), respSeqNum);
-        }
+        uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, sizeof(tempBuf), respSeqNum);
         
         if (respLen > 0 && respLen <= len) {
             memcpy(buf, tempBuf, respLen);
@@ -7531,7 +7529,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.149 - REVERT WAIT + 0x80FFF490 FOR POST-BURST REQUESTS");
+    DLOG(@"[VERSION] WangXianHook v36.150 - TWO-PHASE: RECV#20+#21 FIRST, RECV#22-#24 ON ROLE SELECT");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
