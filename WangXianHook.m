@@ -1,37 +1,25 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.134: FIX UUID INJECTION POSITION (Based on Real Capture Data)
+ * WangXianHook v36.135: DUMP DECRYPTED PLAINTEXT + Re-enable fake response injection
  *
- * v36.134 FIX: UUID injection position was WRONG!
- *   Previous versions (v36.87-v36.133) injected UUID at offset 34 (after device ID)
- *   with format: 2-byte len + UUID string.
- *   REAL CAPTURE (hook.txt SEND #29) shows UUID is AFTER GPU field with format:
- *     7 bytes zero (reserved) + 1 byte len(0x24) + 36 bytes UUID + 1 byte zero
+ * v36.135 CHANGES:
+ *   1. ADD: Dump SecKeyCreateDecryptedData plaintext to see server error in 0x80FFF495
+ *   2. RE-ENABLE: Fake response injection on recv-close (server closes connection)
+ *   3. KEEP: v36.133 fix - do NOT patch 0x80FFF495 offset[12] (format flag 0x01)
+ *   4. KEEP: v36.134 fix - UUID injection after GPU field
  *
- *   Our 143B packet had 9 bytes zero after GPU field (missing UUID).
- *   Normal 178B packet has 7 zero + 1 len + 36 UUID + 1 zero = 45 bytes after GPU.
- *   v36.134: Replace 9 zero bytes with correct UUID TLV (45 bytes) -> 179 bytes total.
+ * PROBLEM ANALYSIS (v36.134 log):
+ *   - UUID injection CORRECT (179 bytes with UUID)
+ *   - Client sends 0x000EE007(179B) + 0x00FFF493(492B) + 0x00FFF493(876B)
+ *   - BUT server STILL closes connection
+ *   - SecKeyCreateDecryptedData: plainLen=40 (may be error message)
+ *   - Need to see decrypted content to determine server error
  *
- * v36.133 BREAKTHROUGH FIX (kept): Do NOT patch 0x80FFF495 offset[12].
- *   offset[12]=0x01 is FORMAT FLAG (0x01=response), NOT error status.
- *   Previous v36.124-v36.132 patched 1->0 CORRUPTING response format.
- *
- * v36.134 CHANGES:
- *   1. KEEP: Do NOT patch 0x80FFF495 offset[12] (v36.133 fix)
- *   2. KEEP: Do NOT enable crypto bypass (v36.133 fix)
- *   3. FIX: UUID injection position - now AFTER GPU field (not after device ID)
- *   4. FIX: UUID TLV format - 7 zero + 1 len + UUID + 1 zero (not 2 len + UUID)
- *   5. KEEP: close() hook to prevent disconnect
- *
- * REAL PROTOCOL FLOW (from hook.txt):
- *   1. Client->Server: 0x00FFF495 (703B, encrypted challenge response)
- *   2. Server->Client: 0x80FFF495 (365B, offset[12]=0x01, encrypted payload)
- *   3. Client->Server: 0x000EE007 (178B, PLAINTEXT device info with UUID)
- *   4. Client->Server: 0x00FFF493 (472B, encrypted role request)
- *   5. Server->Client: 0x0CB0A300 (1632B) -> 0x12F00080 (71B, token)
- *   6. Server->Client: 0x13000080 (840B, role info "luoyueshangu")
- *   7. Server->Client: 0x80FFF490 (27B, account "kk994")
+ * STRATEGY:
+ *   - If server returns error in 0x80FFF495, cannot fix challenge response (RSA encrypted)
+ *   - Fallback: inject fake responses after server closes connection
+ *   - Fake responses based on hook.txt real capture format
  *
  * v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
@@ -442,7 +430,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.134 loaded ===");
+        _log(@"=== WangXianHook v36.135 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4597,7 +4585,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 //   If server closes connection, it means our challenge response was rejected.
                 //   Injecting fake responses at this point corrupts the protocol flow.
                 //   Just return EAGAIN to keep client waiting, close() hook prevents disconnect.
-                DLOG(@"[RECV-CLOSE] v36.134: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
+                DLOG(@"[RECV-CLOSE] v36.135: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
                 
                 // v36.61: Original rotation logic
                 DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
@@ -6035,8 +6023,21 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
     if (errPtr && *errPtr) {
         DLOG(@"[SEC] SecKeyCreateDecryptedData FAILED: %@", CFBridgingRelease(CFErrorCopyDescription(*errPtr)));
     } else if (result) {
-        DLOG(@"[SEC] SecKeyCreateDecryptedData SUCCESS: cipherLen=%lu plainLen=%lu", 
+        DLOG(@"[SEC] SecKeyCreateDecryptedData SUCCESS: cipherLen=%lu plainLen=%lu",
              ciphertext ? CFDataGetLength(ciphertext) : 0, CFDataGetLength(result));
+        // v36.135: Dump decrypted plaintext to see what server returned
+        CFIndex plainLen = CFDataGetLength(result);
+        if (plainLen > 0 && plainLen <= 512) {
+            const UInt8 *plainBytes = CFDataGetBytePtr(result);
+            NSMutableString *plainHex = [NSMutableString stringWithCapacity:plainLen * 3];
+            NSMutableString *plainAscii = [NSMutableString stringWithCapacity:plainLen];
+            for (CFIndex i = 0; i < plainLen; i++) {
+                [plainHex appendFormat:@"%02X ", plainBytes[i]];
+                [plainAscii appendFormat:@"%c", (plainBytes[i] >= 0x20 && plainBytes[i] < 0x7F) ? plainBytes[i] : '.'];
+            }
+            DLOG(@"[SEC-PLAIN] v36.135: Decrypted plaintext (%ld bytes): HEX: %@", plainLen, plainHex);
+            DLOG(@"[SEC-PLAIN] v36.135: Decrypted plaintext ASCII: %@", plainAscii);
+        }
     } else {
         DLOG(@"[SEC] SecKeyCreateDecryptedData returned NULL");
     }
@@ -6847,7 +6848,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.134 - FIX UUID INJECTION POSITION (AFTER GPU FIELD)");
+    DLOG(@"[VERSION] WangXianHook v36.135 - DUMP PLAINTEXT + RE-ENABLE FAKE RESP INJECTION");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
