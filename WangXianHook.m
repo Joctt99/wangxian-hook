@@ -1,7 +1,7 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.131: C++ CCFileUtils::rsaDecryptLarge Hook (FIX CRASH)
+ * WangXianHook v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
  * v36.130 CRITICAL FIX (RECURSION BUG):
  *   v36.129 had INFINITE RECURSION in non-bypass path: method_getImplementation()
@@ -6427,15 +6427,18 @@ static BOOL g_encryptUtilsHooksInstalled = NO;
 // are defined earlier (near g_forceValidDecrypt) for forward access in hook_recv logic.
 
 // Hook for +rsaDecryptData:withKeyRef:
+// v36.132: ENCRYPT-BYPASS only triggers when C++ Crypto Hook is NOT installed
+//          If C++ Hook is active, bypass is handled at C++ level (returning std::string)
+//          EncryptUtils bypass would return NSData which causes C++ type mismatch crash
 static NSData* hooked_rsaDecryptData(Class self, SEL _cmd, NSData *data, id keyRef) {
-    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0 && !g_cppCryptoHooksInstalled) {
         const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
         NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
         g_bypassRemaining--;
-        DLOG(@"[ENCRYPT-BYPASS] v36.130: rsaDecryptData: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        DLOG(@"[ENCRYPT-BYPASS] v36.132: rsaDecryptData: SKIP real decrypt, return fake (remaining=%d, cppHook=%d)", g_bypassRemaining, g_cppCryptoHooksInstalled);
         if (g_bypassRemaining <= 0) {
             g_forceValidDecrypt = NO;
-            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+            DLOG(@"[ENCRYPT-BYPASS] v36.132: bypass exhausted, forceValidDecrypt=NO");
         }
         return fakeData;
     }
@@ -6448,17 +6451,25 @@ static NSData* hooked_rsaDecryptData(Class self, SEL _cmd, NSData *data, id keyR
 }
 
 // Hook for +rsaDecryptLarge:withPrivateKey:
+// v36.132: CRITICAL CHANGE - DO NOT trigger bypass when C++ Hook is installed!
+//   C++ code expects std::string, not NSData. Returning NSData causes:
+//   -[_NSInlineData UTF8String]: unrecognized selector → SIGABRT crash
+//   Bypass is now handled by cpp_stub_force in C++ layer
 static NSData* hooked_rsaDecryptLarge(Class self, SEL _cmd, NSData *data, NSData *privateKey) {
-    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0 && !g_cppCryptoHooksInstalled) {
         const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
         NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
         g_bypassRemaining--;
-        DLOG(@"[ENCRYPT-BYPASS] v36.130: rsaDecryptLarge: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        DLOG(@"[ENCRYPT-BYPASS] v36.132: rsaDecryptLarge: SKIP real decrypt, return fake (remaining=%d, cppHook=%d)", g_bypassRemaining, g_cppCryptoHooksInstalled);
         if (g_bypassRemaining <= 0) {
             g_forceValidDecrypt = NO;
-            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+            DLOG(@"[ENCRYPT-BYPASS] v36.132: bypass exhausted, forceValidDecrypt=NO");
         }
         return fakeData;
+    }
+    // C++ Hook is installed - always pass through to original (C++ layer handles bypass)
+    if (g_cppCryptoHooksInstalled && g_forceValidDecrypt) {
+        DLOG(@"[ENCRYPT-PASS] v36.132: rsaDecryptLarge: pass through to original (C++ hook active, cppHook=%d)", g_cppCryptoHooksInstalled);
     }
     if (g_orig_rsaDecryptLarge) {
         typedef NSData* (*OriginalFunc)(Class, SEL, NSData*, NSData*);
@@ -6469,14 +6480,14 @@ static NSData* hooked_rsaDecryptLarge(Class self, SEL _cmd, NSData *data, NSData
 
 // Hook for +aesDecryptData:key:iv:
 static NSData* hooked_aesDecryptData(Class self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
-    if (g_forceValidDecrypt && data && g_bypassRemaining > 0) {
+    if (g_forceValidDecrypt && data && g_bypassRemaining > 0 && !g_cppCryptoHooksInstalled) {
         const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
         NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
         g_bypassRemaining--;
-        DLOG(@"[ENCRYPT-BYPASS] v36.130: aesDecryptData: SKIP real decrypt, return fake (remaining=%d)", g_bypassRemaining);
+        DLOG(@"[ENCRYPT-BYPASS] v36.132: aesDecryptData: SKIP real decrypt, return fake (remaining=%d, cppHook=%d)", g_bypassRemaining, g_cppCryptoHooksInstalled);
         if (g_bypassRemaining <= 0) {
             g_forceValidDecrypt = NO;
-            DLOG(@"[ENCRYPT-BYPASS] v36.130: bypass exhausted, forceValidDecrypt=NO");
+            DLOG(@"[ENCRYPT-BYPASS] v36.132: bypass exhausted, forceValidDecrypt=NO");
         }
         return fakeData;
     }
@@ -6582,18 +6593,28 @@ static const char g_cppEmptyStr[] = "";
 static const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
 
 // ARM64 assembly stub for CCFileUtils::rsaDecryptLarge
-// C++ member function ABI (ARM64):
-//   x0 = output buffer (24 bytes for std::string: ptr, len, cap)
+// C++ member function ABI (ARM64) - CRITICAL for large return:
+//   For functions returning objects > 16 bytes (like std::string):
+//   x0 = output buffer pointer (caller-allocated, 24 bytes for std::string)
 //   x1 = this pointer
 //   x2 = first arg (std::string const&)
 //   x3 = second arg (std::string const&)
 // Return: std::string written to x0 buffer, x0 stays as buffer ptr
+//
+// v36.132 FIX: Correct function signature to match ARM64 ABI
+//   void* self -> void* output_buf (x0 must be output buffer, not self!)
+//   Without this fix, x0 is treated as self, causing all params to be shifted!
 __attribute__((naked))
-static void* cpp_stub_force(void* self, void* data, void* key) {
+static void cpp_stub_force(void* output_buf, void* self, void* data, void* key) {
     asm volatile(
         // Save frame
         "stp x29, x30, [sp, #-16]!\n"
         "mov x29, sp\n"
+        
+        // Load original function pointer
+        "adrp x9, g_cppOrig@PAGE\n"
+        "add x9, x9, g_cppOrig@PAGEOFF\n"
+        "ldr x9, [x9, #0]\n"  // Load g_cppOrig.orig_rsaDecryptLarge
         
         // Check g_forceValidDecrypt flag
         "adrp x3, g_forceValidDecrypt@PAGE\n"
@@ -6601,28 +6622,34 @@ static void* cpp_stub_force(void* self, void* data, void* key) {
         "ldr w4, [x3]\n"
         "cbnz w4, 2f\n"  // If forceValidDecrypt != 0, goto return_success
         
-        // Normal path: call original function (tail call)
-        // Restore frame, then branch to original (no new call frame)
+        // === NORMAL PATH: call original function ===
+        // At this point:
+        //   x0 = output_buf (correct for original function!)
+        //   x1 = self (this pointer)
+        //   x2 = data (first arg)
+        //   x3 = key (second arg)
+        // These match the original function's expected ABI perfectly!
         "ldp x29, x30, [sp], #16\n"
-        "b %[origFunc]\n"
+        "braa x9, x15\n"  // Branch with pointer auth to original (tail call)
+        // NOTE: We restored frame and braa, so original function will
+        // execute with our caller's stack frame. x0-x3 are unchanged.
         
-        // forceValidDecrypt path: return success std::string
+        // === BYPASS PATH: return success std::string ===
         "2:\n"
-        // Write success string to x0 output buffer (caller's buffer)
-        // x0 = output buffer ptr (already set by caller, don't change it)
-        "adrp x3, %[successStr]@PAGE\n"
-        "add x3, x3, %[successStr]@PAGEOFF\n"
-        "str x3, [x0, #0]\n"      // data_ = g_cppSuccessStr
-        "mov x3, #37\n"           // length of success string
-        "str x3, [x0, #8]\n"      // length_ = 37
-        "str x3, [x0, #16]\n"     // capacity_ = 37 (or 0, either works)
-        // Keep x0 pointing to output buffer
+        // x0 = output_buf (pointer to caller's std::string buffer)
+        // We write directly to this buffer to construct the return value
+        "adrp x3, g_cppSuccessStr@PAGE\n"
+        "add x3, x3, g_cppSuccessStr@PAGEOFF\n"
+        "str x3, [x0, #0]\n"      // std::string::data_ = g_cppSuccessStr (SSO or heap ptr)
+        "mov x3, #37\n"           // length of "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}"
+        "str x3, [x0, #8]\n"      // std::string::length_ = 37
+        "str x3, [x0, #16]\n"     // std::string::capacity_ = 37 (must be >= length_)
+        // x0 still points to output_buf (caller reads returned string from here)
         "ldp x29, x30, [sp], #16\n"
         "ret\n"
         :
-        : [origFunc] "S"(g_cppOrig.orig_rsaDecryptLarge),
-          [successStr] "S"(g_cppSuccessStr)
-        : "x0", "x1", "x2", "x3", "x4", "x29", "x30", "memory"
+        : 
+        : "x0", "x1", "x2", "x3", "x4", "x9", "x29", "x30", "memory"
     );
 }
 
@@ -6806,7 +6833,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.131 - C++ CCFileUtils::rsaDecryptLarge Hook (FIX CRASH)");
+    DLOG(@"[VERSION] WangXianHook v36.132 - FIX ABI (OUTPUT BUFFER) + C++ Crypto Hook");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
