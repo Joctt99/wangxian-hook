@@ -1,6 +1,6 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.124: Complete 0x80FFF495 response patch (status+format+payload) +
+ * WangXianHook v36.125: COMPLETE response replacement + crypto bypass (forceValidDecrypt) +
  *                        Send-intercept approach: wait for client's native commands with
  *                        REAL seq numbers, intercept in hook_send, generate matching fake responses.
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
@@ -391,7 +391,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.124 loaded ===");
+        _log(@"=== WangXianHook v36.125 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -570,7 +570,7 @@ static void installKeyboardProtection(void) {
             g_panel.layer.cornerRadius = 12;
             
             UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, pw - 200, 24)];
-            lbl.text = @"WXHook v36.124 诊断面板";
+            lbl.text = @"WXHook v36.125 诊断面板";
             lbl.textColor = [UIColor greenColor];
             lbl.font = [UIFont boldSystemFontOfSize:14];
             [g_panel addSubview:lbl];
@@ -1549,6 +1549,12 @@ static int g_triggerFakeFd = -1;
 // append all fake responses to the CURRENT return as a TCP sticky buffer.
 static BOOL g_burstInjectAfterPatch = NO;
 static int g_burstInjectFd = -1;
+
+// v36.125: NEW — Force valid decryption mode for game server responses
+// When client decrypts 0x80FFF495 payload, return valid plaintext
+// instead of letting decryption fail (no AES key available)
+static BOOL g_forceValidDecrypt = NO;
+static int g_forceValidDecryptFd = -1;
 
 // v36.124: NEW — Wait for client to send native commands with REAL seq numbers
 // Instead of pre-generating responses with wrong seq (0x10000+), wait for the
@@ -5006,100 +5012,114 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.124: COMPLETE RESPONSE PATCH — not just status byte!
-                        // Based on FORCE-HS-PREP (v36.88) success pattern:
-                        //   Byte[12] = 0x00 (status SUCCESS)
-                        //   Byte[13] = 0x88 (format flag — CRITICAL for handler parsing)
-                        //   Bytes[14..] = Base64 padding (prevents SIGSEGV in handler)
-                        //   Keep original seq number (client uses it to match response)
+                        // v36.125: COMPLETE RESPONSE REPLACEMENT + CRYPTO BYPASS
                         //
-                        // v36.123 problem analysis:
-                        //   - We only patched status 1→0 at byte[12], but left byte[13]
-                        //     as the ORIGINAL payload byte (e.g. 0x5F from base64 data)
-                        //   - Client's handle_CHOOSE_WOOD_BOX_RES checks byte[13] for
-                        //     format flag 0x88 — without it, the response is treated
-                        //     as malformed or rejected
-                        //   - We also kept the ERROR payload (encrypted failure data)
-                        //     which the client can't decrypt (no AES key)
+                        // ROOT CAUSE ANALYSIS (v36.124):
+                        //   Even after patching status=0 and format=0x88, the client
+                        //   still tries to DECRYPT the payload using the AES session key.
+                        //   Since the server returned status=1 (handshake failed), no
+                        //   valid AES key was established. Decryption produces garbage
+                        //   or fails, causing the client to reject the response.
                         //
-                        // v36.124 fix: FULL replacement of response body
-                        if (status != 0) {
-                            DLOG(@"[GAME-PATCH] v36.124: Patching 0x80FFF495: status %u->0, format->0x88, padding->Base64", status);
-                            
-                            // Patch status byte
-                            ((unsigned char *)buf)[12] = 0;
-                            
-                            // CRITICAL: Set format flag byte (like FORCE-HS-PREP)
-                            // Client's handler checks this to know how to parse payload
-                            ((unsigned char *)buf)[13] = 0x88;
-                            
-                            // Replace error payload with Base64 padding
-                            // This prevents SIGSEGV when handler parses bytes[14+]
-                            const char *padding = 
-                                "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzOJwUMBZ0a1FZkot1lJ"
-                                "+LB4rodylyGvUbq7sOO6nHgBqeqT2bp/mCShyDsVKdGGruFM8TY1cKlrHHhukEHV"
-                                "vr2+5zTL7Pg+ywmn+53vB4azfuaetHwVctLFmTyqrENWsTiL0uyl5w4k52TSvX7sC"
-                                "tuMx2grh6f1Hhb0/LqsFNjPobudwS00ypDtBG0Ung3T32DO2eFQ4JI0hXKkbCp0cyBT";
-                            size_t padLen = strlen(padding);
-                            ssize_t payloadLen = ret - 14;
-                            size_t copyLen = (padLen < (size_t)payloadLen) ? padLen : (size_t)payloadLen;
-                            memcpy(((unsigned char *)buf) + 14, padding, copyLen);
-                            // Zero out remaining payload bytes beyond the padding
-                            if ((ssize_t)copyLen < payloadLen) {
-                                memset(((unsigned char *)buf) + 14 + copyLen, 0, payloadLen - (ssize_t)copyLen);
-                            }
-                            
-                            g_handshakeComplete = YES;
-                            g_challengeResponded = YES;
-                            DLOG(@"[GAME-PATCH] v36.124: FULL PATCH done: status=0 format=0x88 payload=Base64(%zu bytes)", copyLen);
-                            
-                            // Log the patched response header
-                            NSMutableString *patchedHex = [NSMutableString stringWithCapacity:64];
-                            unsigned char *pb = (unsigned char *)buf;
-                            for (int i = 0; i < MIN(20, (int)ret); i++) {
-                                [patchedHex appendFormat:@"%02X ", pb[i]];
-                            }
-                            DLOG(@"[GAME-PATCH] v36.124: Patched response first 20 bytes: %@", patchedHex);
-                        } else {
-                            DLOG(@"[GAME-PATCH] v36.124: 0x80FFF495 status=0 already OK, patching format flag");
-                            ((unsigned char *)buf)[13] = 0x88;
-                            g_handshakeComplete = YES;
-                            g_challengeResponded = YES;
-                        }
-
-                        // v36.124: NEW STRATEGY — DO NOT inject fake responses immediately!
-                        // Let the client's state machine process the patched response NATURALLY.
-                        // The client should now send 0x000EE007 (device info) because:
-                        //   - status=0 (no auth error)
-                        //   - format=0x88 (handler can parse the response)
-                        //   - payload has valid-looking Base64 data
+                        // v36.125 TWO-PRONG FIX:
+                        //   1. COMPLETE RESPONSE REPLACEMENT: Truncate the 365-byte response
+                        //      to a clean minimal packet (200 bytes) with proper structure.
+                        //      Remove ALL original error payload data.
+                        //   2. CRYPTO BYPASS (forceValidDecrypt flag): When the client
+                        //      tries to decrypt this response, the crypto hook returns
+                        //      a fixed VALID plaintext instead of letting decryption fail.
+                        //      This fools the client into thinking decryption succeeded.
                         //
-                        // Instead of pre-generating responses with WRONG seq numbers (0x10000+),
-                        // wait for the client to ACTUALLY send EE007/FFF493/etc.
-                        // Then intercept in hook_send, capture the REAL seq number,
-                        // and generate a MATCHING fake response on the next recv().
-                        //
-                        // This mirrors the FORCE-HS-PREP approach which successfully
-                        // triggered the client to send native (encrypted) commands.
+                        //   RESULT: Client processes the response, thinks handshake
+                        //   succeeded, and advances to send EE007 device info.
                         
-                        if (!g_fakeRespInjected && fd >= 0) {
-                            // Clear any previously queued commands (they have wrong seq numbers)
-                            resetCmdQueue();
-                            DLOG(@"[VIRTUAL-QUEUE] v36.124: resetCmdQueue() — cleared stale cmds with wrong seq numbers");
+                        // ============================================================
+                        // STEP 1: Save original seq BEFORE modifying buffer
+                        // ============================================================
+                        uint32_t origSeq = ((unsigned char *)buf)[8] << 24 |
+                                           ((unsigned char *)buf)[9] << 16 |
+                                           ((unsigned char *)buf)[10] << 8 |
+                                           ((unsigned char *)buf)[11];
+                        DLOG(@"[GAME-PATCH] v36.125: Original seq from response = 0x%08X", origSeq);
+                        
+                        // ============================================================
+                        // STEP 2: Build a completely new minimal response
+                        // ============================================================
+                        {
+                            uint32_t newSize = 200;  // Minimal valid response size
+                            if (newSize > (uint32_t)len) newSize = (uint32_t)len;
                             
-                            // Enter "waiting for client commands" mode
-                            g_waitingForClientCmds = YES;
-                            g_waitingFd = fd;
-                            g_fakeRespInjected = YES;  // Mark as active to intercept sends
+                            unsigned char *nb = (unsigned char *)buf;
+                            memset(nb, 0, newSize);
+                            
+                            // Bytes 0-3: Packet length (big-endian)
+                            nb[0] = (newSize >> 24) & 0xFF;
+                            nb[1] = (newSize >> 16) & 0xFF;
+                            nb[2] = (newSize >> 8) & 0xFF;
+                            nb[3] = newSize & 0xFF;
+                            
+                            // Bytes 4-7: cmd = 0x80FFF495
+                            nb[4] = 0x80; nb[5] = 0xFF; nb[6] = 0xF4; nb[7] = 0x95;
+                            
+                            // Bytes 8-11: seq number (PRESERVE original from response)
+                            uint32_t useSeq = origSeq;
+                            if (useSeq == 0) useSeq = 0x00000017; // Default fallback
+                            nb[8]  = (useSeq >> 24) & 0xFF;
+                            nb[9]  = (useSeq >> 16) & 0xFF;
+                            nb[10] = (useSeq >> 8)  & 0xFF;
+                            nb[11] =  useSeq       & 0xFF;
+                            
+                            // Byte 12: status = 0x00 (SUCCESS)
+                            nb[12] = 0x00;
+                            
+                            // Byte 13: format = 0x88 (Base64-encoded payload)
+                            // CRITICAL: Tells client handler to process as Base64
+                            nb[13] = 0x88;
+                            
+                            // Bytes 14+: Minimal payload with valid content
+                            // Using Base64-encoded "SUCCESS" as payload
+                            const char *minPayload = "SUCCEEDED";
+                            size_t minLen = strlen(minPayload);
+                            if (14 + minLen <= newSize) {
+                                memcpy(nb + 14, minPayload, minLen);
+                            }
+                            
+                            // Update return value to new size (TRUNCATE original 365 bytes to 200)
+                            ret = (ssize_t)newSize;
+                            
+                            g_handshakeComplete = YES;
+                            g_challengeResponded = YES;
+                            
+                            DLOG(@"[GAME-PATCH] v36.125: COMPLETE REPLACEMENT: newSize=%u seq=0x%08X status=0 format=0x88",
+                                 newSize, useSeq);
+                            
+                            // Log new response structure
+                            NSMutableString *newHex = [NSMutableString stringWithCapacity:64];
+                            for (int i = 0; i < MIN(20, (int)newSize); i++) {
+                                [newHex appendFormat:@"%02X ", nb[i]];
+                            }
+                            DLOG(@"[GAME-PATCH] v36.125: New response first 20 bytes: %@", newHex);
+                        }
+                        
+                        // ============================================================
+                        // STEP 3: Enable crypto bypass
+                        // ============================================================
+                        // When client decrypts this response's payload, return valid plaintext
+                        g_forceValidDecrypt = YES;
+                        g_forceValidDecryptFd = fd;
+                        DLOG(@"[CRYPTO-BYPASS] v36.125: forceValidDecrypt=YES for fd=%d (crypto hook will return valid plaintext)", fd);
+                        
+                        // ============================================================
+                        // STEP 4: Enter intercept mode
+                        // ============================================================
+                        if (!g_fakeRespInjected && fd >= 0) {
+                            resetCmdQueue();
+                            g_fakeRespInjected = YES;
                             g_fakeRespFd = fd;
                             g_fakeRespActive = YES;
-                            
-                            DLOG(@"[VIRTUAL-QUEUE] v36.124: Waiting for client to send EE007/FFF493 with REAL seq numbers");
-                            DLOG(@"[VIRTUAL-QUEUE] v36.124: Original response seq=0x%02X%02X%02X%02X (client will use next seq for EE007)",
-                                 ((unsigned char *)buf)[8], ((unsigned char *)buf)[9],
-                                 ((unsigned char *)buf)[10], ((unsigned char *)buf)[11]);
-                        } else if (g_fakeRespInjected) {
-                            DLOG(@"[VIRTUAL-QUEUE] v36.124: SKIP (fake-resp already active for fd=%d)", fd);
+                            g_waitingForClientCmds = YES;
+                            g_waitingFd = fd;
+                            DLOG(@"[VIRTUAL-QUEUE] v36.125: Waiting for client to send EE007 (crypto bypass will help decryption succeed)");
                         }
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
@@ -5938,6 +5958,21 @@ static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
     
     int ret = orig_CCCrypt(op, alg, options, key, keyLen, iv, dataIn, dataInLen, dataOut, dataOutAvailable, dataOutMoved);
     
+    // v36.125: Crypto bypass for AES decryption
+    // If decrypt failed and forceValidDecrypt is on, return fake valid data
+    if (op == 1 && g_forceValidDecrypt && ret != 0 && dataOutMoved) {
+        DLOG(@"[SEC-BYPASS] v36.125: CCCrypt DEC failed (ret=%d) - returning fake plaintext", ret);
+        const char *fakePlaintext = "{\"success\":true}";
+        size_t fakeLen = strlen(fakePlaintext);
+        if (fakeLen <= dataOutAvailable) {
+            memcpy(dataOut, fakePlaintext, fakeLen);
+            *dataOutMoved = fakeLen;
+            g_forceValidDecrypt = NO;
+            DLOG(@"[SEC-BYPASS] v36.125: CCCrypt bypass - returned %zu bytes fake data", fakeLen);
+            return 0;
+        }
+    }
+    
     if (dataOutMoved && *dataOutMoved > 0) {
         DLOG(@"[CC-AES-OUT] #%d %s len=%zu", op, opStr, *dataOutMoved);
     }
@@ -5960,6 +5995,27 @@ static SecKeyDecryptFunc orig_SecKeyDecrypt = NULL;
 static OSStatus hook_SecKeyDecrypt(SecKeyRef key, SecPadding padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen) {
     if (!orig_SecKeyDecrypt) orig_SecKeyDecrypt = (SecKeyDecryptFunc)dlsym(RTLD_NEXT, "SecKeyDecrypt");
     if (!orig_SecKeyDecrypt) return errSecParam;
+    
+    // v36.125: Crypto bypass for lower-level RSA decryption
+    if (g_forceValidDecrypt) {
+        OSStatus ret = orig_SecKeyDecrypt(key, padding, cipherText, cipherTextLen, plainText, plainTextLen);
+        if (ret != errSecSuccess && plainTextLen) {
+            DLOG(@"[SEC-BYPASS] v36.125: SecKeyDecrypt failed (ret=%d) - returning fake plaintext", (int)ret);
+            // Fill with fake valid data
+            const char *fakePlaintext = "{\"success\":true}";
+            size_t fakeLen = strlen(fakePlaintext);
+            if (fakeLen <= cipherTextLen && plainTextLen) {
+                memcpy(plainText, fakePlaintext, fakeLen);
+                *plainTextLen = fakeLen;
+                g_forceValidDecrypt = NO;
+                DLOG(@"[SEC-BYPASS] v36.125: SecKeyDecrypt bypass - returned fake data, cleared flag");
+                return errSecSuccess;
+            }
+        }
+        DLOG(@"[SEC-BYPASS] v36.125: SecKeyDecrypt cipherLen=%zu plainLen=%zu ret=%d", cipherTextLen, plainTextLen ? *plainTextLen : 0, (int)ret);
+        return ret;
+    }
+    
     OSStatus ret = orig_SecKeyDecrypt(key, padding, cipherText, cipherTextLen, plainText, plainTextLen);
     DLOG(@"[SEC] SecKeyDecrypt cipherLen=%zu plainLen=%zu ret=%d", cipherTextLen, plainTextLen ? *plainTextLen : 0, (int)ret);
     return ret;
@@ -5975,6 +6031,42 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
         orig_SecKeyCreateDecryptedData = (SecKeyCreateDecryptedDataFunc)dlsym(RTLD_NEXT, "SecKeyCreateDecryptedData");
     }
     if (!orig_SecKeyCreateDecryptedData) return NULL;
+    
+    // v36.125: Crypto bypass mode - force valid decryption for game server responses
+    if (g_forceValidDecrypt && ciphertext) {
+        CFIndex cipherLen = CFDataGetLength(ciphertext);
+        DLOG(@"[SEC-BYPASS] v36.125: forceValidDecrypt=YES, cipherLen=%ld - will return valid plaintext", cipherLen);
+        
+        // Call original first to see if decryption would fail
+        CFErrorRef *errPtr = NULL;
+        CFDataRef result = orig_SecKeyCreateDecryptedData(key, algorithm, ciphertext, errPtr);
+        
+        // If decryption failed or returned NULL, return valid fake plaintext
+        if ((errPtr && *errPtr) || !result) {
+            DLOG(@"[SEC-BYPASS] v36.125: Decryption failed (err=%d) - returning fake valid plaintext", 
+                 errPtr && *errPtr ? (int)CFErrorGetCode(*errPtr) : 0);
+            
+            // Create a minimal valid plaintext that client's handler will accept
+            // Using a simple JSON-like structure with success flag
+            // The exact format depends on the game protocol, but we use a simple
+            // non-empty plaintext that won't cause SIGSEGV
+            const char *fakePlaintext = "{\"success\":true,\"status\":\"ok\"}";
+            CFDataRef fakeData = CFDataCreate(NULL, (const UInt8 *)fakePlaintext, strlen(fakePlaintext));
+            
+            // Clear the force flag after use
+            g_forceValidDecrypt = NO;
+            DLOG(@"[SEC-BYPASS] v36.125: Returning fake plaintext, forceValidDecrypt cleared");
+            return fakeData;
+        }
+        
+        // Decryption succeeded naturally - just log and return
+        DLOG(@"[SEC-BYPASS] v36.125: Decryption succeeded naturally (len=%lu)", 
+             result ? CFDataGetLength(result) : 0);
+        g_forceValidDecrypt = NO;  // Clear flag after successful decryption
+        return result;
+    }
+    
+    // Normal mode - no bypass
     CFErrorRef *errPtr = NULL;
     CFDataRef result = orig_SecKeyCreateDecryptedData(key, algorithm, ciphertext, errPtr);
     if (errPtr && *errPtr) {
@@ -6395,7 +6487,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.124 - Complete 0x80FFF495 patch (status+format+payload) + send-intercept with REAL seq numbers");
+    DLOG(@"[VERSION] WangXianHook v36.125 - COMPLETE response replacement + crypto bypass (forceValidDecrypt) + send-intercept with REAL seq numbers");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
