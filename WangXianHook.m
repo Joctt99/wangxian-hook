@@ -1,6 +1,38 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.141: MATCH REAL PROTOCOL FLOW (skip EE007, single 0x0CB0A300)
+ *
+ * v36.141 CHANGES:
+ *   1. FIX: Skip 0x000EE007 in BURST inject. Real capture (hook.txt) shows
+ *      the server does NOT respond to 0x000EE007. Between RECV #18
+ *      (0x80FFF495) and RECV #19 (0x0CB0A300) the client sends two
+ *      0x00FFF493 and receives ONE 0x0CB0A300 — no 0x800EE007 in between.
+ *      v36.140 injected a bogus 0x800EE007 (200 bytes) that confused the
+ *      client and derailed the protocol flow.
+ *   2. FIX: Only generate ONE 0x0CB0A300 (1632 bytes) for the first
+ *      0x00FFF493. v36.140 generated two (3264 bytes total), but the real
+ *      server returns a single 0x0CB0A300 for two 0x00FFF493 requests.
+ *   3. FIX: Fallback (empty queue) changed from EE007 to FFF493.
+ *   4. RESULT: BURST = single 0x0CB0A300 (1632 bytes), matching real flow.
+ *   5. KEEP: v36.140 - complete 1632-byte 0x0CB0A300 (sub1 + sub2)
+ *   6. KEEP: v36.140 - skip bogus 0x48736343
+ *   7. KEEP: v36.138 - skip stale cmds (0x00FFF495, 0x50584666, ...)
+ *   8. KEEP: v36.137 - direct BURST inject on RECV-CLOSE
+ *   9. KEEP: v36.136 - poll/select/getsockopt/close/send check g_fakeRespFd
+ *
+ * PROBLEM ANALYSIS (v36.140 log):
+ *   - BURST inject returned 3464 bytes: 0x800EE007(200) + 0x0CB0A300(1632)
+ *     + 0x0CB0A300(1632). Client stuck at "正在进入...".
+ *   - Root cause: 0x800EE007 is BOGUS (server never sends it), and the
+ *     second 0x0CB0A300 is a DUPLICATE (server sends only one).
+ *   - Real flow: two 0x00FFF493 -> ONE 0x0CB0A300 (no 0x800EE007).
+ *
+ * STRATEGY:
+ *   - Skip 0x000EE007 (no server response)
+ *   - Generate 0x0CB0A300 only once (first 0x00FFF493)
+ *   - BURST = 1632 bytes = exactly one 0x0CB0A300, matching real server
+ *
  * WangXianHook v36.140: COMPLETE 0x0CB0A300 + SKIP BOGUS 0x48736343
  *
  * v36.140 CHANGES:
@@ -505,7 +537,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.140 loaded ===");
+        _log(@"=== WangXianHook v36.141 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4515,12 +4547,18 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     uint32_t respCount    = 0;
     uint8_t *burstBuf    = (uint8_t *)buf;
     size_t   remaining   = len;
+    // v36.141: Track whether we already generated a 0x0CB0A300 response.
+    // Real server returns ONE 0x0CB0A300 (1632 bytes) for two 0x00FFF493
+    // requests (hook.txt SEND #30 + #31 -> RECV #19). Duplicating it
+    // pollutes the protocol flow.
+    BOOL roleRespGenerated = NO;
 
     if (batchCount == 0) {
-        // Guard: queue was empty - fallback to EE007 single-response behaviour
-        DLOG(@"[FORCE-FAKE] v36.137: Queue empty, fallback single EE007 inject (seq=0x10000)");
-        GameCmdEntry ee; ee.cmd = 0x000EE007; ee.seqNum = 0x00010000; ee.fd = fd; ee.sendLen = 217;
-        batch[0] = ee; batchCount = 1;
+        // v36.141: Fallback changed from EE007 to FFF493 — server does NOT
+        // respond to EE007, so injecting 0x800EE007 would confuse the client.
+        DLOG(@"[FORCE-FAKE] v36.141: Queue empty, fallback single FFF493 inject (seq=0x10000)");
+        GameCmdEntry ff; ff.cmd = 0x00FFF493; ff.seqNum = 0x00010000; ff.fd = fd; ff.sendLen = 472;
+        batch[0] = ff; batchCount = 1;
     }
 
     for (int i = 0; i < batchCount && remaining >= 16u; i++) {
@@ -4540,15 +4578,32 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
             // in the v36.139 log, polluting the BURST with a 0xC8736343
             // response that derailed the protocol flow before 0x0CB0A300.
             // Skip it — it is not a recognised game command.
-            skipCmd == 0x48736343) {     // Bogus/garbage cmd - skip
-            DLOG(@"[FORCE-FAKE] v36.138: SKIP cmd=0x%08X seq=0x%08X (already processed or no resp needed)",
+            skipCmd == 0x48736343 ||     // Bogus/garbage cmd - skip
+            // v36.141: Real capture (hook.txt) shows the server does NOT
+            // respond to 0x000EE007. Between RECV #18 (0x80FFF495) and
+            // RECV #19 (0x0CB0A300) the client sends two 0x00FFF493 and
+            // receives ONE 0x0CB0A300 — no 0x800EE007 in between.
+            // Injecting a bogus 0x800EE007 confuses the client.
+            skipCmd == 0x000EE007) {     // Device info - server sends NO response
+            DLOG(@"[FORCE-FAKE] v36.141: SKIP cmd=0x%08X seq=0x%08X (no server response expected)",
                  skipCmd, batch[i].seqNum);
+            continue;
+        }
+        // v36.141: Only generate ONE 0x0CB0A300 for the first 0x00FFF493.
+        // Real capture (hook.txt): two 0x00FFF493 -> ONE 0x0CB0A300 (1632B).
+        if (batch[i].cmd == 0x00FFF493 && roleRespGenerated) {
+            DLOG(@"[FORCE-FAKE] v36.141: SKIP duplicate 0x00FFF493 seq=0x%08X (role resp already generated)",
+                 batch[i].seqNum);
             continue;
         }
         uint32_t rLen = generateFakeResponse(batch[i].cmd,
                                              burstBuf + totalLen,
                                              (uint32_t)MIN(MAX_FAKE_RESP_BUF, (int)remaining),
                                              batch[i].seqNum);
+        // v36.141: Mark 0x0CB0A300 as generated so subsequent 0x00FFF493 are skipped
+        if (batch[i].cmd == 0x00FFF493 && rLen > 0) {
+            roleRespGenerated = YES;
+        }
         if (rLen == 0) {
             rLen = 200;
             if (remaining < rLen) break;
@@ -7087,7 +7142,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.140 - COMPLETE 0x0CB0A300 + SKIP BOGUS 0x48736343");
+    DLOG(@"[VERSION] WangXianHook v36.141 - MATCH REAL PROTOCOL FLOW (skip EE007, single 0x0CB0A300)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
