@@ -1,6 +1,36 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v36.143: WHITELIST BURST + POST-BURST STATE MACHINE
+ *
+ * v36.143 CHANGES:
+ *   1. FIX: Replaced blacklist skip-list with WHITELIST in doBurstFakeInject.
+ *      v36.142 BURST returned 1832 bytes (200 + 1632) because a new garbage
+ *      command 0x766A7370 (seq=0x48475153) was NOT in the skip list, generating
+ *      a 200-byte bogus response 0xF66A7370 BEFORE 0x0CB0A300. Client received
+ *      garbage first, derailed protocol parser, never called recv() for RECV #20.
+ *      v36.143: ONLY 0x00FFF493 gets a fake response (0x0CB0A300). All other
+ *      commands are skipped. BURST = clean 1632 bytes.
+ *   2. KEEP: v36.142 - post-BURST state machine (RECV #20 + #21)
+ *   3. KEEP: v36.141 - single 0x0CB0A300, skip duplicate FFF493
+ *   4. KEEP: v36.140 - complete 1632-byte 0x0CB0A300
+ *   5. KEEP: v36.137 - direct BURST inject on RECV-CLOSE
+ *   6. KEEP: v36.136 - poll/select/getsockopt/close/send check g_fakeRespFd
+ *
+ * PROBLEM ANALYSIS (v36.142 log):
+ *   - BURST inject returned 1832 bytes (2 responses): 200B bogus 0xF66A7370
+ *     + 1632B 0x0CB0A300. g_postBurstState=1 was set correctly.
+ *   - Client sent ACK (20B) + heartbeats (22B×3) via FAKE-SEND.
+ *   - Client NEVER called recv() again — protocol parser stuck on the
+ *     200-byte garbage response prepended to 0x0CB0A300.
+ *   - No [POST-BURST] Injected RECV #20 log → state machine never triggered.
+ *
+ * STRATEGY:
+ *   - WHITELIST: only 0x00FFF493 → 0x0CB0A300 (1632 bytes). Skip ALL else.
+ *   - BURST = clean 1632 bytes → client processes 0x0CB0A300 → sends ACK.
+ *   - g_postBurstState=1 → recv() returns RECV #20 (71B session token).
+ *   - g_postBurstState=2 → recv() returns RECV #21 (840B map data).
+ *
  * WangXianHook v36.142: POST-BURST STATE MACHINE (RECV #20 + #21)
  *
  * v36.142 CHANGES:
@@ -571,7 +601,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.142 loaded ===");
+        _log(@"=== WangXianHook v36.143 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4655,36 +4685,19 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     }
 
     for (int i = 0; i < batchCount && remaining >= 16u; i++) {
-        // v36.138: SKIP commands that should NOT get fake responses:
-        //   1. 0x00FFF495 (challenge response) - already handled by real server 0x80FFF495.
-        //      Injecting a fake 0x80FFF495 with empty payload causes client to RSA-decrypt
-        //      garbage data, stalling the state machine at "正在进入...".
-        //   2. 0x50584666 / 0x66666669 / 0x07777777 / 0x66465850 - heartbeat/logging cmds,
-        //      no response expected. Injecting fake responses pollutes protocol flow.
-        uint32_t skipCmd = batch[i].cmd;
-        if (skipCmd == 0x00FFF495 ||     // Challenge response - already processed
-            skipCmd == 0x50584666 ||     // Unknown file-transfer cmd
-            skipCmd == 0x66666669 ||     // Heartbeat/logging cmd (fffi)
-            skipCmd == 0x07777777 ||     // Login module cmd
-            skipCmd == 0x66465850 ||     // Unknown cmd
-            // v36.140: 0x48736343 ("CshH") appeared with bogus seq=0x4B577533
-            // in the v36.139 log, polluting the BURST with a 0xC8736343
-            // response that derailed the protocol flow before 0x0CB0A300.
-            // Skip it — it is not a recognised game command.
-            skipCmd == 0x48736343 ||     // Bogus/garbage cmd - skip
-            // v36.141: Real capture (hook.txt) shows the server does NOT
-            // respond to 0x000EE007. Between RECV #18 (0x80FFF495) and
-            // RECV #19 (0x0CB0A300) the client sends two 0x00FFF493 and
-            // receives ONE 0x0CB0A300 — no 0x800EE007 in between.
-            // Injecting a bogus 0x800EE007 confuses the client.
-            skipCmd == 0x000EE007) {     // Device info - server sends NO response
-            DLOG(@"[FORCE-FAKE] v36.141: SKIP cmd=0x%08X seq=0x%08X (no server response expected)",
-                 skipCmd, batch[i].seqNum);
+        // v36.143: WHITELIST mode — only 0x00FFF493 gets a fake response
+        // (0x0CB0A300 role data). ALL other commands are skipped.
+        // Previous blacklist approach (v36.138-v36.141) kept missing new
+        // garbage commands (0x48736343, 0x766A7370, ...) that polluted the
+        // BURST with 200-byte bogus responses before 0x0CB0A300.
+        if (batch[i].cmd != 0x00FFF493) {
+            DLOG(@"[FORCE-FAKE] v36.143: SKIP cmd=0x%08X seq=0x%08X (whitelist: only FFF493)",
+                 batch[i].cmd, batch[i].seqNum);
             continue;
         }
         // v36.141: Only generate ONE 0x0CB0A300 for the first 0x00FFF493.
         // Real capture (hook.txt): two 0x00FFF493 -> ONE 0x0CB0A300 (1632B).
-        if (batch[i].cmd == 0x00FFF493 && roleRespGenerated) {
+        if (roleRespGenerated) {
             DLOG(@"[FORCE-FAKE] v36.141: SKIP duplicate 0x00FFF493 seq=0x%08X (role resp already generated)",
                  batch[i].seqNum);
             continue;
@@ -7272,7 +7285,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.142 - POST-BURST STATE MACHINE (RECV #20 + #21)");
+    DLOG(@"[VERSION] WangXianHook v36.143 - WHITELIST BURST + POST-BURST STATE MACHINE");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
