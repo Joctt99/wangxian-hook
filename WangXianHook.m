@@ -1,30 +1,30 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.136: RE-ENABLE FAKE RESP INJECTION + DISABLE SERVER-ROTATE
+ * WangXianHook v36.137: DIRECT BURST INJECT ON RECV-CLOSE
  *
- * v36.136 CHANGES:
- *   1. FIX: Set g_triggerFakeNextRecv=YES on RECV-CLOSE to trigger BURST fake resp injection
- *      (v36.135 bug: g_triggerFakeNextRecv was NEVER set to YES, so fake resp never fired)
- *   2. DISABLE: SERVER-ROTATE logic (rotation caused client reconnect loop + "连接异常中断")
- *   3. ADD: Force poll/select/getsockopt to return OK for game fd before fake resp injected
- *   4. KEEP: v36.133 fix - do NOT patch 0x80FFF495 offset[12] (format flag 0x01)
- *   5. KEEP: v36.134 fix - UUID injection after GPU field
- *   6. KEEP: v36.135 - SecKeyCreateDecryptedData plaintext dump
+ * v36.137 CHANGES:
+ *   1. FIX: Direct BURST injection on RECV-CLOSE (not deferred to next recv())
+ *      v36.136 bug: armed g_triggerFakeNextRecv but client NEVER called recv() again.
+ *      Client detected disconnect via heartbeat→quitFromServer→close() and reconnected.
+ *   2. REFACTOR: Extracted BURST injection logic into doBurstFakeInject() function
+ *   3. KEEP: v36.136 - poll/select/getsockopt/close/send check g_fakeRespFd (not g_fakeRespInjected)
+ *   4. KEEP: v36.136 - SERVER-ROTATE disabled
+ *   5. KEEP: v36.133 - do NOT patch 0x80FFF495 offset[12]
+ *   6. KEEP: v36.134 - UUID injection after GPU field
+ *   7. KEEP: v36.135 - SecKeyCreateDecryptedData plaintext dump
  *
- * PROBLEM ANALYSIS (v36.135 log):
- *   - Login OK, server click OK, client sends 0x000EE007(179B)+0x00FFF493(472B)+0x00FFF493(876B)
- *   - SEC-PLAIN shows session key decrypted OK: "FcQeZ8EBNrnZybxv@$_pSen4Y9Ly2GKcOqv@$_21"
- *   - Challenge response ACCEPTED, but server closes connection after 0x00FFF493
- *   - RECV-CLOSE returns EAGAIN but NO fake response injected (g_triggerFakeNextRecv never set)
- *   - SERVER-ROTATE triggers reconnect to 101.132.180.110:12003, which ALSO closes connection
- *   - Client heartbeat detects disconnection -> quitFromServer -> "连接异常中断"
+ * PROBLEM ANALYSIS (v36.136 log):
+ *   - RECV-CLOSE: ARMING fake-resp injection fired (g_triggerFakeNextRecv=YES)
+ *   - But client NEVER called recv() again! Instead: close(105) → reconnect to 5678
+ *   - Call stack: close() ← quitFromServer ← heartbeat ← GameDisplay::heartbeat
+ *   - Client's heartbeat detected dead connection, triggered quitFromServer
+ *   - Client restarted entire login flow from scratch
  *
  * STRATEGY:
- *   - On RECV-CLOSE: arm g_triggerFakeNextRecv so next recv() fires BURST fake resp injection
- *   - Disable SERVER-ROTATE to keep client on current fd (no reconnect loop)
- *   - Fake responses from command queue: 0x80EEE007, 0x80FFF493, 0x80FFF493
- *   - close() hook already blocks quitFromServer; poll/select/getsockopt hooks mask error
+ *   - On RECV-CLOSE: call doBurstFakeInject() DIRECTLY, write fake responses into buf
+ *   - Return totalLen (>0) so client sees fake responses, NOT connection close
+ *   - Client state machine advances without ever knowing server disconnected
  *
  * v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
@@ -435,7 +435,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.136 loaded ===");
+        _log(@"=== WangXianHook v36.137 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4295,109 +4295,110 @@ static void applyServerListPatch(unsigned char *payload, size_t payloadLen) {
     }
 }
 
+// v36.137: Extracted BURST injection logic as independent function
+// Called from: (1) hook_recv entry when g_triggerFakeNextRecv, (2) RECV-CLOSE direct inject
+static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
+    if (!buf || len < 16) return -1;
+
+    DLOG(@"[FORCE-FAKE] v36.137: BURST inject for fd=%d (draining command queue)", fd);
+    g_triggerFakeNextRecv = NO;
+    g_triggerFakeFd       = -1;
+
+    // Drain entire virtual queue (up to 16 entries)
+    GameCmdEntry batch[16];
+    int        batchCount = 0;
+    for (int i = 0; i < 16; i++) {
+        GameCmdEntry e;
+        if (!dequeueGameCmd(&e)) break;
+        batch[batchCount++] = e;
+        DLOG(@"[FORCE-FAKE] v36.137: Batch collected [%d] cmd=0x%08X seq=0x%08X",
+             batchCount - 1, e.cmd, e.seqNum);
+    }
+
+    uint32_t totalLen     = 0;
+    uint32_t respCount    = 0;
+    uint8_t *burstBuf    = (uint8_t *)buf;
+    size_t   remaining   = len;
+
+    if (batchCount == 0) {
+        // Guard: queue was empty - fallback to EE007 single-response behaviour
+        DLOG(@"[FORCE-FAKE] v36.137: Queue empty, fallback single EE007 inject (seq=0x10000)");
+        GameCmdEntry ee; ee.cmd = 0x000EE007; ee.seqNum = 0x00010000; ee.fd = fd; ee.sendLen = 217;
+        batch[0] = ee; batchCount = 1;
+    }
+
+    for (int i = 0; i < batchCount && remaining >= 16u; i++) {
+        uint32_t rLen = generateFakeResponse(batch[i].cmd,
+                                             burstBuf + totalLen,
+                                             (uint32_t)MIN(MAX_FAKE_RESP_BUF, (int)remaining),
+                                             batch[i].seqNum);
+        if (rLen == 0) {
+            rLen = 200;
+            if (remaining < rLen) break;
+            memset(burstBuf + totalLen, 0, rLen);
+            burstBuf[totalLen + 0] = (rLen >> 24) & 0xFF;
+            burstBuf[totalLen + 1] = (rLen >> 16) & 0xFF;
+            burstBuf[totalLen + 2] = (rLen >> 8)  & 0xFF;
+            burstBuf[totalLen + 3] =  rLen & 0xFF;
+            uint32_t rc2 = batch[i].cmd | 0x80000000u;
+            burstBuf[totalLen + 4] = (rc2 >> 24) & 0xFF; burstBuf[totalLen + 5] = (rc2 >> 16) & 0xFF;
+            burstBuf[totalLen + 6] = (rc2 >> 8)  & 0xFF; burstBuf[totalLen + 7] =  rc2 & 0xFF;
+            burstBuf[totalLen + 8]  = (batch[i].seqNum >> 24) & 0xFF; burstBuf[totalLen + 9]  = (batch[i].seqNum >> 16) & 0xFF;
+            burstBuf[totalLen + 10] = (batch[i].seqNum >> 8)  & 0xFF; burstBuf[totalLen + 11] =  batch[i].seqNum & 0xFF;
+            burstBuf[totalLen + 12] = 0x00; // status = success
+        }
+        if ((uint32_t)remaining < rLen) {
+            DLOG(@"[FORCE-FAKE] v36.137: Batch [%d] truncated (need %u, remaining %zu) — stop burst",
+                 i, rLen, remaining);
+            break;
+        }
+
+        // Copy to persistent g_fakeRespBuf for legacy readers (only first response)
+        if (i == 0 && g_fakeRespLen == 0) {
+            memcpy(g_fakeRespBuf, burstBuf + totalLen, MIN(rLen, (uint32_t)MAX_FAKE_RESP_BUF));
+            g_fakeRespLen = rLen;
+        }
+
+        totalLen  += rLen;
+        remaining -= rLen;
+        respCount++;
+        DLOG(@"[FORCE-FAKE] v36.137: Batch [%d] appended cmd=0x%08X -> 0x%08X seq=0x%08X len=%u (cum=%u respCount=%d)",
+             i, batch[i].cmd, (batch[i].cmd | 0x80000000u), batch[i].seqNum, rLen, totalLen, respCount);
+    }
+
+    g_fakeRespInjected  = YES;
+    g_fakeRespFd        = fd;
+    g_fakeRespSentCount = respCount;
+    g_fakeRespActive    = YES;
+    g_fakeRespDelivered = YES;
+    g_lastRespCmd       = batch[respCount > 0 ? respCount - 1 : 0].cmd;
+    g_respCount         = respCount;
+
+    if (totalLen > 0) {
+        DLOG(@"[FAKE-RESP] v36.137: BURST-INJECT returned %u bytes (%d responses, %zu left in recv buffer)",
+             totalLen, respCount, remaining);
+        NSMutableString *burstHex = [NSMutableString stringWithCapacity:256];
+        for (uint32_t i = 0; i < MIN(totalLen, 64u); i++) {
+            [burstHex appendFormat:@"%02X ", ((const uint8_t *)buf)[i]];
+            if (i == 15 || i == 31 || i == 47) [burstHex appendString:@"\n  "];
+        }
+        DLOG(@"%@", burstHex);
+        return (ssize_t)totalLen;
+    }
+    DLOG(@"[FAKE-RESP] v36.137: BURST-INJECT produced 0 bytes — returning EAGAIN");
+    return -1;
+}
+
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
     // v36.123: TRIGGER FAKE-RESP IMMEDIATELY after 0x80FFF495 patch, NO WAIT for RECV-CLOSE.
-    // KEY v36.123→v36.123 FIX:
-    //   v36.123 returned ONLY the FIRST fake response (0x800EE007) and relied on the
-    //   client calling recv() again to pull 0x80FFF493 / 0x80FFF49F / 0x80FFF4A1.
-    //   If the client's internal state machine did not proceed past "waiting for
-    //   user to select a role / send FFF493", it would never recv() again and the
-    //   remaining 3 responses would sit in the queue forever (UI stuck "正在进入...").
-    //   Fix: Drain the ENTIRE virtual queue NOW and concatenate ALL responses as a
-    //   single TCP "sticky" burst. Client's own TCP splitter handles multi-packet
-    //   recv() buffers natively, so it will see 4 responses and advance through
-    //   device-ack → login-ack → role-list → enter-game in one logical tick.
+    // v36.137: Use extracted doBurstFakeInject() function.
     if (g_triggerFakeNextRecv && g_triggerFakeFd == fd &&
         g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
-        DLOG(@"[FORCE-FAKE] v36.123: triggerFakeNextRecv fired for fd=%d (BURST all queued cmds as sticky TCP buffer)", fd);
-        g_triggerFakeNextRecv = NO;
-        g_triggerFakeFd       = -1;
-
-        // Drain entire virtual queue (up to 16 entries, well beyond 4-step login flow)
-        GameCmdEntry batch[16];
-        int        batchCount = 0;
-        for (int i = 0; i < 16; i++) {
-            GameCmdEntry e;
-            if (!dequeueGameCmd(&e)) break;
-            batch[batchCount++] = e;
-            DLOG(@"[FORCE-FAKE] v36.123: Batch collected [%d] cmd=0x%08X seq=0x%08X",
-                 batchCount - 1, e.cmd, e.seqNum);
-        }
-
-        uint32_t totalLen     = 0;
-        uint32_t respCount    = 0;
-        uint8_t *burstBuf    = (uint8_t *)buf;  // Write directly into recv() output buffer
-        size_t   remaining   = len;
-
-        if (batchCount == 0) {
-            // Guard: queue was empty - fallback to EE007 single-response behaviour
-            DLOG(@"[FORCE-FAKE] v36.123: Queue empty, fallback single EE007 inject (seq=0x10000)");
-            GameCmdEntry ee; ee.cmd = 0x000EE007; ee.seqNum = 0x00010000; ee.fd = fd; ee.sendLen = 217;
-            batch[0] = ee; batchCount = 1;
-        }
-
-        for (int i = 0; i < batchCount && remaining >= 16u; i++) {
-            uint32_t rLen = generateFakeResponse(batch[i].cmd,
-                                                 burstBuf + totalLen,
-                                                 (uint32_t)MIN(MAX_FAKE_RESP_BUF, (int)remaining),
-                                                 batch[i].seqNum);
-            if (rLen == 0) {
-                rLen = 200;
-                if (remaining < rLen) break;
-                memset(burstBuf + totalLen, 0, rLen);
-                burstBuf[totalLen + 0] = (rLen >> 24) & 0xFF;
-                burstBuf[totalLen + 1] = (rLen >> 16) & 0xFF;
-                burstBuf[totalLen + 2] = (rLen >> 8)  & 0xFF;
-                burstBuf[totalLen + 3] =  rLen & 0xFF;
-                uint32_t rc2 = batch[i].cmd | 0x80000000u;
-                burstBuf[totalLen + 4] = (rc2 >> 24) & 0xFF; burstBuf[totalLen + 5] = (rc2 >> 16) & 0xFF;
-                burstBuf[totalLen + 6] = (rc2 >> 8)  & 0xFF; burstBuf[totalLen + 7] =  rc2 & 0xFF;
-                burstBuf[totalLen + 8]  = (batch[i].seqNum >> 24) & 0xFF; burstBuf[totalLen + 9]  = (batch[i].seqNum >> 16) & 0xFF;
-                burstBuf[totalLen + 10] = (batch[i].seqNum >> 8)  & 0xFF; burstBuf[totalLen + 11] =  batch[i].seqNum & 0xFF;
-                burstBuf[totalLen + 12] = 0x00; // status = success
-            }
-            if ((uint32_t)remaining < rLen) {
-                DLOG(@"[FORCE-FAKE] v36.123: Batch [%d] truncated (need %u, remaining %zu) — stop burst",
-                     i, rLen, remaining);
-                break;
-            }
-
-            // Copy to persistent g_fakeRespBuf for legacy readers (only first response)
-            if (i == 0 && g_fakeRespLen == 0) {
-                memcpy(g_fakeRespBuf, burstBuf + totalLen, MIN(rLen, (uint32_t)MAX_FAKE_RESP_BUF));
-                g_fakeRespLen = rLen;
-            }
-
-            totalLen  += rLen;
-            remaining -= rLen;
-            respCount++;
-            DLOG(@"[FORCE-FAKE] v36.123: Batch [%d] appended cmd=0x%08X -> 0x%08X seq=0x%08X len=%u (cum=%u respCount=%d)",
-                 i, batch[i].cmd, (batch[i].cmd | 0x80000000u), batch[i].seqNum, rLen, totalLen, respCount);
-        }
-
-        g_fakeRespInjected  = YES;
-        g_fakeRespFd        = fd;
-        g_fakeRespSentCount = respCount;
-        g_fakeRespActive    = YES;
-        g_fakeRespDelivered = YES;
-        g_lastRespCmd       = batch[respCount > 0 ? respCount - 1 : 0].cmd;
-        g_respCount         = respCount;
-
-        if (buf && totalLen > 0) {
-            DLOG(@"[FAKE-RESP] v36.123: BURST-INJECT returned %u bytes (%d responses, %zu left in recv buffer) FIRST_HEX=",
-                 totalLen, respCount, remaining);
-            NSMutableString *burstHex = [NSMutableString stringWithCapacity:256];
-            for (uint32_t i = 0; i < MIN(totalLen, 64u); i++) {
-                [burstHex appendFormat:@"%02X ", ((const uint8_t *)buf)[i]];
-                if (i == 15 || i == 31 || i == 47) [burstHex appendString:@"\n  "];
-            }
-            DLOG(@"%@", burstHex);
-            return (ssize_t)totalLen;
-        }
-        DLOG(@"[FAKE-RESP] v36.123: BURST-INJECT produced 0 bytes — falling through EAGAIN");
+        ssize_t injectLen = doBurstFakeInject(fd, buf, len);
+        if (injectLen > 0) return injectLen;
         errno = EAGAIN;
         return -1;
     }
@@ -4593,43 +4594,31 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // v36.99: KEY FIX - For game server fd, NEVER return 0 to client!
                 // Returning 0 causes SocketClient/NetImpl to detect "connection closed"
                 // and set internal disconnected state, leading to "网络中断" error.
-                // Instead: return EAGAIN to keep connection alive.
                 
-                // v36.136: RE-ENABLE fake response injection on recv-close!
-                //   v36.135 bug: g_triggerFakeNextRecv was NEVER set to YES, so BURST
-                //   fake response injection in hook_recv (line ~4298) never fired.
-                //   Server closes connection after 0x000EE007+0x00FFF493 (challenge accepted
-                //   per SEC-PLAIN session key, but login packets rejected).
-                //   Fix: arm g_triggerFakeNextRecv so next recv() fires BURST injection
-                //   using commands from the command queue (0x80EEE007, 0x80FFF493, ...).
+                // v36.137: DIRECT BURST INJECTION on RECV-CLOSE!
+                //   v36.136 bug: armed g_triggerFakeNextRecv but client NEVER called recv()
+                //   again. Client detected disconnect via heartbeat→quitFromServer→close()
+                //   and reconnected from scratch (login server 5678).
+                //   Fix: inject fake responses DIRECTLY into buf NOW, return totalLen.
+                //   This prevents client from ever seeing ret=0 on game server fd.
                 if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
-                    DLOG(@"[RECV-CLOSE] v36.136: Game server closed connection (fd=%d). ARMING fake-resp injection (handshake=%d loginSent=%d).",
+                    DLOG(@"[RECV-CLOSE] v36.137: Game server closed connection (fd=%d). DIRECT BURST inject (handshake=%d loginSent=%d).",
                          fd, g_handshakeComplete, g_loginPacketsSent);
-                    g_triggerFakeNextRecv = YES;
-                    g_triggerFakeFd       = fd;
-                    // Mark fd as fake-resp pending so poll/select/getsockopt return OK
-                    g_fakeRespFd          = fd;
+                    ssize_t injectLen = doBurstFakeInject(fd, buf, len);
+                    if (injectLen > 0) {
+                        DLOG(@"[RECV-CLOSE] v36.137: BURST inject SUCCESS %zd bytes for fd=%d — client sees fake responses, NOT connection close", injectLen, fd);
+                        return injectLen;
+                    }
+                    DLOG(@"[RECV-CLOSE] v36.137: BURST inject FAILED, falling through to EAGAIN");
                 } else {
-                    DLOG(@"[RECV-CLOSE] v36.136: Game server closed connection (fd=%d). EAGAIN only (handshake=%d loginSent=%d fakeInjected=%d).",
+                    DLOG(@"[RECV-CLOSE] v36.137: Game server closed connection (fd=%d). EAGAIN only (handshake=%d loginSent=%d fakeInjected=%d).",
                          fd, g_handshakeComplete, g_loginPacketsSent, g_fakeRespInjected);
                 }
                 
                 // v36.136: DISABLED SERVER-ROTATE!
                 //   Rotation caused client to reconnect to next server (101.132.180.110),
                 //   which ALSO closes connection, creating an infinite reconnect loop.
-                //   This led to "连接异常中断" error because client heartbeat detected
-                //   the disconnection during rotation.
-                //   Instead: keep client on current fd and inject fake responses.
                 // [SERVER-ROTATE DISABLED in v36.136]
-                // DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
-                // @try {
-                //     BOOL rotated = tryNextServer();
-                //     if (rotated) {
-                //         DLOG(@"[SERVER-ROTATE] Rotated to %s:%d, game should retry connection", g_gameServerIP, g_gameServerPort);
-                //     }
-                // } @catch (NSException *e) {
-                //     DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
-                // }
                 
                 errno = EAGAIN;
                 return -1;
@@ -6881,7 +6870,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.136 - RE-ENABLE FAKE RESP INJECTION + DISABLE SERVER-ROTATE");
+    DLOG(@"[VERSION] WangXianHook v36.137 - DIRECT BURST INJECT ON RECV-CLOSE");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
