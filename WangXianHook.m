@@ -1,9 +1,18 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.126: SIMPLE status patch (keep original packet) + CRYPTO BYPASS
+ * WangXianHook v36.127: SIMPLE status patch + EncryptUtils RSA/ECB/AES decrypt Hook
  *                        Send-intercept approach: wait for client's native commands with
  *                        REAL seq numbers, intercept in hook_send, generate matching fake responses.
  * MODE: PROACTIVE - Inject fake responses when server closes, block quitFromServer
+ *
+ * v36.127 FIXES (CRITICAL):
+ *   1. EncryptUtils Hook: Client uses BoringSSL (not System Crypto API) for RSA decryption.
+ *      Previous Crypto Bypass via SecKeyCreateDecryptedData/CCCrypt NEVER triggered because
+ *      EncryptUtils.rsaDecryptData/rsaDecryptLarge/aesDecryptData are used instead.
+ *      Now HOOKING EncryptUtils class methods to return valid fake plaintext when forceValidDecrypt=YES.
+ *   2. Keeps v36.126 SIMPLE STATUS PATCH: Original 365-byte packet, only status 1→0.
+ *      Client can decrypt original encrypted data with its own RSA private key (via BoringSSL).
+ *   3. EncryptUtils hook uses IMP replacement for 4-arg methods (no va_list risk).
  *
  * v36.123 FIXES (CRITICAL):
  *   1. IMMEDIATE burst injection: After patching 0x80FFF495 status=1->0, append all 4 fake
@@ -391,7 +400,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.126 loaded ===");
+        _log(@"=== WangXianHook v36.127 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6381,6 +6390,147 @@ static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
 }
 
 // ============================================================
+#pragma mark - EncryptUtils Hook (v36.127)
+// ============================================================
+// Client uses EncryptUtils (BoringSSL) for RSA/AES decryption, NOT System Crypto API.
+// We must hook these class methods to return valid plaintext when forceValidDecrypt=YES.
+// All methods have fixed arguments (no va_list risk).
+
+typedef NSData* (*RsaDecryptDataFunc)(Class self, SEL _cmd, NSData *data, void *keyRef);
+static RsaDecryptDataFunc orig_rsaDecryptData = NULL;
+
+typedef NSData* (*RsaDecryptLargeFunc)(Class self, SEL _cmd, NSData *data, NSData *privateKey);
+static RsaDecryptLargeFunc orig_rsaDecryptLarge = NULL;
+
+typedef NSData* (*AesDecryptDataFunc)(Class self, SEL _cmd, NSData *data, NSData *key, NSData *iv);
+static AesDecryptDataFunc orig_aesDecryptData = NULL;
+
+// v36.127: Hook for +rsaDecryptData:withKeyRef:
+static NSData* hook_rsaDecryptData(Class self, SEL _cmd, NSData *data, void *keyRef) {
+    if (g_forceValidDecrypt && data) {
+        NSUInteger dataLen = data.length;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: rsaDecryptData:withKeyRef: SKIPPING real decrypt (dataLen=%lu), returning fake plaintext", (unsigned long)dataLen);
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_forceValidDecrypt = NO;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: rsaDecryptData returning fake plaintext (%zu bytes), forceValidDecrypt=NO", strlen(fakePlaintext));
+        return fakeData;
+    }
+    if (orig_rsaDecryptData) {
+        NSData *result = orig_rsaDecryptData(self, _cmd, data, keyRef);
+        if (data) {
+            DLOG(@"[ENCRYPT-ORIG] rsaDecryptData:withKeyRef: dataLen=%lu resultLen=%lu",
+                 (unsigned long)data.length, result ? (unsigned long)result.length : 0);
+        }
+        return result;
+    }
+    return nil;
+}
+
+// v36.127: Hook for +rsaDecryptLarge:withPrivateKey:
+static NSData* hook_rsaDecryptLarge(Class self, SEL _cmd, NSData *data, NSData *privateKey) {
+    if (g_forceValidDecrypt && data) {
+        NSUInteger dataLen = data.length;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: rsaDecryptLarge:withPrivateKey: SKIPPING real decrypt (dataLen=%lu), returning fake plaintext", (unsigned long)dataLen);
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_forceValidDecrypt = NO;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: rsaDecryptLarge returning fake plaintext (%zu bytes), forceValidDecrypt=NO", strlen(fakePlaintext));
+        return fakeData;
+    }
+    if (orig_rsaDecryptLarge) {
+        NSData *result = orig_rsaDecryptLarge(self, _cmd, data, privateKey);
+        if (data) {
+            DLOG(@"[ENCRYPT-ORIG] rsaDecryptLarge:withPrivateKey: dataLen=%lu resultLen=%lu",
+                 (unsigned long)data.length, result ? (unsigned long)result.length : 0);
+        }
+        return result;
+    }
+    return nil;
+}
+
+// v36.127: Hook for +aesDecryptData:key:iv:
+static NSData* hook_aesDecryptData(Class self, SEL _cmd, NSData *data, NSData *key, NSData *iv) {
+    if (g_forceValidDecrypt && data) {
+        NSUInteger dataLen = data.length;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: aesDecryptData:key:iv: SKIPPING real decrypt (dataLen=%lu), returning fake plaintext", (unsigned long)dataLen);
+        const char *fakePlaintext = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        NSData *fakeData = [NSData dataWithBytes:fakePlaintext length:strlen(fakePlaintext)];
+        g_forceValidDecrypt = NO;
+        DLOG(@"[ENCRYPT-HOOK] v36.127: aesDecryptData returning fake plaintext (%zu bytes), forceValidDecrypt=NO", strlen(fakePlaintext));
+        return fakeData;
+    }
+    if (orig_aesDecryptData) {
+        NSData *result = orig_aesDecryptData(self, _cmd, data, key, iv);
+        if (data) {
+            DLOG(@"[ENCRYPT-ORIG] aesDecryptData:key:iv: dataLen=%lu keyLen=%lu resultLen=%lu",
+                 (unsigned long)data.length, key ? (unsigned long)key.length : 0, result ? (unsigned long)result.length : 0);
+        }
+        return result;
+    }
+    return nil;
+}
+
+// v36.127: Install EncryptUtils hooks
+static void installEncryptUtilsHooks(void) {
+    @try {
+        Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
+        if (!encryptUtilsCls) {
+            DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils class NOT found");
+            return;
+        }
+        
+        Class metaCls = object_getClass(encryptUtilsCls);
+        DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils class found, metaCls=%p", metaCls);
+        
+        // Hook +rsaDecryptData:withKeyRef:
+        SEL rsaDecryptSel = NSSelectorFromString(@"rsaDecryptData:withKeyRef:");
+        if ([metaCls instancesRespondToSelector:rsaDecryptSel]) {
+            Method m = class_getInstanceMethod(metaCls, rsaDecryptSel);
+            if (m) {
+                orig_rsaDecryptData = (RsaDecryptDataFunc)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_rsaDecryptData);
+                DLOG(@"[ENCRYPT-HOOK] v36.127: SUCCESS - Hooked +rsaDecryptData:withKeyRef: (orig=%p)", orig_rsaDecryptData);
+            } else {
+                DLOG(@"[ENCRYPT-HOOK] v36.127: FAILED - method_getInstanceMethod returned NULL for rsaDecryptData:withKeyRef:");
+            }
+        } else {
+            DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils does NOT respond to rsaDecryptData:withKeyRef:");
+        }
+        
+        // Hook +rsaDecryptLarge:withPrivateKey:
+        SEL rsaDecryptLargeSel = NSSelectorFromString(@"rsaDecryptLarge:withPrivateKey:");
+        if ([metaCls instancesRespondToSelector:rsaDecryptLargeSel]) {
+            Method m = class_getInstanceMethod(metaCls, rsaDecryptLargeSel);
+            if (m) {
+                orig_rsaDecryptLarge = (RsaDecryptLargeFunc)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_rsaDecryptLarge);
+                DLOG(@"[ENCRYPT-HOOK] v36.127: SUCCESS - Hooked +rsaDecryptLarge:withPrivateKey: (orig=%p)", orig_rsaDecryptLarge);
+            }
+        } else {
+            DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils does NOT respond to rsaDecryptLarge:withPrivateKey:");
+        }
+        
+        // Hook +aesDecryptData:key:iv:
+        SEL aesDecryptSel = NSSelectorFromString(@"aesDecryptData:key:iv:");
+        if ([metaCls instancesRespondToSelector:aesDecryptSel]) {
+            Method m = class_getInstanceMethod(metaCls, aesDecryptSel);
+            if (m) {
+                orig_aesDecryptData = (AesDecryptDataFunc)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_aesDecryptData);
+                DLOG(@"[ENCRYPT-HOOK] v36.127: SUCCESS - Hooked +aesDecryptData:key:iv: (orig=%p)", orig_aesDecryptData);
+            }
+        } else {
+            DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils does NOT respond to aesDecryptData:key:iv:");
+        }
+        
+        DLOG(@"[ENCRYPT-HOOK] v36.127: EncryptUtils hook installation complete");
+    } @catch (NSException *e) {
+        DLOG(@"[ENCRYPT-HOOK] v36.127: Exception during hook installation: %@", e.reason);
+    }
+}
+
+// ============================================================
 #pragma mark - Constructor - MINIMAL + observer hooks
 // ============================================================
 
@@ -6402,13 +6552,17 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.126 - SIMPLE status patch + CRYPTO BYPASS (skip real decrypt, return fake valid plaintext) + send-intercept");
+    DLOG(@"[VERSION] WangXianHook v36.127 - SIMPLE status patch + EncryptUtils decrypt Hook (BoringSSL bypass) + send-intercept");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
     installSecurityHooks();
 #endif
     installKeyboardProtection();
+    
+    // v36.127: Install EncryptUtils hooks (BoringSSL decrypt bypass)
+    // This is CRITICAL - client uses EncryptUtils for RSA/AES, NOT System Crypto API
+    installEncryptUtilsHooks();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
