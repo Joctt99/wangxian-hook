@@ -1574,6 +1574,12 @@ static int g_burstInjectFd = -1;
 static BOOL g_forceValidDecrypt = NO;
 static int g_forceValidDecryptFd = -1;
 
+// v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
+static int g_bypassRemaining = 0;
+static IMP g_orig_rsaDecryptData = NULL;
+static IMP g_orig_rsaDecryptLarge = NULL;
+static IMP g_orig_aesDecryptData = NULL;
+
 // v36.124: NEW — Wait for client to send native commands with REAL seq numbers
 // Instead of pre-generating responses with wrong seq (0x10000+), wait for the
 // client to send EE007/FFF493 etc., capture the REAL seq, and use it for responses.
@@ -6416,10 +6422,8 @@ static void hook_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
 //   Use bypass counter (up to 5) instead of one-shot flag, to handle multi-step decryption.
 
 static BOOL g_encryptUtilsHooksInstalled = NO;
-static int g_bypassRemaining = 0;  // Number of bypasses remaining
-static IMP g_orig_rsaDecryptData = NULL;
-static IMP g_orig_rsaDecryptLarge = NULL;
-static IMP g_orig_aesDecryptData = NULL;
+// Note: g_bypassRemaining, g_orig_rsaDecryptData, g_orig_rsaDecryptLarge, g_orig_aesDecryptData
+// are defined earlier (near g_forceValidDecrypt) for forward access in hook_recv logic.
 
 // Hook for +rsaDecryptData:withKeyRef:
 static NSData* hooked_rsaDecryptData(Class self, SEL _cmd, NSData *data, id keyRef) {
