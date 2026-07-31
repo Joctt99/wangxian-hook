@@ -1575,6 +1575,8 @@ static int g_burstInjectFd = -1;
 // NOTE: g_forceValidDecrypt must NOT be static because it's referenced from
 // inline ARM64 assembly in cpp_stub_force() (linker needs external symbol)
 BOOL g_forceValidDecrypt = NO;
+__asm__(".globl g_forceValidDecrypt");
+__asm__(".type g_forceValidDecrypt, %object");
 static int g_forceValidDecryptFd = -1;
 
 // v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
@@ -6600,7 +6602,7 @@ static const char g_cppEmptyStr[] = "";
 // inline ARM64 assembly in cpp_stub_force()
 const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
 
-// ARM64 assembly stub for CCFileUtils::rsaDecryptLarge
+// ARM64 C stub for CCFileUtils::rsaDecryptLarge
 // C++ member function ABI (ARM64) - CRITICAL for large return:
 //   For functions returning objects > 16 bytes (like std::string):
 //   x0 = output buffer pointer (caller-allocated, 24 bytes for std::string)
@@ -6609,56 +6611,44 @@ const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"resu
 //   x3 = second arg (std::string const&)
 // Return: std::string written to x0 buffer, x0 stays as buffer ptr
 //
-// v36.132 FIX: Correct function signature to match ARM64 ABI
-//   void* self -> void* output_buf (x0 must be output buffer, not self!)
-//   Without this fix, x0 is treated as self, causing all params to be shifted!
-__attribute__((naked))
-static void cpp_stub_force(void* output_buf, void* self, void* data, void* key) {
-    asm volatile(
-        // Save frame
-        "stp x29, x30, [sp, #-16]!\n"
-        "mov x29, sp\n"
+// v36.132 FIX: Pure C implementation (no inline assembly)
+//   - Correct function signature matches ARM64 ABI
+//   - Writes fake std::string to output_buf directly via pointer manipulation
+//   - Calls original function via function pointer for non-bypass path
+void cpp_stub_force(void* output_buf, void* self, void* data, void* key) {
+    // Check forceValidDecrypt flag (now a non-static global variable)
+    if (g_forceValidDecrypt) {
+        // Bypass path: write fake success std::string to output_buf
+        // std::string internal layout (for Apple's libc++):
+        //   offset 0: char* data_ (pointer to string data)
+        //   offset 8: size_t length_
+        //   offset 16: size_t capacity_
+        // Note: For strings <= 15 chars, libc++ uses SSO (small string optimization)
+        // which stores data inline. But our 37-char string exceeds SSO threshold,
+        // so it uses heap allocation with a pointer.
+        const char* fakeStr = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+        size_t fakeLen = 37;  // strlen(fakeStr)
         
-        // Load original function pointer
-        "adrp x9, g_cppOrig@PAGE\n"
-        "add x9, x9, g_cppOrig@PAGEOFF\n"
-        "ldr x9, [x9, #0]\n"  // Load g_cppOrig.orig_rsaDecryptLarge
+        // Write directly to the output buffer (caller's std::string storage)
+        char** dataPtr = (char**)output_buf;
+        *dataPtr = (char*)fakeStr;  // data_ = pointer to fake string
         
-        // Check g_forceValidDecrypt flag
-        "adrp x3, g_forceValidDecrypt@PAGE\n"
-        "add x3, x3, g_forceValidDecrypt@PAGEOFF\n"
-        "ldr w4, [x3]\n"
-        "cbnz w4, 2f\n"  // If forceValidDecrypt != 0, goto return_success
+        size_t* lenPtr = (size_t*)((char*)output_buf + 8);
+        *lenPtr = fakeLen;  // length_ = 37
         
-        // === NORMAL PATH: call original function ===
-        // At this point:
-        //   x0 = output_buf (correct for original function!)
-        //   x1 = self (this pointer)
-        //   x2 = data (first arg)
-        //   x3 = key (second arg)
-        // These match the original function's expected ABI perfectly!
-        "ldp x29, x30, [sp], #16\n"
-        "br x9\n"  // Branch to original function (tail call, no link needed)
-        // NOTE: We restored frame and br, so original function will
-        // execute with our caller's stack frame. x0-x3 are unchanged.
+        size_t* capPtr = (size_t*)((char*)output_buf + 16);
+        *capPtr = fakeLen;  // capacity_ = 37 (must be >= length_)
         
-        // === BYPASS PATH: return success std::string ===
-        "2:\n"
-        // x0 = output_buf (pointer to caller's std::string buffer)
-        // We write directly to this buffer to construct the return value
-        "adrp x3, g_cppSuccessStr@PAGE\n"
-        "add x3, x3, g_cppSuccessStr@PAGEOFF\n"
-        "str x3, [x0, #0]\n"      // std::string::data_ = g_cppSuccessStr (SSO or heap ptr)
-        "mov x3, #37\n"           // length of "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}"
-        "str x3, [x0, #8]\n"      // std::string::length_ = 37
-        "str x3, [x0, #16]\n"     // std::string::capacity_ = 37 (must be >= length_)
-        // x0 still points to output_buf (caller reads returned string from here)
-        "ldp x29, x30, [sp], #16\n"
-        "ret\n"
-        :
-        : 
-        : "x0", "x1", "x2", "x3", "x4", "x9", "x30", "memory"
-    );
+        return;
+    }
+    
+    // Normal path: call original function
+    // Use function pointer stored in g_cppOrig.orig_rsaDecryptLarge
+    typedef void (*OriginalFunc)(void* output_buf, void* self, void* data, void* key);
+    OriginalFunc origFunc = (OriginalFunc)g_cppOrig.orig_rsaDecryptLarge;
+    if (origFunc) {
+        origFunc(output_buf, self, data, key);
+    }
 }
 
 // Install C++ crypto hooks using rebind_symbols
