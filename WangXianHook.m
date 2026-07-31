@@ -1,7 +1,33 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
+ * WangXianHook v36.133: OBSERVATION MODE - Based on Real Capture Data (hook.txt)
+ *
+ * v36.133 BREAKTHROUGH FIX (based on real Frida capture of working client):
+ *   ROOT CAUSE FOUND: We incorrectly treated 0x80FFF495 offset[12] as "status" field.
+ *   Real capture shows offset[12]=0x01 is the FORMAT FLAG (0x01=response, 0x02=request),
+ *   NOT an error status! Real client receives 0x01 and proceeds naturally.
+ *
+ *   PREVIOUS BUG (v36.124-v36.132): Patching offset[12] 1→0 CORRUPTED the response
+ *   format, causing client to fail parsing and get stuck at "正在进入...".
+ *
+ *   v36.133 CHANGES:
+ *     1. DO NOT patch 0x80FFF495 offset[12] — preserve real format flag
+ *     2. DO NOT enable crypto bypass — client decrypts natively via BoringSSL
+ *     3. DO NOT inject fake responses — client sends 0x000EE007 + 0x00FFF493 naturally
+ *     4. Keep close() hook — prevent client disconnect during heartbeat detection
+ *     5. Keep UUID injection — ensure challenge response contains valid UUID
+ *
+ * REAL PROTOCOL FLOW (from hook.txt):
+ *   1. Client→Server: 0x00FFF495 (703B, encrypted challenge response)
+ *   2. Server→Client: 0x80FFF495 (365B, offset[12]=0x01, encrypted payload)
+ *   3. Client→Server: 0x000EE007 (178B, PLAINTEXT device info)
+ *   4. Client→Server: 0x00FFF493 (472B, encrypted role request)
+ *   5. Server→Client: 0x0CB0A300 (1632B) → 0x12F00080 (71B, token)
+ *   6. Server→Client: 0x13000080 (840B, role info "luoyueshangu")
+ *   7. Server→Client: 0x80FFF490 (27B, account "kk994")
+ *
+ * v36.132: FIX ABI - C++ CCFileUtils::rsaDecryptLarge Hook (OUTPUT BUFFER)
  *
  * v36.130 CRITICAL FIX (RECURSION BUG):
  *   v36.129 had INFINITE RECURSION in non-bypass path: method_getImplementation()
@@ -4487,88 +4513,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // v36.99: KEY FIX - For game server fd, NEVER return 0 to client!
                 // Returning 0 causes SocketClient/NetImpl to detect "connection closed"
                 // and set internal disconnected state, leading to "网络中断" error.
-                // Instead: inject fake response or return EAGAIN to keep connection alive.
+                // Instead: return EAGAIN to keep connection alive.
                 
-                // v36.123: Fix initial injection - use command queue instead of hardcoding
-                if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
-                    // v36.123: Get first command from queue for proper response matching
-                    GameCmdEntry firstEntry;
-                    uint32_t responseCmd = 0;
-                    uint32_t respSeqNum = 0;
-                    BOOL hasEntry = NO;
-                    
-                    // Try to dequeue the first command
-                    if (dequeueGameCmd(&firstEntry)) {
-                        responseCmd = firstEntry.cmd;
-                        respSeqNum = firstEntry.seqNum;
-                        hasEntry = YES;
-                        DLOG(@"[FAKE-RESP] v36.123: Using queued cmd=0x%08X seq=0x%08X for initial injection", responseCmd, respSeqNum);
-                    } else if (g_lastGameCmd != 0) {
-                        // Fallback: use last tracked command
-                        responseCmd = g_lastGameCmd;
-                        respSeqNum = g_lastSeqNum;
-                        DLOG(@"[FAKE-RESP] v36.123: No queued cmd, using last cmd=0x%08X seq=0x%08X", responseCmd, respSeqNum);
-                    } else {
-                        DLOG(@"[FAKE-RESP] v36.123: No commands tracked, using default response");
-                        responseCmd = 0x000EE007;  // Default to device info response
-                        respSeqNum = 0;
-                    }
-                    
-                    // v36.123: Generate response using proper function with correct sequence number
-                    uint8_t *tempBuf = g_fakeRespBuf;
-                    uint32_t respLen = generateFakeResponse(responseCmd, tempBuf, MAX_FAKE_RESP_BUF, respSeqNum);
-                    
-                    if (respLen == 0) {
-                        // v36.123: Fallback should also use 200 bytes, not 16
-                        respLen = 200;
-                        memset(tempBuf, 0, respLen);
-                        tempBuf[0] = 0x00; tempBuf[1] = 0x00;
-                        tempBuf[2] = (respLen >> 8) & 0xFF;
-                        tempBuf[3] = respLen & 0xFF;
-                        tempBuf[4] = ((responseCmd | 0x80000000) >> 24) & 0xFF;
-                        tempBuf[5] = ((responseCmd | 0x80000000) >> 16) & 0xFF;
-                        tempBuf[6] = ((responseCmd | 0x80000000) >> 8) & 0xFF;
-                        tempBuf[7] = (responseCmd | 0x80000000) & 0xFF;
-                        tempBuf[8] = (respSeqNum >> 24) & 0xFF;
-                        tempBuf[9] = (respSeqNum >> 16) & 0xFF;
-                        tempBuf[10] = (respSeqNum >> 8) & 0xFF;
-                        tempBuf[11] = respSeqNum & 0xFF;
-                    }
-                    
-                    g_fakeRespInjected = YES;
-                    g_fakeRespFd = fd;
-                    g_fakeRespLen = respLen;
-                    g_fakeRespSentCount = 1;
-                    g_fakeRespActive = YES;
-                    g_fakeRespDelivered = YES;
-                    g_lastRespCmd = responseCmd;
-                    g_respCount = 1;
-                    
-                    if (buf) {
-                        ssize_t retLen = (ssize_t)respLen;
-                        if (retLen > (ssize_t)len) retLen = (ssize_t)len;
-                        memcpy(buf, tempBuf, retLen);
-                        DLOG(@"[FAKE-RESP] v36.123: Injected response for cmd=0x%08X seq=0x%08X len=%u (queue=%d)", 
-                             responseCmd, respSeqNum, respLen, g_cmdQueueCount);
-                        
-                        NSMutableString *fakeHex = [NSMutableString stringWithCapacity:64];
-                        for (uint32_t i = 0; i < MIN(respLen, 32); i++) {
-                            [fakeHex appendFormat:@"%02X ", tempBuf[i]];
-                        }
-                        DLOG(@"[FAKE-RESP] v36.123: Response hex: %@", fakeHex);
-                        
-                        return retLen;
-                    }
-                }
-                
-                // v36.96: This check is now a safety net only
-                // Primary fake response handling is at the BEGINNING of hook_recv (line 3377)
-                // which returns EAGAIN immediately for ALL subsequent recv calls
-                if (g_fakeRespInjected && g_fakeRespFd == fd && g_fakeRespSentCount > 2) {
-                    DLOG(@"[FAKE-RESP] v36.123: Safety net triggered - returning EAGAIN for fd=%d", fd);
-                    errno = EAGAIN;
-                    return -1;
-                }
+                // v36.133: DISABLED fake response injection on recv-close!
+                //   Real capture shows server does NOT close connection after 0x80FFF495.
+                //   If server closes connection, it means our challenge response was rejected.
+                //   Injecting fake responses at this point corrupts the protocol flow.
+                //   Just return EAGAIN to keep client waiting, close() hook prevents disconnect.
+                DLOG(@"[RECV-CLOSE] v36.133: Game server closed connection (fd=%d). Returning EAGAIN (no fake inject).", fd);
                 
                 // v36.61: Original rotation logic
                 DLOG(@"[SERVER-ROTATE] Game server %s:%d disconnected, attempting rotation...", host, port);
@@ -4581,11 +4533,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[SERVER-ROTATE] Exception during rotation: %@", e.reason);
                 }
                 
-                // v36.99: KEY FIX - For game server fd, NEVER return 0 to client!
-                // Always return EAGAIN for game server fd when server closes
-                // This prevents SocketClient/NetImpl from detecting "connection closed"
-                // and setting internal disconnected state, leading to "网络中断" error
-                DLOG(@"[RECV-EAGAIN] v36.99: Game server fd=%d ret=0 -> returning EAGAIN (prevent disconnect detection)", fd);
                 errno = EAGAIN;
                 return -1;
             }
@@ -5039,57 +4986,51 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                             }
                         }
                     } else if (rcmd == 0x80FFF495) {
-                        // v36.130: SIMPLE STATUS PATCH + CRYPTO BYPASS (FIXED RECURSION)
+                        // v36.133: OBSERVATION MODE - DO NOT PATCH! (based on real capture data)
                         //
-                        // v36.130 CRITICAL FIX:
-                        //   EncryptUtils Hooks now save original IMPs, avoiding infinite recursion.
-                        //   Bypass counter (5 max) handles multi-step decryption.
+                        // REAL CAPTURE ANALYSIS (hook.txt RECV #18):
+                        //   00 00 01 6d 80 ff f4 95 00 00 00 17 01 5f 65 61 ...fFJA==#|74297
+                        //   offset  8-11: seq = 0x00000017 (sequence number)
+                        //   offset    12: 0x01 = FORMAT FLAG (0x01=response, 0x02=request)
+                        //   offset    13: 0x5f = sub-type/length
+                        //   offset 14+: Base64 encrypted payload
                         //
-                        // v36.126 FIX (kept):
-                        // 1. Keep ORIGINAL packet structure (365 bytes, Base64 payload intact)
-                        //    Only patch status byte: 1→0
-                        // 2. In crypto hooks: when forceValidDecrypt=YES, SKIP orig call entirely
-                        //    Return fake valid plaintext DIRECTLY
-                        // 3. Dump plaintext content for analysis
-                        
+                        // KEY INSIGHT: offset 12 is NOT a status field! 0x01 is the normal
+                        //   response format flag. Real client receives 0x01 and proceeds
+                        //   naturally to send 0x000EE007 (178B plaintext) + 0x00FFF493 (472B encrypted).
+                        //
+                        // PREVIOUS BUG (v36.124-v36.132): We incorrectly treated offset 12
+                        //   as "status" and patched 1→0, CORRUPTING the response format.
+                        //   This caused client to fail parsing and get stuck at "正在进入...".
+                        //
+                        // v36.133 FIX: Do NOT modify the packet at all. Let client handle
+                        //   the real 0x80FFF495 response naturally. Client will decrypt
+                        //   using its own BoringSSL and proceed to send subsequent packets.
+
                         // Save original seq for logging
                         uint32_t origSeq = ((unsigned char *)buf)[8] << 24 |
                                            ((unsigned char *)buf)[9] << 16 |
                                            ((unsigned char *)buf)[10] << 8 |
                                            ((unsigned char *)buf)[11];
-                        
-                        // STEP 1: Simple status patch (1→0)
-                        if (status != 0) {
-                            ((unsigned char *)buf)[12] = 0;
-                            DLOG(@"[GAME-PATCH] v36.131: Patched 0x80FFF495 status %u→0 (seq=0x%08X, ret=%zd bytes)",
-                                 status, origSeq, ret);
-                            // v36.130: VERIFY the patch was applied to the ACTUAL buffer
-                            DLOG(@"[VERIFY] v36.130: buf[12] after patch = %u (should be 0)", ((unsigned char *)buf)[12]);
-                        } else {
-                            DLOG(@"[GAME-PATCH] v36.130: 0x80FFF495 status already=0 (seq=0x%08X)", origSeq);
-                        }
-                        
+                        uint8_t origFmtFlag = ((unsigned char *)buf)[12];
+
+                        DLOG(@"[GAME-OBSERVE] v36.133: 0x80FFF495 received — NOT PATCHING (seq=0x%08X, fmtFlag=%u, ret=%zd bytes)",
+                             origSeq, origFmtFlag, ret);
+                        DLOG(@"[GAME-OBSERVE] v36.133: Real client flow: recv 0x80FFF495 -> send 0x000EE007 -> send 0x00FFF493");
+
                         g_handshakeComplete = YES;
                         g_challengeResponded = YES;
-                        
-                        // STEP 2: Enable crypto bypass (forceValidDecrypt + bypass counter)
-                        // When client decrypts this response, hooks will SKIP real decryption
-                        // and return a valid fake plaintext instead
-                        g_forceValidDecrypt = YES;
-                        g_bypassRemaining = 5;  // Allow up to 5 bypasses for multi-step decryption
-                        g_forceValidDecryptFd = fd;
-                        DLOG(@"[CRYPTO-BYPASS] v36.130: forceValidDecrypt=YES bypassRemaining=5 for fd=%d — EncryptUtils hooks will return fake plaintext", fd);
-                        
-                        // STEP 3: Enter intercept mode
-                        if (!g_fakeRespInjected && fd >= 0) {
-                            resetCmdQueue();
-                            g_fakeRespInjected = YES;
-                            g_fakeRespFd = fd;
-                            g_fakeRespActive = YES;
-                            g_waitingForClientCmds = YES;
-                            g_waitingFd = fd;
-                            DLOG(@"[VIRTUAL-QUEUE] v36.130: Waiting for client EE007/FFF493 (encrypt bypass active)");
-                        }
+
+                        // v36.133: DO NOT enable crypto bypass!
+                        //   Real client decrypts 0x80FFF495 payload successfully on its own.
+                        //   Enabling bypass returns fake JSON which client may reject.
+                        // g_forceValidDecrypt = NO;  (already NO by default)
+                        DLOG(@"[GAME-OBSERVE] v36.133: Crypto bypass DISABLED — client will decrypt natively");
+
+                        // v36.133: DO NOT inject fake responses!
+                        //   Real client sends 0x000EE007 + 0x00FFF493 naturally after 0x80FFF495.
+                        //   Fake response injection corrupts the protocol flow.
+                        DLOG(@"[GAME-OBSERVE] v36.133: Virtual queue DISABLED — client will send native packets");
                     } else {
                         [detail appendFormat:@"  *** WARNING: Non-zero status on non-handshake packet (cmd=0x%08X) ***\n", rcmd];
                         DLOG(@"[GAME-PATCH] Non-handshake packet (cmd=0x%08X) status=%u left unchanged", rcmd, status);
