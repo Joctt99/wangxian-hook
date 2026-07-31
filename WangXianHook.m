@@ -709,7 +709,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.147 loaded ===");
+        _log(@"=== WangXianHook v36.148 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3494,13 +3494,15 @@ static int hook_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     // client calls recv() to receive RECV #20/#21. Without this, the
     // g_fakeRespDelivered check below clears POLLIN, and the client never
     // calls recv() again (stuck at "正在进入...").
-    if (g_postBurstState >= 1 && g_postBurstFd >= 0) {
+    // v36.148: Only set POLLIN for inject states (1-5), NOT wait states (10-12).
+    // Wait states require client to SEND first (handled in hook_send).
+    if (g_postBurstState >= 1 && g_postBurstState <= 5 && g_postBurstFd >= 0) {
         for (nfds_t i = 0; i < nfds; i++) {
             if (fds[i].fd == g_postBurstFd) {
                 fds[i].revents |= POLLIN;
                 fds[i].revents &= ~(POLLHUP | POLLERR);
                 if (result <= 0) result = 1;
-                DLOG(@"[FAKE-POLL] v36.144: SET POLLIN for post-BURST fd=%d state=%d", fds[i].fd, g_postBurstState);
+                DLOG(@"[FAKE-POLL] v36.148: SET POLLIN for post-BURST fd=%d state=%d", fds[i].fd, g_postBurstState);
                 break;
             }
         }
@@ -3551,7 +3553,8 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
     // client calls recv() to receive RECV #20/#21. Without this, the
     // g_fakeRespDelivered check below clears readfds, and the client
     // never calls recv() again (stuck at "正在进入...").
-    if (g_postBurstState >= 1 && g_postBurstFd >= 0) {
+    // v36.148: Only set readfds for inject states (1-5), NOT wait states (10-12).
+    if (g_postBurstState >= 1 && g_postBurstState <= 5 && g_postBurstFd >= 0) {
         if (readfds && g_postBurstFd < nfds) {
             FD_SET(g_postBurstFd, readfds);
         }
@@ -3559,7 +3562,7 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
             FD_CLR(g_postBurstFd, exceptfds);
         }
         if (result <= 0) result = 1;
-        DLOG(@"[FAKE-SELECT] v36.144: SET readfds for post-BURST fd=%d state=%d", g_postBurstFd, g_postBurstState);
+        DLOG(@"[FAKE-SELECT] v36.148: SET readfds for post-BURST fd=%d state=%d", g_postBurstFd, g_postBurstState);
     }
     
     // v36.104: If fake response fd is in the except set, clear it
@@ -3805,6 +3808,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
                 DLOG(@"[FAKE-SEND] v36.146: Post-BURST done, cmd=0x%08X seq=0x%08X send-only (no fake response)", newCmd, newSeq);
+            }
+            // v36.148: Advance post-BURST wait states on client SEND.
+            // Real protocol has SEND between each RECV. Wait states (10/11/12)
+            // block recv() until client sends a request, matching real flow.
+            if (g_postBurstState >= 10 && g_postBurstState <= 12 && g_postBurstFd == fd) {
+                int oldState = g_postBurstState;
+                g_postBurstState = g_postBurstState - 8;  // 10→2, 11→3, 12→4
+                DLOG(@"[POST-BURST] v36.148: Client SEND advanced state %d→%d (cmd=0x%08X seq=0x%08X)", oldState, g_postBurstState, newCmd, newSeq);
             }
         }
         if (isNewCmd) {
@@ -4992,13 +5003,22 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     //   RECV #23: cmd=0x16000080 (273 bytes) — scene entity data
     //   RECV #24: cmd=0x80FFF161 (63 bytes) — role attr notifications
     // Without these the client enters heartbeat mode and stays at "正在进入...".
-    // State: 0=idle, 1=RECV#20, 2=RECV#21, 3=RECV#22, 4=RECV#23, 5=RECV#24, 0=done
-    // v36.147: Extended from 2 states to 6 (add RECV #22-24).
+    // v36.148: REAL PROTOCOL has SEND between each RECV. v36.147 injected all
+    // RECVs back-to-back without waiting for client SENDs, causing protocol
+    // mismatch. Now using wait states:
+    //   State 1: inject RECV#20 → state 10 (wait for SEND)
+    //   State 10: client SEND → state 2 (inject RECV#21)
+    //   State 2: inject RECV#21 → state 11 (wait for SEND)
+    //   State 11: client SEND → state 3 (inject RECV#22)
+    //   State 3: inject RECV#22 → state 12 (wait for SEND)
+    //   State 12: client SEND → state 4 (inject RECV#23)
+    //   State 4: inject RECV#23 → state 5 (inject RECV#24, push, no wait)
+    //   State 5: inject RECV#24 → state 0 (done)
     if (g_postBurstState >= 1 && g_postBurstFd == fd) {
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
-            g_postBurstState = 2;
-            DLOG(@"[POST-BURST] v36.142: Injected RECV #20 (71B session token) fd=%d state=2", fd);
+            g_postBurstState = 10;  // v36.148: wait for client SEND
+            DLOG(@"[POST-BURST] v36.148: Injected RECV #20 (71B session token) fd=%d state=10 (wait SEND)", fd);
             return 71;
         }
         if (g_postBurstState == 2 && len >= 840) {
@@ -5008,20 +5028,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
-            g_postBurstState = 3;  // v36.147: was 0, now go to state 3 for RECV #22
-            DLOG(@"[POST-BURST] v36.147: Injected RECV #21 (840B map data) fd=%d state=3", fd);
+            g_postBurstState = 11;  // v36.148: wait for client SEND
+            DLOG(@"[POST-BURST] v36.148: Injected RECV #21 (840B map data) fd=%d state=11 (wait SEND)", fd);
             return 840;
         }
         if (g_postBurstState == 3 && len >= 27) {
             memcpy(buf, kRecv22Data, 27);
-            g_postBurstState = 4;
-            DLOG(@"[POST-BURST] v36.147: Injected RECV #22 (27B enter-game ack) fd=%d state=4", fd);
+            g_postBurstState = 12;  // v36.148: wait for client SEND
+            DLOG(@"[POST-BURST] v36.148: Injected RECV #22 (27B enter-game ack) fd=%d state=12 (wait SEND)", fd);
             return 27;
         }
         if (g_postBurstState == 4 && len >= 273) {
             memcpy(buf, kRecv23Data, 273);
-            g_postBurstState = 5;
-            DLOG(@"[POST-BURST] v36.147: Injected RECV #23 (273B scene data) fd=%d state=5", fd);
+            g_postBurstState = 5;  // v36.148: RECV#24 is push, no wait
+            DLOG(@"[POST-BURST] v36.148: Injected RECV #23 (273B scene data) fd=%d state=5", fd);
             return 273;
         }
         if (g_postBurstState == 5 && len >= 63) {
@@ -5029,8 +5049,14 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             g_postBurstState = 0;
             g_fakeRespActive = NO;
             g_postBurstDone = YES;
-            DLOG(@"[POST-BURST] v36.147: Injected RECV #24 (63B attrs) fd=%d state=0 (done)", fd);
+            DLOG(@"[POST-BURST] v36.148: Injected RECV #24 (63B attrs) fd=%d state=0 (done)", fd);
             return 63;
+        }
+        // v36.148: wait states (10/11/12) return EAGAIN, poll/select won't
+        // signal POLLIN. Client must SEND first to advance state.
+        if (g_postBurstState >= 10 && g_postBurstState <= 12) {
+            errno = EAGAIN;
+            return -1;
         }
     }
 
@@ -7504,7 +7530,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.147 - EXTEND POST-BURST TO INCLUDE RECV #22/#23/#24");
+    DLOG(@"[VERSION] WangXianHook v36.148 - WAIT STATES: RECV INJECTION MATCHES REAL SEND-RECV PAIRING");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
