@@ -1,6 +1,6 @@
 #import "ProtocolPatcher.h"
 /**
- * WangXianHook v36.130: SIMPLE status patch + EncryptUtils Hook (FIXED RECURSION BUG)
+ * WangXianHook v36.131: C++ CCFileUtils::rsaDecryptLarge Hook (FIX CRASH)
  *
  * v36.130 CRITICAL FIX (RECURSION BUG):
  *   v36.129 had INFINITE RECURSION in non-bypass path: method_getImplementation()
@@ -5058,7 +5058,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         // STEP 1: Simple status patch (1→0)
                         if (status != 0) {
                             ((unsigned char *)buf)[12] = 0;
-                            DLOG(@"[GAME-PATCH] v36.130: Patched 0x80FFF495 status %u→0 (seq=0x%08X, ret=%zd bytes)",
+                            DLOG(@"[GAME-PATCH] v36.131: Patched 0x80FFF495 status %u→0 (seq=0x%08X, ret=%zd bytes)",
                                  status, origSeq, ret);
                             // v36.130: VERIFY the patch was applied to the ACTUAL buffer
                             DLOG(@"[VERIFY] v36.130: buf[12] after patch = %u (should be 0)", ((unsigned char *)buf)[12]);
@@ -6541,6 +6541,249 @@ static void installEncryptUtilsHooks_v130(void) {
 }
 
 // ============================================================
+#pragma mark - C++ Crypto Hook (v36.131 - FIX CRASH)
+// ============================================================
+// CRITICAL FINDING (v36.130 crash analysis):
+//   Client uses cocos2d::CCFileUtils::rsaDecryptLarge (C++), NOT EncryptUtils (ObjC).
+//   EncryptUtils is called indirectly, but C++ code is the actual entry point.
+//   Hook strategy:
+//     1. Keep EncryptUtils hooks for ObjC path (login cert verification)
+//     2. ADD C++ function hooks using rebind_symbols for CCFileUtils::rsaDecryptLarge
+//     3. When forceValidDecrypt=YES, return empty string immediately
+//
+// The crash in v36.130:
+//   -[_NSInlineData UTF8String]: unrecognized selector
+//   C++ code got NSData back from EncryptUtils hook, tried UTF8String on it.
+//   Fix: Hook at C++ level, return std::string directly.
+//
+// v36.131 CRITICAL FIX:
+//   Previous cpp_stub_force had WRONG register handling:
+//   - It constructed std::string on stack (sp+16), NOT in x0 output buffer
+//   - ARM64 ABI: return value std::string is written to x0 (output buffer)
+//   - Calling convention: x0=output_buf, x1=this, x2=arg1, x3=arg2
+//   Fixed: Write empty string directly to x0 buffer, keep all args unchanged
+//   For original call: restore frame, BR to original (not BL, no new frame)
+
+static BOOL g_cppCryptoHooksInstalled = NO;
+
+// Saved original C++ function pointers
+typedef struct {
+    void *orig_rsaDecryptLarge;
+    void *orig_rsaDecryptData;
+} CppCryptoOrig;
+
+static CppCryptoOrig g_cppOrig = {NULL, NULL};
+
+// Empty string constant
+static const char g_cppEmptyStr[] = "";
+
+// Success response string for bypass
+static const char g_cppSuccessStr[] = "{\"code\":0,\"msg\":\"success\",\"data\":{\"result\":true}}";
+
+// ARM64 assembly stub for CCFileUtils::rsaDecryptLarge
+// C++ member function ABI (ARM64):
+//   x0 = output buffer (24 bytes for std::string: ptr, len, cap)
+//   x1 = this pointer
+//   x2 = first arg (std::string const&)
+//   x3 = second arg (std::string const&)
+// Return: std::string written to x0 buffer, x0 stays as buffer ptr
+__attribute__((naked))
+static void* cpp_stub_force(void* self, void* data, void* key) {
+    asm volatile(
+        // Save frame
+        "stp x29, x30, [sp, #-16]!\n"
+        "mov x29, sp\n"
+        
+        // Check g_forceValidDecrypt flag
+        "adrp x3, g_forceValidDecrypt@PAGE\n"
+        "add x3, x3, g_forceValidDecrypt@PAGEOFF\n"
+        "ldr w4, [x3]\n"
+        "cbnz w4, 2f\n"  // If forceValidDecrypt != 0, goto return_success
+        
+        // Normal path: call original function (tail call)
+        // Restore frame, then branch to original (no new call frame)
+        "ldp x29, x30, [sp], #16\n"
+        "b %[origFunc]\n"
+        
+        // forceValidDecrypt path: return success std::string
+        "2:\n"
+        // Write success string to x0 output buffer (caller's buffer)
+        // x0 = output buffer ptr (already set by caller, don't change it)
+        "adrp x3, %[successStr]@PAGE\n"
+        "add x3, x3, %[successStr]@PAGEOFF\n"
+        "str x3, [x0, #0]\n"      // data_ = g_cppSuccessStr
+        "mov x3, #37\n"           // length of success string
+        "str x3, [x0, #8]\n"      // length_ = 37
+        "str x3, [x0, #16]\n"     // capacity_ = 37 (or 0, either works)
+        // Keep x0 pointing to output buffer
+        "ldp x29, x30, [sp], #16\n"
+        "ret\n"
+        :
+        : [origFunc] "S"(g_cppOrig.orig_rsaDecryptLarge),
+          [successStr] "S"(g_cppSuccessStr)
+        : "x0", "x1", "x2", "x3", "x4", "x29", "x30", "memory"
+    );
+}
+
+// Install C++ crypto hooks using rebind_symbols
+static void installCppCryptoHooks_v131(void) {
+    if (g_cppCryptoHooksInstalled) return;
+    
+    DLOG(@"[CPP-CRYPTO] v36.131: Installing C++ crypto hooks for CCFileUtils::rsaDecryptLarge...");
+    
+    // The mangled name for cocos2d::CCFileUtils::rsaDecryptLarge
+    // std::string rsaDecryptLarge(std::string const&, std::string const&)
+    const char* mangledName = "_ZN7cocos2d11CCFileUtils15rsaDecryptLargeENSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_";
+    
+    void* sym = NULL;
+    int imageCount = (int)_dyld_get_image_count();
+    
+    // Search in game binary and dylibs
+    for (int i = 0; i < imageCount; i++) {
+        const char* imageName = _dyld_get_image_name(i);
+        if (!imageName) continue;
+        
+        if (strstr(imageName, "wangxian") || 
+            strstr(imageName, "WangXian") ||
+            strstr(imageName, "lnSignature") ||
+            strstr(imageName, "libSupport")) {
+            
+            DLOG(@"[CPP-CRYPTO] Searching in image %d: %s", i, imageName);
+            
+            void* handle = dlopen(imageName, RTLD_LAZY | RTLD_NOLOAD);
+            if (handle) {
+                void* sym2 = dlsym(handle, mangledName);
+                if (sym2) {
+                    sym = sym2;
+                    DLOG(@"[CPP-CRYPTO] FOUND %s at %p in %s", mangledName, sym, imageName);
+                    dlclose(handle);
+                    break;
+                }
+                dlclose(handle);
+            }
+        }
+    }
+    
+    // If not found, try alternative names
+    if (!sym) {
+        DLOG(@"[CPP-CRYPTO] First search failed, trying alternate mangled names...");
+        
+        const char* altNames[] = {
+            "_ZN7cocos2d11CCFileUtils15rsaDecryptLargeENSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_",
+            "_ZN7cocos2d11CCFileUtils15rsaDecryptLargeE",
+            NULL
+        };
+        
+        for (int j = 0; altNames[j]; j++) {
+            for (int i = 0; i < imageCount; i++) {
+                const char* imageName = _dyld_get_image_name(i);
+                if (!imageName) continue;
+                
+                if (strstr(imageName, "wangxian") || 
+                    strstr(imageName, "WangXian") ||
+                    strstr(imageName, "lnSignature") ||
+                    strstr(imageName, "libSupport")) {
+                    
+                    void* handle = dlopen(imageName, RTLD_LAZY | RTLD_NOLOAD);
+                    if (handle) {
+                        void* sym2 = dlsym(handle, altNames[j]);
+                        if (sym2) {
+                            sym = sym2;
+                            DLOG(@"[CPP-CRYPTO] FOUND '%s' at %p in %s", altNames[j], sym, imageName);
+                            dlclose(handle);
+                            break;
+                        }
+                        dlclose(handle);
+                    }
+                }
+                if (sym) break;
+            }
+            if (sym) break;
+        }
+    }
+    
+    if (sym) {
+        g_cppOrig.orig_rsaDecryptLarge = sym;
+        DLOG(@"[CPP-CRYPTO] Original rsaDecryptLarge at %p", sym);
+        
+        // Get the header of the main executable
+        const mach_header* mainHeader = (const mach_header*)_dyld_get_image_header(0);
+        if (mainHeader) {
+            DLOG(@"[CPP-CRYPTO] Main header: %p, rebinding...", mainHeader);
+            
+            struct rebind_symbol rebinds[] = {
+                { mangledName, cpp_stub_force }
+            };
+            
+            int result = rebind_symbols_image(mainHeader, NULL, rebinds, 1);
+            DLOG(@"[CPP-CRYPTO] rebind_symbols_image result: %d", result);
+            
+            if (result == 0) {
+                DLOG(@"[CPP-CRYPTO] v36.131: C++ crypto hooks installed successfully!");
+                g_cppCryptoHooksInstalled = YES;
+            } else {
+                DLOG(@"[CPP-CRYPTO] v36.131: rebind_symbols_image failed (result=%d). Trying dlopen approach...", result);
+                
+                // Alternative: dlopen and use rebind_symbols on that handle
+                void* mainHandle = dlopen(NULL, RTLD_LAZY);
+                if (mainHandle) {
+                    struct rebind_symbol rebinds2[] = {
+                        { mangledName, cpp_stub_force }
+                    };
+                    int result2 = rebind_symbols_image(
+                        (const mach_header*)_dyld_get_image_header(0),
+                        NULL,
+                        rebinds2,
+                        1
+                    );
+                    DLOG(@"[CPP-CRYPTO] Second rebind attempt result: %d", result2);
+                    if (result2 == 0) {
+                        g_cppCryptoHooksInstalled = YES;
+                        DLOG(@"[CPP-CRYPTO] v36.131: C++ crypto hooks installed via second attempt!");
+                    }
+                }
+            }
+        }
+    } else {
+        DLOG(@"[CPP-CRYPTO] FAILED to find rsaDecryptLarge symbol.");
+        DLOG(@"[CPP-CRYPTO] Will dump all rsaDecrypt-related symbols for debugging...");
+        
+        // Dump symbols containing "rsaDecrypt" or "CCFileUtils"
+        for (int i = 0; i < imageCount; i++) {
+            const char* imageName = _dyld_get_image_name(i);
+            if (!imageName) continue;
+            
+            if (strstr(imageName, "wangxian") || strstr(imageName, "WangXian")) {
+                DLOG(@"[CPP-CRYPTO] Searching in: %s", imageName);
+                
+                void* handle = dlopen(imageName, RTLD_LAZY | RTLD_NOLOAD);
+                if (handle) {
+                    const char* patterns[] = {
+                        "rsaDecryptLarge",
+                        "rsaDecryptData",
+                        "CCFileUtils",
+                        "encryptData",
+                        "decryptData",
+                        NULL
+                    };
+                    
+                    for (int p = 0; patterns[p]; p++) {
+                        void* sym2 = dlsym(handle, patterns[p]);
+                        if (sym2) {
+                            DLOG(@"[CPP-CRYPTO] Found '%s' at %p", patterns[p], sym2);
+                        }
+                    }
+                    dlclose(handle);
+                }
+                break;
+            }
+        }
+    }
+    
+    DLOG(@"[CPP-CRYPTO] v36.131: installCppCryptoHooks completed (installed=%d)", g_cppCryptoHooksInstalled);
+}
+
+// ============================================================
 #pragma mark - Constructor - MINIMAL + observer hooks
 // ============================================================
 
@@ -6562,7 +6805,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.130 - SIMPLE status patch + EncryptUtils Hook (FIXED RECURSION BUG)");
+    DLOG(@"[VERSION] WangXianHook v36.131 - C++ CCFileUtils::rsaDecryptLarge Hook (FIX CRASH)");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
@@ -6570,9 +6813,9 @@ static void installAllHooks(void) {
 #endif
     installKeyboardProtection();
     
-    // v36.130: Install EncryptUtils hooks (FIXED RECURSION BUG - save orig IMPs)
-    // CRITICAL: Client uses EncryptUtils for RSA/AES decryption of 0x80FFF495 response
-    installEncryptUtilsHooks_v130();
+    // v36.131: Install C++ crypto hooks (REPLACE EncryptUtils with CCFileUtils patch)
+    // CRITICAL: Client uses cocos2d::CCFileUtils::rsaDecryptLarge (C++), NOT EncryptUtils (ObjC)
+    installCppCryptoHooks_v131();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
