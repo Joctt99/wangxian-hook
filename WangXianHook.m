@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.5-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.6-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7675,10 +7675,12 @@ static void installCppCryptoHooks_v131(void) {
 #pragma mark - v37.0 Minimal Recv Hook (login server patches only)
 // ============================================================
 
-// v37.2: Patch login server response data in-place
-// ONLY patches 0x802EE118/120/121 — status + 维护→运行 + 版本过低 strings
-// v37.2 FIX: Early return for non-login-server cmds to avoid corrupting game server
-//            encrypted traffic (which may accidentally contain matching byte patterns)
+// v37.6: Patch login server response data in-place
+// ONLY patches status byte for 0x802EE118/120/121 — NO string modifications
+// v37.6 FIX: v37.1-v37.4 patched status + cleared strings, which corrupted
+//            response body → '网络连接中断'. v37.5 disabled recv hook entirely
+//            → '版本过低' returned. v37.6: ONLY patch status=4→0, leave body intact.
+//            Client sees status=0 (success) + original body → parses server list correctly.
 static void patchLoginServerData(uint8_t *data, ssize_t len) {
     if (len < 8) return;
 
@@ -7693,40 +7695,15 @@ static void patchLoginServerData(uint8_t *data, ssize_t len) {
 
     DLOG(@"[RECV-PATCH] Login server response cmd=0x%08X len=%zd", cmd, len);
 
-    // Patch status byte for login server responses
+    // v37.6: ONLY patch status byte — do NOT modify response body
     if (len >= 13 && data[12] != 0) {
         DLOG(@"[RECV-PATCH] cmd=0x%08X status: %d -> 0", cmd, data[12]);
         data[12] = 0;
     }
 
-    // Replace "维护" with "运行" in login server responses only (UTF-8)
-    // 维护 = E7 BB B4 E6 8A A4, 运行 = E8 BF 90 E8 A1 8C
-    for (ssize_t i = 0; i <= len - 6; i++) {
-        if (data[i] == 0xE7 && data[i+1] == 0xBB && data[i+2] == 0xB4 &&
-            data[i+3] == 0xE6 && data[i+4] == 0x8A && data[i+5] == 0xA4) {
-            data[i] = 0xE8; data[i+1] = 0xBF; data[i+2] = 0x90;
-            data[i+3] = 0xE8; data[i+4] = 0xA1; data[i+5] = 0x8C;
-            DLOG(@"[RECV-PATCH] 替换 '维护' -> '运行' at offset %zd", i);
-        }
-    }
-
-    // Clear "版本过低" (UTF-8: E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E)
-    static const uint8_t versionLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= len - 12; i++) {
-        if (memcmp(data + i, versionLow, 12) == 0) {
-            memset(data + i, 0x20, 12);
-            DLOG(@"[RECV-PATCH] 清除 '版本过低' at offset %zd", i);
-        }
-    }
-
-    // Clear "当前版本" (UTF-8: E5 BD 93 E5 89 8D E7 89 88 E6 9C AC)
-    static const uint8_t curVersion[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
-    for (ssize_t i = 0; i <= len - 12; i++) {
-        if (memcmp(data + i, curVersion, 12) == 0) {
-            memset(data + i, 0x20, 12);
-            DLOG(@"[RECV-PATCH] 清除 '当前版本' at offset %zd", i);
-        }
-    }
+    // v37.6: DISABLED all string replacements — they corrupt response body
+    // "维护"→"运行", "版本过低" clear, "当前版本" clear all removed.
+    // Client receives status=0 + original body, parses server list natively.
 }
 
 // v37.0: Minimal recv hook — patches login server responses ONLY
@@ -7772,7 +7749,7 @@ static ssize_t hook_recvmsg_minimal(int fd, struct msghdr *msg, int flags) {
 
 // v37.0: Install minimal recv hooks (login server patches only, no game server mods)
 static void installMinimalSocketHooks(void) {
-    DLOG(@"[SOCK-MINIMAL] v37.4: Installing minimal recv hooks (login server patches only)...");
+    DLOG(@"[SOCK-MINIMAL] v37.6: Installing minimal recv hooks (status-only patch)...");
 
     int r = rebindSymbol("_recv", (void *)hook_recv_minimal, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom_minimal, (void **)&orig_recvfrom);
@@ -7808,7 +7785,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.5-MINIMAL — NO recv patches, native protocol, UIAlertView suppress");
+    DLOG(@"[VERSION] WangXianHook v37.6-MINIMAL — status-only patch, no body modification");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
@@ -7830,13 +7807,11 @@ static void installAllHooks(void) {
     // v37.1: DISABLED full socket hooks (send/recv/poll/select break native protocol)
     // installSocketHooks();
 
-    // v37.5: DISABLED minimal recv hooks — patchLoginServerData corrupts 0x802EE121
-    //        response by changing status=4→0 and clearing 版本过低 string.
-    //        capture_real.js (Frida diagnostic, which WORKED) never patched any
-    //        login server response. status=4 is NORMAL, not an error. Client
-    //        parses the original response correctly and connects to game server.
-    //        版本过低 popup is suppressed by UIAlertView.show hook instead.
-    // installMinimalSocketHooks();
+    // v37.6: RESTORED minimal recv hooks — ONLY patch status byte (no string mods)
+    //        v37.5 disabled recv hook entirely → '版本过低' returned
+    //        v37.1-v37.4 patched status + strings → '网络连接中断' (body corrupted)
+    //        v37.6: ONLY patch status=4→0, leave body intact → client parses correctly
+    installMinimalSocketHooks();
 
     // v37.0: DISABLED — C++ function patches (quitFromServer/heartbeat) break connection
     // proactivePatchCppFunctions();
