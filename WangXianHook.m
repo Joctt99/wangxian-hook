@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.33-DIST loaded ===");
+        _log(@"=== WangXianHook v37.34-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8195,10 +8195,31 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             }
         }
         patchCount = chCount + dmCount + gpCount;
-        if (patchCount > 0) {
+        // v37.34: If plaintext looks like FFF493#2 stub JSON (starts with
+        // {"username": ..., "password": and does NOT contain "accountId"),
+        // then automatically append the missing fields that the canonical
+        // channel builder adds but our stub skips. This inflates 612B → ~1000B.
+        // We insert fields before the trailing '}' to keep valid JSON format.
+        BOOL addStubExt = NO;
+        if (op == 0 && dataInLen >= 200 && dataInLen <= 800) {
+            const char *dp = (const char *)dataIn;
+            if (dp[0] == '{' && dp[1] == '"') {
+                // First key should be username for our stub; canonical starts with accountId
+                BOOL firstIsUsername = (memmem(dp, MIN(dataInLen, (size_t)100),
+                                           "\"username\"", 10) != NULL);
+                BOOL hasAccountId = (memmem(dp, dataInLen,
+                                            "\"accountId\"", 11) != NULL);
+                BOOL hasHasRole = (memmem(dp, dataInLen, "\"hasRole\"", 9) != NULL);
+                if (firstIsUsername && (!hasAccountId || !hasHasRole)) {
+                    addStubExt = YES;
+                }
+            }
+        }
+        if (patchCount > 0 || addStubExt) {
             ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
-            patchedBuf = malloc(newDataInLen + 32); // safety slack
+            size_t cap = newDataInLen + 800; // +800 for stub extension fields
+            patchedBuf = malloc(cap);
             if (patchedBuf) {
                 char *out = (char *)patchedBuf;
                 const char *p = (const char *)dataIn;
@@ -8233,12 +8254,67 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     }
                     *out++ = *p++;
                 }
+                // v37.34: If addStubExt, strip trailing '}' and append extended
+                // fields before re-adding '}'. Inflate ~612B → ~1000B.
+                if (addStubExt && out > (char *)patchedBuf + 2) {
+                    // Rewind trailing newline/whitespace and '}'
+                    char *end = out - 1;
+                    while (end > (char *)patchedBuf &&
+                           (*end == '}' || *end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
+                        end--;
+                    }
+                    // Now end points at last non-whitespace non-} char
+                    char *insertAt = end + 1;
+                    // Build extension string
+                    const char *ext =
+                        ",\"accountId\":\"04957636686538473198\","
+                        "\"hasRole\":\"0\","
+                        "\"serverCode\":\"S100\","
+                        "\"serverName\":\"%E6%B5%8B%E8%AF%95%E6%9C%8D%E5%8A%A1%E5%99%A8\","
+                        "\"serverId\":\"100\","
+                        "\"channel\":\"DYanyou0040_MIESHI\","
+                        "\"platform\":\"IOS\","
+                        "\"verType\":\"FULL\","
+                        "\"gameVer\":\"7.6.3\","
+                        "\"userLevel\":\"0\","
+                        "\"vipLevel\":\"0\","
+                        "\"loginIp\":\"\","
+                        "\"loginPort\":\"0\","
+                        "\"zoneId\":\"0\","
+                        "\"mergeId\":\"0\","
+                        "\"lang\":\"zh\","
+                        "\"country\":\"CN\","
+                        "\"characterList\":[],"
+                        "\"serverInfo\":{\"openTime\":\"\",\"state\":\"1\",\"maintainTip\":\"\"},"
+                        "\"registerTime\":\"0\","
+                        "\"deviceId\":\"04957636686538473198\","
+                        "\"udid\":\"04957636686538473198\","
+                        "\"idfa\":\"00000000-0000-0000-0000-000000000000\","
+                        "\"idfv\":\"00000000-0000-0000-0000-000000000000\","
+                        "\"osVer\":\"iOS 15.8\","
+                        "\"jailBreak\":\"0\","
+                        "\"carrier\":\"\u4e2d\u56fd\u8054\u901a\","
+                        "\"mcc\":\"460\","
+                        "\"mnc\":\"01\","
+                        "\"cpuArch\":\"arm64\","
+                        "\"memTotal\":\"3872\","
+                        "\"diskTotal\":\"64\","
+                        "\"batteryLevel\":\"100\","
+                        "\"isEmulator\":\"0\""
+                        "}";
+                    size_t extLen = strlen(ext);
+                    size_t remCap = cap - (size_t)(insertAt - (char *)patchedBuf);
+                    if (extLen <= remCap) {
+                        memcpy(insertAt, ext, extLen);
+                        out = insertAt + extLen;
+                    }
+                }
                 realDataIn = patchedBuf;
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
                 if (logged < 4) {
-                    DLOG(@"[CH-L4] v37.31 patchesTot=%d ch=%d dm=%d gp=%d origLen=%zu newLen=%zu delta=%lld",
-                         patchCount, chCount, dmCount, gpCount, dataInLen, realDataInLen,
+                    DLOG(@"[CH-L4] v37.34 patchesTot=%d ch=%d dm=%d gp=%d stubExt=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, addStubExt ? 1 : 0, dataInLen, realDataInLen,
                          (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
@@ -8248,15 +8324,27 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
     DLOG(@"[CC-AES] %s inLen=%zu (real=%zu) keyLen=%zu", opStr, dataInLen, realDataInLen, keyLen);
 
-    // v37.27: Dump first 80 bytes of ENC plaintext for diagnosis
+    // v37.34: Dump FULL plaintext (not only first 80B) for ENC calls whose size is in
+    // FFF493 range (280-1200 bytes). This lets us see exactly which JSON fields are
+    // present in our stub JSON (604B) vs the 1010B full JSON built by the canonical
+    // channel. Short JSONs only contain username/password/clientId.
     if (op == 0 && realDataIn && realDataInLen > 0) {
-        char hexbuf[260] = {0};
-        int pos = 0;
-        int dumpLen = (int)(realDataInLen < 80 ? realDataInLen : 80);
+        // Diagnostic dump — FFF493 always < 2048 bytes; cap at 2048.
+        int dumpLen = (int)(realDataInLen < 2048 ? realDataInLen : 2048);
+        // HEX + ASCII view
+        NSMutableString *hexStr = [NSMutableString stringWithCapacity:dumpLen * 3 + 200];
+        NSMutableString *ascStr = [NSMutableString stringWithCapacity:dumpLen + 50];
         for (int i = 0; i < dumpLen; i++) {
-            pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "%02x ", (unsigned char)((const char*)realDataIn)[i]);
+            unsigned char c = ((const unsigned char *)realDataIn)[i];
+            [hexStr appendFormat:@"%02X ", c];
+            [ascStr appendFormat:@"%c", (c >= 0x20 && c < 0x7F) ? c : '.'];
         }
-        DLOG(@"[CC-AES-PLAIN] ENC first %dB: %s", dumpLen, hexbuf);
+        static int dumpCount = 0;
+        if (dumpCount < 8) {
+            DLOG(@"[CC-AES-PLAIN-FULL] v37.34 ENC #%d inLen=%zu realLen=%zu HEX: %@", dumpCount, dataInLen, realDataInLen, hexStr);
+            DLOG(@"[CC-AES-PLAIN-FULL] v37.34 ENC #%d ASCII: %@", dumpCount, ascStr);
+            dumpCount++;
+        }
     }
 
     // v37.31 CRITICAL FIX: If we expanded plaintext (patchedBuf != NULL), the
@@ -8390,11 +8478,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.33 %d layers active (L0=strlen/strcmp/strncmp L1=CF L2=NSString L3=memcpy L4=CCCryptENC L5=sendScan L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.34 %d layers active (L0=dead/fishhook-rebind=0 L1=dead L2=NSString L3=dead L4=CCCryptENC+STUB-EXT L5=sendScan L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.33-DIST — v37.32 FFF493#2 was 604B (missing accountId/hasRole 400+ bytes JSON) because init-time DY_MIESHI triggered short JSON build. v37.33 adds L0 fishhooks strlen/strcmp/strncmp so that ALL INIT-TIME reads see DYanyou0040_MIESHI correctly: strlen('DY_MIESHI')→18 (malloc 19B), strcmp(DY_MIESHI, canonical)→0 (branch right). L3 memcpy n>=19 copies full replacement. L1/L2/L4/L5/L6 kept. Expected: construct_NEW_USER_ENTER_SERVER_REQER builds ~1010B FFF493#2 JSON, pkt size≈1432B matches clean.");
+    DLOG(@"[VERSION] WangXianHook v37.34-DIST — v37.33: L0 fishhooks ALL FAILED (strlen/strcmp/memcpy/CFString rebind=0: libSystem inline calls bypass lazy symbol table). FFF493#2 JSON remained stub 612B missing 400B fields. v37.34 two-pronged attack: (A) CC-AES-PLAIN-FULL dumps ENTIRE FFF493#1/#2 plaintext (hex+ascii, 8x) so we can compare fields byte-by-byte vs clean 1010B JSON. (B) Auto stub-extend: if ENC JSON starts with username first (stub signature) + NO accountId/hasRole, append all missing canonical fields (accountId, hasRole, serverCode/serverId/serverName, platform/IOS, verType, gameVer, userLevel, zoneId, characterList:[], serverInfo:{}, deviceId, jailBreak, carrier, cpuArch etc) before trailing }. Inflates 612B → ~1000B to match clean builder. Also L2×2 NSString hooks still work, L4 ch/dm/gp replace kept. Layers L0/L1/L3 were logged as rebind=0 forensically but removed from expectation of effect.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
