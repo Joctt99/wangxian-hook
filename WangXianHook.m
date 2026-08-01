@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.30-DIST loaded ===");
+        _log(@"=== WangXianHook v37.31-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8091,65 +8091,100 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         return -1;
     }
 
-    // L4: ENCRYPT only — scan plaintext dataIn for DY_MIESHI, create patched buffer
+    // L4: ENCRYPT only — scan plaintext dataIn for channel+deviceModel+GPU strings,
+    // create patched buffer with canonical replacements.
+    //
+    // v37.31: Replaces 3 strings (not only channel):
+    //   DY_MIESHI           (9)  → DYanyou0040_MIESHI (18)  +9B each
+    //   iPhone 16 Pro Max   (17) → iPhone7Plus       (11)  -6B each
+    //   Apple Inc. Apple A18 Pro GPU (28) → Apple Inc. Apple A10 GPU (24)  -4B each
+    // Net per occurrence: +9 -6 -4 = -1B.
+    // If all 3 found: -1B. If only channel: +9B.
     const void *realDataIn = dataIn;
     size_t  realDataInLen = dataInLen;
     void   *patchedBuf = NULL;
+    int patchCount = 0;
+    int chCount = 0, dmCount = 0, gpCount = 0;
     if (op == 0 && dataIn && dataInLen >= 9) {
-        int patchCount = 0;
-        // First pass: count occurrences and compute new length
-        const char *scan = (const char *)dataIn;
-        const char *end  = scan + dataInLen;
-        size_t newLen = 0;
-        const char *cur = scan;
-        while (cur + 9 <= end) {
-            if (memcmp(cur, "DY_MIESHI", 9) == 0) {
-                // Ensure it's bounded (not part of longer alphanumeric)
-                char prev = (cur > scan) ? *(cur-1) : 0;
-                char next = (cur + 9 < end) ? *(cur+9) : 0;
-                BOOL bounded = !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_');
-                bounded = bounded && !((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_');
-                if (bounded) {
-                    const char *base = (const char *)realDataIn;
-                    newLen += (size_t)(cur - (const char *)(base + newLen + patchCount*9 - (patchCount ? 18 : 0)));
-                    patchCount++;
-                }
-                cur += 9;
+        // First pass: count ALL replacements
+        const char *scanP = (const char *)dataIn;
+        const char *scanEnd = scanP + dataInLen;
+        const char *pcur = scanP;
+        chCount = dmCount = gpCount = 0;
+        while (pcur < scanEnd) {
+            size_t rem = (size_t)(scanEnd - pcur);
+            if (rem >= 9 && memcmp(pcur, "DY_MIESHI", 9) == 0) {
+                BOOL bounded = YES;
+                // Only match when it's clearly the channel field (in JSON, between " or delimiters)
+                // To avoid false positives, only match when surrounded by quotes/braces
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 9 < scanEnd) ? *(pcur+9) : 0;
+                bounded = (prev == '"' || prev == ':' || prev == ',' || prev == '{' || prev == '[' || prev == ' ') &&
+                          (next == '"' || next == ',' || next == '}' || next == ']' || next == ' ' || next == '\0' || next == ':');
+                if (bounded) chCount++;
+                pcur += 9;
+            } else if (rem >= 17 && memcmp(pcur, "iPhone 16 Pro Max", 17) == 0) {
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 17 < scanEnd) ? *(pcur+17) : 0;
+                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                if (bounded) dmCount++;
+                pcur += 17;
+            } else if (rem >= 28 && memcmp(pcur, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 28 < scanEnd) ? *(pcur+28) : 0;
+                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                if (bounded) gpCount++;
+                pcur += 28;
             } else {
-                cur++;
+                pcur++;
             }
         }
+        patchCount = chCount + dmCount + gpCount;
         if (patchCount > 0) {
-            // Second pass: build patched buffer
-            size_t extra = (size_t)patchCount * 9; // each replacement adds 9 bytes
-            size_t newDataInLen = dataInLen + extra;
-            patchedBuf = malloc(newDataInLen);
+            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
+            size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
+            patchedBuf = malloc(newDataInLen + 32); // safety slack
             if (patchedBuf) {
                 char *out = (char *)patchedBuf;
                 const char *p = (const char *)dataIn;
                 const char *e = p + dataInLen;
-                while (p + 9 <= e) {
-                    if (memcmp(p, "DY_MIESHI", 9) == 0) {
+                while (p < e) {
+                    size_t rem = (size_t)(e - p);
+                    if (rem >= 9 && memcmp(p, "DY_MIESHI", 9) == 0) {
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 9 < e) ? *(p+9) : 0;
-                        BOOL bounded = !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_');
-                        bounded = bounded && !((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_');
+                        BOOL bounded = (prev == '"' || prev == ':' || prev == ',' || prev == '{' || prev == '[' || prev == ' ') &&
+                                      (next == '"' || next == ',' || next == '}' || next == ']' || next == ' ' || next == '\0' || next == ':');
                         if (bounded) {
                             memcpy(out, "DYanyou0040_MIESHI", 18);
-                            out += 18;
-                            p   += 9;
-                            continue;
+                            out += 18; p += 9; continue;
+                        }
+                    } else if (rem >= 17 && memcmp(p, "iPhone 16 Pro Max", 17) == 0) {
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 17 < e) ? *(p+17) : 0;
+                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        if (bounded) {
+                            memcpy(out, "iPhone7Plus", 11);
+                            out += 11; p += 17; continue;
+                        }
+                    } else if (rem >= 28 && memcmp(p, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 28 < e) ? *(p+28) : 0;
+                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        if (bounded) {
+                            memcpy(out, "Apple Inc. Apple A10 GPU", 24);
+                            out += 24; p += 28; continue;
                         }
                     }
                     *out++ = *p++;
                 }
-                // Copy trailing 8 bytes
-                while (p < e) *out++ = *p++;
                 realDataIn = patchedBuf;
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
-                if (logged < 2) {
-                    DLOG(@"[CH-L4] tag=CCCrypt_ENC patches=%d origLen=%zu newLen=%zu alg=%u", patchCount, dataInLen, realDataInLen, alg);
+                if (logged < 4) {
+                    DLOG(@"[CH-L4] v37.31 patchesTot=%d ch=%d dm=%d gp=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, dataInLen, realDataInLen,
+                         (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
             }
@@ -8169,9 +8204,62 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         DLOG(@"[CC-AES-PLAIN] ENC first %dB: %s", dumpLen, hexbuf);
     }
 
+    // v37.31 CRITICAL FIX: If we expanded plaintext (patchedBuf != NULL), the
+    // caller's dataOut buffer is sized for the ORIGINAL plaintext's AES output.
+    // (CCFileUtils::aesEncryptData allocates a fixed stack/heap buffer based on
+    // dataInLen passed to it, NOT our realDataInLen.  orig_CCCrypt will write
+    // past dataOutAvailable → SIGSEGV.)
+    // Workaround: allocate a HEAP dataOutTmp big enough for the expanded input,
+    // run orig_CCCrypt into that, then memcpy the first dataOutAvailable bytes
+    // back to caller's dataOut only if it fits, else return kCCBufferTooSmall.
+    // Actually, to avoid breaking the caller, we MUST pass enough room:
+    //   CCCrypt ENC: dataOutMoved <= dataOutAvailable
+    //   Required: ceil((realDataInLen + blocksize) / blocksize) * blocksize
+    //   AES blocksize=16, with padding (kCCOptionPKCS7Padding usually):
+    //   Worst case: (realDataInLen + 16) & ~0xF
+    // If caller's dataOutAvailable is not enough, use our own buffer.
+    void *tmpOut = NULL;
+    size_t tmpOutSize = 0;
+    if (patchedBuf != NULL) {
+        size_t needed = ((realDataInLen + 15 + 16) / 16) * 16;  // with padding worst case
+        if (dataOutAvailable < needed) {
+            tmpOutSize = needed + 16; // extra safety margin
+            tmpOut = malloc(tmpOutSize);
+            DLOG(@"[CH-L4-BUF] v37.31: caller dataOutAvailable=%zu < needed=%zu → use heap tmpOut=%p (tmpOutSize=%zu)",
+                 dataOutAvailable, needed, tmpOut, tmpOutSize);
+        }
+    }
+    void *outBuf = tmpOut ? tmpOut : dataOut;
+    size_t outBufAvail = tmpOut ? tmpOutSize : dataOutAvailable;
+    size_t outMovedTmp = 0;
     int ret = orig_CCCrypt(op, alg, options, key, keyLen, iv,
                            realDataIn, realDataInLen,
-                           dataOut, dataOutAvailable, dataOutMoved);
+                           outBuf, outBufAvail, tmpOut ? &outMovedTmp : dataOutMoved);
+
+    if (tmpOut) {
+        if (ret == 0 && outMovedTmp > 0) {
+            // Now copy back as much as possible. But caller buffer is too small!
+            // Instead of truncating silently, we do: call orig AGAIN with caller's
+            // dataOutAvailable (should return kCCBufferTooSmall, then caller knows).
+            // But actually the PROPER fix is to let caller understand the longer
+            // output. Since we can't easily grow caller's stack buffer, we simply
+            // memcpy data into caller's buffer up to its size and set dataOutMoved
+            // to what we COULD copy — BUT THIS IS WRONG because it corrupts tail.
+            // Better approach: ONLY apply the patch IF dataOutAvailable is already
+            // large enough. If not, do NOT patch: send the unmodified plaintext
+            // (preserve original dataIn, reset realDataIn=realDataInLen, free
+            // patchedBuf, call orig_CCCrypt again with original parameters).
+            DLOG(@"[CH-L4-BUF] v37.31: tmpOut produced %zu bytes but caller dataOutAvailable=%zu < needed. FALLBACK: call CCCrypt without patch.",
+                 outMovedTmp, dataOutAvailable);
+            free(tmpOut);
+            if (patchedBuf) { free(patchedBuf); patchedBuf = NULL; realDataIn = dataIn; realDataInLen = dataInLen; }
+            ret = orig_CCCrypt(op, alg, options, key, keyLen, iv,
+                               dataIn, dataInLen,
+                               dataOut, dataOutAvailable, dataOutMoved);
+        } else {
+            free(tmpOut);
+        }
+    }
 
     if (patchedBuf) free(patchedBuf);
 
@@ -8225,7 +8313,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.30-DIST — EE007 FIELD-ALIGN (channel+deviceModel+GPU) match clean 178B, CCCrypt L4 hook gated active (v37.28 safe)");
+    DLOG(@"[VERSION] WangXianHook v37.31-DIST — CCCrypt L4: add deviceModel/GPU replacement (iPhone16ProMax→iPhone7Plus, A18Pro→A10 GPU), fix SIGSEGV via tmpOut heap + buffer-size fallback, EE007 FIELD-ALIGN 178B proven active on 5678+12003 (fieldsMask=7)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
