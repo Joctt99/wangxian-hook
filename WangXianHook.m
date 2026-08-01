@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.7-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.8-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6970,10 +6970,12 @@ static void installSecurityHooks(void) {
         }
     }
     
-    // v37.7: DISABLED DYLD hiding — capture_real.js (which worked) never hid dylibs.
-    //        Hiding injected libraries may trigger client's integrity checks.
-    // installDyldHooks();
-    // installDladdrHook();
+    // v37.8: RESTORED DYLD hiding — Frida diagnostic (hook.txt) confirmed client
+    //        calls _dyld_image_count() 100+ times and detects lnSignature.dylib
+    //        + libSupport.dylib → triggers '版本过低'. DYLD hiding is REQUIRED.
+    //        capture_real.js worked because Frida agent is NOT in dyld list.
+    installDyldHooks();
+    installDladdrHook();
     installDlsymHook();  // KEEP: dlsym hook is in capture_real.js
     
     // Hook fopen/fgets for /proc/self/maps (Linux fallback)
@@ -7786,7 +7788,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.7-MINIMAL — EXACT capture_real.js parity");
+    DLOG(@"[VERSION] WangXianHook v37.8-MINIMAL — DYLD hiding restored (data-driven fix)");
     DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
 
     // === capture_real.js parity: ONLY these hooks ===
@@ -7881,7 +7883,7 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
 
-    _log(@"[INIT] v37.7: capture_real.js parity mode — minimal hooks only");
+    _log(@"[INIT] v37.8: capture_real.js parity + DYLD hiding (data-driven)");
 
     // === DEFERRED: Create log button (keep for debugging) ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -7903,7 +7905,7 @@ static void installAllHooks(void) {
         }
     });
 
-    DLOG(@"[ACT] v37.7: All hooks installed (capture_real.js parity)");
+    DLOG(@"[ACT] v37.8: All hooks installed (capture_real.js parity + DYLD hiding)");
 }
 
 
