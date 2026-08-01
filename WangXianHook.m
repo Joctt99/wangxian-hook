@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.22-DIST loaded ===");
+        _log(@"=== WangXianHook v37.23-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3930,36 +3930,26 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
 
-    // v37.22-DIST: Patch channel name ONLY for game server cmd=0x000EE007.
+    // v37.23-DIST: Patch channel name for cmd=0x000EE007 on ALL ports.
     //
-    // v37.21 FAILED: patched login server cmd=0x002EE121 → signature mismatch,
-    // server sent FIN immediately (happened 3x in a row: EE120→PATCH-EE121→CLOSE).
-    // 0x002EE121 has trailing 16/32/16 byte signature fields that are content
-    // hashes of the ORIGINAL packet body; patching pktLen/channel invalidates
-    // the hash, server kicks for anti-tamper. BUT v37.19 NEVER patched EE121
-    // and it successfully got past login → server-select → click-server, so
-    // the LOGIN server ACCEPTS DY_MIESHI (short channel) with valid signature.
+    // v37.22 FAILED: only patched EE007 on GAME port (12003) but NOT on LOGIN
+    // port (5678). Login server received DY_MIESHI (179B), game server received
+    // DYanyou0040_MIESHI (188B). Server compared the two → MISMATCH → FIN after
+    // FFF493 #2. Both must be consistent.
     //
-    // What actually fails in v37.19 is the GAME server side: cmd=0x000EE007
-    // uses DY_MIESHI but the account is bound to DYanyou0040_MIESHI, so after
-    // receiving two 0x00FFF493 the GAME server sends FIN.
+    // v37.21 proved: cmd=0x002EE121 has anti-tamper signature HASH → can't patch.
+    // But cmd=0x000EE007 is a device-info packet with NO signature (v36.x
+    // UUID-INJECT modified it without login-server kicks). So patching EE007
+    // on port 5678 should be safe.
     //
-    // v37.22 Strategy: channel validation on login vs game server is INDEPENDENT.
-    //   - cmd=0x002EE121 on 5678 : UNTOUCHED. Native DY_MIESHI + valid HASH.
-    //   - cmd=0x000EE007 on game : PATCHED. DY_MIESHI → DYanyou0040_MIESHI,
-    //                               no signature hash on device-info packet
-    //                               (proven because v36.x UUID-INJECT could
-    //                                modify it in earlier versions without kick).
-    //
-    // Risk-mitigation: If game server EE007 also has anti-tamper we will see
-    // the same v37.19-style FIN, but this is the ONLY remaining direction.
-    BOOL isGamePort = (port == 12003 || port == 58158 ||
-                       (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
-    if (isGamePort && len >= 12) {
+    // v37.23: patch EE007 on ALL ports (5678 + 12003 + 58158 + dynamic).
+    //         Do NOT patch any other cmd (EE121 has signature, E002/2EE118/2A018
+    //         break the 0x8002A016 response).
+    if (len >= 12) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        // v37.22: Only patch GAME SERVER cmd=0x000EE007
+        // v37.23: Patch EE007 on ALL ports (login + game)
         if (cmd == 0x000EE007 && len >= 19) {
             const unsigned char needle[11] = {
                 0x00, 0x09, 'D', 'Y', '_', 'M', 'I', 'E', 'S', 'H', 'I'
@@ -3989,10 +3979,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[1] = (newPktLen >> 16) & 0xFF;
                         newBuf[2] = (newPktLen >> 8)  & 0xFF;
                         newBuf[3] =  newPktLen       & 0xFF;
-                        DLOG(@"[CHANNEL-PATCH] v37.22 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
+                        DLOG(@"[CHANNEL-PATCH] v37.23 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
                              fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
                     } else {
-                        DLOG(@"[CHANNEL-PATCH] v37.22 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
+                        DLOG(@"[CHANNEL-PATCH] v37.23 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
                              fd, port, cmd, len, newBufLen, patchOffset);
                     }
                     ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
@@ -4000,14 +3990,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (ret >= 0) return (ssize_t)len;
                     return ret;
                 } else {
-                    DLOG(@"[CHANNEL-PATCH] v37.22: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
+                    DLOG(@"[CHANNEL-PATCH] v37.23: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
                          newBufLen, len, cmd);
                 }
             }
         }
     }
 
-    // v37.22-DIST: For ALL game server packets, call orig_send directly — NO processing (CHANNEL-PATCH applied earlier in this function if cmd=0x000EE007).
+    // v37.23-DIST: For ALL game server packets, call orig_send directly — NO processing (CHANNEL-PATCH applied earlier in this function if cmd=0x000EE007).
     // Added verbose FULL hex dump for 0x000EE007 and 0x00FFF493 so we can do byte-by-byte
     // comparison against the clean (non-injected) client capture (hook.txt).
     if (len >= 8 && (port == 12003 || port == 58158 ||
@@ -4033,7 +4023,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
-        DLOG(@"[SEND-DIRECT] v37.22: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH)", cmd, len, port, ret);
+        DLOG(@"[SEND-DIRECT] v37.23: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH)", cmd, len, port, ret);
         return ret;
     }
 
@@ -6988,7 +6978,7 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
         NSUUID *real = orig_identifierForVendor(self, _cmd);
         static BOOL logged = NO;
         if (!logged) {
-            DLOG(@"[IDFV-HOOK] v37.22-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
+            DLOG(@"[IDFV-HOOK] v37.23-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
             logged = YES;
         }
         return real;
@@ -7918,7 +7908,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.22-DIST — CHANNEL-PATCH ONLY game cmd=0x000EE007 (login cmd=0x002EE121 UNTOUCHED, preserves signature hash)");
+    DLOG(@"[VERSION] WangXianHook v37.23-DIST — CHANNEL-PATCH cmd=0x000EE007 on ALL ports (login+game consistent channel)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
