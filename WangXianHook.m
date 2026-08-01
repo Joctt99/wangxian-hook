@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.17-RESTORE loaded ===");
+        _log(@"=== WangXianHook v37.18-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3930,20 +3930,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
 
-    // v37.17: For game server 0x000EE007 packets, call orig_send directly — NO processing.
-    // User confirmed: send hook processing (DEVICE-INFO capture, CMD-QUEUE, CMD-TRACK, etc.)
-    // corrupts packet structure → server validation fails → connection closed.
-    if (len >= 12 && (port == 12003 || port == 58158 ||
+    // v37.18: For ALL game server packets, call orig_send directly — NO processing.
+    // User goal: distributable IPA with hooks. Server closes connection after receiving
+    // processed packets. Skip ALL send hook processing for game server ports.
+    if (len >= 8 && (port == 12003 || port == 58158 ||
                       (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024))) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (cmd == 0x000EE007) {
-            // Direct orig_send — no DEVICE-INFO capture, no UUID-INJECT, no CMD-QUEUE, no CMD-TRACK
-            ssize_t ret = orig_send(fd, buf, len, flags);
-            DLOG(@"[SEND-DIRECT] v37.17: cmd=0x000EE007 len=%zu port=%d ret=%zd (NO processing)", len, port, ret);
-            return ret;
-        }
+        // Direct orig_send for ALL game server commands — no processing at all
+        ssize_t ret = orig_send(fd, buf, len, flags);
+        DLOG(@"[SEND-DIRECT] v37.18: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct)", cmd, len, port, ret);
+        return ret;
     }
 
     void *sendBuf = (void *)buf;
@@ -7815,7 +7813,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.16-RESTORE — disabled UUID-INJECT + CLOSE-BLOCK");
+    DLOG(@"[VERSION] WangXianHook v37.18-DIST — ALL game server packets direct orig_send (distributable IPA)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
