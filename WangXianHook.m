@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.29-DIST loaded ===");
+        _log(@"=== WangXianHook v37.30-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3953,72 +3953,116 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
 
-    // v37.23-DIST: Patch channel name for cmd=0x000EE007 on ALL ports.
+    // v37.30-DIST: EE007 FIELD-ALIGNED reconstruction.
     //
-    // v37.22 FAILED: only patched EE007 on GAME port (12003) but NOT on LOGIN
-    // port (5678). Login server received DY_MIESHI (179B), game server received
-    // DYanyou0040_MIESHI (188B). Server compared the two → MISMATCH → FIN after
-    // FFF493 #2. Both must be consistent.
+    // Byte-level analysis (EE007-ORIG 179B vs clean 178B):
+    //   FIELD         | CLEAN (178B)            | OURS (179B)               | DIFF
+    //   deviceId(20)  | 00 14 "6565788104..."    | 00 14 "049576366..."       | 0
+    //   channel       | 00 12 "DYanyou0040_M..."  | 00 09 "DY_MIESHI"          | -9B
+    //   deviceModel   | 00 0B "iPhone7Plus"(11)  | 00 11 "iPhone 16 Pro Max"(17) | +6B
+    //   GPU           | 00 18 "Apple A10 GPU"(24)| 00 1C "Apple A18 Pro GPU"(28) | +4B
+    //   NET SUM       |                         |                            | +1B → 179 vs 178
     //
-    // v37.21 proved: cmd=0x002EE121 has anti-tamper signature HASH → can't patch.
-    // But cmd=0x000EE007 is a device-info packet with NO signature (v36.x
-    // UUID-INJECT modified it without login-server kicks). So patching EE007
-    // on port 5678 should be safe.
-    //
-    // v37.23: patch EE007 on ALL ports (5678 + 12003 + 58158 + dynamic).
-    //         Do NOT patch any other cmd (EE121 has signature, E002/2EE118/2A018
-    //         break the 0x8002A016 response).
+    // After channel replacement (+9B), our EE007 becomes 188B, but clean should be
+    // 178B +9B channel extra? NO. Clean EE007 is 178B with DYanyou0040 (18B).
+    // Our raw EE007 is 179B with DY_MIESHI (9B). So after channel fix we should
+    // end at 179 + 9 = 188B. But clean is 178B at construction (DYanyou0040 18B).
+    // So we must also SHRINK deviceModel (00 11→00 0B, "iPhone 16 Pro Max"→"iPhone7Plus")
+    // and shrink GPU (00 1C→00 18, "Apple A18 Pro GPU"→"Apple A10 GPU").
+    // Net changes: +9(channel) -6(model) -4(GPU) = -1B.  Starting 179B → 178B.
     if (len >= 12) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        // v37.23: Patch EE007 on ALL ports (login + game)
-        if (cmd == 0x000EE007 && len >= 19) {
-            const unsigned char needle[11] = {
-                0x00, 0x09, 'D', 'Y', '_', 'M', 'I', 'E', 'S', 'H', 'I'
-            };
-            size_t patchOffset = (size_t)-1;
-            for (size_t i = 8; i + 11 <= len; i++) {
-                if (memcmp(p + i, needle, 11) == 0) {
-                    patchOffset = i;
-                    break;
-                }
+        if (cmd == 0x000EE007 && len >= 100) {
+            // Locate each TLV field by scanning from offset 12 (after cmd+seq+pktLen)
+            // EE007 header: pktLen(4) + cmd(4) + seq(4) = 12 bytes
+            size_t off = 12;
+            size_t chOff = (size_t)-1; // channel TLV
+            size_t dmOff = (size_t)-1; // deviceModel TLV
+            size_t gpOff = (size_t)-1; // GPU TLV
+            while (off + 2 < len) {
+                uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
+                if (off + 2 + fLen > len) break;
+                const unsigned char *val = p + off + 2;
+                // field detection by content match
+                if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
+                else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) dmOff = off;
+                else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) gpOff = off;
+                // or fallback: if value contains known strings
+                else if (chOff == (size_t)-1 && fLen >= 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
+                else if (dmOff == (size_t)-1 && fLen >= 11 && (memmem(val, fLen, "iPhone", 6) != NULL)) dmOff = off;
+                else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
+                off += 2 + fLen;
             }
-            if (patchOffset != (size_t)-1) {
-                size_t newBufLen = len + 9;
-                unsigned char *newBuf = (unsigned char *)malloc(newBufLen);
-                if (newBuf) {
-                    memcpy(newBuf, p, patchOffset);
-                    newBuf[patchOffset]      = 0x00;
-                    newBuf[patchOffset + 1]  = 0x12;
-                    memcpy(newBuf + patchOffset + 2, "DYanyou0040_MIESHI", 18);
-                    size_t tailLen = len - (patchOffset + 11);
-                    memcpy(newBuf + patchOffset + 20, p + patchOffset + 11, tailLen);
-                    if (len >= 4) {
-                        uint32_t oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                             ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-                        uint32_t newPktLen = oldPktLen + 9;
-                        newBuf[0] = (newPktLen >> 24) & 0xFF;
-                        newBuf[1] = (newPktLen >> 16) & 0xFF;
-                        newBuf[2] = (newPktLen >> 8)  & 0xFF;
-                        newBuf[3] =  newPktLen       & 0xFF;
-                        DLOG(@"[CHANNEL-PATCH] v37.27 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
-                             fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
-                    } else {
-                        DLOG(@"[CHANNEL-PATCH] v37.27 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
-                             fd, port, cmd, len, newBufLen, patchOffset);
-                    }
-                    ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
-                    free(newBuf);
-                    if (ret >= 0) return (ssize_t)len;
-                    return ret;
+            if (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1) {
+                // Reconstruct packet by replacing all 3 fields found
+                // Use dynamic buffer, write from 0 sequentially
+                size_t bufCap = len + 64;
+                unsigned char *newBuf = (unsigned char *)malloc(bufCap);
+                if (!newBuf) {
+                    DLOG(@"[EE007-ALIGN] v37.30: malloc(%zu) FAILED, fallthrough", bufCap);
                 } else {
-                    DLOG(@"[CHANNEL-PATCH] v37.27: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
-                         newBufLen, len, cmd);
+                    memset(newBuf, 0, bufCap);
+                    // Copy header (first 12 bytes: pktLen cmd seq)
+                    memcpy(newBuf, p, 12);
+                    size_t out = 12;
+                    size_t in = 12;
+                    uint32_t fieldsApplied = 0;
+                    while (in + 2 < len) {
+                        uint16_t fLen = ((uint16_t)p[in] << 8) | p[in + 1];
+                        if (in + 2 + fLen > len) break;
+                        if (in == chOff && fLen == 9) {
+                            // replace channel: 00 12 + DYanyou0040_MIESHI
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x12;
+                            memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
+                            out += 20; in += 11; fieldsApplied |= 1;
+                        } else if (in == dmOff) {
+                            // replace deviceModel: 00 0B + iPhone7Plus (11 chars fixed canonical)
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x0B;
+                            memcpy(newBuf + out + 2, "iPhone7Plus", 11);
+                            out += 13; in += 2 + fLen; fieldsApplied |= 2;
+                        } else if (in == gpOff) {
+                            // replace GPU: 00 18 + Apple Inc. Apple A10 GPU (24 chars)
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x18;
+                            memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
+                            out += 26; in += 2 + fLen; fieldsApplied |= 4;
+                        } else {
+                            // unchanged field: copy as-is
+                            memcpy(newBuf + out, p + in, 2 + fLen);
+                            out += 2 + fLen; in  += 2 + fLen;
+                        }
+                    }
+                    // Copy trailing bytes (null terminator + padding + trailer 01 00)
+                    if (in < len) {
+                        size_t tailC = len - in;
+                        memcpy(newBuf + out, p + in, tailC);
+                        out += tailC;
+                    }
+                    // Rewrite pktLen (4 bytes BE at [0])
+                    uint32_t newPktLen = (uint32_t)out;
+                    newBuf[0] = (newPktLen >> 24) & 0xFF;
+                    newBuf[1] = (newPktLen >> 16) & 0xFF;
+                    newBuf[2] = (newPktLen >> 8)  & 0xFF;
+                    newBuf[3] =  newPktLen        & 0xFF;
+                    uint32_t oldPktLen = 0;
+                    if (len >= 4) oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+                    DLOG(@"[EE007-ALIGN] v37.30 port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u)",
+                         port, oldPktLen, newPktLen, fieldsApplied,
+                         (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0);
+                    // Post-alignment hex dump for verification (first 100 bytes)
+                    NSMutableString *ph = [NSMutableString stringWithCapacity:300];
+                    for (size_t i = 0; i < out && i < 100; i++) [ph appendFormat:@"%02X ", newBuf[i]];
+                    DLOG(@"[EE007-ALIGN] v37.30 POST first%zub: %@", out < 100 ? out : (size_t)100, ph);
+                    ssize_t rret = orig_send(fd, newBuf, out, flags);
+                    free(newBuf);
+                    if (rret >= 0) return (ssize_t)len;
+                    return rret;
                 }
             }
         }
     }
+    // NOTE: old CHANNEL-PATCH for DY_MIESHI only is now replaced by EE007-ALIGN above.
 
     // v37.26-DIST: For ALL game server packets, call orig_send directly — NO processing. L5 sendScan + L6 EE007 patch applied earlier.
     // Added verbose FULL hex dump for 0x000EE007 and 0x00FFF493 so we can do byte-by-byte
@@ -7119,20 +7163,20 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
-    // v37.29: CCCrypt hook DISABLED — v37.27/v37.28 proved that even with
-    // g_cccrypt_l4_active gate, fishhook rebind of CCCrypt itself crashes
-    // the app during createSignatureParams (likely infinite recursion or
-    // fishhook corrupts the CCCrypt call chain in SecKey/JudgeApp paths).
-    // Instead, we rely on EE007-ORIG + FFF493 hex dumps for diagnosis.
-    // L4 channel replacement will be done at network layer if needed.
-    // {
-    //     orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
-    //     if (orig_CCCrypt) {
-    //         int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-    //         DLOG(@"[SEC] CCCrypt hook v37.27: rebind=%d addr=%p (ENABLED for L4 plaintext interception)", r1, orig_CCCrypt);
-    //     }
-    // }
-    DLOG(@"[SEC] CCCrypt hook DISABLED (v37.29: fishhook rebind crashes app even with gate)");
+    // v37.30: Restore v37.28 CCCrypt gated hook. USER CONFIRMED v37.28 did NOT
+    // crash — only disconnected. CCCrypt fishhook rebind is SAFE when gated
+    // after 0x80FFF495 (game server phase). We need this to:
+    //   (A) Dump FULL plaintext hex of FFF493 payload before AES encrypt
+    //   (B) Replace DY_MIESHI → DYanyou0040_MIESHI in plaintext before encryption
+    {
+        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
+        if (orig_CCCrypt) {
+            int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+            DLOG(@"[SEC] CCCrypt hook v37.30: rebind=%d addr=%p (GATED after 0x80FFF495 per v37.28 safe)", r1, orig_CCCrypt);
+        } else {
+            DLOG(@"[SEC] CCCrypt not found via dlsym (L4 won't work!)");
+        }
+    }
 
 #if !DISABLE_CRYPTO_HOOKS
     // Hook SecKeyEncrypt / SecKeyDecrypt for RSA logging
@@ -8181,7 +8225,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.29-DIST — CCCrypt hook disabled (crashes app), EE007+FFF493 hex dumps for byte-level diagnosis vs clean 178B/472B/1432B");
+    DLOG(@"[VERSION] WangXianHook v37.30-DIST — EE007 FIELD-ALIGN (channel+deviceModel+GPU) match clean 178B, CCCrypt L4 hook gated active (v37.28 safe)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
