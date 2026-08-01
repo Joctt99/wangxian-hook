@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.20.1-DIST loaded ===");
+        _log(@"=== WangXianHook v37.21-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3930,106 +3930,74 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
 
-    // v37.20-DIST: Patch channel name for LOGIN + GAME servers — fixes
-    // v37.19 "connection interrupted after two 0x00FFF493 packets".
+    // v37.21-DIST: Patch channel name ONLY for two critical commands.
     //
-    // Clean IPA (enterprise cert) has native channel: "DYanyou0040_MIESHI"
-    // (18 bytes, TLV = 00 12  44 59 61 6E 79 6F 75 30 30 34 30 5F 4D 49 45 53 48 49)
-    // After 全能签 re-signing, the bundled cert changes channel to:
-    // "DY_MIESHI" (9 bytes, TLV = 00 09  44 59 5F 4D 49 45 53 48 49)
+    // v37.20/v37.20.1 FAILED: patching 0x0000E002 / 0x002EE118 / 0x0002A018
+    // caused the login server to STOP sending 0x8002A016, freezing the client
+    // at the startup screen ("无法联网"). These 3 packets use the shorter
+    // DY_MIESHI channel but the server ACCEPTS them as-is (v37.19 worked up
+    // to server-click).
     //
-    // Server validates channel matches the registered account channel (kk994
-    // is bound to DYanyou0040 via 0x002EE121). A mismatch causes it to send
-    // TCP FIN immediately after receiving the 2nd 0x00FFF493, i.e. exactly
-    // what we saw in v37.19.
-    //
-    // We find the byte sequence 00 09 DY_MIESHI within the packet body
-    // (starting from offset 8, after the 8-byte header), expand the TLV
-    // length field from 9 → 18, write the clean channel string, move the
-    // trailing bytes forward by 9, and increment the pktLen header (bytes
-    // 0..3) by 9.
-    //
-    // Applies to: LOGIN (5678): cmd=0x0000E002/0x002EE118/0x0002A018/0x002EE121
-    //              GAME (12003/58158/dynamic): cmd=0x000EE007, etc.
-    // Risk: 0x002EE121 has 16/32/16 byte trailing signature fields. If those
-    // are content-hashes of the ORIGINAL body, server will still reject our
-    // modified packet. BUT not patching guarantees a kick, so this is a
-    // strictly better bet, and matches the ONE clean capture.
+    // The TWO commands where channel MUST match DYanyou0040_MIESHI (18B) are:
+    //   (1) cmd=0x002EE121 on port 5678 — account-channel binding register
+    //   (2) cmd=0x000EE007 on game ports — device-info channel verification
+    // These are the ONLY two whose mismatch caused the FIN after FFF493 #2.
     BOOL isLoginOrGame = (port == 5678 || port == 12003 || port == 58158 ||
                           (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
-    if (isLoginOrGame && len >= 19) {
+    if (isLoginOrGame && len >= 12) {
         const unsigned char *p = (const unsigned char *)buf;
-        const unsigned char needle[11] = {
-            0x00, 0x09, 'D', 'Y', '_', 'M', 'I', 'E', 'S', 'H', 'I'
-        };
-        size_t patchOffset = (size_t)-1;
-        for (size_t i = 8; i + 11 <= len; i++) {
-            if (memcmp(p + i, needle, 11) == 0) {
-                patchOffset = i;
-                break;
+        uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                       ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        // v37.21: Only patch 0x002EE121 (login register) or 0x000EE007 (game device info)
+        BOOL shouldPatch = (cmd == 0x002EE121 || cmd == 0x000EE007);
+        if (shouldPatch && len >= 19) {
+            const unsigned char needle[11] = {
+                0x00, 0x09, 'D', 'Y', '_', 'M', 'I', 'E', 'S', 'H', 'I'
+            };
+            size_t patchOffset = (size_t)-1;
+            for (size_t i = 8; i + 11 <= len; i++) {
+                if (memcmp(p + i, needle, 11) == 0) {
+                    patchOffset = i;
+                    break;
+                }
             }
-        }
-        if (patchOffset != (size_t)-1) {
-            size_t newBufLen = len + 9;
-            unsigned char *newBuf = (unsigned char *)malloc(newBufLen);
-            if (newBuf) {
-                // Part 1: copy everything before the TLV we are replacing
-                memcpy(newBuf, p, patchOffset);
-                // Part 2: write the replacement TLV (len=0x0012 + 18-byte str)
-                newBuf[patchOffset]      = 0x00;
-                newBuf[patchOffset + 1]  = 0x12;  // 18 = 0x12
-                memcpy(newBuf + patchOffset + 2, "DYanyou0040_MIESHI", 18);
-                // Part 3: move the tail (originally at patchOffset + 11,
-                // now starts at patchOffset + 2 + 18)
-                size_t tailLen = len - (patchOffset + 11);
-                memcpy(newBuf + patchOffset + 20, p + patchOffset + 11, tailLen);
-                // Update big-endian pktLen header (bytes 0..3)
-                if (len >= 4) {
-                    uint32_t oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                                         ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-                    uint32_t newPktLen = oldPktLen + 9;
-                    newBuf[0] = (newPktLen >> 24) & 0xFF;
-                    newBuf[1] = (newPktLen >> 16) & 0xFF;
-                    newBuf[2] = (newPktLen >> 8)  & 0xFF;
-                    newBuf[3] =  newPktLen       & 0xFF;
-                    // Show cmd for log readability
-                    uint32_t cmd = 0;
-                    if (len >= 8) {
-                        cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                              ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
+            if (patchOffset != (size_t)-1) {
+                size_t newBufLen = len + 9;
+                unsigned char *newBuf = (unsigned char *)malloc(newBufLen);
+                if (newBuf) {
+                    memcpy(newBuf, p, patchOffset);
+                    newBuf[patchOffset]      = 0x00;
+                    newBuf[patchOffset + 1]  = 0x12;
+                    memcpy(newBuf + patchOffset + 2, "DYanyou0040_MIESHI", 18);
+                    size_t tailLen = len - (patchOffset + 11);
+                    memcpy(newBuf + patchOffset + 20, p + patchOffset + 11, tailLen);
+                    if (len >= 4) {
+                        uint32_t oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                             ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+                        uint32_t newPktLen = oldPktLen + 9;
+                        newBuf[0] = (newPktLen >> 24) & 0xFF;
+                        newBuf[1] = (newPktLen >> 16) & 0xFF;
+                        newBuf[2] = (newPktLen >> 8)  & 0xFF;
+                        newBuf[3] =  newPktLen       & 0xFF;
+                        DLOG(@"[CHANNEL-PATCH] v37.21 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
+                             fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
+                    } else {
+                        DLOG(@"[CHANNEL-PATCH] v37.21 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
+                             fd, port, cmd, len, newBufLen, patchOffset);
                     }
-                    DLOG(@"[CHANNEL-PATCH] v37.20 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
-                         fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
+                    ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
+                    free(newBuf);
+                    if (ret >= 0) return (ssize_t)len;
+                    return ret;
                 } else {
-                    DLOG(@"[CHANNEL-PATCH] v37.20 fd=%d port=%d oldLen=%zu newLen=%zu patchOffset=%zu (len<4 skip pktLen update)",
-                         fd, port, len, newBufLen, patchOffset);
+                    DLOG(@"[CHANNEL-PATCH] v37.21: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
+                         newBufLen, len, cmd);
                 }
-                ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
-                free(newBuf);
-                // v37.20-DIST FIX: return ORIGINAL len, NOT ret(newBufLen).
-                // If we return newBufLen(37) > client's requested len(28), the
-                // client's send pointer advances 37 bytes, overflowing into the
-                // NEXT packet (0x002EE118) and truncating it by 9 bytes. This
-                // was the root cause of v37.20 "网络中断": 0x002EE118 was cut to
-                // 21 bytes (cmd=0x0944595F garbage), server couldn't parse it,
-                // returned only 0x8000E002 (120B) without 0x802EE118 (13B),
-                // then closed the connection.
-                // By returning len(28), the client thinks 28 bytes were sent,
-                // advances its pointer by 28, and correctly sends the next
-                // packet (0x002EE118) in full. The patched 37 bytes already
-                // went to the wire via orig_send above.
-                if (ret >= 0) {
-                    return (ssize_t)len;
-                }
-                return ret;
-            } else {
-                DLOG(@"[CHANNEL-PATCH] v37.20: malloc(%zu) FAILED! Falling back to unpatched send len=%zu",
-                     newBufLen, len);
             }
         }
     }
 
-    // v37.20-DIST: For ALL game server packets, call orig_send directly — NO processing.
+    // v37.21-DIST: For ALL game server packets, call orig_send directly — NO processing.
     // Added verbose FULL hex dump for 0x000EE007 and 0x00FFF493 so we can do byte-by-byte
     // comparison against the clean (non-injected) client capture (hook.txt).
     if (len >= 8 && (port == 12003 || port == 58158 ||
@@ -4055,7 +4023,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
-        DLOG(@"[SEND-DIRECT] v37.20: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct)", cmd, len, port, ret);
+        DLOG(@"[SEND-DIRECT] v37.21: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct)", cmd, len, port, ret);
         return ret;
     }
 
@@ -7010,7 +6978,7 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
         NSUUID *real = orig_identifierForVendor(self, _cmd);
         static BOOL logged = NO;
         if (!logged) {
-            DLOG(@"[IDFV-HOOK] v37.20-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
+            DLOG(@"[IDFV-HOOK] v37.21-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
             logged = YES;
         }
         return real;
@@ -7940,7 +7908,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.20.1-DIST — CHANNEL-PATCH return len fix (was truncating next packet)");
+    DLOG(@"[VERSION] WangXianHook v37.21-DIST — CHANNEL-PATCH only cmd=0x002EE121 and 0x000EE007");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
