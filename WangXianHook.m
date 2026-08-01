@@ -1,32 +1,22 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.153: REQUEST-DRIVEN PHASE 1 (MATCH REAL SERVER TIMING)
+ * WangXianHook v36.154: REVERT TO CONTIGUOUS INJECTION + TIME-BASED PHASE 2 DELAY
  *
- * v36.153 CHANGES (fixes v36.152 role UI not rendering):
- *   1. ROOT CAUSE (v36.152): Phase 1 injected RECV #20 and RECV #21
- *      CONTIGUOUSLY in 2 back-to-back recv() calls. Real server (hook.txt)
- *      uses REQUEST-DRIVEN responses:
- *        RECV#19(0x0CB0A300) → SEND#32(0x0CB0A380 ACK) → RECV#20 →
- *        SEND#33(FFF493#1) → SEND#34(FFF493#2) → RECV#21 → [role UI render]
- *      v36.152's continuous injection skipped the client's internal ACK
- *      processing window, so role UI parser never ran. v36.146 "worked" only
- *      because it did NOT inject RECV #20/#21 in the original design, so
- *      the client had more time to process the BURST data before waiting.
- *   2. FIX: Redesign Phase 1 state machine from DRIVEN-BY-RECV to
- *      DRIVEN-BY-SEND. New Phase 1 sub-states (10→11→12→13→14→0):
- *        state=10 (BURST done): wait for SEND cmd==0x0CB0A380 (role ACK, 20B)
- *        state=11: next recv() injects RECV #20 (71B session token) → 12
- *        state=12: wait for SEND 1st 0x00FFF493 (auto-load ACK #1) → 13
- *        state=13: wait for SEND 2nd 0x00FFF493 (auto-load ACK #2) → 14
- *        state=14: next recv() injects RECV #21 (840B map data) → 0+done
- *      This exactly matches hook.txt. Client processes each ACK BEFORE
- *      receiving the next server push, so role UI render window is open.
- *   3. Phase 2 trigger THRESHOLD CHANGED from count=3 to count=1. The
- *      first two 0x00FFF493 in Phase 1 (state=12→13→14) are now consumed
- *      by the sub-state transitions and do NOT increment g_phase2TriggerCount.
- *      So the FIRST new 0x00FFF493 after g_postBurstDone=YES IS the user
- *      clicking "进入游戏" — trigger Phase 2 immediately (count=1).
+ * v36.154 CHANGES (fixes v36.153 "连接异常中断"):
+ *   1. ROOT CAUSE (v36.153): state=10 WAIT for SEND 0x0CB0A380 ACK caused
+ *      poll/select to set POLLIN while recv() returned EAGAIN. Client
+ *      entered a busy-wait loop (POLLIN→recv→EAGAIN→POLLIN→...) that it
+ *      interpreted as a connection error → "连接异常中断".
+ *   2. FIX: Revert to v36.146-proven CONTIGUOUS injection (state=1→2→0):
+ *        state=1: recv injects RECV#20 (71B) → state=2
+ *        state=2: recv injects RECV#21 (840B) → state=0, g_postBurstDone=YES
+ *      No WAIT states, no EAGAIN during Phase 1.
+ *   3. FIX (v36.152 role UI not rendering): Replace count-based Phase 2
+ *      trigger with TIME-BASED 3-second delay. After Phase 1 completes,
+ *      g_phase1DoneTime is set. Phase 2 only triggers if elapsed >= 3.0s,
+ *      giving the client time to render role selection UI. Auto-load ACK
+ *      0x00FFF493 requests (fired ~100ms after Phase 1) are blocked.
  *   4. KEEP: v36.152 Phase 2 design (state 3→4→5→0) + all earlier fixes.
  *
  * v36.152 PROBLEM: BURST→RECV#20→RECV#21 injected back-to-back. Client's
@@ -719,7 +709,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.153 loaded ===");
+        _log(@"=== WangXianHook v36.154 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2027,6 +2017,13 @@ static BOOL g_postBurstDone = NO;
 // select) triggers Phase 2, >1=subsequent requests return EAGAIN.
 // Reset to 0 on BURST inject so re-login works.
 static int g_phase2TriggerCount = 0;
+// v36.154: Timestamp when Phase 1 completed (RECV #21 injected). Phase 2
+// trigger requires at least 3 seconds elapsed since Phase 1 completion,
+// giving the client sufficient time to render the role selection UI.
+// Without this delay, auto-load ACK 0x00FFF493 requests (fired within
+// ~100ms of Phase 1) trigger Phase 2 too early — before the user can
+// even see the role list — causing the client to skip the role UI.
+static double g_phase1DoneTime = 0;
 
 // RECV #20 data (71 bytes) from hook.txt line 944.
 // cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
@@ -3822,40 +3819,35 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             // enqueue — otherwise duplicate 0x00FFF493 generates spurious
             // 0x0CB0A300/0x80FFF490 responses that corrupt the RECV #22-#24
             // injection sequence.
-            // v36.153: Phase 1 SUB-STATE machine (state 10,12,13) driven
-            // by SEND events, matching hook.txt real server timing.
-            if (g_postBurstState == 10 && newCmd == 0x0CB0A380) {
-                // Client processed 0x0CB0A300 (RECV#19) and sent ACK.
-                // Ready to inject RECV#20 (session token) on next recv().
-                g_postBurstState = 11;
-                DLOG(@"[POST-BURST] v36.153: Phase 1A — SEND 0x0CB0A380 (role ACK) detected → state=11 (inject RECV#20 next recv)");
-            } else if (g_postBurstState == 12 && newCmd == 0x00FFF493) {
-                // Client processed RECV#20 (session token), sent 1st FFF493.
-                g_postBurstState = 13;
-                DLOG(@"[POST-BURST] v36.153: Phase 1B — SEND 1st 0x00FFF493 (auto-load ACK #1) detected → state=13 (wait 2nd)");
-            } else if (g_postBurstState == 13 && newCmd == 0x00FFF493) {
-                // Client sent 2nd FFF493 auto-load ACK. Ready to inject RECV#21.
-                g_postBurstState = 14;
-                DLOG(@"[POST-BURST] v36.153: Phase 1C — SEND 2nd 0x00FFF493 (auto-load ACK #2) detected → state=14 (inject RECV#21 next recv)");
-            } else if (newCmd != 0x00000015 && newCmd < 0x80000000 && !g_postBurstDone && g_postBurstState < 3 &&
-                       g_postBurstState != 10 && g_postBurstState != 12 && g_postBurstState != 13) {
+            // v36.154: REVERTED to contiguous injection. No request-driven
+            // sub-states. Phase 2 trigger uses TIME-BASED delay (3 seconds
+            // since Phase 1 completion) instead of count threshold.
+            // This fixes v36.152 (auto-load ACKs triggered Phase 2 too
+            // early, before role UI rendered) and v36.153 (state=10
+            // busy-wait caused "连接异常中断").
+            if (newCmd != 0x00000015 && newCmd < 0x80000000 && !g_postBurstDone && g_postBurstState < 3) {
                 isNewCmd = YES;
                 DLOG(@"[FAKE-SEND] v36.123: New cmd=0x%08X seq=0x%08X detected, enqueuing + resetting delivered flag", newCmd, newSeq);
             } else if (g_postBurstDone && newCmd != 0x00000015 && newCmd < 0x80000000) {
-                // v36.153: Phase 2 trigger — CHANGED threshold from count=3 to count=1.
-                // The first TWO 0x00FFF493s (hook.txt SEND#33,#34) were consumed
-                // in Phase 1 sub-states 12→13→14 above. So the FIRST FFF493
-                // after g_postBurstDone=YES IS the user clicking "进入游戏"
-                // (hook.txt SEND#35) — trigger Phase 2 immediately for lowest
-                // possible latency while still matching real protocol order.
-                g_phase2TriggerCount++;
-                if (g_phase2TriggerCount == 1) {
-                    // First post-Phase-1 0x00FFF493 = user clicked role
-                    g_postBurstDone = NO;
-                    g_postBurstState = 3;  // Start Phase 2: inject RECV #22
-                    DLOG(@"[POST-BURST] v36.153: Phase 2 TRIGGERED (count=1) by cmd=0x%08X seq=0x%08X (user selected role, Phase1 FFF493 already consumed), state=3", newCmd, newSeq);
+                // v36.154: Phase 2 trigger — TIME-BASED 3-second delay.
+                // After Phase 1 completes (RECV#21 injected), the client
+                // fires auto-load ACK 0x00FFF493 within ~100ms. These are
+                // NOT user clicks. Only after 3 seconds can a 0x00FFF493
+                // trigger Phase 2 (RECV #22-#24), ensuring the user has
+                // time to see and click the role UI.
+                double elapsed = g_phase1DoneTime > 0 ?
+                    (CFAbsoluteTimeGetCurrent() - g_phase1DoneTime) : 999.0;
+                if (elapsed < 3.0) {
+                    DLOG(@"[FAKE-SEND] v36.154: Phase 2 LOCKED (%.1fs < 3.0s) cmd=0x%08X seq=0x%08X — EAGAIN (role UI rendering)", elapsed, newCmd, newSeq);
                 } else {
-                    DLOG(@"[FAKE-SEND] v36.153: Phase 2 POST (count=%d) cmd=0x%08X seq=0x%08X — EAGAIN (no new response)", g_phase2TriggerCount, newCmd, newSeq);
+                    g_phase2TriggerCount++;
+                    if (g_phase2TriggerCount == 1) {
+                        g_postBurstDone = NO;
+                        g_postBurstState = 3;  // Start Phase 2: inject RECV #22
+                        DLOG(@"[POST-BURST] v36.154: Phase 2 TRIGGERED (%.1fs elapsed) by cmd=0x%08X seq=0x%08X state=3", elapsed, newCmd, newSeq);
+                    } else {
+                        DLOG(@"[FAKE-SEND] v36.154: Phase 2 POST (count=%d) cmd=0x%08X — EAGAIN", g_phase2TriggerCount, newCmd);
+                    }
                 }
             } else if (!g_postBurstDone && g_postBurstState >= 3 && newCmd != 0x00000015 && newCmd < 0x80000000) {
                 // v36.150: Phase 2 in progress — don't enqueue, don't generate
@@ -5000,23 +4992,21 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     g_lastRespCmd       = batch[respCount > 0 ? respCount - 1 : 0].cmd;
     g_respCount         = respCount;
 
-    // v36.153: REQUEST-DRIVEN Phase 1 state machine. After BURST injects
-    // 0x0CB0A300 (RECV#19), client must SEND 0x0CB0A380 (role ACK) BEFORE
-    // server sends RECV#20. After RECV#20, client sends 2x 0x00FFF493
-    // (auto-load ACKs) BEFORE server sends RECV#21. This matches hook.txt
-    // real server timing and gives the client time to parse/render role UI.
-    //   state=10: wait SEND 0x0CB0A380 (role ACK)
-    //   state=11: next recv injects RECV#20
-    //   state=12: wait SEND 1st 0x00FFF493 (auto ACK #1)
-    //   state=13: wait SEND 2nd 0x00FFF493 (auto ACK #2)
-    //   state=14: next recv injects RECV#21 → g_postBurstDone=YES
+    // v36.154: REVERT to CONTIGUOUS injection (state=1→2→0). v36.153's
+    // request-driven state=10 caused "连接异常中断" because poll/select
+    // set POLLIN while recv() returned EAGAIN, creating a busy-wait loop
+    // that the client interpreted as a connection error.
+    // v36.154 FIX: Use contiguous injection (proven in v36.146 to show
+    // role UI) + add 3-second time delay before Phase 2 can trigger
+    // (fixes v36.152 where auto-load ACKs triggered Phase 2 too early).
+    //   state=1: next recv injects RECV#20 (71B) → state=2
+    //   state=2: next recv injects RECV#21 (840B) → state=0, done
     if (totalLen > 0) {
-        g_postBurstState = 10;  // v36.153: start at "wait role ACK"
+        g_postBurstState = 1;  // v36.154: contiguous injection
         g_postBurstFd = fd;
-        // v36.150: Reset Phase 2 trigger counter so re-login can trigger
-        // Phase 2 again (first 0x00FFF493 after role UI).
         g_phase2TriggerCount = 0;
-        DLOG(@"[POST-BURST] v36.153: State=10 (wait SEND 0x0CB0A380 role ACK, then drive Phase 1 via SENDs)");
+        g_phase1DoneTime = 0;  // Reset; set when RECV#21 is injected
+        DLOG(@"[POST-BURST] v36.154: State=1 (contiguous inject RECV#20 on next recv)");
     }
 
     if (totalLen > 0) {
@@ -5061,61 +5051,21 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     // 0x00FFF493 (select role / enter game), inject RECV #22-#24.
     // v36.149 injected #22-#24 immediately after #21, causing client to
     // skip role selection and get stuck at "进入角色界面".
-    // v36.153: REQUEST-DRIVEN Phase 1 sub-states (match hook.txt timing):
-    //   state=10: wait SEND 0x0CB0A380 (role ACK) → handled in hook_send
-    //   state=11: inject RECV#20 next recv → 12
-    //   state=12: wait SEND 1st 0x00FFF493 → handled in hook_send
-    //   state=13: wait SEND 2nd 0x00FFF493 → handled in hook_send
-    //   state=14: inject RECV#21 next recv → 0, g_postBurstDone=YES
-    // Old design (state 1→2→0) kept as legacy fallback but not reached.
-    // State: 0=idle, 1=RECV#20(old), 2=RECV#21(old)
-    //        10=wait roleACK, 11=RECV#20(new), 12=wait FFF493#1,
-    //        13=wait FFF493#2, 14=RECV#21(new)
+    // v36.154: CONTIGUOUS injection (state=1→2→0). v36.153's request-driven
+    // state=10 caused "连接异常中断" (poll/select set POLLIN but recv returned
+    // EAGAIN → busy-wait → client timeout). Reverted to proven v36.146 design.
+    // v36.154 adds 3-second time delay before Phase 2 can trigger.
+    // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21→done
     //        3=RECV#22, 4=RECV#23, 5=RECV#24, 0=done
     if (g_postBurstState >= 1 && g_postBurstFd == fd) {
-        // v36.153: WAIT STATES — return EAGAIN so client loops and sends ACKs,
-        // do NOT fall into fake response queue (would emit wrong responses).
-        //   state=10: waiting SEND 0x0CB0A380 (role data ACK)
-        //   state=12: waiting SEND 1st 0x00FFF493 (auto-load ACK #1)
-        //   state=13: waiting SEND 2nd 0x00FFF493 (auto-load ACK #2)
-        if (g_postBurstState == 10 || g_postBurstState == 12 || g_postBurstState == 13) {
-            static int lastWaitState = 0;
-            if (lastWaitState != g_postBurstState) {
-                DLOG(@"[POST-BURST] v36.153: WAIT state=%d — return EAGAIN (waiting for client to SEND ACK before injecting next RECV)", g_postBurstState);
-                lastWaitState = g_postBurstState;
-            }
-            errno = EAGAIN;
-            return -1;
-        }
-        // v36.153 NEW PATH: state=11 (ready to inject RECV#20)
-        if (g_postBurstState == 11 && len >= 71) {
-            memcpy(buf, kRecv20Data, 71);
-            g_postBurstState = 12;  // Next: wait SEND 1st 0x00FFF493
-            DLOG(@"[POST-BURST] v36.153: Injected RECV #20 (71B) fd=%d state=12 (wait 1st FFF493 auto-ACK)", fd);
-            return 71;
-        }
-        // v36.153 NEW PATH: state=14 (ready to inject RECV#21)
-        if (g_postBurstState == 14 && len >= 840) {
-            memcpy(buf, kRecv21Head, 288);
-            memset((uint8_t *)buf + 288, 0, 840 - 288);
-            for (int i = 0; kRecv21Sparse[i].off != 0 || kRecv21Sparse[i].val != 0; i++) {
-                if (kRecv21Sparse[i].off < 840)
-                    ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
-            }
-            // v36.153: Phase 1 done. Stop here, let client show role UI.
-            // Phase 2 (RECV #22-#24) starts when client sends next 0x00FFF493.
-            g_postBurstState = 0;
-            g_postBurstDone = YES;  // Blocks further injection until role select
-            DLOG(@"[POST-BURST] v36.153: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, role UI window OPEN, wait user-click FFF493)", fd);
-            return 840;
-        }
-        // Legacy old design (kept as safety fallback, should not trigger in v36.153+)
+        // Phase 1: RECV #20 (71B session token)
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
             g_postBurstState = 2;
-            DLOG(@"[POST-BURST] v36.150-LEGACY: Injected RECV #20 (71B) fd=%d state=2", fd);
+            DLOG(@"[POST-BURST] v36.154: Injected RECV #20 (71B) fd=%d state=2", fd);
             return 71;
         }
+        // Phase 1: RECV #21 (840B map data) → Phase 1 done
         if (g_postBurstState == 2 && len >= 840) {
             memcpy(buf, kRecv21Head, 288);
             memset((uint8_t *)buf + 288, 0, 840 - 288);
@@ -5125,27 +5075,28 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             }
             g_postBurstState = 0;
             g_postBurstDone = YES;
-            DLOG(@"[POST-BURST] v36.150-LEGACY: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, wait for role select)", fd);
+            g_phase1DoneTime = CFAbsoluteTimeGetCurrent();
+            DLOG(@"[POST-BURST] v36.154: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, role UI window OPEN, Phase 2 locked for 3s)", fd);
             return 840;
         }
         // Phase 2: RECV #22-#24 (triggered by hook_send on role select)
         if (g_postBurstState == 3 && len >= 27) {
             memcpy(buf, kRecv22Data, 27);
             g_postBurstState = 4;
-            DLOG(@"[POST-BURST] v36.150: Injected RECV #22 (27B) fd=%d state=4 (Phase 2)", fd);
+            DLOG(@"[POST-BURST] v36.154: Injected RECV #22 (27B) fd=%d state=4 (Phase 2)", fd);
             return 27;
         }
         if (g_postBurstState == 4 && len >= 273) {
             memcpy(buf, kRecv23Data, 273);
             g_postBurstState = 5;
-            DLOG(@"[POST-BURST] v36.150: Injected RECV #23 (273B) fd=%d state=5", fd);
+            DLOG(@"[POST-BURST] v36.154: Injected RECV #23 (273B) fd=%d state=5", fd);
             return 273;
         }
         if (g_postBurstState == 5 && len >= 63) {
             memcpy(buf, kRecv24Data, 63);
             g_postBurstState = 0;
             g_postBurstDone = YES;
-            DLOG(@"[POST-BURST] v36.150: Injected RECV #24 (63B) fd=%d state=0 (Phase 2 done)", fd);
+            DLOG(@"[POST-BURST] v36.154: Injected RECV #24 (63B) fd=%d state=0 (Phase 2 done)", fd);
             return 63;
         }
     }
@@ -7620,7 +7571,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.153 - REQUEST-DRIVEN Phase 1 (wait SEND ACK before RECV#20/#21) + state=10/12/13 returns EAGAIN");
+    DLOG(@"[VERSION] WangXianHook v36.154 - REVERT contiguous injection (state=1→2→0) + time-based 3s Phase 2 delay");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
