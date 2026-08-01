@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.20-DIST loaded ===");
+        _log(@"=== WangXianHook v37.20.1-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4006,6 +4006,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 }
                 ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
                 free(newBuf);
+                // v37.20-DIST FIX: return ORIGINAL len, NOT ret(newBufLen).
+                // If we return newBufLen(37) > client's requested len(28), the
+                // client's send pointer advances 37 bytes, overflowing into the
+                // NEXT packet (0x002EE118) and truncating it by 9 bytes. This
+                // was the root cause of v37.20 "网络中断": 0x002EE118 was cut to
+                // 21 bytes (cmd=0x0944595F garbage), server couldn't parse it,
+                // returned only 0x8000E002 (120B) without 0x802EE118 (13B),
+                // then closed the connection.
+                // By returning len(28), the client thinks 28 bytes were sent,
+                // advances its pointer by 28, and correctly sends the next
+                // packet (0x002EE118) in full. The patched 37 bytes already
+                // went to the wire via orig_send above.
+                if (ret >= 0) {
+                    return (ssize_t)len;
+                }
                 return ret;
             } else {
                 DLOG(@"[CHANNEL-PATCH] v37.20: malloc(%zu) FAILED! Falling back to unpatched send len=%zu",
@@ -7925,7 +7940,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.20-DIST — CHANNEL-PATCH (DY_MIESHI→DYanyou0040_MIESHI) on all LOGIN/GAME pkts");
+    DLOG(@"[VERSION] WangXianHook v37.20.1-DIST — CHANNEL-PATCH return len fix (was truncating next packet)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
