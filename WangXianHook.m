@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.0-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.1-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7648,6 +7648,115 @@ static void installCppCryptoHooks_v131(void) {
 }
 
 // ============================================================
+#pragma mark - v37.0 Minimal Recv Hook (login server patches only)
+// ============================================================
+
+// v37.0: Patch login server response data in-place
+// ONLY patches 0x802EE118/120/121 status + 维护→运行 + 版本过低 strings
+// Does NOT touch game server traffic, does NOT inject fake responses
+static void patchLoginServerData(uint8_t *data, ssize_t len) {
+    if (len < 8) return;
+
+    // Parse command ID (bytes 4-7, big-endian)
+    uint32_t cmd = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                   ((uint32_t)data[6] << 8) | (uint32_t)data[7];
+
+    // Patch status byte for login server responses
+    if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
+        if (len >= 13 && data[12] != 0) {
+            DLOG(@"[RECV-PATCH] cmd=0x%08X status: %d -> 0", cmd, data[12]);
+            data[12] = 0;
+        }
+    }
+
+    // Replace "维护" with "运行" in any response (UTF-8)
+    // 维护 = E7 BB B4 E6 8A A4, 运行 = E8 BF 90 E8 A1 8C
+    for (ssize_t i = 0; i <= len - 6; i++) {
+        if (data[i] == 0xE7 && data[i+1] == 0xBB && data[i+2] == 0xB4 &&
+            data[i+3] == 0xE6 && data[i+4] == 0x8A && data[i+5] == 0xA4) {
+            data[i] = 0xE8; data[i+1] = 0xBF; data[i+2] = 0x90;
+            data[i+3] = 0xE8; data[i+4] = 0xA1; data[i+5] = 0x8C;
+            DLOG(@"[RECV-PATCH] 替换 '维护' -> '运行' at offset %zd", i);
+        }
+    }
+
+    // Clear "版本过低" (UTF-8: E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E)
+    static const uint8_t versionLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= len - 12; i++) {
+        if (memcmp(data + i, versionLow, 12) == 0) {
+            memset(data + i, 0x20, 12);
+            DLOG(@"[RECV-PATCH] 清除 '版本过低' at offset %zd", i);
+        }
+    }
+
+    // Clear "当前版本" (UTF-8: E5 BD 93 E5 89 8D E7 89 88 E6 9C AC)
+    static const uint8_t curVersion[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= len - 12; i++) {
+        if (memcmp(data + i, curVersion, 12) == 0) {
+            memset(data + i, 0x20, 12);
+            DLOG(@"[RECV-PATCH] 清除 '当前版本' at offset %zd", i);
+        }
+    }
+}
+
+// v37.0: Minimal recv hook — patches login server responses ONLY
+static ssize_t hook_recv_minimal(int fd, void *buf, size_t len, int flags) {
+    if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recv) return -1;
+
+    ssize_t ret = orig_recv(fd, buf, len, flags);
+    if (ret > 0) {
+        patchLoginServerData((uint8_t *)buf, ret);
+    }
+    return ret;
+}
+
+// v37.0: Minimal recvfrom hook
+static ssize_t hook_recvfrom_minimal(int fd, void *buf, size_t len, int flags,
+                                     struct sockaddr *from, socklen_t *fromlen) {
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_recvfrom) return -1;
+
+    ssize_t ret = orig_recvfrom(fd, buf, len, flags, from, fromlen);
+    if (ret > 0) {
+        patchLoginServerData((uint8_t *)buf, ret);
+    }
+    return ret;
+}
+
+// v37.0: Minimal recvmsg hook
+static ssize_t hook_recvmsg_minimal(int fd, struct msghdr *msg, int flags) {
+    if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+    if (!orig_recvmsg) return -1;
+
+    ssize_t ret = orig_recvmsg(fd, msg, flags);
+    if (ret > 0 && msg && msg->msg_iov && msg->msg_iovlen > 0) {
+        // Patch first iov buffer
+        struct iovec *iov = &msg->msg_iov[0];
+        if (iov->iov_base && iov->iov_len >= 8) {
+            patchLoginServerData((uint8_t *)iov->iov_base, MIN((ssize_t)iov->iov_len, ret));
+        }
+    }
+    return ret;
+}
+
+// v37.0: Install minimal recv hooks (login server patches only, no game server mods)
+static void installMinimalSocketHooks(void) {
+    DLOG(@"[SOCK-MINIMAL] v37.1: Installing minimal recv hooks (login server patches only)...");
+
+    int r = rebindSymbol("_recv", (void *)hook_recv_minimal, (void **)&orig_recv);
+    int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom_minimal, (void **)&orig_recvfrom);
+    int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg_minimal, (void **)&orig_recvmsg);
+
+    if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
+
+    DLOG(@"[SOCK-MINIMAL] recv=%d recvfrom=%d recvmsg=%d (orig: recv=%p recvfrom=%p recvmsg=%p)",
+         r, rf, rm, orig_recv, orig_recvfrom, orig_recvmsg);
+}
+
+// ============================================================
 #pragma mark - Constructor - MINIMAL + observer hooks
 // ============================================================
 
@@ -7669,7 +7778,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.0-MINIMAL — Native encryption, NO fake responses, NO socket mods");
+    DLOG(@"[VERSION] WangXianHook v37.1-MINIMAL — Native encryption, login server patches RESTORED, NO game server mods");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
@@ -7688,9 +7797,16 @@ static void installAllHooks(void) {
     orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
     
-    // v37.0: DISABLED — Socket hooks (send/recv/poll/select) break native protocol
+    // v37.1: DISABLED full socket hooks (send/recv/poll/select break native protocol)
     // installSocketHooks();
-    
+
+    // v37.1: RESTORED — Minimal recv hooks for login server patches ONLY
+    //        (patches 0x802EE118/120/121 status, 维护→运行, clears 版本过低)
+    //        Does NOT touch game server traffic, does NOT inject fake responses.
+    //        FIX: v37.0 defined installMinimalSocketHooks() but never called it,
+    //             causing "版本过低" popup to reappear.
+    installMinimalSocketHooks();
+
     // v37.0: DISABLED — C++ function patches (quitFromServer/heartbeat) break connection
     // proactivePatchCppFunctions();
     
