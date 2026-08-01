@@ -575,7 +575,7 @@ extern "C" kern_return_t mach_vm_remap(
 // v36.47: Critical fix - Disable all crypto function hooks that corrupt encryption data
 // v36.47: Critical fix - Fix hook_alertControllerPresent SIGSEGV crash
 #define MINIMAL_MODE 0
-#define DISABLE_CRYPTO_HOOKS 0  // v37.13: RESTORE crypto hooks — needed for injection detection bypass
+#define DISABLE_CRYPTO_HOOKS 1  // v37.14: Disable crypto hooks (caused crash), keep socket hooks for injection bypass
 #define DISABLE_SOCKET_MODS 0
 #define DISABLE_UI_HOOKS 0
 
@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.13-RESTORE loaded ===");
+        _log(@"=== WangXianHook v37.14-RESTORE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7788,7 +7788,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.13-RESTORE — full hooks from v36.155");
+    DLOG(@"[VERSION] WangXianHook v37.14-RESTORE — socket hooks only, crypto hooks disabled");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
@@ -7880,7 +7880,7 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
 
-    _log(@"[INIT] v37.13: Full hooks restored from v36.155 working configuration");
+    _log(@"[INIT] v37.14: Socket hooks + NETIMPL hooks (crypto hooks disabled to prevent crash)");
 
     // === DEFERRED: Create log button (keep for debugging) ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -7902,7 +7902,7 @@ static void installAllHooks(void) {
         }
     });
 
-    DLOG(@"[ACT] v37.13: All hooks installed (v36.155 full configuration)");
+    DLOG(@"[ACT] v37.14: All hooks installed (socket + NETIMPL, crypto disabled)");
 }
 
 
