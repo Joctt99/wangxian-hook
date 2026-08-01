@@ -1,7 +1,25 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v36.154: REVERT TO CONTIGUOUS INJECTION + TIME-BASED PHASE 2 DELAY
+ * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
+ *
+ * v36.155 CHANGES (fixes v36.154 "all servers show same character"):
+ *   1. ROOT CAUSE: v36.154's RECV #21 (map data, 840B) contained a
+ *      HARDCODED role name "luoyueshangu" at offset 16-31. The role
+ *      selection UI displays this name, so EVERY server showed the
+ *      SAME character. The 0x0CB0A300 response also used STATIC
+ *      role attributes (100 entries from real capture).
+ *   2. FIX: Dynamic role name in RECV #21 based on g_roleIndex.
+ *      Each server entry increments g_roleIndex, generating unique
+ *      role names "玩家001", "玩家002", "玩家003", etc.
+ *   3. FIX: Dynamic role attributes in 0x0CB0A300 response.
+ *      Entry 0 (roleId), Entry 1 (level), Entry 2 (profession),
+ *      Entry 3 (maxHp) are now computed from g_roleIndex:
+ *        - roleId = g_roleIndex
+ *        - level = 1 + (roleIndex-1)*10 (capped at 100)
+ *        - profession = (roleIndex-1) % 3 + 1 (战士/法师/道士)
+ *        - maxHp = 100 + level*50
+ *   4. KEEP: All v36.154 fixes (contiguous injection, 3s Phase 2 delay).
  *
  * v36.154 CHANGES (fixes v36.153 "连接异常中断"):
  *   1. ROOT CAUSE (v36.153): state=10 WAIT for SEND 0x0CB0A380 ACK caused
@@ -709,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.154 loaded ===");
+        _log(@"=== WangXianHook v36.155 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1858,6 +1876,37 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
         // Sub-packet 1 (816 bytes): role attribute table
         memcpy(respBuf, roleHeader, 16);
         memcpy(respBuf + 16, roleAttrs, 800);
+        // v36.155: Dynamic role attributes based on g_roleIndex.
+        // Modify key attribute entries so each server gets unique character
+        // stats (roleId, level, profession, etc.). Without this, all servers
+        // share identical attribute values from the real capture.
+        if (g_roleIndex > 0) {
+            // Entry 0 (offset 16): role ID — set to g_roleIndex (big-endian uint64)
+            uint32_t rid = (uint32_t)g_roleIndex;
+            respBuf[16] = (rid >> 24) & 0xFF; respBuf[17] = (rid >> 16) & 0xFF;
+            respBuf[18] = (rid >> 8) & 0xFF; respBuf[19] = rid & 0xFF;
+            respBuf[20] = 0x00; respBuf[21] = 0x00; respBuf[22] = 0x00; respBuf[23] = 0x00;
+
+            // Entry 1 (offset 24): level — 1 + (roleIndex-1)*10, capped at 100
+            uint32_t level = 1 + (g_roleIndex - 1) * 10;
+            if (level > 100) level = 100;
+            respBuf[24] = (level >> 24) & 0xFF; respBuf[25] = (level >> 16) & 0xFF;
+            respBuf[26] = (level >> 8) & 0xFF; respBuf[27] = level & 0xFF;
+
+            // Entry 2 (offset 32): profession/class — cycle through 3 types
+            // 1=战士(warrior), 2=法师(mage), 3=道士(taoist)
+            uint32_t prof = (uint32_t)((g_roleIndex - 1) % 3) + 1;
+            respBuf[32] = 0x00; respBuf[33] = 0x00; respBuf[34] = 0x00; respBuf[35] = prof;
+            respBuf[36] = 0x00; respBuf[37] = 0x00; respBuf[38] = 0x00; respBuf[39] = 0x00;
+
+            // Entry 3 (offset 40): max HP — scale with level
+            uint32_t maxHp = 100 + level * 50;
+            respBuf[40] = (maxHp >> 24) & 0xFF; respBuf[41] = (maxHp >> 16) & 0xFF;
+            respBuf[42] = (maxHp >> 8) & 0xFF; respBuf[43] = maxHp & 0xFF;
+
+            DLOG(@"[FAKE-RESP] v36.155: 0x0CB0A300 dynamic attrs — roleId=%u level=%u prof=%u maxHp=%u (roleIndex=%d)",
+                 rid, level, prof, maxHp, g_roleIndex);
+        }
         // Sub-packet 2 (816 bytes): companion table.
         // Real capture (hook.txt line 921) header: 00 00 03 30 00 02 a3 0c
         // 08 88 7d 81 00 00 00 64. The 100 attribute entries were truncated
@@ -1872,8 +1921,8 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
         memcpy(respBuf + 816, sub2Header, 16);
         memset(respBuf + 832, 0, 800);  // zero-padded attribute entries
 
-        DLOG(@"[FAKE-RESP] v36.140: 0x0CB0A300 role-data response built (1632 bytes, 2 sub-packets: 0x00A3B00C + 0x00A30200) for req=0x%08X seq=0x%08X",
-             requestCmd, seqNum);
+        DLOG(@"[FAKE-RESP] v36.155: 0x0CB0A300 role-data response built (1632 bytes, 2 sub-packets: 0x00A3B00C + 0x00A30200) for req=0x%08X seq=0x%08X roleIndex=%d",
+             requestCmd, seqNum, g_roleIndex);
         return 1632;
     }
 
@@ -1929,20 +1978,37 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     //   bytes 50-51 : profession / class id (LE 0x0001 = 战士)
     //   bytes 52-55 : mapId / serverId
     //   remaining   : zero
+    // v36.155: Dynamic role data based on g_roleIndex — each server gets
+    // a DIFFERENT character with unique name, profession, and level.
     if (requestCmd == 0x00FFF49E) {
+        // Rotate through 3 professions: 战士(1), 法师(2), 道士(3)
+        int professions[3] = {1, 2, 3};
+        int profIdx = (g_roleIndex - 1) % 3;
+        int roleId = g_roleIndex;
+        int level = 1 + (g_roleIndex - 1) * 10;  // Lv.1, Lv.11, Lv.21, ...
+        if (level > 100) level = 100;  // Cap at Lv.100
+
         respBuf[13] = 0x01;  // numRoles = 1
-        // roleId = 1, little-endian uint16 at offset 14
-        respBuf[14] = 0x01; respBuf[15] = 0x00;
-        // role name "玩家001" (UTF-8, 9 bytes) at bytes 16..47, rest padding
-        const char *roleName = "\xE7\x8E\xA9\xE5\xAE\xB6\x30\x30\x31"; // 玩家001
-        memcpy(respBuf + 16, roleName, 9);
-        // level = 1, uint16 LE at offset 48
-        respBuf[48] = 0x01; respBuf[49] = 0x00;
-        // profession = 1 (warrior), uint16 LE at offset 50
-        respBuf[50] = 0x01; respBuf[51] = 0x00;
-        // mapId / serverId at offset 52 = 1
-        respBuf[52] = 0x01; respBuf[53] = 0x00;
+        // roleId = g_roleIndex, little-endian uint16 at offset 14
+        respBuf[14] = (roleId & 0xFF); respBuf[15] = ((roleId >> 8) & 0xFF);
+
+        // Build role name dynamically: "玩家" + zero-padded 3-digit number
+        char roleNameBuf[48] = {0};
+        snprintf(roleNameBuf, sizeof(roleNameBuf), "\xE7\x8E\xA9\xE5\xAE\xB6%03d", g_roleIndex);
+        // Ensure exactly 32 bytes (UTF-8 "玩家"=6bytes + 3digits + padding)
+        int nameLen = (int)strlen(roleNameBuf);
+        memcpy(respBuf + 16, roleNameBuf, MIN(nameLen, 32));
+
+        // level = computed level, uint16 LE at offset 48
+        respBuf[48] = (level & 0xFF); respBuf[49] = ((level >> 8) & 0xFF);
+        // profession = rotated profession, uint16 LE at offset 50
+        respBuf[50] = professions[profIdx]; respBuf[51] = 0x00;
+        // mapId / serverId at offset 52 = g_roleIndex
+        respBuf[52] = (roleId & 0xFF); respBuf[53] = ((roleId >> 8) & 0xFF);
         respBuf[54] = 0x00; respBuf[55] = 0x00;
+
+        DLOG(@"[FAKE-RESP] v36.155: Role list — roleId=%d name=%s level=%d prof=%d",
+             roleId, roleNameBuf, level, professions[profIdx]);
     }
 
     // v36.123: For 0x80FFF4A1 (enter game / select role response), put minimal
@@ -2024,6 +2090,12 @@ static int g_phase2TriggerCount = 0;
 // ~100ms of Phase 1) trigger Phase 2 too early — before the user can
 // even see the role list — causing the client to skip the role UI.
 static double g_phase1DoneTime = 0;
+// v36.155: Role rotation index. Increments each time a new server is
+// entered, so each server shows a DIFFERENT character (name, profession,
+// level). Without this, all servers show the same hardcoded "玩家001"
+// warrior with level 1, which is unrealistic — each server should have
+// a unique character.
+static int g_roleIndex = 0;
 
 // RECV #20 data (71 bytes) from hook.txt line 944.
 // cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
@@ -3838,15 +3910,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 double elapsed = g_phase1DoneTime > 0 ?
                     (CFAbsoluteTimeGetCurrent() - g_phase1DoneTime) : 999.0;
                 if (elapsed < 3.0) {
-                    DLOG(@"[FAKE-SEND] v36.154: Phase 2 LOCKED (%.1fs < 3.0s) cmd=0x%08X seq=0x%08X — EAGAIN (role UI rendering)", elapsed, newCmd, newSeq);
+                    DLOG(@"[FAKE-SEND] v36.155: Phase 2 LOCKED (%.1fs < 3.0s) cmd=0x%08X seq=0x%08X — EAGAIN (role UI rendering)", elapsed, newCmd, newSeq);
                 } else {
                     g_phase2TriggerCount++;
                     if (g_phase2TriggerCount == 1) {
                         g_postBurstDone = NO;
                         g_postBurstState = 3;  // Start Phase 2: inject RECV #22
-                        DLOG(@"[POST-BURST] v36.154: Phase 2 TRIGGERED (%.1fs elapsed) by cmd=0x%08X seq=0x%08X state=3", elapsed, newCmd, newSeq);
+                        DLOG(@"[POST-BURST] v36.155: Phase 2 TRIGGERED (%.1fs elapsed) by cmd=0x%08X seq=0x%08X state=3", elapsed, newCmd, newSeq);
                     } else {
-                        DLOG(@"[FAKE-SEND] v36.154: Phase 2 POST (count=%d) cmd=0x%08X — EAGAIN", g_phase2TriggerCount, newCmd);
+                        DLOG(@"[FAKE-SEND] v36.155: Phase 2 POST (count=%d) cmd=0x%08X — EAGAIN", g_phase2TriggerCount, newCmd);
                     }
                 }
             } else if (!g_postBurstDone && g_postBurstState >= 3 && newCmd != 0x00000015 && newCmd < 0x80000000) {
@@ -5001,12 +5073,16 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     // (fixes v36.152 where auto-load ACKs triggered Phase 2 too early).
     //   state=1: next recv injects RECV#20 (71B) → state=2
     //   state=2: next recv injects RECV#21 (840B) → state=0, done
+    // v36.155: Increment role rotation index so each server shows a
+    // different character. Must increment BEFORE building the fake
+    // response so the role data uses the new index.
     if (totalLen > 0) {
+        g_roleIndex++;
         g_postBurstState = 1;  // v36.154: contiguous injection
         g_postBurstFd = fd;
         g_phase2TriggerCount = 0;
         g_phase1DoneTime = 0;  // Reset; set when RECV#21 is injected
-        DLOG(@"[POST-BURST] v36.154: State=1 (contiguous inject RECV#20 on next recv)");
+        DLOG(@"[POST-BURST] v36.155: State=1 (contiguous inject RECV#20, roleIndex=%d)", g_roleIndex);
     }
 
     if (totalLen > 0) {
@@ -5062,7 +5138,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
             g_postBurstState = 2;
-            DLOG(@"[POST-BURST] v36.154: Injected RECV #20 (71B) fd=%d state=2", fd);
+            DLOG(@"[POST-BURST] v36.155: Injected RECV #20 (71B) fd=%d state=2", fd);
             return 71;
         }
         // Phase 1: RECV #21 (840B map data) → Phase 1 done
@@ -5073,30 +5149,38 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
+            // v36.155: Dynamic role name in RECV #21 based on g_roleIndex.
+            // The role selection UI displays this name (offset 16-31) for
+            // the character. Each server must show a DIFFERENT character.
+            char dynName[48] = {0};
+            snprintf(dynName, sizeof(dynName), "\xE7\x8E\xA9\xE5\xAE\xB6%03d", g_roleIndex);
+            int nameLen = (int)strlen(dynName);
+            memcpy((uint8_t *)buf + 16, dynName, MIN(nameLen, 16));
+            DLOG(@"[POST-BURST] v36.155: RECV #21 role name set to '%s' (roleIndex=%d)", dynName, g_roleIndex);
             g_postBurstState = 0;
             g_postBurstDone = YES;
             g_phase1DoneTime = CFAbsoluteTimeGetCurrent();
-            DLOG(@"[POST-BURST] v36.154: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, role UI window OPEN, Phase 2 locked for 3s)", fd);
+            DLOG(@"[POST-BURST] v36.155: Injected RECV #21 (840B) fd=%d state=0 (Phase 1 done, role '%s' displayed, Phase 2 locked for 3s)", fd, dynName);
             return 840;
         }
         // Phase 2: RECV #22-#24 (triggered by hook_send on role select)
         if (g_postBurstState == 3 && len >= 27) {
             memcpy(buf, kRecv22Data, 27);
             g_postBurstState = 4;
-            DLOG(@"[POST-BURST] v36.154: Injected RECV #22 (27B) fd=%d state=4 (Phase 2)", fd);
+            DLOG(@"[POST-BURST] v36.155: Injected RECV #22 (27B) fd=%d state=4 (Phase 2)", fd);
             return 27;
         }
         if (g_postBurstState == 4 && len >= 273) {
             memcpy(buf, kRecv23Data, 273);
             g_postBurstState = 5;
-            DLOG(@"[POST-BURST] v36.154: Injected RECV #23 (273B) fd=%d state=5", fd);
+            DLOG(@"[POST-BURST] v36.155: Injected RECV #23 (273B) fd=%d state=5", fd);
             return 273;
         }
         if (g_postBurstState == 5 && len >= 63) {
             memcpy(buf, kRecv24Data, 63);
             g_postBurstState = 0;
             g_postBurstDone = YES;
-            DLOG(@"[POST-BURST] v36.154: Injected RECV #24 (63B) fd=%d state=0 (Phase 2 done)", fd);
+            DLOG(@"[POST-BURST] v36.155: Injected RECV #24 (63B) fd=%d state=0 (Phase 2 done)", fd);
             return 63;
         }
     }
@@ -7571,7 +7655,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.154 - REVERT contiguous injection (state=1→2→0) + time-based 3s Phase 2 delay");
+    DLOG(@"[VERSION] WangXianHook v36.155 - DYNAMIC ROLE GENERATION PER SERVER + contiguous injection + 3s Phase 2 delay");
     DLOG(@"[ACT] Installing all hooks...");
     
 #if !DISABLE_CRYPTO_HOOKS
