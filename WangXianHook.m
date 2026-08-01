@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.9-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.10-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -762,14 +762,18 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - Call original to allow normal auth flow
-// IMPORTANT: Do NOT bypass this - it breaks device authorization
-// Let the game make real requests to md5xor.com
+// 4. judgeAppInfoWithBaseUrl: - v37.10: DO NOT call original
+// ROOT CAUSE (data-driven): capture_real.js ran on OFFICIAL enterprise cert
+// (unmodified IPA) → server signature verification passed → no '版本过低'.
+// v37.x runs on 全能签 (re-signed IPA) → server detects signature modification
+// → returns '版本过低'. SK.judgeAppInfoWithBaseUrl: calls original → sends
+// request to cert.qunhongtech.com → server returns '版本过低'.
+// FIX: Do NOT call original — prevents signature verification request.
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (calling original)", baseUrl);
-    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ BLOCKED (not calling original — prevents 版本过低)", baseUrl);
+    // v37.10: Do NOT call original — server signature verification fails on re-signed IPA
 }
 
 // 5. judgeNet - Call original to let it complete
@@ -7791,7 +7795,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.9-MINIMAL — SC.JudgeApp BLOCKED (no original)");
+    DLOG(@"[VERSION] WangXianHook v37.10-MINIMAL — SK.judgeAppInfoWithBaseUrl BLOCKED (no original)");
     DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
 
     // === capture_real.js parity: ONLY these hooks ===
