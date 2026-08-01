@@ -7808,7 +7808,7 @@ static void installAllHooks(void) {
     proactivePatchCppFunctions();
 
     // v37.13: RESTORE MSI retry
-    tryHookMieshiServerInfo();
+    tryHookMieshiServerInfo(0);
 
     // === KEEP: UIAlertView.show hook (in capture_real.js) ===
     Class alertCls = [UIAlertView class];
