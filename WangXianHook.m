@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.8-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.9-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -816,8 +816,11 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 typedef void (*JudgeAppIMP)(id, SEL);
 static JudgeAppIMP orig_judgeApp = NULL;
 static void hook_judgeApp(id self, SEL _cmd) {
-    DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
-    if (orig_judgeApp) orig_judgeApp(self, _cmd);
+    // v37.9: DO NOT call original — original detects IPA signature modification
+    // (全能签 re-signing) and triggers '版本过低'.
+    // capture_real.js (Frida, which worked) also BLOCKS this method (no original call).
+    // Log data (v37.8): JudgeApp called → calling original → '版本过低'.
+    DLOG(@"[SC] SignatureCheck.JudgeApp BLOCKED (not calling original — prevents 版本过低)");
 }
 
 typedef void (*ShowTipIMP)(id, SEL, id);
@@ -7788,7 +7791,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.8-MINIMAL — DYLD hiding restored (data-driven fix)");
+    DLOG(@"[VERSION] WangXianHook v37.9-MINIMAL — SC.JudgeApp BLOCKED (no original)");
     DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
 
     // === capture_real.js parity: ONLY these hooks ===
