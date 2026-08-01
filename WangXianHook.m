@@ -575,7 +575,7 @@ extern "C" kern_return_t mach_vm_remap(
 // v36.47: Critical fix - Disable all crypto function hooks that corrupt encryption data
 // v36.47: Critical fix - Fix hook_alertControllerPresent SIGSEGV crash
 #define MINIMAL_MODE 0
-#define DISABLE_CRYPTO_HOOKS 0
+#define DISABLE_CRYPTO_HOOKS 1  // v37.0: Disable ALL crypto hooks — native encryption works!
 #define DISABLE_SOCKET_MODS 0
 #define DISABLE_UI_HOOKS 0
 
@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v36.155 loaded ===");
+        _log(@"=== WangXianHook v37.0-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7669,17 +7669,15 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v36.155 - DYNAMIC ROLE GENERATION PER SERVER + contiguous injection + 3s Phase 2 delay");
+    DLOG(@"[VERSION] WangXianHook v37.0-MINIMAL — Native encryption, NO fake responses, NO socket mods");
     DLOG(@"[ACT] Installing all hooks...");
     
-#if !DISABLE_CRYPTO_HOOKS
+    // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
     installSecurityHooks();
-#endif
     installKeyboardProtection();
     
-    // v36.131: Install C++ crypto hooks (REPLACE EncryptUtils with CCFileUtils patch)
-    // CRITICAL: Client uses cocos2d::CCFileUtils::rsaDecryptLarge (C++), NOT EncryptUtils (ObjC)
-    installCppCryptoHooks_v131();
+    // v37.0: DISABLED — C++ crypto hooks break native encryption
+    // installCppCryptoHooks_v131();
     
     orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
@@ -7690,10 +7688,11 @@ static void installAllHooks(void) {
     orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
     DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
     
-    installSocketHooks();
+    // v37.0: DISABLED — Socket hooks (send/recv/poll/select) break native protocol
+    // installSocketHooks();
     
-    // v36.103: Proactively patch C++ disconnect/heartbeat functions
-    proactivePatchCppFunctions();
+    // v37.0: DISABLED — C++ function patches (quitFromServer/heartbeat) break connection
+    // proactivePatchCppFunctions();
     
     // === IMMEDIATE: NSUserDefaults hooks ===
     Class udCls = [NSUserDefaults class];
