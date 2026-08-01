@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.28-DIST loaded ===");
+        _log(@"=== WangXianHook v37.29-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7119,22 +7119,20 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
-    // v37.27: Enable CCCrypt hook SEPARATELY from DISABLE_CRYPTO_HOOKS.
-    // Clean client (hook.txt) uses CCCrypt for AES encryption of FFF493.
-    // v37.13 disabled ALL crypto hooks (DISABLE_CRYPTO_HOOKS=1) because
-    // SecKey + EncryptUtils + C++ crypto caused crashes. But CCCrypt alone
-    // is safe — it only logs + does L4 plaintext replacement on ENC.
-    // This is CRITICAL: without CCCrypt hook, L4 never fires and we can't
-    // replace DY_MIESHI in FFF493 plaintext before AES encryption.
-    {
-        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
-        if (orig_CCCrypt) {
-            int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-            DLOG(@"[SEC] CCCrypt hook v37.27: rebind=%d addr=%p (ENABLED for L4 plaintext interception)", r1, orig_CCCrypt);
-        } else {
-            DLOG(@"[SEC] CCCrypt not found via dlsym (L4 will NOT work!)");
-        }
-    }
+    // v37.29: CCCrypt hook DISABLED — v37.27/v37.28 proved that even with
+    // g_cccrypt_l4_active gate, fishhook rebind of CCCrypt itself crashes
+    // the app during createSignatureParams (likely infinite recursion or
+    // fishhook corrupts the CCCrypt call chain in SecKey/JudgeApp paths).
+    // Instead, we rely on EE007-ORIG + FFF493 hex dumps for diagnosis.
+    // L4 channel replacement will be done at network layer if needed.
+    // {
+    //     orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
+    //     if (orig_CCCrypt) {
+    //         int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+    //         DLOG(@"[SEC] CCCrypt hook v37.27: rebind=%d addr=%p (ENABLED for L4 plaintext interception)", r1, orig_CCCrypt);
+    //     }
+    // }
+    DLOG(@"[SEC] CCCrypt hook DISABLED (v37.29: fishhook rebind crashes app even with gate)");
 
 #if !DISABLE_CRYPTO_HOOKS
     // Hook SecKeyEncrypt / SecKeyDecrypt for RSA logging
@@ -8183,7 +8181,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.28-DIST — CCCrypt L4 gated: inactive during login server (JudgeApp), active after 0x80FFF495 (game server FFF493)");
+    DLOG(@"[VERSION] WangXianHook v37.29-DIST — CCCrypt hook disabled (crashes app), EE007+FFF493 hex dumps for byte-level diagnosis vs clean 178B/472B/1432B");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
