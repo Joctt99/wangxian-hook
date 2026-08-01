@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.27-DIST loaded ===");
+        _log(@"=== WangXianHook v37.28-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2187,6 +2187,11 @@ static const uint8_t kRecv24Data[63] = {
 // inline ARM64 assembly in cpp_stub_force() (linker needs external symbol)
 BOOL g_forceValidDecrypt = NO;
 static int g_forceValidDecryptFd = -1;
+
+// v37.28: CCCrypt L4 hook gate — only active AFTER game server challenge
+// response (0x80FFF495) is received. Before that (login server phase),
+// CCCrypt calls pass through unchanged to avoid crashing JudgeApp.
+static BOOL g_cccrypt_l4_active = NO;
 
 // v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
 static int g_bypassRemaining = 0;
@@ -6018,6 +6023,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         g_handshakeComplete = YES;
                         g_challengeResponded = YES;
 
+                        // v37.28: Activate CCCrypt L4 hook NOW — game server phase begins.
+                        // FFF493 will be AES-encrypted via CCCrypt, and L4 will intercept
+                        // the plaintext to replace DY_MIESHI → DYanyou0040_MIESHI.
+                        g_cccrypt_l4_active = YES;
+                        DLOG(@"[CH-L4-GATE] v37.28: CCCrypt L4 hook ACTIVATED (0x80FFF495 received)");
+
                         // v36.133: DO NOT enable crypto bypass!
                         //   Real client decrypts 0x80FFF495 payload successfully on its own.
                         //   Enabling bypass returns fake JSON which client may reject.
@@ -8016,6 +8027,13 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     if (!orig_CCCrypt) orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
     if (!orig_CCCrypt) return -1;
 
+    // v37.28: L4 gate — only active after game server challenge (0x80FFF495).
+    // Before that, pass through unchanged to avoid crashing JudgeApp/SecKey.
+    if (!g_cccrypt_l4_active) {
+        return orig_CCCrypt(op, alg, options, key, keyLen, iv,
+                            dataIn, dataInLen, dataOut, dataOutAvailable, dataOutMoved);
+    }
+
     const char *opStr = (op == 0) ? "ENC" : "DEC";
 
     // v36.126: Skip real AES decryption when forceValidDecrypt=YES
@@ -8165,7 +8183,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.27-DIST — Enable CCCrypt hook for L4 plaintext interception + EE007 hex dump for byte-level diagnosis");
+    DLOG(@"[VERSION] WangXianHook v37.28-DIST — CCCrypt L4 gated: inactive during login server (JudgeApp), active after 0x80FFF495 (game server FFF493)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
