@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.31-DIST loaded ===");
+        _log(@"=== WangXianHook v37.32-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8221,11 +8221,17 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     void *tmpOut = NULL;
     size_t tmpOutSize = 0;
     if (patchedBuf != NULL) {
-        size_t needed = ((realDataInLen + 15 + 16) / 16) * 16;  // with padding worst case
+        // v37.32: Correct AES PKCS7 padding output calculation:
+        //   output = ceil((plainLen + 1) / 16) * 16
+        // PKCS7 always adds at least 1 byte of padding (hence +1).
+        // Verified with v37.31 data: real=307 → needed=320, caller 333 fits!
+        size_t needed = ((realDataInLen + 1 + 15) / 16) * 16;
+        // Use caller's buffer if STRICTLY enough room; otherwise fall back to tmpOut.
+        // We use needed+1 as threshold so tight fits still succeed (320 <= 333).
         if (dataOutAvailable < needed) {
-            tmpOutSize = needed + 16; // extra safety margin
+            tmpOutSize = needed + 32;
             tmpOut = malloc(tmpOutSize);
-            DLOG(@"[CH-L4-BUF] v37.31: caller dataOutAvailable=%zu < needed=%zu → use heap tmpOut=%p (tmpOutSize=%zu)",
+            DLOG(@"[CH-L4-BUF] v37.32: caller dataOutAvailable=%zu < needed=%zu → use heap tmpOut=%p (tmpOutSize=%zu)",
                  dataOutAvailable, needed, tmpOut, tmpOutSize);
         }
     }
@@ -8238,27 +8244,27 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
     if (tmpOut) {
         if (ret == 0 && outMovedTmp > 0) {
-            // Now copy back as much as possible. But caller buffer is too small!
-            // Instead of truncating silently, we do: call orig AGAIN with caller's
-            // dataOutAvailable (should return kCCBufferTooSmall, then caller knows).
-            // But actually the PROPER fix is to let caller understand the longer
-            // output. Since we can't easily grow caller's stack buffer, we simply
-            // memcpy data into caller's buffer up to its size and set dataOutMoved
-            // to what we COULD copy — BUT THIS IS WRONG because it corrupts tail.
-            // Better approach: ONLY apply the patch IF dataOutAvailable is already
-            // large enough. If not, do NOT patch: send the unmodified plaintext
-            // (preserve original dataIn, reset realDataIn=realDataInLen, free
-            // patchedBuf, call orig_CCCrypt again with original parameters).
-            DLOG(@"[CH-L4-BUF] v37.31: tmpOut produced %zu bytes but caller dataOutAvailable=%zu < needed. FALLBACK: call CCCrypt without patch.",
-                 outMovedTmp, dataOutAvailable);
-            free(tmpOut);
-            if (patchedBuf) { free(patchedBuf); patchedBuf = NULL; realDataIn = dataIn; realDataInLen = dataInLen; }
-            ret = orig_CCCrypt(op, alg, options, key, keyLen, iv,
-                               dataIn, dataInLen,
-                               dataOut, dataOutAvailable, dataOutMoved);
-        } else {
-            free(tmpOut);
+            // v37.32 FIX: tmpOut ENCRYPT SUCCESS → copy ciphertext to caller's dataOut IF it FITS.
+            // CCCrypt output length follows: ciphertext ≤ plaintext + block alignment with PKCS7.
+            // Caller's dataOutAvailable may be LARGER than outMovedTmp? Yes!
+            // v37.31 buggy fallback was wrong — outMovedTmp=320 vs dataOutAvailable=333 fits!
+            if (outMovedTmp <= dataOutAvailable) {
+                memcpy(dataOut, tmpOut, outMovedTmp);
+                if (dataOutMoved) *dataOutMoved = outMovedTmp;
+                DLOG(@"[CH-L4-BUF] v37.32: PATCH APPLIED via tmpOut copy outMoved=%zu callerAvail=%zu (FIT perfectly!)",
+                     outMovedTmp, dataOutAvailable);
+            } else {
+                // output does not fit! call orig WITHOUT patch (conservative safe fallback
+                DLOG(@"[CH-L4-BUF] v37.32: tmpOut produced %zu bytes > caller %zu available → SAFE FALLBACK no patch",
+                     outMovedTmp, dataOutAvailable);
+                if (patchedBuf) { free(patchedBuf); patchedBuf = NULL; realDataIn = dataIn; realDataInLen = dataInLen; }
+                free(tmpOut); tmpOut = NULL;
+                ret = orig_CCCrypt(op, alg, options, key, keyLen, iv,
+                                   dataIn, dataInLen,
+                                   dataOut, dataOutAvailable, dataOutMoved);
+            }
         }
+        if (tmpOut) free(tmpOut);
     }
 
     if (patchedBuf) free(patchedBuf);
@@ -8313,7 +8319,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.31-DIST — CCCrypt L4: add deviceModel/GPU replacement (iPhone16ProMax→iPhone7Plus, A18Pro→A10 GPU), fix SIGSEGV via tmpOut heap + buffer-size fallback, EE007 FIELD-ALIGN 178B proven active on 5678+12003 (fieldsMask=7)");
+    DLOG(@"[VERSION] WangXianHook v37.32-DIST — Fix CCCrypt L4 fallback bug. v37.31 patches dm+gp+ch applied but wrongly falled-back to orig without patch: (1) Fix needed PKCS7 formula realDataInLen+1 (real 307→need 320 ≤ caller 333! 619→need 624 ≤ caller 636!) → uses caller buffer; (2) When tmpOut still needed for rare case, if outMovedTmp ≤ dataOutAvailable, memcpy ciphertext to caller & DLOG 'PATCH APPLIED via tmpOut' instead of fallback. Fallback only if output > callerAvail. Verified CC-AES-PLAIN has 'iPhone7Plus/A10 GPU' ✔. L4 ch=1 dm=1 gp=1 applied 3 fields FFF493 #2 plaintext, FFF493 #1 dm+gp applied.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
