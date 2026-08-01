@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.6-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.7-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6970,10 +6970,11 @@ static void installSecurityHooks(void) {
         }
     }
     
-    // Install DYLD hooks to hide injected libraries
-    installDyldHooks();
-    installDladdrHook();
-    installDlsymHook();
+    // v37.7: DISABLED DYLD hiding — capture_real.js (which worked) never hid dylibs.
+    //        Hiding injected libraries may trigger client's integrity checks.
+    // installDyldHooks();
+    // installDladdrHook();
+    installDlsymHook();  // KEEP: dlsym hook is in capture_real.js
     
     // Hook fopen/fgets for /proc/self/maps (Linux fallback)
     void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
@@ -7785,132 +7786,67 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.6-MINIMAL — status-only patch, no body modification");
-    DLOG(@"[ACT] Installing all hooks...");
-    
-    // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
+    DLOG(@"[VERSION] WangXianHook v37.7-MINIMAL — EXACT capture_real.js parity");
+    DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
+
+    // === capture_real.js parity: ONLY these hooks ===
+    // 1. dlsym hook (hide substrate/fishhook/cydia) — in installSecurityHooks
+    // 2. SCNetworkReachabilityGetFlags — in installSecurityHooks
+    // 3. UIDevice.identifierForVendor — in installSecurityHooks
+    // 4. SignatureKit hooks
+    // 5. SignatureCheck hooks
+    // 6. UIAlertView.show hook
+    //
+    // v37.7: ALL OTHER HOOKS DISABLED — they were causing '网络连接中断' or '版本过低'
+    //        by triggering client's integrity checks or corrupting network data.
+
     installSecurityHooks();
-    installKeyboardProtection();
-    
-    // v37.0: DISABLED — C++ crypto hooks break native encryption
-    // installCppCryptoHooks_v131();
-    
-    orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-    orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
-    orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-    orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
-    orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
-    orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
-    orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-    DLOG(@"[SOCK] Fallback originals: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p", orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg);
-    
-    // v37.1: DISABLED full socket hooks (send/recv/poll/select break native protocol)
-    // installSocketHooks();
+    // v37.7: DISABLED keyboard protection — not in capture_real.js
+    // installKeyboardProtection();
 
-    // v37.6: RESTORED minimal recv hooks — ONLY patch status byte (no string mods)
-    //        v37.5 disabled recv hook entirely → '版本过低' returned
-    //        v37.1-v37.4 patched status + strings → '网络连接中断' (body corrupted)
-    //        v37.6: ONLY patch status=4→0, leave body intact → client parses correctly
-    installMinimalSocketHooks();
+    // v37.7: DISABLED recv hooks — capture_real.js never patched network traffic
+    // installMinimalSocketHooks();
 
-    // v37.0: DISABLED — C++ function patches (quitFromServer/heartbeat) break connection
-    // proactivePatchCppFunctions();
-    
-    // === IMMEDIATE: NSUserDefaults hooks ===
-    Class udCls = [NSUserDefaults class];
-    if (udCls) {
-        Method m1 = class_getInstanceMethod(udCls, @selector(objectForKey:));
-        if (m1) { orig_objectForKey = (ObjForKeyIMP)method_getImplementation(m1); method_setImplementation(m1, (IMP)hook_objectForKey); }
-        Method m2 = class_getInstanceMethod(udCls, @selector(boolForKey:));
-        if (m2) { orig_boolForKey = (BoolForKeyIMP)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_boolForKey); }
-        _log(@"[INIT] NSUserDefaults hooked (objectForKey + boolForKey)");
-    }
-    
-    // === IMMEDIATE: Observation-only hooks ===
-    // NSURLSession completion handler mode
-    Class sessCls = [NSURLSession class];
-    if (sessCls) {
-        Method m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:completionHandler:));
-        if (m) { orig_dtwrc = (DTReqCompIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtwrc); _log(@"[INIT] NSURLSession.dataTask+comp observe"); }
-        // Delegate mode (no completion handler)
-        m = class_getInstanceMethod(sessCls, @selector(dataTaskWithRequest:));
-        if (m) { orig_dtr = (DTReqIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_dtr); _log(@"[INIT] NSURLSession.dataTask delegate observe"); }
-    }
-    // NSURLConnection
-    Class connCls = [NSURLConnection class];
-    if (connCls) {
-        Method am = class_getClassMethod(connCls, @selector(sendAsynchronousRequest:queue:completionHandler:));
-        if (am) { orig_asyncReq = (AsyncReqIMP)method_getImplementation(am); method_setImplementation(am, (IMP)hook_async); }
-        Method sm = class_getClassMethod(connCls, @selector(sendSynchronousRequest:returningResponse:error:));
-        if (sm) { orig_syncReq = (SyncReqIMP)method_getImplementation(sm); method_setImplementation(sm, (IMP)hook_sync); }
-        _log(@"[INIT] NSURLConnection observe");
-    }
-    // UIViewController present
-    Class vcCls = [UIViewController class];
-    if (vcCls) {
-        Method m = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
-        if (m) { orig_presentVC = (PresentVC_IMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_presentVC); _log(@"[INIT] presentVC observe"); }
-    }
-    
-    // === DIAGNOSTIC: UIAlertView show hook ===
+    // v37.7: DISABLED all observation hooks — not in capture_real.js
+    // NSUserDefaults, NSURLSession, NSURLConnection, UIViewController.presentViewController,
+    // NSDictionary, UITableView, NSJSONSerialization all disabled.
+
+    // === KEEP: UIAlertView.show hook (in capture_real.js) ===
     Class alertCls = [UIAlertView class];
     if (alertCls) {
         Method m = class_getInstanceMethod(alertCls, @selector(show));
         if (m) { orig_alertViewShow = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertViewShow); _log(@"[INIT] UIAlertView.show: hook"); }
     }
-    
-    // === DIAGNOSTIC: UIAlertController hook ===
-    // v36.59: REMOVED the UIAlertController.presentViewController hook!
-    // REASON: presentViewController:animated:completion: is called ON THE PRESENTING VC,
-    //         not on the UIAlertController itself. So this method was NEVER triggered.
-    //         Worse, the function signature was WRONG (missing viewController param) which
-    //         caused SIGSEGV when the IMP was called.
-    //         The version alert blocking is NOW correctly done in hook_presentVC (UIViewController).
-    // Class alertCtrlCls = [UIAlertController class];
-    // if (alertCtrlCls) {
-    //     Method m = class_getInstanceMethod(alertCtrlCls, @selector(presentViewController:animated:completion:));
-    //     if (m) { orig_alertControllerPresent = ...; ... }
-    // }
-    _log(@"[INIT] UIAlertController: using correct hook_presentVC from UIViewController (blocked old sigfault hook)");
-    
-    // === DIAGNOSTIC: NSDictionary hooks ===
-    Class dictCls = [NSDictionary class];
-    if (dictCls) {
-        Method m = class_getInstanceMethod(dictCls, @selector(objectForKey:));
-        if (m) { orig_dictObjectForKey = (id (*)(id, SEL, id))method_getImplementation(m); method_setImplementation(m, (IMP)hook_dictObjectForKey); _log(@"[INIT] NSDictionary.objectForKey: observe"); }
-        m = class_getInstanceMethod(dictCls, @selector(arrayForKey:));
-        if (m) { orig_arrayForKey = (id (*)(id, SEL, id))method_getImplementation(m); method_setImplementation(m, (IMP)hook_arrayForKey); _log(@"[INIT] NSDictionary.arrayForKey: observe"); }
-    }
-    
-    // === IMMEDIATE: Hook SignatureKit (must run before original +load) ===
+
+    // === KEEP: SignatureKit hooks (in capture_real.js) ===
     Class skCls = NSClassFromString(@"SignatureKit");
     if (skCls) {
         Class metaCls = object_getClass(skCls);
-        
+
         Method m = class_getClassMethod(skCls, @selector(showAlert:));
         if (m) { orig_showAlert = (ShowAlertIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showAlert); _log(@"[INIT] SK.showAlert: SUPPRESS"); }
-        
+
         m = class_getClassMethod(skCls, @selector(exitApplication));
         if (m) { orig_exitApp = (ExitAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_exitApp); _log(@"[INIT] SK.exitApplication: BLOCK"); }
-        
+
         m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
         if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: ORIG"); }
-        
+
         m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
         if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: LOG"); }
-        
+
         m = class_getClassMethod(skCls, @selector(judgeNet));
         if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet: BLOCK"); }
-        
+
         m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
         if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: ORIG"); }
-        
+
         m = class_getClassMethod(skCls, @selector(generateRequestParams));
         if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams: LOG"); }
-        
+
         m = class_getClassMethod(skCls, @selector(createSignatureParams:));
         if (m) { orig_createSigParams = (CreateSigParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_createSigParams); _log(@"[INIT] SK.createSignatureParams: LOG"); }
-        
+
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(metaCls, &mcount);
         for (unsigned int i = 0; i < mcount; i++) {
@@ -7920,21 +7856,21 @@ static void installAllHooks(void) {
     } else {
         _log(@"[INIT] WARNING: SignatureKit NOT found!");
     }
-    
-    // === IMMEDIATE: Hook SignatureCheck ===
+
+    // === KEEP: SignatureCheck hooks (in capture_real.js) ===
     Class scCls = NSClassFromString(@"SignatureCheck");
     if (scCls) {
         Class metaCls = object_getClass(scCls);
-        
+
         Method m = class_getClassMethod(scCls, @selector(JudgeApp));
         if (m) { orig_judgeApp = (JudgeAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeApp); _log(@"[INIT] SC.JudgeApp: BLOCK"); }
-        
+
         m = class_getClassMethod(scCls, @selector(showTipViewEND:));
         if (m) { orig_showTip = (ShowTipIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showTip); _log(@"[INIT] SC.showTipViewEND: SUPPRESS"); }
-        
+
         m = class_getClassMethod(scCls, @selector(exitApplication));
         if (m) { orig_scExit = (SCExitIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_scExit); _log(@"[INIT] SC.exitApplication: BLOCK"); }
-        
+
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(metaCls, &mcount);
         for (unsigned int i = 0; i < mcount; i++) {
@@ -7944,211 +7880,17 @@ static void installAllHooks(void) {
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
-    
-    // === IMMEDIATE: Version check bypass hooks ===
-    // Based on observed version status codes: 58, 64, 73
-    NSArray *versionCheckClasses = @[
-        @"VersionManager", @"AppVersion", @"GameVersion", @"UpdateManager",
-        @"VersionChecker", @"VersionVerify", @"ClientVersion", @"GameClient"
-    ];
-    
-    for (NSString *clsName in versionCheckClasses) {
-        Class cls = NSClassFromString(clsName);
-        if (cls) {
-            DLOG(@"[VER-CHK] Found version check class: %@", clsName);
-            
-            unsigned int mcount = 0;
-            Method *methods = class_copyMethodList(cls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                SEL sel = method_getName(methods[i]);
-                NSString *selName = NSStringFromSelector(sel);
-                
-                if ([selName containsString:@"version"] || [selName containsString:@"Version"] ||
-                    [selName containsString:@"check"] || [selName containsString:@"Check"] ||
-                    [selName containsString:@"verify"] || [selName containsString:@"Verify"] ||
-                    [selName containsString:@"update"] || [selName containsString:@"Update"] ||
-                    [selName containsString:@"status"] || [selName containsString:@"Status"]) {
-                    DLOG(@"[VER-CHK] Instance method to monitor: -[%@ %@]", clsName, selName);
-                }
-            }
-            if (methods) free(methods);
-            
-            Class metaCls = object_getClass(cls);
-            Method *classMethods = class_copyMethodList(metaCls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                SEL sel = method_getName(classMethods[i]);
-                NSString *selName = NSStringFromSelector(sel);
-                
-                if ([selName containsString:@"version"] || [selName containsString:@"Version"] ||
-                    [selName containsString:@"check"] || [selName containsString:@"Check"] ||
-                    [selName containsString:@"verify"] || [selName containsString:@"Verify"] ||
-                    [selName containsString:@"update"] || [selName containsString:@"Update"] ||
-                    [selName containsString:@"status"] || [selName containsString:@"Status"]) {
-                    DLOG(@"[VER-CHK] Class method to monitor: +[%@ %@]", clsName, selName);
-                }
-            }
-            if (classMethods) free(classMethods);
-        }
-    }
-    
-    // === IMMEDIATE: Hook ServerInfoForClient class to trace server list parsing ===
-    Class msiCls = NSClassFromString(@"ServerInfoForClient");
-    if (msiCls) {
-        DLOG(@"[MSI] ServerInfoForClient class FOUND!");
-        
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(msiCls, &mcount);
-        for (unsigned int i = 0; i < mcount; i++) {
-            SEL sel = method_getName(methods[i]);
-            NSString *selName = NSStringFromSelector(sel);
-            DLOG(@"[MSI] -[%@ %@]", NSStringFromClass(msiCls), selName);
-        }
-        if (methods) free(methods);
-        
-        Method m_init = class_getInstanceMethod(msiCls, @selector(init));
-        if (m_init) {
-            orig_msi_init = method_getImplementation(m_init);
-            method_setImplementation(m_init, (IMP)msi_init_hook);
-            DLOG(@"[MSI-HOOK] Hooked: init");
-        }
-        
-        Method m_initDict = class_getInstanceMethod(msiCls, @selector(initWithDictionary:));
-        if (m_initDict) {
-            orig_msi_initWithDict = method_getImplementation(m_initDict);
-            method_setImplementation(m_initDict, (IMP)msi_initWithDict_hook);
-            DLOG(@"[MSI-HOOK] Hooked: initWithDictionary:");
-        }
-        
-        Method m_status = class_getInstanceMethod(msiCls, @selector(status));
-        if (m_status) {
-            orig_msi_status = method_getImplementation(m_status);
-            method_setImplementation(m_status, (IMP)msi_status_hook);
-            DLOG(@"[MSI-HOOK] Hooked: status");
-        }
-        
-        Method m_statusValue = class_getInstanceMethod(msiCls, @selector(statusValue));
-        if (m_statusValue) {
-            method_setImplementation(m_statusValue, (IMP)msi_status_hook);
-            DLOG(@"[MSI-HOOK] Hooked: statusValue");
-        }
-        
-        Method m_ip = class_getInstanceMethod(msiCls, @selector(ip));
-        if (m_ip) {
-            method_setImplementation(m_ip, (IMP)msi_ip_hook);
-            DLOG(@"[MSI-HOOK] Hooked: ip");
-        }
-        
-        Method m_category = class_getInstanceMethod(msiCls, @selector(category));
-        if (m_category) {
-            method_setImplementation(m_category, (IMP)msi_category_hook);
-            DLOG(@"[MSI-HOOK] Hooked: category");
-        }
-        
-        Method m_serverType = class_getInstanceMethod(msiCls, @selector(serverType));
-        if (m_serverType) {
-            method_setImplementation(m_serverType, (IMP)msi_serverType_hook);
-            DLOG(@"[MSI-HOOK] Hooked: serverType");
-        }
-        
-        Method m_serverId = class_getInstanceMethod(msiCls, @selector(serverid));
-        if (m_serverId) {
-            method_setImplementation(m_serverId, (IMP)msi_serverType_hook);
-            DLOG(@"[MSI-HOOK] Hooked: serverid");
-        }
-        
-        Method m_clientId = class_getInstanceMethod(msiCls, @selector(clientid));
-        if (m_clientId) {
-            method_setImplementation(m_clientId, (IMP)msi_serverType_hook);
-            DLOG(@"[MSI-HOOK] Hooked: clientid");
-        }
-    } else {
-        DLOG(@"[MSI] ServerInfoForClient class NOT found!");
-    }
-    
-    // Dump NSUserDefaults
-    @try {
-        NSDictionary *allDefaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-        DLOG(@"[NSUD-DUMP] Total keys: %lu", (unsigned long)allDefaults.count);
-        for (NSString *key in allDefaults) {
-            NSString *lk = [key lowercaseString];
-            if ([lk containsString:@"pass"] || [lk containsString:@"verify"] || 
-                [lk containsString:@"sign"] || [lk containsString:@"ispass"] ||
-                [lk containsString:@"cert"] || [lk containsString:@"check"]) {
-                DLOG(@"[NSUD-DUMP] %@ = %@", key, allDefaults[key]);
-            }
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[NSUD-DUMP] Exception: %@", e);
-    }
-    DLOG(@"[NSUD] Total reads so far: %d", g_nsudCount);
-    
-    // === ANTI-CHEAT MONITOR: Dynamic method logging ===
-    // Monitor common anti-cheat related classes and methods
-    NSArray *antiCheatClasses = @[
-        @"SecurityCheck", @"AntiCheat", @"SafeGuard", @"CheatDetection",
-        @"ProtectManager", @"GameGuard", @"AntiHack", @"SignatureVerify",
-        @"DeviceCheck", @"EnvironmentCheck", @"DebugDetector", @"BanManager"
-    ];
-    
-    for (NSString *clsName in antiCheatClasses) {
-        Class cls = NSClassFromString(clsName);
-        if (cls) {
-            DLOG(@"[AC-MONITOR] Found anti-cheat class: %@", clsName);
-            unsigned int mcount = 0;
-            Method *methods = class_copyMethodList(cls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                SEL sel = method_getName(methods[i]);
-                NSString *selName = NSStringFromSelector(sel);
-                DLOG(@"[AC-MONITOR] Instance method: -[%@ %@]", clsName, selName);
-            }
-            if (methods) free(methods);
-            
-            Class metaCls = object_getClass(cls);
-            Method *classMethods = class_copyMethodList(metaCls, &mcount);
-            for (unsigned int i = 0; i < mcount; i++) {
-                SEL sel = method_getName(classMethods[i]);
-                NSString *selName = NSStringFromSelector(sel);
-                DLOG(@"[AC-MONITOR] Class method: +[%@ %@]", clsName, selName);
-            }
-            if (classMethods) free(classMethods);
-        }
-    }
-    
-    // Monitor common anti-cheat method names
-    NSArray *antiCheatSelectors = @[
-        @"isJailbroken", @"isDebugged", @"isSimulator", @"isDebuggerAttached",
-        @"detectCheat", @"detectHack", @"checkEnvironment", @"antiDebug",
-        @"checkDebugger", @"securityCheck", @"verifySecurity", @"checkSecurityStatus",
-        @"checkBanStatus", @"isBanned", @"punish:", @"verifySignature:",
-        @"judgeApp:", @"JudgeApp", @"showAlert:", @"exitApplication"
-    ];
-    
-    Class nsobjCls = [NSObject class];
-    for (NSString *selName in antiCheatSelectors) {
-        SEL sel = NSSelectorFromString(selName);
-        if (sel) {
-            if ([nsobjCls instancesRespondToSelector:sel]) {
-                DLOG(@"[AC-MONITOR] NSObject responds to: %@", selName);
-            }
-            if ([nsobjCls respondsToSelector:sel]) {
-                DLOG(@"[AC-MONITOR] NSObject class responds to: %@", selName);
-            }
-        }
-    }
-    
-    // === v36.113: DECODE-SEARCH COMPLETELY DISABLED ===
-    // This scan was causing crashes by iterating thousands of ObjC classes.
-    // It was only diagnostic and serves no functional purpose.
-    DLOG(@"[DECODE-SEARCH] v36.113: Scan DISABLED (was causing crashes)");
-    
-    // === DEFERRED: Create UI button with retry ===
+
+    _log(@"[INIT] v37.7: capture_real.js parity mode — minimal hooks only");
+
+    // === DEFERRED: Create log button (keep for debugging) ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
                 if (s.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *win in s.windows) { 
-                        if (win.isKeyWindow) { w = win; break; } 
+                    for (UIWindow *win in s.windows) {
+                        if (win.isKeyWindow) { w = win; break; }
                         if (!w && win.rootViewController) w = win;
                     }
                 }
@@ -8156,498 +7898,12 @@ static void installAllHooks(void) {
         }
         if (!w) w = [UIApplication sharedApplication].keyWindow;
         if (!w) w = [UIApplication sharedApplication].windows.firstObject;
-        
         if (w) {
             createLogButton(w);
-        } else {
-            DLOG(@"[UI] No window at 0.5s, retry at 2s");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIWindow *w2 = [UIApplication sharedApplication].windows.firstObject;
-                if (w2) {
-                    createLogButton(w2);
-                } else {
-                    DLOG(@"[UI] No window at 2s, retry at 5s");
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        UIWindow *w3 = [UIApplication sharedApplication].windows.firstObject;
-                        if (w3) {
-                            createLogButton(w3);
-                        } else {
-                            DLOG(@"[UI] No window found after 5s, giving up");
-                        }
-                    });
-                }
-            });
         }
     });
-    
-    tryHookMieshiServerInfo(0);
-    
-    // === DEFERRED: UITableView DataSource Hook for server list debugging ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        Class tableViewCls = [UITableView class];
-        
-        Method numberOfRows = class_getInstanceMethod(tableViewCls, @selector(numberOfRowsInSection:));
-        if (numberOfRows) {
-            IMP orig_impl = method_getImplementation(numberOfRows);
-            method_setImplementation(numberOfRows, (IMP)hook_numberOfRowsInSection);
-            orig_tableView_numberOfRows = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView numberOfRowsInSection:");
-        }
-        
-        Method cellForRow = class_getInstanceMethod(tableViewCls, @selector(cellForRowAtIndexPath:));
-        if (cellForRow) {
-            IMP orig_impl = method_getImplementation(cellForRow);
-            method_setImplementation(cellForRow, (IMP)hook_cellForRowAtIndexPath);
-            orig_tableView_cellForRow = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView cellForRowAtIndexPath:");
-        }
-        
-        Method numberOfSections = class_getInstanceMethod(tableViewCls, @selector(numberOfSections));
-        if (numberOfSections) {
-            IMP orig_impl = method_getImplementation(numberOfSections);
-            method_setImplementation(numberOfSections, (IMP)hook_numberOfSections);
-            orig_tableView_numberOfSections = orig_impl;
-            DLOG(@"[TV-HOOK] Hooked UITableView numberOfSections");
-        }
-    });
-    
-    // === DEFERRED: NSURLSession Hook for HTTP-based version check/server list ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        installNSURLSessionHooks();
-    });
-    
-    // === DEFERRED: Hook NSJSONSerialization for decrypted data modification ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        installJSONSerializationHook();
-    });
-    
-    // === DEFERRED: Scan all server-related classes and hook their init methods ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            unsigned int classCount = 0;
-            Class *classes = objc_copyClassList(&classCount);
-            NSMutableArray *serverClasses = [NSMutableArray array];
-            
-            for (unsigned int i = 0; i < classCount; i++) {
-                Class cls = classes[i];
-                NSString *clsName = NSStringFromClass(cls);
-                if (!clsName) continue;
-                
-                NSString *lower = [clsName lowercaseString];
-                if (([lower containsString:@"server"] || [lower containsString:@"serverlist"] ||
-                     [lower containsString:@"serverinfo"] || [lower containsString:@"servers"]) &&
-                    ![lower containsString:@"mieshi"] && ![clsName isEqualToString:@"UIApplication"]) {
-                    [serverClasses addObject:clsName];
-                }
-            }
-            
-            DLOG(@"[SERVER-CLASS] Found %d server-related classes:", serverClasses.count);
-            for (NSString *clsName in serverClasses) {
-                DLOG(@"[SERVER-CLASS]   %@", clsName);
-            }
-            
-            if (classes) free(classes);
-        } @catch (NSException *e) {
-            DLOG(@"[SERVER-CLASS] Exception: %@", e);
-        }
-    });
-    
-    // === DEFERRED: Hook UITableViewDelegate didSelectRow for server selection ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        Class tableViewCls = [UITableView class];
-        Method didSelect = class_getInstanceMethod(tableViewCls, @selector(didSelectRowAtIndexPath:));
-        if (didSelect) {
-            IMP orig_impl = method_getImplementation(didSelect);
-            DLOG(@"[TV-HOOK] Found didSelectRowAtIndexPath in UITableView");
-        }
-        
-        // Hook reloadData to detect when server list table is reloaded
-        Method reloadData = class_getInstanceMethod(tableViewCls, @selector(reloadData));
-        if (reloadData) {
-            IMP orig_reload = method_getImplementation(reloadData);
-            IMP new_reload = imp_implementationWithBlock(^(id self, SEL _cmd) {
-                NSString *clsName = NSStringFromClass([self class]);
-                DLOG(@"[TV-RELOAD] -[%@ reloadData] called", clsName);
-                
-                @try {
-                    id dataSource = [self respondsToSelector:@selector(dataSource)] ? [self dataSource] : nil;
-                    if (dataSource) {
-                        NSString *dsCls = NSStringFromClass([dataSource class]);
-                        DLOG(@"[TV-RELOAD] dataSource=%@", dsCls);
-                        
-                        if ([dataSource respondsToSelector:@selector(serverList)] || [dataSource respondsToSelector:@selector(servers)]) {
-                            id serverList = [dataSource performSelector:[dataSource respondsToSelector:@selector(serverList)] ? @selector(serverList) : @selector(servers)];
-                            if ([serverList isKindOfClass:[NSArray class]]) {
-                                DLOG(@"[TV-RELOAD] serverList count=%lu", (unsigned long)[serverList count]);
-                            }
-                        }
-                        
-                        if ([dataSource respondsToSelector:@selector(numberOfSections)]) {
-                            NSNumber *sectionsNum = [dataSource performSelector:@selector(numberOfSections)];
-                            NSInteger sections = [sectionsNum integerValue];
-                            DLOG(@"[TV-RELOAD] numberOfSections=%ld", (long)sections);
-                            for (NSInteger s = 0; s < sections; s++) {
-                                if ([dataSource respondsToSelector:@selector(numberOfRowsInSection:)]) {
-                                    NSNumber *rowsNum = [dataSource performSelector:@selector(numberOfRowsInSection:) withObject:@(s)];
-                                    NSInteger rows = [rowsNum integerValue];
-                                    DLOG(@"[TV-RELOAD] numberOfRowsInSection:%ld=%ld", (long)s, (long)rows);
-                                }
-                            }
-                        }
-                    }
-                } @catch (NSException *e) {
-                    DLOG(@"[TV-RELOAD] Exception: %@", e);
-                }
-                
-                ((void(*)(id, SEL))orig_reload)(self, _cmd);
-            });
-            method_setImplementation(reloadData, new_reload);
-            DLOG(@"[TV-HOOK] Hooked UITableView reloadData");
-        }
-    });
-    
-    // === DEFERRED: Hook LoginModuleMessageHandlerImpl for server list response ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            Class lmhiCls = NSClassFromString(@"LoginModuleMessageHandlerImpl");
-            if (lmhiCls) {
-                DLOG(@"[LMHI] LoginModuleMessageHandlerImpl class FOUND!");
-                
-                unsigned int mcount = 0;
-                Method *methods = class_copyMethodList(lmhiCls, &mcount);
-                for (unsigned int i = 0; i < mcount; i++) {
-                    SEL sel = method_getName(methods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    if ([selName containsString:@"SERVER_LIST"] || 
-                        [selName containsString:@"server"] || 
-                        [selName containsString:@"Server"]) {
-                        DLOG(@"[LMHI-METHOD] -[%@ %@]", NSStringFromClass(lmhiCls), selName);
-                        
-                        IMP orig = method_getImplementation(methods[i]);
-                        IMP new_impl = imp_implementationWithBlock(^(id self, SEL _cmd, ...) {
-                            DLOG(@"[LMHI-CALL] -[%@ %@] called", NSStringFromClass([self class]), selName);
-                            va_list args;
-                            va_start(args, _cmd);
-                            id result = ((id(*)(id, SEL, va_list))orig)(self, _cmd, args);
-                            va_end(args);
-                            DLOG(@"[LMHI-CALL] -[%@ %@] returned: %@", NSStringFromClass([self class]), selName, result ?: @"nil");
-                            return result;
-                        });
-                        method_setImplementation(methods[i], new_impl);
-                        DLOG(@"[LMHI-HOOK] Hooked: %@", selName);
-                    }
-                }
-                if (methods) free(methods);
-            } else {
-                DLOG(@"[LMHI] LoginModuleMessageHandlerImpl class NOT found!");
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[LMHI] Exception: %@", e);
-        }
-    });
-    
-    // === DEFERRED: Hook CLogin for server list UI ===
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            Class cLoginCls = NSClassFromString(@"CLogin");
-            if (cLoginCls) {
-                DLOG(@"[CLOGIN] CLogin class FOUND!");
-                
-                unsigned int mcount = 0;
-                Method *methods = class_copyMethodList(cLoginCls, &mcount);
-                for (unsigned int i = 0; i < mcount; i++) {
-                    SEL sel = method_getName(methods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    if ([selName containsString:@"server"] || 
-                        [selName containsString:@"Server"] ||
-                        [selName containsString:@"ServerList"] ||
-                        [selName containsString:@"updateServer"]) {
-                        DLOG(@"[CLOGIN-METHOD] -[%@ %@]", NSStringFromClass(cLoginCls), selName);
-                    }
-                }
-                if (methods) free(methods);
-            } else {
-                DLOG(@"[CLOGIN] CLogin class NOT found!");
-            }
-        } @catch (NSException *e) {
-            DLOG(@"[CLOGIN] Exception: %@", e);
-        }
-    });
-    
-    // === v36.113: CRYPTO-CLASS SCAN COMPLETELY DISABLED ===
-    // This scan was causing crashes by iterating thousands of ObjC classes on the main thread.
-    // It was only diagnostic (finding crypto/protocol classes) and serves no functional purpose.
-    DLOG(@"[CRYPTO-CLASS] v36.113: Scan DISABLED (was causing crashes)");
-    
-    // === v36.113: EncryptUtils check only (no full class scan) ===
-    @try {
-        Class encryptUtilsCls = NSClassFromString(@"EncryptUtils");
-        if (encryptUtilsCls) {
-            unsigned int instCount = 0;
-            Method *instMethods = class_copyMethodList(encryptUtilsCls, &instCount);
-            Class metaCls = object_getClass(encryptUtilsCls);
-            unsigned int clsCount = 0;
-            Method *clsMethods = class_copyMethodList(metaCls, &clsCount);
-            
-            DLOG(@"[ENCRYPT-UTILS] EncryptUtils: %u inst methods, %u cls methods", instCount, clsCount);
-            
-            NSMutableString *allMethods = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Instance methods:"];
-            for (unsigned int i = 0; i < instCount; i++) {
-                SEL sel = method_getName(instMethods[i]);
-                [allMethods appendFormat:@"\n  -%@", NSStringFromSelector(sel)];
-            }
-            DLOG(@"%@", allMethods);
-            
-            NSMutableString *clsMethodList = [NSMutableString stringWithString:@"[ENCRYPT-UTILS] Class methods:"];
-            for (unsigned int i = 0; i < clsCount; i++) {
-                SEL sel = method_getName(clsMethods[i]);
-                [clsMethodList appendFormat:@"\n  +%@", NSStringFromSelector(sel)];
-            }
-            DLOG(@"%@", clsMethodList);
-            
-            DLOG(@"[ENCRYPT-UTILS] %u inst + %u cls methods listed (no hooking - va_list crash risk)", instCount, clsCount);
-            if (instMethods) free(instMethods);
-            if (clsMethods) free(clsMethods);
-        }
-    } @catch (NSException *e) {
-        DLOG(@"[ENCRYPT-UTILS] Exception: %@", e);
-    }
-    
-    // === v36.96: Enhanced NetImpl/SocketClient hook ===
-    // Try multiple approaches to prevent client disconnect after fake response
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            DLOG(@"[NETIMPL-HOOK] v36.96: Starting enhanced search for disconnect functions...");
-            
-            // === Approach 1: Hook SocketClient send/recv to suppress network errors ===
-            // The client may check socket state after recv returns 0
-            // By hooking SocketClient, we can prevent error propagation
-            NSArray *socketClsNames = @[@"SocketClient", @"Socket", @"TCPSocket", @"GameSocket", @"NetworkSocket"];
-            for (NSString *clsName in socketClsNames) {
-                Class cls = NSClassFromString(clsName);
-                if (cls) {
-                    DLOG(@"[NETIMPL-HOOK] v36.96: Found socket class: %@", clsName);
-                    unsigned int mcount = 0;
-                    Method *methods = class_copyMethodList(cls, &mcount);
-                    for (unsigned int i = 0; i < mcount; i++) {
-                        SEL sel = method_getName(methods[i]);
-                        NSString *selName = NSStringFromSelector(sel);
-                        // Hook methods that could trigger disconnect
-                        if ([selName containsString:@"onDisconnect"] || [selName containsString:@"onError"] ||
-                            [selName containsString:@"didDisconnect"] || [selName containsString:@"connectionLost"] ||
-                            [selName containsString:@"networkError"] || [selName containsString:@"onNetworkError"]) {
-                            DLOG(@"[NETIMPL-HOOK] v36.96: Hooking %@.%@", clsName, selName);
-                            IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                DLOG(@"[NETIMPL-SUPPRESS] v36.96: SUPPRESSED %@.%@ (no-op)", clsName, selName);
-                            });
-                            method_setImplementation(methods[i], noopImpl);
-                            if (!g_quitFromServerHooked) g_quitFromServerHooked = YES;
-                        }
-                    }
-                    if (methods) free(methods);
-                }
-            }
-            
-            // === Approach 2: Search ALL images using dlopen for C++ disconnect functions ===
-            DLOG(@"[NETIMPL-HOOK] v36.97: Searching ALL images using dlopen for C++ functions...");
-            int imageCount = _dyld_image_count();
-            
-            // Lists of mangled names to search
-            const char *disconnectNames[] = {
-                "_ZN7NetImpl14quitFromServerEv",
-                "_ZN7NetImpl13quitFromServerEv",
-                "_ZN7NetImpl14quitFromServerEiv",
-                "_ZN12SocketClient14quitFromServerEv",
-                "_ZN12SocketClient13quitFromServerEv",
-                "_ZN7NetImpl10disconnectEv",
-                "_ZN12SocketClient10disconnectEv",
-                "_ZN7NetImpl9closeGameEv",
-                "_ZN12SocketClient9closeGameEv",
-                NULL
-            };
-            
-            const char *heartbeatNames[] = {
-                "_ZN7NetImpl9heartbeatEv",
-                "_ZN7NetImpl14sendHeartbeatEv",
-                "_ZN7NetImpl15processHeartbeatEv",
-                "_ZN12SocketClient14sendHeartbeatEv",
-                "_ZN7NetImpl12checkConnectionEv",
-                "_ZN12SocketClient12checkConnectionEv",
-                NULL
-            };
-            
-            void *foundDisconnectFunc = NULL;
-            void *foundHeartbeatFunc = NULL;
-            char foundDisconnectName[256] = {0};
-            char foundHeartbeatName[256] = {0};
-            
-            // Search using dlopen (correct way to get symbol from specific image)
-            for (int idx = 0; idx < imageCount; idx++) {
-                const char *imageName = _dyld_get_image_name(idx);
-                if (!imageName) continue;
-                
-                // Skip our own dylib
-                if (strstr(imageName, "WangXianHook") || strstr(imageName, "lnSignature")) continue;
-                
-                void *handle = dlopen(imageName, RTLD_NOLOAD | RTLD_LAZY);
-                if (!handle) continue;
-                
-                // Search disconnect functions
-                for (int n = 0; disconnectNames[n] != NULL; n++) {
-                    void *sym = dlsym(handle, disconnectNames[n]);
-                    if (sym) {
-                        foundDisconnectFunc = sym;
-                        strncpy(foundDisconnectName, disconnectNames[n], sizeof(foundDisconnectName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND disconnect: %s in image[%d]: %s at %p", 
-                             disconnectNames[n], idx, imageName, foundDisconnectFunc);
-                        break;
-                    }
-                }
-                
-                // Search heartbeat functions
-                for (int n = 0; heartbeatNames[n] != NULL; n++) {
-                    void *sym = dlsym(handle, heartbeatNames[n]);
-                    if (sym) {
-                        foundHeartbeatFunc = sym;
-                        strncpy(foundHeartbeatName, heartbeatNames[n], sizeof(foundHeartbeatName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND heartbeat: %s in image[%d]: %s at %p", 
-                             heartbeatNames[n], idx, imageName, foundHeartbeatFunc);
-                        break;
-                    }
-                }
-                
-                dlclose(handle);
-                
-                if (foundDisconnectFunc && foundHeartbeatFunc) break;
-            }
-            
-            // === Approach 3: Try RTLD_DEFAULT as fallback ===
-            if (!foundDisconnectFunc) {
-                for (int n = 0; disconnectNames[n] != NULL; n++) {
-                    void *sym = dlsym(RTLD_DEFAULT, disconnectNames[n]);
-                    if (sym) {
-                        foundDisconnectFunc = sym;
-                        strncpy(foundDisconnectName, disconnectNames[n], sizeof(foundDisconnectName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND disconnect via RTLD_DEFAULT: %s at %p", 
-                             disconnectNames[n], foundDisconnectFunc);
-                        break;
-                    }
-                }
-            }
-            
-            if (!foundHeartbeatFunc) {
-                for (int n = 0; heartbeatNames[n] != NULL; n++) {
-                    void *sym = dlsym(RTLD_DEFAULT, heartbeatNames[n]);
-                    if (sym) {
-                        foundHeartbeatFunc = sym;
-                        strncpy(foundHeartbeatName, heartbeatNames[n], sizeof(foundHeartbeatName) - 1);
-                        DLOG(@"[NETIMPL-HOOK] v36.97: FOUND heartbeat via RTLD_DEFAULT: %s at %p", 
-                             heartbeatNames[n], foundHeartbeatFunc);
-                        break;
-                    }
-                }
-            }
-            
-            // === Approach 4: Use rebindSymbol (fishhook) to hook C++ functions ===
-            // This works if the C++ function is referenced through PLT/GOT
-            const char *heartbeatSymbols[] = {
-                "_ZN7NetImpl9heartbeatEv",
-                "_ZN7NetImpl14sendHeartbeatEv",
-                "_ZN7NetImpl15processHeartbeatEv",
-                "_ZN7NetImpl12checkConnectionEv",
-                "_ZN12SocketClient14sendHeartbeatEv",
-                NULL
-            };
-            
-            const char *disconnectSymbols[] = {
-                "_ZN7NetImpl14quitFromServerEv",
-                "_ZN7NetImpl13quitFromServerEv",
-                "_ZN7NetImpl14quitFromServerEiv",
-                "_ZN12SocketClient14quitFromServerEv",
-                "_ZN7NetImpl10disconnectEv",
-                "_ZN7NetImpl9closeGameEv",
-                NULL
-            };
-            
-            // Try to hook heartbeat functions via fishhook
-            for (int n = 0; heartbeatSymbols[n] != NULL; n++) {
-                // rebindSymbol expects symbol name WITHOUT leading underscore
-                const char *symName = heartbeatSymbols[n] + 1;
-                int patched = rebindSymbol(symName, (void *)noop_heartbeat, (void **)&orig_heartbeat_func);
-                if (patched > 0) {
-                    DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked heartbeat %s via fishhook (patched=%d)", symName, patched);
-                    g_quitFromServerHooked = YES;
-                    break;
-                }
-            }
-            
-            // Try to hook disconnect functions via fishhook
-            for (int n = 0; disconnectSymbols[n] != NULL; n++) {
-                const char *symName = disconnectSymbols[n] + 1;
-                int patched = rebindSymbol(symName, (void *)noop_disconnect, (void **)&orig_disconnect_func);
-                if (patched > 0) {
-                    DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked disconnect %s via fishhook (patched=%d)", symName, patched);
-                    g_quitFromServerHooked = YES;
-                    break;
-                }
-            }
-            
-            // Also try to hook via symbol name with underscore (for symbols already loaded)
-            if (!g_quitFromServerHooked) {
-                for (int n = 0; heartbeatSymbols[n] != NULL; n++) {
-                    int patched = rebindSymbol(heartbeatSymbols[n], (void *)noop_heartbeat, (void **)&orig_heartbeat_func);
-                    if (patched > 0) {
-                        DLOG(@"[NETIMPL-HOOK] v36.97: Hooked heartbeat %s (with underscore) via fishhook (patched=%d)", heartbeatSymbols[n], patched);
-                        g_quitFromServerHooked = YES;
-                        break;
-                    }
-                }
-            }
-            
-            // === Approach 5: Hook Objective-C disconnect methods ===
-            NSArray *disconnectClsNames = @[@"NetImpl", @"GameNetManager", @"NetworkManager", 
-                                            @"GameNetwork", @"NetClient", @"GameSocket"];
-            NSArray *methodPatterns = @[@"quitFromServer", @"disconnect", @"closeServer", 
-                                        @"stopConnection", @"onDisconnect", @"connectionLost"];
-            
-            for (NSString *clsName in disconnectClsNames) {
-                Class cls = NSClassFromString(clsName);
-                if (!cls) continue;
-                
-                unsigned int mcount = 0;
-                Method *methods = class_copyMethodList(cls, &mcount);
-                for (unsigned int i = 0; i < mcount; i++) {
-                    SEL sel = method_getName(methods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    
-                    for (NSString *pattern in methodPatterns) {
-                        if ([selName containsString:pattern]) {
-                            DLOG(@"[NETIMPL-HOOK] v36.97: Hooking %@.%@ (matches '%@')", 
-                                 clsName, selName, pattern);
-                            IMP noopImpl = imp_implementationWithBlock(^(void) {
-                                DLOG(@"[NETIMPL-BLOCK] v36.97: BLOCKED %@.%@ (no-op)", clsName, selName);
-                            });
-                            method_setImplementation(methods[i], noopImpl);
-                            g_quitFromServerHooked = YES;
-                            break;
-                        }
-                    }
-                }
-                if (methods) free(methods);
-            }
-            
-            if (!g_quitFromServerHooked) {
-                DLOG(@"[NETIMPL-HOOK] v36.97: INFO - No disconnect function found via ObjC runtime");
-                DLOG(@"[NETIMPL-HOOK] v36.97: This is expected if NetImpl is pure C++ code");
-                DLOG(@"[NETIMPL-HOOK] v36.97: Will rely on FAKE-RESP injection + EAGAIN protection");
-            } else {
-                DLOG(@"[NETIMPL-HOOK] v36.97: Successfully hooked disconnect functions!");
-            }
-            
-        } @catch (NSException *e) {
-            DLOG(@"[NETIMPL-HOOK] v36.96: Exception during hooking: %@", e);
-        }
-    });
+
+    DLOG(@"[ACT] v37.7: All hooks installed (capture_real.js parity)");
 }
 
 
