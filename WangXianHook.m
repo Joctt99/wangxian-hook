@@ -8024,7 +8024,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 BOOL bounded = !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_');
                 bounded = bounded && !((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_');
                 if (bounded) {
-                    newLen += (size_t)(cur - (const char *)(realDataIn + newLen + patchCount*9 - (patchCount ? 18 : 0))) /* approximation */;
+                    const char *base = (const char *)realDataIn;
+                    newLen += (size_t)(cur - (const char *)(base + newLen + patchCount*9 - (patchCount ? 18 : 0)));
                     patchCount++;
                 }
                 cur += 9;
