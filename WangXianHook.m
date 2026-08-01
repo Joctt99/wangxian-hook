@@ -541,7 +541,6 @@
 #include <mach/mach.h>
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
-#include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 
 // v36.103: Declare private Mach API for code page patching
@@ -7920,8 +7919,8 @@ static void scanAndPatchChannelInMemory(void) {
     DLOG(@"[MEM-PATCH] v37.24: Scanning writable memory for DY_MIESHI...");
 
     mach_port_t task = mach_task_self();
-    mach_vm_address_t address = 0;
-    mach_vm_size_t size = 0;
+    vm_address_t address = 0;
+    vm_size_t size = 0;
     natural_t depth = 0;
     int totalFound = 0;
     int totalPatched = 0;
@@ -7930,8 +7929,8 @@ static void scanAndPatchChannelInMemory(void) {
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
 
-        kern_return_t kr = mach_vm_region_recurse(task, &address, &size, &depth,
-                                                   (vm_region_recurse_info_t)&info, &info_count);
+        kern_return_t kr = vm_region_recurse_64(task, &address, &size, &depth,
+                                                 (vm_region_recurse_info_t)&info, &info_count);
         if (kr != KERN_SUCCESS) break;
 
         if (info.is_submap) {
