@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.4-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.5-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7808,7 +7808,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.4-MINIMAL — Login patches + SCNetwork + MSI-STUB disabled");
+    DLOG(@"[VERSION] WangXianHook v37.5-MINIMAL — NO recv patches, native protocol, UIAlertView suppress");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
@@ -7830,12 +7830,13 @@ static void installAllHooks(void) {
     // v37.1: DISABLED full socket hooks (send/recv/poll/select break native protocol)
     // installSocketHooks();
 
-    // v37.1: RESTORED — Minimal recv hooks for login server patches ONLY
-    //        (patches 0x802EE118/120/121 status, 维护→运行, clears 版本过低)
-    //        Does NOT touch game server traffic, does NOT inject fake responses.
-    //        FIX: v37.0 defined installMinimalSocketHooks() but never called it,
-    //             causing "版本过低" popup to reappear.
-    installMinimalSocketHooks();
+    // v37.5: DISABLED minimal recv hooks — patchLoginServerData corrupts 0x802EE121
+    //        response by changing status=4→0 and clearing 版本过低 string.
+    //        capture_real.js (Frida diagnostic, which WORKED) never patched any
+    //        login server response. status=4 is NORMAL, not an error. Client
+    //        parses the original response correctly and connects to game server.
+    //        版本过低 popup is suppressed by UIAlertView.show hook instead.
+    // installMinimalSocketHooks();
 
     // v37.0: DISABLED — C++ function patches (quitFromServer/heartbeat) break connection
     // proactivePatchCppFunctions();
