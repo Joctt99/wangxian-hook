@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.18-DIST loaded ===");
+        _log(@"=== WangXianHook v37.19-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3930,17 +3930,33 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
 
-    // v37.18: For ALL game server packets, call orig_send directly — NO processing.
-    // User goal: distributable IPA with hooks. Server closes connection after receiving
-    // processed packets. Skip ALL send hook processing for game server ports.
+    // v37.19-DIST: For ALL game server packets, call orig_send directly — NO processing.
+    // Added verbose FULL hex dump for 0x000EE007 and 0x00FFF493 so we can do byte-by-byte
+    // comparison against the clean (non-injected) client capture (hook.txt).
     if (len >= 8 && (port == 12003 || port == 58158 ||
                       (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024))) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        // v37.19-DIST: Verbose hex for critical commands (EE007 device info, FFF493 role data)
+        if (cmd == 0x000EE007 || cmd == 0x00FFF493) {
+            NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
+            for (size_t i = 0; i < len; i++) {
+                [hex appendFormat:@"%02X ", p[i]];
+                if ((i + 1) % 32 == 0 && i + 1 < len) [hex appendString:@"\n    "];
+            }
+            DLOG(@"[GAME-SEND-HEX] cmd=0x%08X len=%zu port=%d FULL HEX:\n    %@", cmd, len, port, hex);
+            // Also print tail so we can verify trailing bytes (01 00 vs 00 01 00 for EE007)
+            if (len >= 8) {
+                size_t tailStart = (len > 32) ? (len - 32) : 0;
+                NSMutableString *tail = [NSMutableString string];
+                for (size_t i = tailStart; i < len; i++) [tail appendFormat:@"%02X ", p[i]];
+                DLOG(@"[GAME-SEND-TAIL] cmd=0x%08X len=%zu tail[%zu-%zu]: %@", cmd, len, tailStart, len-1, tail);
+            }
+        }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
-        DLOG(@"[SEND-DIRECT] v37.18: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct)", cmd, len, port, ret);
+        DLOG(@"[SEND-DIRECT] v37.19: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct)", cmd, len, port, ret);
         return ret;
     }
 
@@ -6880,15 +6896,27 @@ static CFDataRef hook_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm a
 // Let client construct 0x000EE007 with UUID NATIVELY
 // (Avoids send-level buffer modification per Experience 1423135)
 // ============================================================
+// v37.19-DIST: Hook [UIDevice identifierForVendor] — do NOT force a fixed UUID.
+// Distributable build: each user must use their OWN native IDFV so that the
+// challenge-response (0x00FFF495 → 0x80FFF495 status) signature matches their
+// real device fingerprint registered on the login server (0x002EE121).
+// A globally hard-coded UUID makes ALL injected users share the same fingerprint,
+// causing 0x80FFF495 status=1 (challenge failure) and immediate server FIN after
+// 0x00FFF493. This was the root cause of v37.18 "connection interrupted".
+// We still swizzle so that we have a hook point for future per-user overrides,
+// but just call the original implementation.
 static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
-    // Always return our fixed, reproducible UUID
-    if (g_fixedIDFV) {
-        return g_fixedIDFV;
-    }
-    // Fallback: call original
+    // v37.19-DIST: Call original — each user's own native IDFV
     if (orig_identifierForVendor) {
-        return orig_identifierForVendor(self, _cmd);
+        NSUUID *real = orig_identifierForVendor(self, _cmd);
+        static BOOL logged = NO;
+        if (!logged) {
+            DLOG(@"[IDFV-HOOK] v37.19-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
+            logged = YES;
+        }
+        return real;
     }
+    // Fallback (should not happen)
     return nil;
 }
 
@@ -7813,7 +7841,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.18-DIST — ALL game server packets direct orig_send (distributable IPA)");
+    DLOG(@"[VERSION] WangXianHook v37.19-DIST — native IDFV (no fixed UUID) + GAME-SEND-HEX verbose logs for EE007/FFF493");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
