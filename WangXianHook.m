@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.3-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.4-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2658,31 +2658,17 @@ static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
         }
     } else {
         DLOG(@"[MSI-RETRY] ServerInfoForClient class not found at attempt #%d", attempt);
-        
+
+        // v37.4: DISABLED stub class creation — creating a fake ServerInfoForClient
+        //        class interferes with client's native server list parsing.
+        //        capture_real.js (Frida diagnostic) never created this stub and
+        //        client worked perfectly. The stub's ip/port methods return invalid
+        //        values, causing '网络连接中断' when client tries to connect game server.
         if (attempt >= 2) {
-            // v36.40: After 2 retries, create stub class so UI can display server list
-            DLOG(@"[MSI-STUB] Attempt %d >= 2, creating ServerInfoForClient stub class...", attempt);
-            createServerInfoForClientStub();
-            
-            // Verify and hook the newly created stub class
-            Class stubCls = NSClassFromString(@"ServerInfoForClient");
-            if (stubCls) {
-                DLOG(@"[MSI-STUB] Stub class created and verified successfully");
-                
-                // Log all methods on stub
-                unsigned int smcount = 0;
-                Method *smethods = class_copyMethodList(stubCls, &smcount);
-                for (unsigned int i = 0; i < smcount; i++) {
-                    SEL sel = method_getName(smethods[i]);
-                    DLOG(@"[MSI-STUB]   Method: %@", NSStringFromSelector(sel));
-                }
-                if (smethods) free(smethods);
-            } else {
-                DLOG(@"[MSI-STUB] Failed to verify stub class after creation!");
-            }
+            DLOG(@"[MSI-STUB] v37.4: STUB CREATION DISABLED — letting client parse natively");
             return;
         }
-        
+
         if (attempt < 3) {
             double delays[] = {2.0, 5.0, 10.0};
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -7786,7 +7772,7 @@ static ssize_t hook_recvmsg_minimal(int fd, struct msghdr *msg, int flags) {
 
 // v37.0: Install minimal recv hooks (login server patches only, no game server mods)
 static void installMinimalSocketHooks(void) {
-    DLOG(@"[SOCK-MINIMAL] v37.3: Installing minimal recv hooks (login server patches only)...");
+    DLOG(@"[SOCK-MINIMAL] v37.4: Installing minimal recv hooks (login server patches only)...");
 
     int r = rebindSymbol("_recv", (void *)hook_recv_minimal, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom_minimal, (void **)&orig_recvfrom);
@@ -7822,7 +7808,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.3-MINIMAL — Login server patches + SCNetworkReachability hook");
+    DLOG(@"[VERSION] WangXianHook v37.4-MINIMAL — Login patches + SCNetwork + MSI-STUB disabled");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
