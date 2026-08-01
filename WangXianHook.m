@@ -7953,9 +7953,9 @@ static id hook_initWithUTF8String(NSString *self, SEL _cmd, const char *cStr) {
 }
 
 // ===== L3: memcpy interception =====
-typedef void *(*memcpyFunc)(void *restrict dest, const void *restrict src, size_t n);
+typedef void *(*memcpyFunc)(void *dest, const void *src, size_t n);
 static memcpyFunc orig_memcpy = NULL;
-static void *hook_memcpy(void *restrict dest, const void *restrict src, size_t n) {
+static void *hook_memcpy(void *dest, const void *src, size_t n) {
     // DY_MIESHI is 9 chars, so n must be >= 9 and src must match exactly or be a larger string containing it
     if (src && n >= 9 && memcmp(src, "DY_MIESHI", 9) == 0) {
         // Three cases:
