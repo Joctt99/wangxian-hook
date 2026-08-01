@@ -1769,6 +1769,13 @@ static void proactivePatchCppFunctions(void) {
          g_quitFromServerPatched, g_heartbeatPatched);
 }
 
+// v36.155: Role rotation index. Increments each time a new server is
+// entered, so each server shows a DIFFERENT character (name, profession,
+// level). Without this, all servers show the same hardcoded "玩家001"
+// warrior with level 1, which is unrealistic — each server should have
+// a unique character. MUST be declared BEFORE generateFakeResponse() which uses it.
+static int g_roleIndex = 0;
+
 // v36.107: Generate fake response based on request command with correct sequence number
 // Returns response length, 0 if no response needed
 static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint32_t bufSize, uint32_t seqNum) {
@@ -2090,15 +2097,7 @@ static int g_phase2TriggerCount = 0;
 // ~100ms of Phase 1) trigger Phase 2 too early — before the user can
 // even see the role list — causing the client to skip the role UI.
 static double g_phase1DoneTime = 0;
-// v36.155: Role rotation index. Increments each time a new server is
-// entered, so each server shows a DIFFERENT character (name, profession,
-// level). Without this, all servers show the same hardcoded "玩家001"
-// warrior with level 1, which is unrealistic — each server should have
-// a unique character.
-static int g_roleIndex = 0;
-
 // RECV #20 data (71 bytes) from hook.txt line 944.
-// cmd=0x1200F080 (wire: 80 00 F0 12), seq=0x1A, payload = session token hex string.
 static const uint8_t kRecv20Data[71] = {
     0x00,0x00,0x00,0x47, 0x80,0x00,0xF0,0x12, 0x00,0x00,0x00,0x1A, 0x00,0x00,0x00,0x00,
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
@@ -4988,6 +4987,14 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     // pollutes the protocol flow.
     BOOL roleRespGenerated = NO;
 
+    // v36.155: MUST increment role index BEFORE calling generateFakeResponse()
+    // so that dynamic role data (name, profession, level) uses the NEW index.
+    // Without this, g_roleIndex would be 0 when generating the first response,
+    // and the if(g_roleIndex > 0) check in generateFakeResponse would fail,
+    // producing static hardcoded attributes instead of unique per-server data.
+    g_roleIndex++;
+    DLOG(@"[POST-BURST] v36.155: Incremented g_roleIndex to %d (before response generation)", g_roleIndex);
+
     if (batchCount == 0) {
         // v36.141: Fallback changed from EE007 to FFF493 — server does NOT
         // respond to EE007, so injecting 0x800EE007 would confuse the client.
@@ -5073,11 +5080,9 @@ static ssize_t doBurstFakeInject(int fd, void *buf, size_t len) {
     // (fixes v36.152 where auto-load ACKs triggered Phase 2 too early).
     //   state=1: next recv injects RECV#20 (71B) → state=2
     //   state=2: next recv injects RECV#21 (840B) → state=0, done
-    // v36.155: Increment role rotation index so each server shows a
-    // different character. Must increment BEFORE building the fake
-    // response so the role data uses the new index.
+    // v36.155: g_roleIndex already incremented above (before generateFakeResponse).
+    // Set post-BURST state for contiguous RECV#20/#21 injection.
     if (totalLen > 0) {
-        g_roleIndex++;
         g_postBurstState = 1;  // v36.154: contiguous injection
         g_postBurstFd = fd;
         g_phase2TriggerCount = 0;
@@ -5149,14 +5154,23 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (kRecv21Sparse[i].off < 840)
                     ((uint8_t *)buf)[kRecv21Sparse[i].off] = kRecv21Sparse[i].val;
             }
-            // v36.155: Dynamic role name in RECV #21 based on g_roleIndex.
-            // The role selection UI displays this name (offset 16-31) for
-            // the character. Each server must show a DIFFERENT character.
+            // v36.155: Dynamic role data in RECV #21 based on g_roleIndex.
+            // The role selection UI displays this data for the character.
+            // Each server must show a DIFFERENT character.
             char dynName[48] = {0};
             snprintf(dynName, sizeof(dynName), "\xE7\x8E\xA9\xE5\xAE\xB6%03d", g_roleIndex);
             int nameLen = (int)strlen(dynName);
             memcpy((uint8_t *)buf + 16, dynName, MIN(nameLen, 16));
-            DLOG(@"[POST-BURST] v36.155: RECV #21 role name set to '%s' (roleIndex=%d)", dynName, g_roleIndex);
+
+            // v36.155: Also set dynamic mapId at offset 48-51 (uint32 LE)
+            // so each server shows a unique map, not the same one.
+            uint32_t mapId = (uint32_t)g_roleIndex;
+            ((uint8_t *)buf)[48] = (mapId & 0xFF);
+            ((uint8_t *)buf)[49] = ((mapId >> 8) & 0xFF);
+            ((uint8_t *)buf)[50] = ((mapId >> 16) & 0xFF);
+            ((uint8_t *)buf)[51] = ((mapId >> 24) & 0xFF);
+
+            DLOG(@"[POST-BURST] v36.155: RECV #21 role name='%s' mapId=%u (roleIndex=%d)", dynName, mapId, g_roleIndex);
             g_postBurstState = 0;
             g_postBurstDone = YES;
             g_phase1DoneTime = CFAbsoluteTimeGetCurrent();
