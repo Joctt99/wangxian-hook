@@ -575,7 +575,7 @@ extern "C" kern_return_t mach_vm_remap(
 // v36.47: Critical fix - Disable all crypto function hooks that corrupt encryption data
 // v36.47: Critical fix - Fix hook_alertControllerPresent SIGSEGV crash
 #define MINIMAL_MODE 0
-#define DISABLE_CRYPTO_HOOKS 1  // v37.0: Disable ALL crypto hooks — native encryption works!
+#define DISABLE_CRYPTO_HOOKS 0  // v37.13: RESTORE crypto hooks — needed for injection detection bypass
 #define DISABLE_SOCKET_MODS 0
 #define DISABLE_UI_HOOKS 0
 
@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.12-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.13-RESTORE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -762,9 +762,7 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - v37.12: RESTORE original call
-// v37.10/v37.11 BLOCKED this but still '版本过低'. Data shows blocking SK methods
-// causes client abnormal state. Need original flow + recv string cleanup.
+// 4. judgeAppInfoWithBaseUrl: - v37.13: Call original (restore v36.155 behavior)
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
@@ -772,8 +770,7 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
     if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
 }
 
-// 5. judgeNet - v37.12: RESTORE original call
-// v37.11 BLOCKED this but still '版本过低'. Need original flow + recv cleanup.
+// 5. judgeNet - v37.13: Call original (restore v36.155 behavior)
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
@@ -817,7 +814,7 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 typedef void (*JudgeAppIMP)(id, SEL);
 static JudgeAppIMP orig_judgeApp = NULL;
 static void hook_judgeApp(id self, SEL _cmd) {
-    // v37.12: RESTORE original call — need normal flow + recv string cleanup
+    // v37.13: Call original (restore v36.155 behavior)
     DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
     if (orig_judgeApp) orig_judgeApp(self, _cmd);
 }
@@ -7791,30 +7788,27 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.12-MINIMAL — recv string cleanup + SK/SC original restored");
-    DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
+    DLOG(@"[VERSION] WangXianHook v37.13-RESTORE — full hooks from v36.155");
+    DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
-    // === capture_real.js parity: ONLY these hooks ===
-    // 1. dlsym hook (hide substrate/fishhook/cydia) — in installSecurityHooks
-    // 2. SCNetworkReachabilityGetFlags — in installSecurityHooks
-    // 3. UIDevice.identifierForVendor — in installSecurityHooks
-    // 4. SignatureKit hooks
-    // 5. SignatureCheck hooks
-    // 6. UIAlertView.show hook
-    //
-    // v37.7: ALL OTHER HOOKS DISABLED — they were causing '网络连接中断' or '版本过低'
-    //        by triggering client's integrity checks or corrupting network data.
+    // === v37.13: RESTORE v36.155 full hook configuration ===
+    // v37.0-v37.12 minimal mode failed — injection detected → '版本过低'
+    // Need full hooks to bypass injection detection.
 
     installSecurityHooks();
-    // v37.7: DISABLED keyboard protection — not in capture_real.js
-    // installKeyboardProtection();
+    installKeyboardProtection();
 
-    // v37.12: ENABLED recv hooks — clear '版本过低' string only, status untouched
-    installMinimalSocketHooks();
+    // v37.13: RESTORE full socket hooks (not minimal)
+    installSocketHooks();
 
-    // v37.7: DISABLED all observation hooks — not in capture_real.js
-    // NSUserDefaults, NSURLSession, NSURLConnection, UIViewController.presentViewController,
-    // NSDictionary, UITableView, NSJSONSerialization all disabled.
+    // v37.13: RESTORE C++ crypto hooks
+    installCppCryptoHooks_v131();
+
+    // v37.13: RESTORE proactive C++ function patches
+    proactivePatchCppFunctions();
+
+    // v37.13: RESTORE MSI retry
+    tryHookMieshiServerInfo();
 
     // === KEEP: UIAlertView.show hook (in capture_real.js) ===
     Class alertCls = [UIAlertView class];
@@ -7886,7 +7880,7 @@ static void installAllHooks(void) {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
 
-    _log(@"[INIT] v37.8: capture_real.js parity + DYLD hiding (data-driven)");
+    _log(@"[INIT] v37.13: Full hooks restored from v36.155 working configuration");
 
     // === DEFERRED: Create log button (keep for debugging) ===
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -7908,7 +7902,7 @@ static void installAllHooks(void) {
         }
     });
 
-    DLOG(@"[ACT] v37.8: All hooks installed (capture_real.js parity + DYLD hiding)");
+    DLOG(@"[ACT] v37.13: All hooks installed (v36.155 full configuration)");
 }
 
 
