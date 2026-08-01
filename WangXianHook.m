@@ -1,4 +1,4 @@
-﻿﻿#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
