@@ -541,6 +541,7 @@
 #include <mach/mach.h>
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 
 // v36.103: Declare private Mach API for code page patching
@@ -727,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.23-DIST loaded ===");
+        _log(@"=== WangXianHook v37.24-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3979,10 +3980,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[1] = (newPktLen >> 16) & 0xFF;
                         newBuf[2] = (newPktLen >> 8)  & 0xFF;
                         newBuf[3] =  newPktLen       & 0xFF;
-                        DLOG(@"[CHANNEL-PATCH] v37.23 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
+                        DLOG(@"[CHANNEL-PATCH] v37.24 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
                              fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
                     } else {
-                        DLOG(@"[CHANNEL-PATCH] v37.23 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
+                        DLOG(@"[CHANNEL-PATCH] v37.24 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
                              fd, port, cmd, len, newBufLen, patchOffset);
                     }
                     ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
@@ -3990,14 +3991,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (ret >= 0) return (ssize_t)len;
                     return ret;
                 } else {
-                    DLOG(@"[CHANNEL-PATCH] v37.23: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
+                    DLOG(@"[CHANNEL-PATCH] v37.24: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
                          newBufLen, len, cmd);
                 }
             }
         }
     }
 
-    // v37.23-DIST: For ALL game server packets, call orig_send directly — NO processing (CHANNEL-PATCH applied earlier in this function if cmd=0x000EE007).
+    // v37.24-DIST: For ALL game server packets, call orig_send directly — NO processing (CHANNEL-PATCH applied earlier in this function if cmd=0x000EE007).
     // Added verbose FULL hex dump for 0x000EE007 and 0x00FFF493 so we can do byte-by-byte
     // comparison against the clean (non-injected) client capture (hook.txt).
     if (len >= 8 && (port == 12003 || port == 58158 ||
@@ -4023,7 +4024,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
-        DLOG(@"[SEND-DIRECT] v37.23: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH)", cmd, len, port, ret);
+        DLOG(@"[SEND-DIRECT] v37.24: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH)", cmd, len, port, ret);
         return ret;
     }
 
@@ -6978,7 +6979,7 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
         NSUUID *real = orig_identifierForVendor(self, _cmd);
         static BOOL logged = NO;
         if (!logged) {
-            DLOG(@"[IDFV-HOOK] v37.23-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
+            DLOG(@"[IDFV-HOOK] v37.24-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
             logged = YES;
         }
         return real;
@@ -7907,9 +7908,129 @@ static void entry(void) {
     installAllHooks();
 }
 
+// v37.24: Memory-level channel name replacement.
+// Scans ALL writable memory regions for the C string "DY_MIESHI" and replaces
+// it with "DYanyou0040_MIESHI". This fixes the channel at the SOURCE so ALL
+// packets (including AES-encrypted FFF493) use the correct channel.
+//
+// v37.19-v37.23 proved: network-level CHANNEL-PATCH on EE007 is insufficient
+// because FFF493 packets are AES-encrypted and also contain the channel name.
+// Only memory-level replacement can fix both plaintext and encrypted packets.
+static void scanAndPatchChannelInMemory(void) {
+    DLOG(@"[MEM-PATCH] v37.24: Scanning writable memory for DY_MIESHI...");
+
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t address = 0;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    int totalFound = 0;
+    int totalPatched = 0;
+
+    while (1) {
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+        kern_return_t kr = mach_vm_region_recurse(task, &address, &size, &depth,
+                                                   (vm_region_recurse_info_t)&info, &info_count);
+        if (kr != KERN_SUCCESS) break;
+
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+
+        if (!(info.protection & VM_PROT_WRITE)) {
+            address += size;
+            continue;
+        }
+
+        // Skip very large regions (>100MB) to avoid long scans
+        if (size > 100 * 1024 * 1024) {
+            address += size;
+            continue;
+        }
+
+        const char *needle = "DY_MIESHI";
+        size_t needleLen = 9;
+        const char *replacement = "DYanyou0040_MIESHI";
+        size_t replacementLen = 18;
+
+        const char *start = (const char *)address;
+        const char *end = start + size;
+
+        for (const char *p = start; p + needleLen <= end; p++) {
+            if (memcmp(p, needle, needleLen) == 0) {
+                // Skip if preceded by alphanumeric (part of a longer string)
+                if (p > start) {
+                    char prev = *(p - 1);
+                    if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+                        (prev >= '0' && prev <= '9') || prev == '_') {
+                        continue;
+                    }
+                }
+
+                totalFound++;
+                size_t remaining = end - p;
+
+                // Log surrounding bytes for diagnosis
+                char hexbuf[120] = {0};
+                int pos = 0;
+                for (int i = 0; i < 24 && p + i < end; i++) {
+                    pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "%02x ", (unsigned char)p[i]);
+                }
+                DLOG(@"[MEM-PATCH] Found DY_MIESHI at %p (region %p-%zu prot=rw remaining=%zu) bytes: %s",
+                     p, (void*)address, (size_t)size, remaining, hexbuf);
+
+                if (remaining >= replacementLen + 1) {
+                    memcpy((void*)p, replacement, replacementLen);
+                    ((char*)p)[replacementLen] = '\0';
+                    totalPatched++;
+                    DLOG(@"[MEM-PATCH] PATCHED -> DYanyou0040_MIESHI");
+                    p += replacementLen;
+                } else {
+                    DLOG(@"[MEM-PATCH] Only %zu bytes left, cannot patch (need %zu)", remaining, replacementLen + 1);
+                }
+            }
+        }
+
+        address += size;
+    }
+
+    DLOG(@"[MEM-PATCH] Done: found=%d patched=%d", totalFound, totalPatched);
+}
+
+// v37.24: Scan Info.plist for channel name (diagnostic)
+static void scanInfoPlistForChannel(void) {
+    NSDictionary *infoDict = [[NSBundle mainBundle] infoDictionary];
+    DLOG(@"[CHANNEL-SCAN] Scanning Info.plist for DY_MIESHI...");
+    for (NSString *key in infoDict) {
+        id value = infoDict[key];
+        NSString *valueStr = [value description];
+        if ([valueStr containsString:@"DY_MIESHI"] || [valueStr containsString:@"DYanyou"] ||
+            [valueStr containsString:@"channel"] || [valueStr containsString:@"Channel"] ||
+            [valueStr containsString:@"MIESHI"]) {
+            DLOG(@"[CHANNEL-SCAN] Info.plist key=%@ value=%@", key, valueStr);
+        }
+    }
+}
+
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.23-DIST — CHANNEL-PATCH cmd=0x000EE007 on ALL ports (login+game consistent channel)");
+    DLOG(@"[VERSION] WangXianHook v37.24-DIST — MEM-PATCH: scan & replace DY_MIESHI in memory (source-level fix for all packets)");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
+
+    // v37.24: Memory-level channel name replacement — scan immediately
+    scanInfoPlistForChannel();
+    scanAndPatchChannelInMemory();
+
+    // v37.24: Re-scan after delays to catch strings loaded after initialization
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DLOG(@"[MEM-PATCH] v37.24: Re-scan after 3s delay...");
+        scanAndPatchChannelInMemory();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DLOG(@"[MEM-PATCH] v37.24: Re-scan after 8s delay...");
+        scanAndPatchChannelInMemory();
+    });
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
     // v37.0-v37.12 minimal mode failed — injection detected → '版本过低'
