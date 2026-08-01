@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.1-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.2-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7651,9 +7651,10 @@ static void installCppCryptoHooks_v131(void) {
 #pragma mark - v37.0 Minimal Recv Hook (login server patches only)
 // ============================================================
 
-// v37.0: Patch login server response data in-place
-// ONLY patches 0x802EE118/120/121 status + 维护→运行 + 版本过低 strings
-// Does NOT touch game server traffic, does NOT inject fake responses
+// v37.2: Patch login server response data in-place
+// ONLY patches 0x802EE118/120/121 — status + 维护→运行 + 版本过低 strings
+// v37.2 FIX: Early return for non-login-server cmds to avoid corrupting game server
+//            encrypted traffic (which may accidentally contain matching byte patterns)
 static void patchLoginServerData(uint8_t *data, ssize_t len) {
     if (len < 8) return;
 
@@ -7661,15 +7662,20 @@ static void patchLoginServerData(uint8_t *data, ssize_t len) {
     uint32_t cmd = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
                    ((uint32_t)data[6] << 8) | (uint32_t)data[7];
 
-    // Patch status byte for login server responses
-    if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
-        if (len >= 13 && data[12] != 0) {
-            DLOG(@"[RECV-PATCH] cmd=0x%08X status: %d -> 0", cmd, data[12]);
-            data[12] = 0;
-        }
+    // v37.2: ONLY patch login server responses — game server traffic untouched
+    if (cmd != 0x802EE118 && cmd != 0x802EE120 && cmd != 0x802EE121) {
+        return;
     }
 
-    // Replace "维护" with "运行" in any response (UTF-8)
+    DLOG(@"[RECV-PATCH] Login server response cmd=0x%08X len=%zd", cmd, len);
+
+    // Patch status byte for login server responses
+    if (len >= 13 && data[12] != 0) {
+        DLOG(@"[RECV-PATCH] cmd=0x%08X status: %d -> 0", cmd, data[12]);
+        data[12] = 0;
+    }
+
+    // Replace "维护" with "运行" in login server responses only (UTF-8)
     // 维护 = E7 BB B4 E6 8A A4, 运行 = E8 BF 90 E8 A1 8C
     for (ssize_t i = 0; i <= len - 6; i++) {
         if (data[i] == 0xE7 && data[i+1] == 0xBB && data[i+2] == 0xB4 &&
@@ -7742,7 +7748,7 @@ static ssize_t hook_recvmsg_minimal(int fd, struct msghdr *msg, int flags) {
 
 // v37.0: Install minimal recv hooks (login server patches only, no game server mods)
 static void installMinimalSocketHooks(void) {
-    DLOG(@"[SOCK-MINIMAL] v37.1: Installing minimal recv hooks (login server patches only)...");
+    DLOG(@"[SOCK-MINIMAL] v37.2: Installing minimal recv hooks (login server patches only)...");
 
     int r = rebindSymbol("_recv", (void *)hook_recv_minimal, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom_minimal, (void **)&orig_recvfrom);
@@ -7778,7 +7784,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.1-MINIMAL — Native encryption, login server patches RESTORED, NO game server mods");
+    DLOG(@"[VERSION] WangXianHook v37.2-MINIMAL — Login server patches ONLY, game server traffic untouched");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
