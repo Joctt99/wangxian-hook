@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.11-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.12-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -762,28 +762,23 @@ static void hook_handleResult(id self, SEL _cmd, id result) {
     }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - v37.10: DO NOT call original
-// ROOT CAUSE (data-driven): capture_real.js ran on OFFICIAL enterprise cert
-// (unmodified IPA) → server signature verification passed → no '版本过低'.
-// v37.x runs on 全能签 (re-signed IPA) → server detects signature modification
-// → returns '版本过低'. SK.judgeAppInfoWithBaseUrl: calls original → sends
-// request to cert.qunhongtech.com → server returns '版本过低'.
-// FIX: Do NOT call original — prevents signature verification request.
+// 4. judgeAppInfoWithBaseUrl: - v37.12: RESTORE original call
+// v37.10/v37.11 BLOCKED this but still '版本过低'. Data shows blocking SK methods
+// causes client abnormal state. Need original flow + recv string cleanup.
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ BLOCKED (not calling original — prevents 版本过低)", baseUrl);
-    // v37.10: Do NOT call original — server signature verification fails on re-signed IPA
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (calling original)", baseUrl);
+    if (orig_judgeBase) orig_judgeBase(self, _cmd, baseUrl);
 }
 
-// 5. judgeNet - v37.11: DO NOT call original
-// capture_real.js BLOCKS this method. v37.10 log shows judgeNet called original
-// → server returns '版本过低' on re-signed IPA.
+// 5. judgeNet - v37.12: RESTORE original call
+// v37.11 BLOCKED this but still '版本过低'. Need original flow + recv cleanup.
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet BLOCKED (not calling original — prevents 版本过低)");
-    // v37.11: Do NOT call original — matches capture_real.js behavior
+    DLOG(@"[SK] judgeNet called, calling original");
+    if (orig_judgeNet) orig_judgeNet(self, _cmd);
 }
 
 // 6. verifySignatureFromParameters: - Call original (returns real signature result)
@@ -822,11 +817,9 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 typedef void (*JudgeAppIMP)(id, SEL);
 static JudgeAppIMP orig_judgeApp = NULL;
 static void hook_judgeApp(id self, SEL _cmd) {
-    // v37.9: DO NOT call original — original detects IPA signature modification
-    // (全能签 re-signing) and triggers '版本过低'.
-    // capture_real.js (Frida, which worked) also BLOCKS this method (no original call).
-    // Log data (v37.8): JudgeApp called → calling original → '版本过低'.
-    DLOG(@"[SC] SignatureCheck.JudgeApp BLOCKED (not calling original — prevents 版本过低)");
+    // v37.12: RESTORE original call — need normal flow + recv string cleanup
+    DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
+    if (orig_judgeApp) orig_judgeApp(self, _cmd);
 }
 
 typedef void (*ShowTipIMP)(id, SEL, id);
@@ -7696,26 +7689,27 @@ static void installCppCryptoHooks_v131(void) {
 static void patchLoginServerData(uint8_t *data, ssize_t len) {
     if (len < 8) return;
 
-    // Parse command ID (bytes 4-7, big-endian)
-    uint32_t cmd = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
-                   ((uint32_t)data[6] << 8) | (uint32_t)data[7];
+    // v37.12: ONLY clear "版本过低" string — do NOT modify status, do NOT replace other strings
+    // v37.6 showed status patch → '网络连接中断'. v37.1-v37.4 showed string patch → '网络连接中断'.
+    // v37.12 tries: ONLY clear "版本过低" (12 bytes UTF-8 → 12 spaces), keep everything else intact.
 
-    // v37.2: ONLY patch login server responses — game server traffic untouched
-    if (cmd != 0x802EE118 && cmd != 0x802EE120 && cmd != 0x802EE121) {
-        return;
+    // Clear "版本过低" (UTF-8: E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E) → 12 spaces
+    static const uint8_t versionLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
+    for (ssize_t i = 0; i <= len - 12; i++) {
+        if (memcmp(data + i, versionLow, 12) == 0) {
+            memset(data + i, 0x20, 12);
+            DLOG(@"[RECV-PATCH] v37.12: Cleared '版本过低' at offset %zd (status untouched)", i);
+        }
     }
 
-    DLOG(@"[RECV-PATCH] Login server response cmd=0x%08X len=%zd", cmd, len);
-
-    // v37.6: ONLY patch status byte — do NOT modify response body
-    if (len >= 13 && data[12] != 0) {
-        DLOG(@"[RECV-PATCH] cmd=0x%08X status: %d -> 0", cmd, data[12]);
-        data[12] = 0;
+    // Also clear "当前版本" (UTF-8: E5 BD 93 E5 89 8D E7 89 88 E6 9C AC) → 12 spaces
+    static const uint8_t curVersion[] = {0xE5,0xBD,0x93,0xE5,0x89,0x8D,0xE7,0x89,0x88,0xE6,0x9C,0xAC};
+    for (ssize_t i = 0; i <= len - 12; i++) {
+        if (memcmp(data + i, curVersion, 12) == 0) {
+            memset(data + i, 0x20, 12);
+            DLOG(@"[RECV-PATCH] v37.12: Cleared '当前版本' at offset %zd", i);
+        }
     }
-
-    // v37.6: DISABLED all string replacements — they corrupt response body
-    // "维护"→"运行", "版本过低" clear, "当前版本" clear all removed.
-    // Client receives status=0 + original body, parses server list natively.
 }
 
 // v37.0: Minimal recv hook — patches login server responses ONLY
@@ -7797,7 +7791,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.11-MINIMAL — SK.judgeNet BLOCKED (no original)");
+    DLOG(@"[VERSION] WangXianHook v37.12-MINIMAL — recv string cleanup + SK/SC original restored");
     DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
 
     // === capture_real.js parity: ONLY these hooks ===
@@ -7815,8 +7809,8 @@ static void installAllHooks(void) {
     // v37.7: DISABLED keyboard protection — not in capture_real.js
     // installKeyboardProtection();
 
-    // v37.7: DISABLED recv hooks — capture_real.js never patched network traffic
-    // installMinimalSocketHooks();
+    // v37.12: ENABLED recv hooks — clear '版本过低' string only, status untouched
+    installMinimalSocketHooks();
 
     // v37.7: DISABLED all observation hooks — not in capture_real.js
     // NSUserDefaults, NSURLSession, NSURLConnection, UIViewController.presentViewController,
