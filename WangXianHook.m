@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.2-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.3-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6935,6 +6935,41 @@ static CFDataRef hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm a
     return result;
 }
 
+// ============================================================
+#pragma mark - v37.3 SCNetworkReachabilityGetFlags hook
+// Force return kSCNetworkReachabilityFlagsReachable so client's
+// pre-connect network check passes for game server (port 12003)
+// ============================================================
+
+typedef int (*SCNetworkReachabilityGetFlagsFunc)(void *target, uint32_t *flags);
+static SCNetworkReachabilityGetFlagsFunc orig_SCNetworkReachabilityGetFlags = NULL;
+
+static int hook_SCNetworkReachabilityGetFlags(void *target, uint32_t *flags) {
+    // v37.3: Force reachable — kSCNetworkReachabilityFlagsReachable = 0x02
+    if (flags) *flags = 0x02;
+    return 1;  // TRUE
+}
+
+static void installSCNetworkReachabilityHook(void) {
+    void *scLib = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOLOAD);
+    if (!scLib) {
+        scLib = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_LAZY);
+    }
+    if (scLib) {
+        orig_SCNetworkReachabilityGetFlags = (SCNetworkReachabilityGetFlagsFunc)dlsym(scLib, "SCNetworkReachabilityGetFlags");
+        if (orig_SCNetworkReachabilityGetFlags) {
+            int r = rebindSymbol("_SCNetworkReachabilityGetFlags",
+                                 (void *)hook_SCNetworkReachabilityGetFlags,
+                                 (void **)&orig_SCNetworkReachabilityGetFlags);
+            DLOG(@"[SEC] SCNetworkReachabilityGetFlags hook: rebind=%d addr=%p", r, orig_SCNetworkReachabilityGetFlags);
+        } else {
+            DLOG(@"[SEC] SCNetworkReachabilityGetFlags NOT found in SystemConfiguration");
+        }
+    } else {
+        DLOG(@"[SEC] SystemConfiguration framework NOT loaded");
+    }
+}
+
 static void installSecurityHooks(void) {
     // Log all loaded dylibs for diagnosis (use original functions before hook)
     uint32_t count = _dyld_image_count();
@@ -7004,6 +7039,9 @@ static void installSecurityHooks(void) {
 
     // v36.123: Hook [UIDevice identifierForVendor] so client builds UUID-natively
     installIDFVHook();
+    
+    // v37.3: Hook SCNetworkReachabilityGetFlags — force reachable for game server connection
+    installSCNetworkReachabilityHook();
     
     DLOG(@"[SEC] Security hooks ready (with DYLD hiding)");
 }
@@ -7748,7 +7786,7 @@ static ssize_t hook_recvmsg_minimal(int fd, struct msghdr *msg, int flags) {
 
 // v37.0: Install minimal recv hooks (login server patches only, no game server mods)
 static void installMinimalSocketHooks(void) {
-    DLOG(@"[SOCK-MINIMAL] v37.2: Installing minimal recv hooks (login server patches only)...");
+    DLOG(@"[SOCK-MINIMAL] v37.3: Installing minimal recv hooks (login server patches only)...");
 
     int r = rebindSymbol("_recv", (void *)hook_recv_minimal, (void **)&orig_recv);
     int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom_minimal, (void **)&orig_recvfrom);
@@ -7784,7 +7822,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.2-MINIMAL — Login server patches ONLY, game server traffic untouched");
+    DLOG(@"[VERSION] WangXianHook v37.3-MINIMAL — Login server patches + SCNetworkReachability hook");
     DLOG(@"[ACT] Installing all hooks...");
     
     // v37.0: Always install security hooks (dlsym/DYLD/IDFV) even with crypto disabled
