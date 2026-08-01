@@ -1,4 +1,4 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.10-MINIMAL loaded ===");
+        _log(@"=== WangXianHook v37.11-MINIMAL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -776,12 +776,14 @@ static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
     // v37.10: Do NOT call original — server signature verification fails on re-signed IPA
 }
 
-// 5. judgeNet - Call original to let it complete
+// 5. judgeNet - v37.11: DO NOT call original
+// capture_real.js BLOCKS this method. v37.10 log shows judgeNet called original
+// → server returns '版本过低' on re-signed IPA.
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called, calling original");
-    if (orig_judgeNet) orig_judgeNet(self, _cmd);
+    DLOG(@"[SK] judgeNet BLOCKED (not calling original — prevents 版本过低)");
+    // v37.11: Do NOT call original — matches capture_real.js behavior
 }
 
 // 6. verifySignatureFromParameters: - Call original (returns real signature result)
@@ -7795,7 +7797,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.10-MINIMAL — SK.judgeAppInfoWithBaseUrl BLOCKED (no original)");
+    DLOG(@"[VERSION] WangXianHook v37.11-MINIMAL — SK.judgeNet BLOCKED (no original)");
     DLOG(@"[ACT] Installing hooks (capture_real.js parity mode)...");
 
     // === capture_real.js parity: ONLY these hooks ===
