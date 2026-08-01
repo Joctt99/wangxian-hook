@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.26-DIST loaded ===");
+        _log(@"=== WangXianHook v37.27-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3930,6 +3930,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
 
+    // v37.27: Dump EE007 ORIGINAL hex (before CHANNEL-PATCH) for byte-level
+    // comparison with clean client (hook.txt SEND #28: 178B).
+    // Clean EE007 structure: pktLen(4) cmd(4) seq(4) [len(2) value(N)]×11 null(1) trailer(2)
+    // Clean total=178B, ours=179B → 10B difference in non-channel fields.
+    if (len >= 8) {
+        const unsigned char *pp = (const unsigned char *)buf;
+        uint32_t diagCmd = ((uint32_t)pp[4] << 24) | ((uint32_t)pp[5] << 16) |
+                           ((uint32_t)pp[6] << 8)  | (uint32_t)pp[7];
+        if (diagCmd == 0x000EE007) {
+            NSMutableString *ehex = [NSMutableString stringWithCapacity:len * 3];
+            for (size_t i = 0; i < len; i++) {
+                [ehex appendFormat:@"%02X ", pp[i]];
+                if ((i + 1) % 32 == 0 && i + 1 < len) [ehex appendString:@"\n    "];
+            }
+            DLOG(@"[EE007-ORIG] v37.27 port=%d len=%zu ORIGINAL HEX (pre-patch):\n    %@", port, len, ehex);
+        }
+    }
+
     // v37.23-DIST: Patch channel name for cmd=0x000EE007 on ALL ports.
     //
     // v37.22 FAILED: only patched EE007 on GAME port (12003) but NOT on LOGIN
@@ -3979,10 +3997,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[1] = (newPktLen >> 16) & 0xFF;
                         newBuf[2] = (newPktLen >> 8)  & 0xFF;
                         newBuf[3] =  newPktLen       & 0xFF;
-                        DLOG(@"[CHANNEL-PATCH] v37.26 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
+                        DLOG(@"[CHANNEL-PATCH] v37.27 fd=%d port=%d cmd=0x%08X oldPktLen=%u newPktLen=%u oldSendLen=%zu newSendLen=%zu patchOffset=%zu",
                              fd, port, cmd, oldPktLen, newPktLen, len, newBufLen, patchOffset);
                     } else {
-                        DLOG(@"[CHANNEL-PATCH] v37.26 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
+                        DLOG(@"[CHANNEL-PATCH] v37.27 fd=%d port=%d cmd=0x%08X oldLen=%zu newLen=%zu patchOffset=%zu (len<4)",
                              fd, port, cmd, len, newBufLen, patchOffset);
                     }
                     ssize_t ret = orig_send(fd, newBuf, newBufLen, flags);
@@ -3990,7 +4008,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (ret >= 0) return (ssize_t)len;
                     return ret;
                 } else {
-                    DLOG(@"[CHANNEL-PATCH] v37.26: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
+                    DLOG(@"[CHANNEL-PATCH] v37.27: malloc(%zu) FAILED! Falling back len=%zu cmd=0x%08X",
                          newBufLen, len, cmd);
                 }
             }
@@ -4023,7 +4041,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
-        DLOG(@"[SEND-DIRECT] v37.26: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH L5/L6)", cmd, len, port, ret);
+        DLOG(@"[SEND-DIRECT] v37.27: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH L5/L6)", cmd, len, port, ret);
         return ret;
     }
 
@@ -6963,7 +6981,7 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
         NSUUID *real = orig_identifierForVendor(self, _cmd);
         static BOOL logged = NO;
         if (!logged) {
-            DLOG(@"[IDFV-HOOK] v37.26-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
+            DLOG(@"[IDFV-HOOK] v37.27-DIST: Using native IDFV = %@ (NOT fixed, distributable safe)", real);
             logged = YES;
         }
         return real;
@@ -7090,16 +7108,24 @@ static void installSecurityHooks(void) {
         DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
     }
     
-#if !DISABLE_CRYPTO_HOOKS
-    // Hook CCCrypt for AES encryption logging
-    orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
-    if (orig_CCCrypt) {
-        int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-        DLOG(@"[SEC] CCCrypt hook: rebind=%d addr=%p", r1, orig_CCCrypt);
-    } else {
-        DLOG(@"[SEC] CCCrypt not found via dlsym");
+    // v37.27: Enable CCCrypt hook SEPARATELY from DISABLE_CRYPTO_HOOKS.
+    // Clean client (hook.txt) uses CCCrypt for AES encryption of FFF493.
+    // v37.13 disabled ALL crypto hooks (DISABLE_CRYPTO_HOOKS=1) because
+    // SecKey + EncryptUtils + C++ crypto caused crashes. But CCCrypt alone
+    // is safe — it only logs + does L4 plaintext replacement on ENC.
+    // This is CRITICAL: without CCCrypt hook, L4 never fires and we can't
+    // replace DY_MIESHI in FFF493 plaintext before AES encryption.
+    {
+        orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
+        if (orig_CCCrypt) {
+            int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+            DLOG(@"[SEC] CCCrypt hook v37.27: rebind=%d addr=%p (ENABLED for L4 plaintext interception)", r1, orig_CCCrypt);
+        } else {
+            DLOG(@"[SEC] CCCrypt not found via dlsym (L4 will NOT work!)");
+        }
     }
-    
+
+#if !DISABLE_CRYPTO_HOOKS
     // Hook SecKeyEncrypt / SecKeyDecrypt for RSA logging
     orig_SecKeyEncrypt = (SecKeyEncryptFunc)dlsym(RTLD_NEXT, "SecKeyEncrypt");
     if (orig_SecKeyEncrypt) {
@@ -8072,6 +8098,17 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
     DLOG(@"[CC-AES] %s inLen=%zu (real=%zu) keyLen=%zu", opStr, dataInLen, realDataInLen, keyLen);
 
+    // v37.27: Dump first 80 bytes of ENC plaintext for diagnosis
+    if (op == 0 && realDataIn && realDataInLen > 0) {
+        char hexbuf[260] = {0};
+        int pos = 0;
+        int dumpLen = (int)(realDataInLen < 80 ? realDataInLen : 80);
+        for (int i = 0; i < dumpLen; i++) {
+            pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "%02x ", (unsigned char)((const char*)realDataIn)[i]);
+        }
+        DLOG(@"[CC-AES-PLAIN] ENC first %dB: %s", dumpLen, hexbuf);
+    }
+
     int ret = orig_CCCrypt(op, alg, options, key, keyLen, iv,
                            realDataIn, realDataInLen,
                            dataOut, dataOutAvailable, dataOutMoved);
@@ -8128,7 +8165,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.26-DIST — 6-LAYER channel interception (source→buffer→encrypt→send). NO memory scan");
+    DLOG(@"[VERSION] WangXianHook v37.27-DIST — Enable CCCrypt hook for L4 plaintext interception + EE007 hex dump for byte-level diagnosis");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
