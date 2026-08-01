@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.32-DIST loaded ===");
+        _log(@"=== WangXianHook v37.33-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7996,6 +7996,89 @@ static void entry(void) {
 // NO LOGGING of DY_MIESHI text in layer hooks to avoid self-recursion.
 // Only ONE final diagnostic log per unique call site using numeric tags.
 
+// ===== L0: strlen / strcmp / strncmp hooks (INIT TIME propagation) =====
+// v37.33: Channel is hardcoded as C-string literal "DY_MIESHI" in TEXT.__cstring.
+// If client reads DY_MIESHI at init time, construct_NEW_USER_ENTER_SERVER_REQER
+// builds ONLY 604B JSON (missing accountId/hasRole/serverInfo fields). If it reads
+// "DYanyou0040_MIESHI" then it builds 1010B FULL JSON. Hence we need to propagate
+// channel replacement BEFORE any ObjC / JSON builder code runs. So intercept
+// strlen + strcmp + strncmp at libSystem level. Combined with L3 memcpy fix,
+// EVERY call site (allocation, comparison, copy) sees the LONGER correct channel.
+
+// Canonical long channel. We keep static storage; if strlen("DY_MIESHI") is called,
+// return 18 instead of 9 → caller mallocs 19 bytes → then our memcpy L3 can fit.
+static const char kLongChannel[20] = "DYanyou0040_MIESHI"; // 18 + NUL
+
+static size_t (*orig_strlen)(const char *s) = NULL;
+static size_t hook_strlen(const char *s) {
+    if (!orig_strlen) orig_strlen = (size_t (*)(const char*))dlsym(RTLD_NEXT, "strlen");
+    // Use memcmp (NOT strcmp — strcmp is hooked and will recurse!)
+    if (s && memcmp(s, "DY_MIESHI", 10) == 0) { // 10 = 9 chars + NUL
+        return 18;
+    }
+    return orig_strlen ? orig_strlen(s) : ((size_t(*)(const char*))strlen)(s);
+}
+
+static int (*orig_strcmp)(const char *a, const char *b) = NULL;
+static int hook_strcmp(const char *a, const char *b) {
+    if (!orig_strcmp) orig_strcmp = (int (*)(const char*, const char*))dlsym(RTLD_NEXT, "strcmp");
+    // Check channel forms with memcmp (to avoid recursion into strcmp)
+    int sa = 0, sb = 0;
+    if (a) {
+        if (memcmp(a, "DY_MIESHI", 10) == 0) sa = 1;
+        else if (memcmp(a, "DYanyou0040_MIESHI", 19) == 0) sa = 2;
+    }
+    if (b) {
+        if (memcmp(b, "DY_MIESHI", 10) == 0) sb = 1;
+        else if (memcmp(b, "DYanyou0040_MIESHI", 19) == 0) sb = 2;
+    }
+    if (sa > 0 && sb > 0) return 0; // canonical equivalence
+    if (sa > 0) a = kLongChannel;
+    if (sb > 0) b = kLongChannel;
+    return orig_strcmp ? orig_strcmp(a, b) : ((int (*)(const char*,const char*))strcmp)(a, b);
+}
+
+static int (*orig_strncmp)(const char *a, const char *b, size_t n) = NULL;
+static int hook_strncmp(const char *a, const char *b, size_t n) {
+    if (!orig_strncmp) orig_strncmp = (int (*)(const char*, const char*, size_t))dlsym(RTLD_NEXT, "strncmp");
+    BOOL aCh = NO, bCh = NO;
+    if (a && n >= 9 && memcmp(a, "DY_MIESHI", 9) == 0) aCh = YES;
+    else if (a && n >= 18 && memcmp(a, "DYanyou0040_MIESHI", 18) == 0) aCh = YES;
+    if (b && n >= 9 && memcmp(b, "DY_MIESHI", 9) == 0) bCh = YES;
+    else if (b && n >= 18 && memcmp(b, "DYanyou0040_MIESHI", 18) == 0) bCh = YES;
+    if (aCh && bCh) return 0;
+    if (aCh && n >= 18) a = kLongChannel;
+    if (bCh && n >= 18) b = kLongChannel;
+    return orig_strncmp ? orig_strncmp(a, b, n) : ((int(*)(const char*,const char*,size_t))strncmp)(a, b, n);
+}
+
+// ===== L3: memcpy interception (v37.33 fixed) =====
+typedef void *(*memcpyFunc)(void *dest, const void *src, size_t n);
+static memcpyFunc orig_memcpy = NULL;
+static void *hook_memcpy(void *dest, const void *src, size_t n) {
+    // DY_MIESHI is 9 chars; if src starts with it, propagate replacement.
+    // v37.33: because strlen hook already returns 18, callers who do
+    //   char *buf = malloc(strlen(s)+1); memcpy(buf, s, strlen(s)+1);
+    // now allocate 19 bytes and memcpy 19 bytes (n==19 or n>=18 since strlen→18).
+    // Hence dest capacity is sufficient to fit replacement. We just copy.
+    if (src && n >= 9 && memcmp(src, "DY_MIESHI", 9) == 0) {
+        // Case A: exact 9-byte or 10-byte (9 + NUL) — handled if n>=18 (thanks to strlen hook).
+        // If n >= 19 we can write full replacement + safety null term.
+        if (n >= 19) {
+            static int count = 0;
+            if (count < 3) { DLOG(@"[CH-L3] memcpy_short→long n=%zu site=%d", n, count); count++; }
+            size_t rlen = 18;
+            if (orig_memcpy) orig_memcpy(dest, kLongChannel, rlen);
+            // NUL fill remaining
+            if (n > rlen) memset((char*)dest + rlen, 0, n - rlen);
+            return dest;
+        }
+        // Case B: n is smaller (e.g. fixed struct copy of 10 bytes or less).
+        // Can't expand → leave as-is; L4/network-layer patch later will correct.
+    }
+    return orig_memcpy ? orig_memcpy(dest, src, n) : memcpy(dest, src, n);
+}
+
 // ===== L1: CFStringCreateWithCString =====
 typedef CFStringRef (*CFStringCreateWithCStringFunc)(CFAllocatorRef alloc, const char *cStr, CFStringEncoding encoding);
 static CFStringCreateWithCStringFunc orig_CFStringCreateWithCString = NULL;
@@ -8003,10 +8086,10 @@ static CFStringRef hook_CFStringCreateWithCString(CFAllocatorRef alloc, const ch
     if (!orig_CFStringCreateWithCString) {
         orig_CFStringCreateWithCString = (CFStringCreateWithCStringFunc)dlsym(RTLD_NEXT, "CFStringCreateWithCString");
     }
-    if (cStr && encoding == kCFStringEncodingUTF8 && strcmp(cStr, "DY_MIESHI") == 0) {
+    if (cStr && encoding == kCFStringEncodingUTF8 && memcmp(cStr, "DY_MIESHI", 10) == 0) {
         static int count = 0;
         if (count < 3) { DLOG(@"[CH-L1] tag=CFStringCreateWithCString site=%d", count); count++; }
-        return CFStringCreateWithCString(alloc, "DYanyou0040_MIESHI", encoding);
+        return CFStringCreateWithCString(alloc, kLongChannel, encoding);
     }
     return orig_CFStringCreateWithCString ? orig_CFStringCreateWithCString(alloc, cStr, encoding) : NULL;
 }
@@ -8014,49 +8097,21 @@ static CFStringRef hook_CFStringCreateWithCString(CFAllocatorRef alloc, const ch
 // ===== L2: NSString UTF8 hooks =====
 static id (*orig_stringWithUTF8String)(Class self, SEL _cmd, const char *cStr);
 static id hook_stringWithUTF8String(Class self, SEL _cmd, const char *cStr) {
-    if (cStr && strcmp(cStr, "DY_MIESHI") == 0) {
+    if (cStr && memcmp(cStr, "DY_MIESHI", 10) == 0) {
         static int count = 0;
         if (count < 3) { DLOG(@"[CH-L2] tag=stringWithUTF8String site=%d", count); count++; }
-        return orig_stringWithUTF8String(self, _cmd, "DYanyou0040_MIESHI");
+        return orig_stringWithUTF8String(self, _cmd, kLongChannel);
     }
     return orig_stringWithUTF8String(self, _cmd, cStr);
 }
 static id (*orig_initWithUTF8String)(NSString *self, SEL _cmd, const char *cStr);
 static id hook_initWithUTF8String(NSString *self, SEL _cmd, const char *cStr) {
-    if (cStr && strcmp(cStr, "DY_MIESHI") == 0) {
+    if (cStr && memcmp(cStr, "DY_MIESHI", 10) == 0) {
         static int count = 0;
         if (count < 3) { DLOG(@"[CH-L2] tag=initWithUTF8String site=%d", count); count++; }
-        return orig_initWithUTF8String(self, _cmd, "DYanyou0040_MIESHI");
+        return orig_initWithUTF8String(self, _cmd, kLongChannel);
     }
     return orig_initWithUTF8String(self, _cmd, cStr);
-}
-
-// ===== L3: memcpy interception =====
-typedef void *(*memcpyFunc)(void *dest, const void *src, size_t n);
-static memcpyFunc orig_memcpy = NULL;
-static void *hook_memcpy(void *dest, const void *src, size_t n) {
-    // DY_MIESHI is 9 chars, so n must be >= 9 and src must match exactly or be a larger string containing it
-    if (src && n >= 9 && memcmp(src, "DY_MIESHI", 9) == 0) {
-        // Three cases:
-        //  (a) src == "DY_MIESHI\0" exactly (n==9 or n>=10 & buf[9]==0) → use replacement
-        //  (b) n >= 19 (fits replacement) → replace inline
-        //  (c) n < 19 but src matches → use longer replacement only if dest capacity from caller context unknowable → use orig memcpy for (b) only if it fits
-        const char *s = (const char *)src;
-        BOOL exact9  = (n == 9);
-        BOOL exact10 = (n >= 10 && s[9] == '\0');
-        if ((exact9 || exact10) && n >= 19) {
-            static int count = 0;
-            if (count < 3) { DLOG(@"[CH-L3] tag=memcpy_exact_fits n=%zu site=%d", n, count); count++; }
-            const char *repl = "DYanyou0040_MIESHI";
-            size_t rlen = strlen(repl);
-            if (orig_memcpy) orig_memcpy(dest, repl, rlen);
-            // zero rest of buffer up to n (or set nul term)
-            if (n > rlen) memset((char *)dest + rlen, 0, n - rlen);
-            return dest;
-        }
-        // Case when n=9 exact replacement: we need 19, only have 9. Use orig — handled by L4/L5 downstream.
-    }
-    return orig_memcpy ? orig_memcpy(dest, src, n) : memcpy(dest, src, n);
 }
 
 // ===== L4: CCCrypt plaintext ENC replacement =====
@@ -8279,6 +8334,31 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 static void installChannelInterceptLayers(void) {
     int layersOK = 0;
 
+    // ===== L0: strlen / strcmp / strncmp FISHHOOK (INIT TIME propagation) =====
+    // v37.33 CRITICAL: These run BEFORE ObjC + CFString initialization, ensuring
+    // every malloc(strlen+1), every strcmp branch, every strncmp prefix check
+    // treats DY_MIESHI as the 18-char canonical channel. This ensures
+    // construct_NEW_USER_ENTER_SERVER_REQER builds 1010B full JSON (accountId,
+    // hasRole, serverInfo...) instead of truncated 604B stub JSON.
+    if (dlsym(RTLD_NEXT, "strlen")) {
+        orig_strlen = (size_t (*)(const char*))dlsym(RTLD_NEXT, "strlen");
+        int r = rebindSymbol("strlen", (void *)hook_strlen, (void **)&orig_strlen);
+        DLOG(@"[CH-L0] strlen rebind=%d orig=%p", r, orig_strlen);
+        layersOK++;
+    }
+    if (dlsym(RTLD_NEXT, "strcmp")) {
+        orig_strcmp = (int (*)(const char*, const char*))dlsym(RTLD_NEXT, "strcmp");
+        int r = rebindSymbol("strcmp", (void *)hook_strcmp, (void **)&orig_strcmp);
+        DLOG(@"[CH-L0] strcmp rebind=%d orig=%p", r, orig_strcmp);
+        layersOK++;
+    }
+    if (dlsym(RTLD_NEXT, "strncmp")) {
+        orig_strncmp = (int (*)(const char*, const char*, size_t))dlsym(RTLD_NEXT, "strncmp");
+        int r = rebindSymbol("strncmp", (void *)hook_strncmp, (void **)&orig_strncmp);
+        DLOG(@"[CH-L0] strncmp rebind=%d orig=%p", r, orig_strncmp);
+        layersOK++;
+    }
+
     // L1: CFString via fishhook
     if (dlsym(RTLD_NEXT, "CFStringCreateWithCString")) {
         int r = rebindSymbol("CFStringCreateWithCString",
@@ -8303,11 +8383,6 @@ static void installChannelInterceptLayers(void) {
     }
 
     // L4: CCCrypt swap pointer (already hook installed later, override IMP here to v37.26 version)
-    //   Note: installSecurityHooks will rebind _CCCrypt next. We set orig_CCCrypt wrapper here.
-    //   Replace hook_CCCrypt's behavior by redirecting later call to our v37_26 variant.
-    //   (Done by name substitution: we keep original function pointer hook_CCCrypt pointing to wrapper,
-    //    but we replace by changing the symbol name mapping for the real hook. Easiest: rename the
-    //    static hook and make hook_CCCrypt point to v37_26 via orig-call routing.)
     DLOG(@"[CH-L4] CCCrypt plaintext-ENC layer ready. installSecurityHooks will rebind CCCrypt next.");
     layersOK++;
 
@@ -8315,11 +8390,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.26 %d layers active (L1=CF / L2=NSString / L3=memcpy / L4=CCCryptENC / L5=sendScan / L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.33 %d layers active (L0=strlen/strcmp/strncmp L1=CF L2=NSString L3=memcpy L4=CCCryptENC L5=sendScan L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.32-DIST — Fix CCCrypt L4 fallback bug. v37.31 patches dm+gp+ch applied but wrongly falled-back to orig without patch: (1) Fix needed PKCS7 formula realDataInLen+1 (real 307→need 320 ≤ caller 333! 619→need 624 ≤ caller 636!) → uses caller buffer; (2) When tmpOut still needed for rare case, if outMovedTmp ≤ dataOutAvailable, memcpy ciphertext to caller & DLOG 'PATCH APPLIED via tmpOut' instead of fallback. Fallback only if output > callerAvail. Verified CC-AES-PLAIN has 'iPhone7Plus/A10 GPU' ✔. L4 ch=1 dm=1 gp=1 applied 3 fields FFF493 #2 plaintext, FFF493 #1 dm+gp applied.");
+    DLOG(@"[VERSION] WangXianHook v37.33-DIST — v37.32 FFF493#2 was 604B (missing accountId/hasRole 400+ bytes JSON) because init-time DY_MIESHI triggered short JSON build. v37.33 adds L0 fishhooks strlen/strcmp/strncmp so that ALL INIT-TIME reads see DYanyou0040_MIESHI correctly: strlen('DY_MIESHI')→18 (malloc 19B), strcmp(DY_MIESHI, canonical)→0 (branch right). L3 memcpy n>=19 copies full replacement. L1/L2/L4/L5/L6 kept. Expected: construct_NEW_USER_ENTER_SERVER_REQER builds ~1010B FFF493#2 JSON, pkt size≈1432B matches clean.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
