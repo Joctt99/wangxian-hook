@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.15-RESTORE loaded ===");
+        _log(@"=== WangXianHook v37.16-RESTORE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3677,6 +3677,9 @@ static int hook_close(int fd) {
         return 0;
     }
     
+    // v37.16: DISABLED CLOSE-BLOCK — server already closed connection, blocking close() is useless.
+    // User confirmed: "CLOSE-BLOCK 阻止了 close 调用，但连接已被服务器关闭，无济于事"
+    if (0) {
     // v36.93: Track game server port closures and BLOCK them during login flow
     for (int i = 0; i < g_trackedCount; i++) {
         if (g_trackedFds[i] == fd && g_trackedActive[i]) {
@@ -3706,7 +3709,8 @@ static int hook_close(int fd) {
             }
         }
     }
-    
+    }  // end if(0) CLOSE-BLOCK disabled
+
     clearTrackedFd(fd);
     return orig_close ? orig_close(fd) : -1;
 }
@@ -4005,8 +4009,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 
                 DLOG(@"[DEVICE-INFO] ===== END DEVICE INFO =====");
                 
-                // v36.66: Capture 0x000EE007 packet for forced send to game server
-                if (len > 0 && len <= MAX_DEVICE_INFO_SIZE) {
+                // v37.16: DISABLED UUID-INJECT — was corrupting 0x000EE007 packet structure.
+                // User confirmed: original 178-byte packet ends with 01 00, but UUID-injected
+                // packet ends with 00 01 00 → server validation fails → connection closed.
+                // Native encryption handles everything, no UUID injection needed.
+                if (0 && len > 0 && len <= MAX_DEVICE_INFO_SIZE) {
                     memcpy(g_deviceInfoPacket, buf, len);
                     g_deviceInfoPacketLen = len;
                     g_deviceInfoCaptured = YES;
@@ -7792,7 +7799,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.15-RESTORE — disabled BURST/fake-response/post-burst injection");
+    DLOG(@"[VERSION] WangXianHook v37.16-RESTORE — disabled UUID-INJECT + CLOSE-BLOCK");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
