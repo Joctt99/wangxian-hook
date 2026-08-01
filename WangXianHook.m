@@ -1,4 +1,4 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.14-RESTORE loaded ===");
+        _log(@"=== WangXianHook v37.15-RESTORE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5094,9 +5094,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
     if (!orig_recv || !buf) return -1;
     
-    // v36.123: TRIGGER FAKE-RESP IMMEDIATELY after 0x80FFF495 patch, NO WAIT for RECV-CLOSE.
-    // v36.137: Use extracted doBurstFakeInject() function.
-    if (g_triggerFakeNextRecv && g_triggerFakeFd == fd &&
+    // v37.15: DISABLED BURST injection — was causing crash on re-signed IPA.
+    // Native encryption works, client sends real encrypted packets, no fake responses needed.
+    if (0 && g_triggerFakeNextRecv && g_triggerFakeFd == fd &&
         g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
         ssize_t injectLen = doBurstFakeInject(fd, buf, len);
         if (injectLen > 0) return injectLen;
@@ -5123,7 +5123,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     // v36.154 adds 3-second time delay before Phase 2 can trigger.
     // State: 0=idle, 1=inject RECV#20, 2=inject RECV#21→done
     //        3=RECV#22, 4=RECV#23, 5=RECV#24, 0=done
-    if (g_postBurstState >= 1 && g_postBurstFd == fd) {
+    // v37.15: DISABLED post-BURST state machine — was causing crash.
+    // Native encryption works, no fake response injection needed.
+    if (0 && g_postBurstState >= 1 && g_postBurstFd == fd) {
         // Phase 1: RECV #20 (71B session token)
         if (g_postBurstState == 1 && len >= 71) {
             memcpy(buf, kRecv20Data, 71);
@@ -5385,7 +5387,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 //   and reconnected from scratch (login server 5678).
                 //   Fix: inject fake responses DIRECTLY into buf NOW, return totalLen.
                 //   This prevents client from ever seeing ret=0 on game server fd.
-                if (g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
+                // v37.15: DISABLED RECV-CLOSE BURST injection — was causing crash.
+                // Native encryption works, let client handle connection close normally.
+                if (0 && g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
                     DLOG(@"[RECV-CLOSE] v36.137: Game server closed connection (fd=%d). DIRECT BURST inject (handshake=%d loginSent=%d).",
                          fd, g_handshakeComplete, g_loginPacketsSent);
                     ssize_t injectLen = doBurstFakeInject(fd, buf, len);
@@ -7788,7 +7792,7 @@ static void entry(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.14-RESTORE — socket hooks only, crypto hooks disabled");
+    DLOG(@"[VERSION] WangXianHook v37.15-RESTORE — disabled BURST/fake-response/post-burst injection");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
