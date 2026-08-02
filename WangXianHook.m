@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.45-DIST loaded ===");
+        _log(@"=== WangXianHook v37.46-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3999,14 +3999,6 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 newBuf[9] = (origSeq >> 16) & 0xFF;
                 newBuf[10] = (origSeq >> 8) & 0xFF;
                 newBuf[11] = origSeq & 0xFF;
-                // v37.45: Replace hash field with ORIGINAL packet's hash.
-                // Clean packet's hash is from clean client binary, but our
-                // binary was modified by 全能签 resigning → different hash →
-                // server rejects. Hash is at packet end: 00 20 <hash 32B> = 34 bytes.
-                if (len >= 34) {
-                    memcpy(newBuf + 223 - 34, p + len - 34, 34);
-                    DLOG(@"[A018-REPL] v37.45: Replaced hash from original pkt (last 34B of origLen=%zu)", len);
-                }
                 DLOG(@"[A018-REPL] v37.42: Replaced 0x0002A018 with clean 223B pkt, seq=%u (origLen=%zu)", origSeq, len);
                 ssize_t rret = orig_send(fd, newBuf, 223, flags);
                 free(newBuf);
@@ -4184,16 +4176,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[9] = (origSeq >> 16) & 0xFF;
                     newBuf[10] = (origSeq >> 8) & 0xFF;
                     newBuf[11] = origSeq & 0xFF;
-                    // v37.45: Replace 3 hash fields with ORIGINAL packet's hashes.
-                    // Clean packet's hashes are from clean client binary, but our
-                    // binary was modified by 全能签 resigning → different hash →
-                    // server returns status=4 "版本过低" → no 0x8234AB89 (sessionId/ticket).
-                    // 3 hashes are at packet end: 00 10 <hash1 16B> 00 20 <hash2 32B> 00 10 <hash3 16B> = 70 bytes
-                    if (len >= 70) {
-                        memcpy(newBuf + 248 - 70, p + len - 70, 70);
-                        DLOG(@"[EE121-REPL] v37.45: Replaced 3 hashes from original pkt (last 70B of origLen=%zu)", len);
+                DLOG(@"[EE121-REPL] v37.39: Replaced 0x002EE121 with clean 248B pkt, seq=%u (origLen=%zu)", origSeq, len);
+                    // v37.46: Dump original packet tail (last 80B) to analyze hash fields
+                    if (len >= 80) {
+                        NSMutableString *tailHex = [NSMutableString string];
+                        for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
+                        DLOG(@"[EE121-ORIG] v37.46: origLen=%zu tail80B: %@", len, tailHex);
                     }
-                    DLOG(@"[EE121-REPL] v37.39: Replaced 0x002EE121 with clean 248B pkt, seq=%u (origLen=%zu)", origSeq, len);
                     ssize_t rret = orig_send(fd, newBuf, 248, flags);
                     free(newBuf);
                     if (rret >= 0) return (ssize_t)len;
@@ -4345,7 +4334,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                                                 length:g_fff493_2_native_len
                                                               encoding:NSUTF8StringEncoding];
                 if (nativeStr) {
-                    NSMutableString *newStr = [nativeStr mutableCopy];
+                    // v37.46: Use stringWithString: instead of mutableCopy to fix compile error
+                    // (compiler inferred NSString instead of NSMutableString from mutableCopy)
+                    NSMutableString *newStr = [NSMutableString stringWithString:nativeStr];
 
                     // 1. Replace sessionId: "" → "zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh"
                     [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
@@ -8813,11 +8804,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.44 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.46 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.45-DIST — v37.44 FFF493-REPL v2 worked (1432B packet sent, server returned heartbeats not disconnect), but server still didn't return 0x00A3B00E character data. Root cause: login server returned 0x802EE121 status=4 (not 0x8234AB89 with sessionId/ticket) because EE121-REPL and A018-REPL used clean client's binary hashes, but our binary was modified by 全能签 resigning → hash mismatch → status=4. v37.45: extract hash fields from ORIGINAL packet and replace into clean packet for both 0x002EE121 (3 hashes, last 70B) and 0x0002A018 (1 hash, last 34B). This preserves correct channel/model/GPU while using our binary's actual hash → server should return 0x8234AB89 with real sessionId/ticket → FFF493#2 will have valid sessionId/ticket → server returns character data.");
+    DLOG(@"[VERSION] WangXianHook v37.46-DIST — v37.45 hash replacement broke packet structure causing no network. v37.46: (1) Reverted EE121-REPL and A018-REPL hash replacement back to clean full-packet replacement (v37.42 behavior). (2) Added [EE121-ORIG] hex dump of original packet tail 80B to analyze hash field location. (3) Fixed FFF493-REPL v2 compile error (NSMutableString stringWithString: instead of mutableCopy). FFF493-REPL v2 still active (injects clean sessionId/ticket). Goal: get EE121-ORIG hex data to identify exact hash offset/length for future proper hash replacement.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
