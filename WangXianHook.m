@@ -589,7 +589,7 @@ static void installAllHooks(void);
 
 // v37.51: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
 static int g_md5_replace_count = 0;
-// v37.59: Flag set when CC_MD5 input had channel name "DY_MIESHI" replaced with
+// v37.60: Flag set when CC_MD5 input had channel name "DY_MIESHI" replaced with
 // "DYanyou0040_MIESHI". Used to decide whether to send native EE121 (hash1/3 fixed)
 // or fall back to clean 248B (hash1/3 unverifiable).
 static int g_md5_channel_replaced = 0;
@@ -737,7 +737,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.59-DIST loaded ===");
+        _log(@"=== WangXianHook v37.60-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4162,10 +4162,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.59: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-ORIG] v37.60: origLen=%zu tail80B: %@", len, tailHex);
                 }
 
-                // v37.59: Conditional EE121 sending based on CC_MD5 channel replacement.
+                // v37.60: Conditional EE121 sending based on CC_MD5 channel replacement.
                 // If CC_MD5 hook replaced "DY_MIESHI"→"DYanyou0040_MIESHI" in hash1/hash3
                 // input, then hash1/hash3 are computed with the CORRECT channel → server
                 // can verify and ACCEPT native EE121 → real sessionId/ticket → game entry.
@@ -4174,11 +4174,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_md5_channel_replaced == 1) {
                     // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
                     // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.59: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
+                    DLOG(@"[EE121-REPL] v37.60: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
                     // Don't return — fall through to TLV replacement at line below
                 } else {
                     // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
-                    DLOG(@"[EE121-REPL] v37.59: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
+                    DLOG(@"[EE121-REPL] v37.60: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
                     uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                        ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     static const uint8_t cleanPkt[248] = {
@@ -4208,7 +4208,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         fbBuf[9] = (origSeq >> 16) & 0xFF;
                         fbBuf[10] = (origSeq >> 8) & 0xFF;
                         fbBuf[11] = origSeq & 0xFF;
-                        DLOG(@"[EE121-REPL] v37.59: Sending clean 248B pkt seq=%u (fallback)", origSeq);
+                        DLOG(@"[EE121-REPL] v37.60: Sending clean 248B pkt seq=%u (fallback)", origSeq);
                         ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                         free(fbBuf);
                         if (rret >= 0) return (ssize_t)len;
@@ -7309,10 +7309,16 @@ static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
 typedef unsigned char *(*CC_MD5Func)(const void *data, uint32_t len, unsigned char *md);
 static CC_MD5Func orig_CC_MD5 = NULL;
 
+// v37.60: Updated to ACTUAL binary hash from CC_MD5(19437B) output.
+// v37.48-v37.60 had 913a1d1a... which was WRONG — output replacement never triggered.
+// Actual hash from log: [MD5-LOG] CC_MD5 inLen=19437 out=f9cc76c534acb63f51917951d486ca0c
 static const uint8_t g_our_binary_hash[16] = {
-    0x91,0x3a,0x1d,0x1a,0x9b,0x70,0x41,0x07,
-    0xb7,0xb6,0x07,0xb1,0x3d,0x53,0xa0,0x94
+    0xf9,0xcc,0x76,0xc5,0x34,0xac,0xb6,0x3f,
+    0x51,0x91,0x79,0x51,0xd4,0x86,0xca,0x0c
 };
+// v37.60: Clean binary hash — ddcb91f4... was previously assumed to be the clean
+// binary hash but may actually be the clean hash3 value. Testing whether it works.
+// If server still returns status=4, need to capture real clean binary hash via Frida.
 static const uint8_t g_clean_binary_hash[16] = {
     0xdd,0xcb,0x91,0xf4,0x2c,0x5a,0x61,0x2b,
     0x49,0x2a,0x22,0x96,0xa9,0x71,0xa5,0xaf
@@ -7320,31 +7326,31 @@ static const uint8_t g_clean_binary_hash[16] = {
 // g_md5_replace_count declared near top of file (line 589)
 
 static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
-    // v37.59: Scan INPUT (≤500B) for channel/deviceModel/GPU and replace ALL THREE
+    // v37.60: Scan INPUT (≤500B) for channel/deviceModel/GPU and replace ALL THREE
     // to match TLV-replaced EE121 packet. v37.58 only replaced channel → hash3 was
     // computed with native iPhone 16 Pro Max + A18 GPU but packet had iPhone7Plus +
     // A10 GPU → hash mismatch → server rejected.
-    // v37.59 replaces all three in CC_MD5 input so hash3 matches packet content.
+    // v37.60 replaces all three in CC_MD5 input so hash3 matches packet content.
     const void *actualInput = data;
     void *cleanInput = NULL;
     uint32_t actualLen = len;
     int inputModified = 0;
 
     if (data && len >= 9 && len <= 65536) {
-        // v37.59: Only process small inputs (≤500B) — hash1/hash3 computations.
+        // v37.60: Only process small inputs (≤500B) — hash1/hash3 computations.
         // Large inputs (e.g., 19437B binary hash) are handled by output replacement.
         if (len <= 500) {
             const uint8_t *in = (const uint8_t *)data;
 
-            // v37.59: Four search/replace pairs (must match TLV replacement + binary hash)
+            // v37.60: Four search/replace pairs (must match TLV replacement + binary hash)
             static const char chOld[]   = "DY_MIESHI";              // 9 bytes
             static const char chNew[]   = "DYanyou0040_MIESHI";     // 18 bytes (+9)
             static const char dmOld[]   = "iPhone 16 Pro Max";       // 17 bytes
             static const char dmNew[]   = "iPhone7Plus";             // 11 bytes (-6)
             static const char gpOld[]   = "Apple Inc. Apple A18 Pro GPU"; // 28 bytes
             static const char gpNew[]   = "Apple Inc. Apple A10 GPU";     // 24 bytes (-4)
-            // v37.59: Also replace binary hash as hex string (32 chars, same length)
-            static const char hOld[]    = "913a1d1a9b704107b7b607b13d53a094"; // 32 bytes
+            // v37.60: Updated to ACTUAL binary hash hex (was wrong 913a1d1a... before)
+            static const char hOld[]    = "f9cc76c534acb63f51917951d486ca0c"; // 32 bytes
             static const char hNew[]    = "ddcb91f42c5a612b492a2296a971a5af"; // 32 bytes
 
             // Check if any of the strings exist in input
@@ -7389,22 +7395,22 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                     actualInput = cleanInput;
                     actualLen = out;
                     inputModified = 2; // content replacement
-                    DLOG(@"[MD5-HOOK] v37.59: Replaced input ch=%d dm=%d gp=%d hash=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
+                    DLOG(@"[MD5-HOOK] v37.60: Replaced input ch=%d dm=%d gp=%d hash=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
                          hasCh, hasDm, hasGp, hasHash, len, newLen, out, g_md5_channel_replaced);
                     // Dump original input for diagnosis
                     if (len <= 200) {
                         NSMutableString *hex = [NSMutableString string];
                         for (uint32_t j = 0; j < len; j++) [hex appendFormat:@"%02x", in[j]];
-                        DLOG(@"[MD5-DUMP] v37.59: CC_MD5 input(%uB): %@", len, hex);
+                        DLOG(@"[MD5-DUMP] v37.60: CC_MD5 input(%uB): %@", len, hex);
                     }
                 }
             }
 
-            // v37.59: Unconditional dump for ALL small inputs (diagnose hash1/hash2 63B input)
+            // v37.60: Unconditional dump for ALL small inputs (diagnose hash1/hash2 63B input)
             if (!inputModified && len <= 200 && len >= 20) {
                 NSMutableString *hex = [NSMutableString string];
                 for (uint32_t j = 0; j < len; j++) [hex appendFormat:@"%02x", in[j]];
-                DLOG(@"[MD5-DUMP-RAW] v37.59: CC_MD5 input(%uB) no-match: %@", len, hex);
+                DLOG(@"[MD5-DUMP-RAW] v37.60: CC_MD5 input(%uB) no-match: %@", len, hex);
             }
         }
 
@@ -7438,7 +7444,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash OUTPUT (#%d, inputLen=%u)", g_md5_replace_count, len);
         }
         // v37.57: Log ALL CC_MD5 calls for diagnosis
-        DLOG(@"[MD5-LOG] v37.59: CC_MD5 inLen=%u actLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+        DLOG(@"[MD5-LOG] v37.60: CC_MD5 inLen=%u actLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
              len, actualLen, inputModified,
              md[0],md[1],md[2],md[3],md[4],md[5],md[6],md[7],
              md[8],md[9],md[10],md[11],md[12],md[13],md[14],md[15]);
@@ -7723,7 +7729,7 @@ static void installSecurityHooks(void) {
         orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
         if (orig_CC_MD5) {
             int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-            DLOG(@"[SEC] CC_MD5 hook v37.59: rebind=%d addr=%p", rm, orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.60: rebind=%d addr=%p", rm, orig_CC_MD5);
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
@@ -9007,7 +9013,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.59 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?NATIVE+TLV:CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.60 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?NATIVE+TLV:CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9135,7 +9141,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.59-DIST — v37.59 replaced channel in CC_MD5 input but NOT deviceModel/GPU → hash3 computed with iPhone 16 Pro Max + A18 GPU but TLV packet had iPhone7Plus + A10 GPU → hash mismatch → server rejected. v37.59: CC_MD5 hook now replaces ALL FOUR in input (≤500B): channel DY_MIESHI→DYanyou0040_MIESHI, deviceModel iPhone 16 Pro Max→iPhone7Plus, GPU A18→A10, binary hash hex 913a...→ddcb... So hash3 matches TLV packet content. Also dumps ALL small CC_MD5 inputs for hash1/hash2 diagnosis. EE121 conditional: g_md5_channel_replaced=1→NATIVE+TLV, =0→clean 248B fallback.");
+    DLOG(@"[VERSION] WangXianHook v37.60-DIST — v37.59 used WRONG g_our_binary_hash (913a1d1a) so CC_MD5(19437B) output replacement never triggered (mod=0). Actual binary hash from log: f9cc76c5. v37.60 updates g_our_binary_hash=f9cc76c5 and hOld hex search=f9cc76c5. KEY INSIGHT: hash1/hash3 input(63B)=binary_hash_hex(32B)+token(31B). v37.60 replaces f9cc76c5→ddcb91f42c in 63B input → MD5(ddcb91f42c+token) → server verifies hash1/hash3 match → status=0 → real sessionId/ticket. hash2 input(156B)=accountId+ch+dm+gp+UUID (no binary hash) already replaced ch/dm/gp → unchanged, server re-computes from packet fields → matches. EE121 conditional: g_md5_channel_replaced=1→NATIVE+TLV, =0→clean 248B fallback.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
