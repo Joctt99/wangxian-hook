@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.38-DIST loaded ===");
+        _log(@"=== WangXianHook v37.39-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3997,6 +3997,55 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
+            // v37.39: For 0x002EE121, replace ENTIRE packet with clean client's
+            // version (correct channel+model+GPU+UUID+hashes). Only preserve seqNum.
+            // v37.38 only patched channel/model/GPU but hash fields stayed wrong →
+            // server detected mismatch → closed connection.
+            if (cmd == 0x002EE121) {
+                // Extract original seqNum (bytes 8-11)
+                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                // Clean client's 0x002EE121 packet (248B) from hook.txt SEND #18
+                // deviceId=656578810453350151551, channel=DYanyou0040_MIESHI,
+                // model=iPhone7Plus, GPU=A10, UUID=66B0EE01-..., hashes match
+                static const uint8_t cleanPkt[248] = {
+                    0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10, // len+cmd+seq(placeholder)
+                    0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31, // deviceId
+                    0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34, // username "kk994"
+                    0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34, // password "994624"
+                    0x00,0x05, 0x53,0x51,0x41,0x47,0x45, // "SQAGE"
+                    0x00,0x03, 0x49,0x4F,0x53, // "IOS"
+                    0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49, // "DYanyou0040_MIESHI"
+                    0x00,0x00, // empty
+                    0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73, // "iPhone7Plus"
+                    0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55, // "Apple Inc. Apple A10 GPU"
+                    0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38, // UUID
+                    0x00,0x04, 0x57,0x49,0x46,0x49, // "WIFI"
+                    0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33, // "7.6.3"
+                    0x00,0x03, 0x39,0x37,0x39, // "979"
+                    0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62, // hash1
+                    0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66, // hash2
+                    0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38, // hash3
+                };
+                // Copy clean packet and update seqNum
+                unsigned char *newBuf = (unsigned char *)malloc(248);
+                if (newBuf) {
+                    memcpy(newBuf, cleanPkt, 248);
+                    newBuf[8] = (origSeq >> 24) & 0xFF;
+                    newBuf[9] = (origSeq >> 16) & 0xFF;
+                    newBuf[10] = (origSeq >> 8) & 0xFF;
+                    newBuf[11] = origSeq & 0xFF;
+                    DLOG(@"[EE121-REPL] v37.39: Replaced 0x002EE121 with clean 248B pkt, seq=%u (origLen=%zu)", origSeq, len);
+                    ssize_t rret = orig_send(fd, newBuf, 248, flags);
+                    free(newBuf);
+                    if (rret >= 0) return (ssize_t)len;
+                    return rret;
+                }
+                // If malloc failed, fall through to normal send (unpatched)
+                DLOG(@"[EE121-REPL] v37.39: malloc FAILED, sending original");
+                ssize_t ret = orig_send(fd, buf, len, flags);
+                return ret;
+            }
             // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
             // (short channel from resigning) + iPhone 16 Pro Max + A18 GPU.
             // Server rejects with "version too low" → no real accountId →
@@ -8628,7 +8677,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.38-DIST — ROOT CAUSE FOUND: 0x002EE121 login request sends DY_MIESHI (9B short channel from resigning) + iPhone 16 Pro Max + A18 GPU. Server rejects with 'version too low' (actually channel/integrity check). We patch error response but never get real accountId → game server can't validate FFF493#2 → no response. FIX: extend EE007-ALIGN to also patch 0x002EE121 TLV fields (channel DYanyou0040_MIESHI 18B, deviceModel iPhone7Plus 11B, GPU Apple A10 GPU 24B). Net change -1B (249→248). If login succeeds, server returns real accountId in 0x802EE121 response, client includes it in FFF493#2 JSON, game server validates and responds with 0x00A3B00E. Also kept FFF493#2 send-hook replacement as fallback (in case login still returns error but client proceeds).");
+    DLOG(@"[VERSION] WangXianHook v37.39-DIST — v37.38 patched channel/model/GPU in 0x002EE121 but hash fields (hash1/MD5/hash3) stayed from original → server detected mismatch → RECV-CLOSE. FIX: replace ENTIRE 0x002EE121 with clean client's 248B packet (from hook.txt SEND #18). Clean packet has ALL correct values: deviceId=656578810453350151551, channel=DYanyou0040_MIESHI, model=iPhone7Plus, GPU=A10, UUID=66B0EE01-..., hash1=3dd8196f64350acb, hash2=ddcb91f42c5a612b492a2296a971a5af, hash3=780a0642619c8498. Only preserve original seqNum. Same username/password (kk994/994624). If server accepts this as valid login, 0x802EE121 returns real accountId → client includes it in FFF493#2 → game server responds with 0x00A3B00E → enter game.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
