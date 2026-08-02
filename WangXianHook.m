@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.40-DIST loaded ===");
+        _log(@"=== WangXianHook v37.41-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3964,14 +3964,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // Scans for TLV patterns: [2B len][string] and replaces channel/model/GPU.
     if (port == 5678 && len >= 20 && len <= 4096) {
         const unsigned char *p = (const unsigned char *)buf;
-        // Skip 0x002EE121 — handled by EE121-REPL with full clean packet
+        // v37.41: Only patch 0x0000E002 and 0x002EE118 (simple packets, no hash).
+        // Skip 0x002EE121 (handled by EE121-REPL) and 0x0002A018 (has MD5 hash
+        // at end that we can't recompute — patching channel/model/GPU without
+        // updating hash causes server to detect tampering).
         uint32_t tlvCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                           ((uint32_t)p[6] << 8) | (uint32_t)p[7];
-        if (tlvCmd != 0x002EE121) {
-        BOOL hasShort = (memmem(p, len, "DY_MIESHI", 9) != NULL);
-        BOOL hasDM = (memmem(p, len, "iPhone 16 Pro Max", 17) != NULL);
-        BOOL hasGPU = (memmem(p, len, "Apple Inc. Apple A18 Pro GPU", 28) != NULL);
-        if (hasShort || hasDM || hasGPU) {
+        if ((tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118) &&
+            memmem(p, len, "DY_MIESHI", 9) != NULL) {
             // Reconstruct packet with TLV field replacements
             size_t bufCap = len + 64;
             unsigned char *newBuf = (unsigned char *)malloc(bufCap);
@@ -4027,7 +4027,6 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // Fall through if no fields applied
             }
         }
-        } // end if tlvCmd != 0x002EE121
     }
 
     // v37.27: Dump EE007 ORIGINAL hex (before CHANNEL-PATCH) for byte-level
@@ -8750,7 +8749,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.40-DIST — v37.39 sent clean 0x002EE121 but server STILL returned status=4! Clean client gets 0x00A3B00E(816B) after 0x002EE121, we get 0x802EE121(94B error). ROOT CAUSE: server flagged us BEFORE 0x002EE121 based on pre-login packets. Clean SENDs: 0x0000E002=37B 0x002EE118=39B 0x0002A018=223B. Ours: 28B 30B 224B. ALL contain DY_MIESHI (9B vs 18B). FIX v37.40: generic TLV scanner for ALL port 5678 packets (except 0x002EE121 handled by EE121-REPL). Scans [2B len][string] patterns: DY_MIESHI→DYanyou0040_MIESHI, iPhone 16 Pro Max→iPhone7Plus, A18 Pro GPU→A10 GPU. Updates TLV lengths + total pktLen. Should fix 0x0000E002, 0x002EE118, 0x0002A018 etc.");
+    DLOG(@"[VERSION] WangXianHook v37.41-DIST — v37.40 TLV-SCAN patched ALL port 5678 packets but 0x0002A018 has MD5 hash at end that we can't recompute → server detected tampering → no network. v37.41: ONLY patch 0x0000E002 and 0x002EE118 (simple packets, no hash fields). Leave 0x0002A018 unpatched (has DY_MIESHI but hash matches). Keep EE121-REPL for 0x002EE121 (full clean packet with correct hashes).");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
