@@ -4328,7 +4328,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                                                 length:g_fff493_2_native_len
                                                               encoding:NSUTF8StringEncoding];
                 if (nativeStr) {
-                    NSString *newStr = [nativeStr mutableCopy];
+                    NSMutableString *newStr = [nativeStr mutableCopy];
 
                     // 1. Replace sessionId: "" → "zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh"
                     [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
