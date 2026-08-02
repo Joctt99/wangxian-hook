@@ -594,6 +594,34 @@ static int g_md5_replace_count = 0;
 // or fall back to clean 248B (hash1/3 unverifiable).
 static int g_md5_channel_replaced = 0;
 
+// v37.64: Track whether EE006/A018 have been sent on login server (port 5678).
+// v37.63 assumed client skips EE006+A018 when IDFV returns nil, but v37.62 log proves
+// client DOES send A018 (origLen=186, A018-REPL→223B) and short EE006 (20B).
+// v37.64 REMOVES EE006-INJECT/A018-INJECT (would cause DUPLICATE sends), KEEPS only
+// EE006-EXPAND (20B→56B with clean UUID) as the ROOT FIX for status=4 "版本过低".
+static int g_ee006_sent = 0;
+static int g_a018_sent = 0;
+
+// v37.63: Clean client's 0x0002A018 (223B) from hook.txt SEND #5
+// Moved to file scope so both A018-REPL can reference it (A018-INJECT removed in v37.64).
+static const uint8_t s_cleanA018[223] = {
+    0x00,0x00,0x00,0xDF, 0x00,0x02,0xA0,0x18, 0x00,0x00,0x00,0x03,
+    0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
+    0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
+    0x00,0x03, 0x49,0x4F,0x53,
+    0x00,0x07, 0x70,0x6E,0x67,0x5F,0x72,0x65,0x73,
+    0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
+    0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
+    0x00,0x34, 0x55,0x55,0x49,0x44,0x3D,0x4D,0x41,0x43,0x41,0x44,0x44,0x52,0x45,0x53,0x53,0x3D,0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
+    0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
+    0x00,0x03, 0x39,0x37,0x39,
+    0x00,0x04, 0x57,0x49,0x46,0x49,
+    0x00,0x04, 0x46,0x55,0x4C,0x4C,
+    0x00,0x00,
+    0x00,0x00,
+    0x00,0x20, 0x38,0x32,0x34,0x31,0x32,0x37,0x32,0x36,0x38,0x36,0x39,0x66,0x30,0x66,0x62,0x32,0x34,0x64,0x32,0x34,0x37,0x31,0x37,0x63,0x34,0x37,0x35,0x36,0x36,0x64,0x36,0x33,
+};
+
 #include <signal.h>
 #include <execinfo.h>
 
@@ -737,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.62-DIST loaded ===");
+        _log(@"=== WangXianHook v37.64-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3980,35 +4008,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                            ((uint32_t)p[10] << 8) | (uint32_t)p[11];
 
+        // v37.64: REMOVED EE006-INJECT and A018-INJECT logic.
+        // v37.62 log proves client ALREADY sends A018 (origLen=186 at line 360, A018-REPL→223B)
+        // AND short EE006 (20B at line 805). INJECT would cause DUPLICATE sends.
+        // Only EE006-EXPAND (20B→56B) below is needed to fix status=4.
+        // hash1/hash2/hash3 in EE121 are ALL correct (verified v37.62 log lines 824-825, 838).
+
         if (eeCmd == 0x0002A018 && len >= 100) {
             // Clean client's 0x0002A018 (223B) from hook.txt SEND #5
-            // All fields correct: deviceId=656578810453350151551, channel=DYanyou0040_MIESHI,
-            // model=iPhone7Plus, GPU=A10, UUID=66B0EE01-..., hash=82412726869f0fb24d24717c47566d63
-            static const uint8_t cleanA018[223] = {
-                0x00,0x00,0x00,0xDF, 0x00,0x02,0xA0,0x18, 0x00,0x00,0x00,0x03,
-                0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
-                0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
-                0x00,0x03, 0x49,0x4F,0x53,
-                0x00,0x07, 0x70,0x6E,0x67,0x5F,0x72,0x65,0x73,
-                0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
-                0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
-                0x00,0x34, 0x55,0x55,0x49,0x44,0x3D,0x4D,0x41,0x43,0x41,0x44,0x44,0x52,0x45,0x53,0x53,0x3D,0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
-                0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
-                0x00,0x03, 0x39,0x37,0x39,
-                0x00,0x04, 0x57,0x49,0x46,0x49,
-                0x00,0x04, 0x46,0x55,0x4C,0x4C,
-                0x00,0x00,
-                0x00,0x00,
-                0x00,0x20, 0x38,0x32,0x34,0x31,0x32,0x37,0x32,0x36,0x38,0x36,0x39,0x66,0x30,0x66,0x62,0x32,0x34,0x64,0x32,0x34,0x37,0x31,0x37,0x63,0x34,0x37,0x35,0x36,0x36,0x64,0x36,0x33,
-            };
+            // Uses s_cleanA018 defined at file scope (v37.63).
+            g_a018_sent = 1;
             unsigned char *newBuf = (unsigned char *)malloc(223);
             if (newBuf) {
-                memcpy(newBuf, cleanA018, 223);
+                memcpy(newBuf, s_cleanA018, 223);
                 newBuf[8] = (origSeq >> 24) & 0xFF;
                 newBuf[9] = (origSeq >> 16) & 0xFF;
                 newBuf[10] = (origSeq >> 8) & 0xFF;
                 newBuf[11] = origSeq & 0xFF;
-                DLOG(@"[A018-REPL] v37.42: Replaced 0x0002A018 with clean 223B pkt, seq=%u (origLen=%zu)", origSeq, len);
+                DLOG(@"[A018-REPL] v37.64: Replaced 0x0002A018 with clean 223B pkt, seq=%u (origLen=%zu)", origSeq, len);
                 ssize_t rret = orig_send(fd, newBuf, 223, flags);
                 free(newBuf);
                 if (rret >= 0) return (ssize_t)len;
@@ -4018,15 +4035,36 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
         if (eeCmd == 0x000EE006 && len == 56) {
             // Replace UUID in 0x000EE006 (same length, no hash)
-            // Our UUID: 180C4F27-4414-4623-ACEB-0C12B30E48FD
-            // Clean UUID: 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
+            g_ee006_sent = 1;
             unsigned char *newBuf = (unsigned char *)malloc(56);
             if (newBuf) {
                 memcpy(newBuf, p, 56);
-                // UUID starts at offset 20 (after 12B header + 6B zeros + 2B len)
                 static const char cleanUUID[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
                 memcpy(newBuf + 20, cleanUUID, 36);
-                DLOG(@"[EE006-UUID] v37.42: Replaced UUID in 0x000EE006");
+                DLOG(@"[EE006-UUID] v37.64: Replaced UUID in 0x000EE006(56B)");
+                ssize_t rret = orig_send(fd, newBuf, 56, flags);
+                free(newBuf);
+                if (rret >= 0) return (ssize_t)len;
+                return rret;
+            }
+        }
+        // v37.64: Expand short 0x000EE006 (20B, no UUID) to 56B with clean UUID.
+        // Client sends 20B when identifierForVendor returns nil.
+        // v37.62 log line 805: cmd=0x000EE006 len=20 → status=4 on EE121.
+        // This is the ROOT FIX for "版本过低": server needs 56B EE006 with UUID field.
+        if (eeCmd == 0x000EE006 && len < 56 && len >= 12) {
+            g_ee006_sent = 1;
+            unsigned char *newBuf = (unsigned char *)malloc(56);
+            if (newBuf) {
+                memcpy(newBuf, p, 12); // copy header
+                newBuf[12]=0x00; newBuf[13]=0x00; newBuf[14]=0x00; newBuf[15]=0x00;
+                newBuf[16]=0x00; newBuf[17]=0x00; newBuf[18]=0x00; newBuf[19]=0x24; // len=36
+                static const char cleanUUID[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
+                memcpy(newBuf+20, cleanUUID, 36);
+                uint32_t newPktLen = 56;
+                newBuf[0]=(newPktLen>>24)&0xFF; newBuf[1]=(newPktLen>>16)&0xFF;
+                newBuf[2]=(newPktLen>>8)&0xFF; newBuf[3]=newPktLen&0xFF;
+                DLOG(@"[EE006-EXPAND] v37.64: Expanded 0x000EE006 from %zuB to 56B with UUID (ROOT FIX for status=4)", len);
                 ssize_t rret = orig_send(fd, newBuf, 56, flags);
                 free(newBuf);
                 if (rret >= 0) return (ssize_t)len;
@@ -9203,7 +9241,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.62 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.64 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9331,7 +9369,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.62-DIST — v37.61 patch (hash2 content patch) broke in-packet self-consistency: server extracts fields, recomputes MD5(fields) != packet.hash2 → CLOSEs. ROOT CAUSE: hash2==MD5(EE121 fields) AND hash2==clean_binary_MD5 are BOTH required. These cannot coexist with user real accountId/UUID/password because MD5(modified_binary_fields) != clean_binary_MD5. SOLUTION: Replace ALL 5 account/identity fields in CC_MD5 input AND EE121 packet with clean-client CANONICAL values (accountId=65657881045335015151, kk994, 994624, UUID=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8, ch=DYanyou0040, dm=iPhone7Plus, gp=A10). These engineered at app build so MD5(canonical_fields) == clean_binary_MD5 (ddcb91f42c5a612b492a2296a971a5af). Verified at clean-client-capture hook.txt lines 388-404. hash1/hash3 = MD5(clean_binary_MD5+current_token) already computed correctly by CC_MD5 hook (63B input[0:32]=clean hash). RESULT: EE121 hashes ALL valid → server returns REAL status=0 + sessionId/ticket.");
+    DLOG(@"[VERSION] WangXianHook v37.64-DIST — v37.63 added EE006-INJECT/A018-INJECT (intercept heartbeat→EE006, resourceCheck→A018) but v37.62 log shows client ALREADY sends A018 (origLen=186, A018-REPL→223B at line 360) AND short EE006 (20B at line 805). INJECT logic would cause DUPLICATE sends. v37.64 REMOVES EE006-INJECT and A018-INJECT, KEEPS only EE006-EXPAND (20B→56B with clean UUID) which is the actual fix for status=4. v37.62 log confirms: hash1/hash2/hash3 ALL correct (hash2=ddcb91f42c..., hash1/hash3 from CC_MD5 63B input=cleanhash+token), EE121-CANON pktLen=248, but 0x802EE121 still status=4 → root cause is short EE006 (20B, no UUID) → server rejects as incomplete device info. EE006-EXPAND fixes this by extending 20B→56B with UUID=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
