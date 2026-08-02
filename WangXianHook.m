@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.44-DIST loaded ===");
+        _log(@"=== WangXianHook v37.45-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3999,6 +3999,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 newBuf[9] = (origSeq >> 16) & 0xFF;
                 newBuf[10] = (origSeq >> 8) & 0xFF;
                 newBuf[11] = origSeq & 0xFF;
+                // v37.45: Replace hash field with ORIGINAL packet's hash.
+                // Clean packet's hash is from clean client binary, but our
+                // binary was modified by 全能签 resigning → different hash →
+                // server rejects. Hash is at packet end: 00 20 <hash 32B> = 34 bytes.
+                if (len >= 34) {
+                    memcpy(newBuf + 223 - 34, p + len - 34, 34);
+                    DLOG(@"[A018-REPL] v37.45: Replaced hash from original pkt (last 34B of origLen=%zu)", len);
+                }
                 DLOG(@"[A018-REPL] v37.42: Replaced 0x0002A018 with clean 223B pkt, seq=%u (origLen=%zu)", origSeq, len);
                 ssize_t rret = orig_send(fd, newBuf, 223, flags);
                 free(newBuf);
@@ -4176,6 +4184,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[9] = (origSeq >> 16) & 0xFF;
                     newBuf[10] = (origSeq >> 8) & 0xFF;
                     newBuf[11] = origSeq & 0xFF;
+                    // v37.45: Replace 3 hash fields with ORIGINAL packet's hashes.
+                    // Clean packet's hashes are from clean client binary, but our
+                    // binary was modified by 全能签 resigning → different hash →
+                    // server returns status=4 "版本过低" → no 0x8234AB89 (sessionId/ticket).
+                    // 3 hashes are at packet end: 00 10 <hash1 16B> 00 20 <hash2 32B> 00 10 <hash3 16B> = 70 bytes
+                    if (len >= 70) {
+                        memcpy(newBuf + 248 - 70, p + len - 70, 70);
+                        DLOG(@"[EE121-REPL] v37.45: Replaced 3 hashes from original pkt (last 70B of origLen=%zu)", len);
+                    }
                     DLOG(@"[EE121-REPL] v37.39: Replaced 0x002EE121 with clean 248B pkt, seq=%u (origLen=%zu)", origSeq, len);
                     ssize_t rret = orig_send(fd, newBuf, 248, flags);
                     free(newBuf);
@@ -8800,7 +8817,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.44-DIST — v37.43 disabled FFF493-REPL entirely, but server rejected FFF493#2 (896B) because sessionId='' and ticket='' (login server returned status=4, no 0x8234AB89 response with sessionId/ticket). Frida capture of clean client confirmed: clean FFF493#2 plaintext is 1018B with sessionId='zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh' (32B) and ticket='kk994|1785665252271|236923||SwnLPVw4w...' (366B). Our native plaintext is 619B with both empty. v37.44 implements FFF493-REPL v2: (1) CCCrypt hook saves FFF493#2 native plaintext when detecting NEW_USER_ENTER_SERVER_REQ, (2) send hook replaces 5 fields (sessionId/ticket/clientId/MACADDRESS/md5) with REAL clean client values, re-encrypts with saved AES key+iv, computes HMAC, builds new packet matching clean 1432B format. Login server packets unchanged from v37.42.");
+    DLOG(@"[VERSION] WangXianHook v37.45-DIST — v37.44 FFF493-REPL v2 worked (1432B packet sent, server returned heartbeats not disconnect), but server still didn't return 0x00A3B00E character data. Root cause: login server returned 0x802EE121 status=4 (not 0x8234AB89 with sessionId/ticket) because EE121-REPL and A018-REPL used clean client's binary hashes, but our binary was modified by 全能签 resigning → hash mismatch → status=4. v37.45: extract hash fields from ORIGINAL packet and replace into clean packet for both 0x002EE121 (3 hashes, last 70B) and 0x0002A018 (1 hash, last 34B). This preserves correct channel/model/GPU while using our binary's actual hash → server should return 0x8234AB89 with real sessionId/ticket → FFF493#2 will have valid sessionId/ticket → server returns character data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
