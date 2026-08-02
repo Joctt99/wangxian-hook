@@ -733,7 +733,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.53-DIST loaded ===");
+        _log(@"=== WangXianHook v37.54-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4143,85 +4143,37 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
-            // v37.51: ALWAYS send clean 248B packet for EE121 (login server).
-            // Analysis of v37.38-v37.51 results:
-            //   - v37.38 (orig pkt + TLV, hash2=913a1d1a modified): server CLOSE (wrong binary hash)
-            //   - v37.39 (clean 248B, hash2=ddcb91f4 clean, hash1/3 wrong challenge): status=4 ACCEPT
-            //   - v37.51 (orig pkt + TLV + CC_MD5 hook, hash2=clean, hash1/3 current challenge): server CLOSE
-            // Conclusion: CC_MD5 hook only fixes hash2, NOT hash1/hash3 (different algorithm).
-            // Server logic: if hash2=clean → verify hash1/hash3 against current challenge.
-            //   v37.51: hash1/hash3 verifiable but WRONG (modified binary) → server CLOSE.
-            //   v37.39: hash1/hash3 NOT verifiable (different challenge) → status=4 ACCEPT.
-            // So the ONLY working approach is: send clean 248B (hash1/hash3 from different
-            // session → unverifiable → status=4 but login works).
-            // v37.51 also replaces accountId + UUID in clean pkt with current session's values.
+            // v37.54: STOP sending clean 248B packet! Send NATIVE EE121 packet instead.
+            //
+            // ROOT CAUSE (from clean client log analysis):
+            //   Clean client flow: RECV 0x802EE120 (challenge) → SEND EE121 → RECV 0x8234AB89 (sessionId+ticket)
+            //   v37.51-v37.53 sent clean 248B (hash1/hash3 from DIFFERENT session) → server returns
+            //   "版本过低" (status=4) → we patch status=0 but NO real sessionId/ticket → FFF493#2
+            //   has empty sessionId/ticket → server returns only heartbeats → stuck at "正在进入..."
+            //
+            // v37.54 FIX: Send native EE121 packet (hash1/hash3 based on CURRENT session challenge,
+            //   hash2 already clean via CC_MD5 hook). Server should verify hash1/hash3 and return
+            //   0x8234AB89 with real sessionId+ticket. Channel name remains DY_MIESHI (short) but
+            //   server may accept it if hash verification passes.
             if (cmd == 0x002EE121) {
-                // Clean hash2 as ASCII hex string: "ddcb91f42c5a612b492a2296a971a5af"
-                static const char cleanHash2Hex[33] = "ddcb91f42c5a612b492a2296a971a5af";
-                // Our hash2 as ASCII hex string: "913a1d1a9b704107b7b607b13d53a094"
-                static const char ourHash2Hex[33] = "913a1d1a9b704107b7b607b13d53a094";
-
                 // Dump original packet tail for debugging
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.51: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-NATIVE] v37.54: origLen=%zu tail80B: %@", len, tailHex);
                 }
-
-                // Determine hash2 status for logging
-                const char *hash2Status = "unknown";
-                char pktHash2Buf[33] = {0}; // declared outside if to avoid dangling pointer
-                if (len >= 54 && p[len-52] == 0x00 && p[len-51] == 0x20 &&
-                    p[len-18] == 0x00 && p[len-17] == 0x10) {
-                    memcpy(pktHash2Buf, p + len - 50, 32);
-                    if (strncmp(pktHash2Buf, cleanHash2Hex, 32) == 0) hash2Status = "clean(CC_MD5 worked)";
-                    else if (strncmp(pktHash2Buf, ourHash2Hex, 32) == 0) hash2Status = "our(CC_MD5 missed)";
-                    else hash2Status = pktHash2Buf;
+                // Dump full hex for first 60 bytes (header + accountId + username + password + SQAGE + IOS + channel)
+                if (len >= 60) {
+                    NSMutableString *headHex = [NSMutableString string];
+                    for (size_t i = 0; i < 60 && i < len; i++) [headHex appendFormat:@"%02X ", p[i]];
+                    DLOG(@"[EE121-NATIVE] v37.54: head60B: %@", headHex);
                 }
-
-                // v37.51: ALWAYS send clean 248B packet regardless of hash2 status.
-                // Replace seq + accountId + UUID with current session's values.
-                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                static const uint8_t cleanPkt[248] = {
-                    0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
-                    0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
-                    0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
-                    0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
-                    0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
-                    0x00,0x03, 0x49,0x4F,0x53,
-                    0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
-                    0x00,0x00,
-                    0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
-                    0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
-                    0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
-                    0x00,0x04, 0x57,0x49,0x46,0x49,
-                    0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
-                    0x00,0x03, 0x39,0x37,0x39,
-                    0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
-                    0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
-                    0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
-                };
-                unsigned char *fbBuf = (unsigned char *)malloc(248);
-                if (fbBuf) {
-                    memcpy(fbBuf, cleanPkt, 248);
-                    // Replace seq (offset 8-11)
-                    fbBuf[8] = (origSeq >> 24) & 0xFF;
-                    fbBuf[9] = (origSeq >> 16) & 0xFF;
-                    fbBuf[10] = (origSeq >> 8) & 0xFF;
-                    fbBuf[11] = origSeq & 0xFF;
-                    // v37.51: DO NOT replace accountId/UUID! v37.51 proved that replacing
-                    // accountId makes hash1/hash3 verifiable (server can look up account +
-                    // verify against current challenge). But hash1/hash3 are from a DIFFERENT
-                    // session (clean pkt) → mismatch → server CLOSE. Without accountId
-                    // replacement, server can't verify hash1/hash3 → status=4 ACCEPT (v37.39/v37.46 behavior).
-                    DLOG(@"[EE121-REPL] v37.51: Sending clean 248B pkt seq=%u hash2=%s (replaced seq ONLY, no accountId/UUID replace)",
-                         origSeq, hash2Status);
-                    ssize_t rret = orig_send(fd, fbBuf, 248, flags);
-                    free(fbBuf);
-                    if (rret >= 0) return (ssize_t)len;
-                    return rret;
-                }
+                // v37.54: Send native packet AS-IS (no replacement).
+                // hash1/hash3 are based on current session challenge (correct).
+                // hash2 is clean (CC_MD5 hook replaces 913a1d1a → ddcb91f4).
+                // Channel is DY_MIESHI (short, from 全能签 resigning) — server MAY accept
+                // if it only verifies hashes, not channel name.
+                DLOG(@"[EE121-NATIVE] v37.54: Sending native EE121 pkt len=%zu (NO replacement, hash1/3=current session, hash2=clean via CC_MD5 hook)", len);
                 ssize_t ret = orig_send(fd, buf, len, flags);
                 return ret;
             }
@@ -4353,7 +4305,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         //   md5: "bdf8dad65adff0f9fed3876640c9418d" (clean client binary hash)
         // Flow: take saved native plaintext → replace 5 fields → re-encrypt with saved
         // AES key+iv → Base64 → HMAC → build new packet (matches clean 1432B format).
-        if (cmd == 0x00FFF493 && len > 800 && g_aes_key_saved && g_fff493_2_native_plain && g_fff493_2_native_len > 500) {
+        // v37.54: FFF493-REPL v2 DISABLED.
+        // v37.51-v37.53 needed this because EE121-REPL sent clean 248B (wrong session) →
+        // server returned "版本过低" → no real sessionId/ticket → had to forge them.
+        // v37.54 sends NATIVE EE121 → server should return 0x8234AB89 with REAL
+        // sessionId/ticket → client builds complete FFF493#2 natively → no replacement needed.
+        // If EE121 fails (server rejects DY_MIESHI channel), re-enable this block.
+        if (0 && cmd == 0x00FFF493 && len > 800 && g_aes_key_saved && g_fff493_2_native_plain && g_fff493_2_native_len > 500) {
             // Parse original packet to extract seqNum and algo
             if (len >= 20) {
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
@@ -8903,7 +8861,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.53 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.54 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-DISABLED L6=EE007-TLV+EE121-NATIVE+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9031,7 +8989,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.53-DIST — v37.52 found the channel string in __TEXT.__cstring but mprotect FAILED (errno=13 EACCES — iOS code signature protects __TEXT). v37.53 uses vm_protect with VM_PROT_COPY to force kernel COW page, bypassing code signature. Writes 19B DYanyou0040_MIESHI over DY_MIESHI (may overwrite first 9B of adjacent DYquick string — acceptable, user uses DYanyou0040 channel). EE121 logic unchanged (seq-only, v37.51 behavior).");
+    DLOG(@"[VERSION] WangXianHook v37.54-DIST — CRITICAL FIX: v37.51-v37.53 sent clean 248B EE121 (hash1/hash3 from DIFFERENT session) → server returned '版本过低' → no real sessionId/ticket → FFF493#2 had empty sessionId/ticket → stuck at '正在进入...'. v37.54 sends NATIVE EE121 packet (hash1/hash3 based on CURRENT session challenge, hash2 clean via CC_MD5 hook). Server should return 0x8234AB89 with REAL sessionId+ticket. FFF493-REPL v2 DISABLED (no longer forging sessionId/ticket). CH-PATCH vm_protect kept (v37.53). Channel in EE121 remains DY_MIESHI (short) — server may accept if hash verification passes.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
