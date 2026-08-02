@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.36-DIST loaded ===");
+        _log(@"=== WangXianHook v37.37-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8321,16 +8321,21 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             }
         }
         patchCount = chCount + dmCount + gpCount;
-        // v37.35: Save AES key+iv from FFF493#1 ENC (inLen 280-400).
-        // This is the first ENC after challenge response, used for FFF493#1.
-        if (op == 0 && !g_aes_key_saved && dataInLen >= 200 && dataInLen <= 500 && keyLen <= 32) {
+        // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
+        // v37.37 CRITICAL FIX: Must save from FFF493#2 (inLen 500-800B) NOT FFF493#1!
+        // AES-CBC uses different IV per message. Using FFF493#1's IV to encrypt FFF493#2
+        // produces wrong ciphertext → server can't decrypt → no response.
+        // Always update to the LATEST ENC call's key+iv.
+        if (op == 0 && keyLen <= 32 && dataInLen >= 200 && dataInLen <= 800) {
             memcpy(g_saved_aes_key, key, keyLen);
             memcpy(g_saved_aes_iv, iv, keyLen);
             g_saved_key_len = keyLen;
             g_saved_alg = alg;
             g_saved_options = options;
             g_aes_key_saved = YES;
-            DLOG(@"[FFF493-REPL] v37.35: Saved AES key(%zuB)+iv+alg=%u+opt=%u from ENC inLen=%zu", keyLen, alg, options, dataInLen);
+            NSMutableString *ivHex = [NSMutableString string];
+            for (size_t i = 0; i < keyLen && i < 16; i++) [ivHex appendFormat:@"%02X", ((uint8_t*)iv)[i]];
+            DLOG(@"[FFF493-REPL] v37.37: Updated AES key(%zuB)+iv=%@ alg=%u opt=%u from ENC inLen=%zu", keyLen, ivHex, alg, options, dataInLen);
         }
         // v37.35: Detect FFF493#2 stub JSON — save EXTENDED plaintext for send-hook replacement.
         // But DON'T extend patchedBuf (causes buffer overflow in CCCrypt). Instead, build
@@ -8619,7 +8624,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.36-DIST — v37.35 FFF493#2 replacement WORKED (896→1900B sent, no disconnect!) but server didn't respond with 0x80FFF493 — silently dropped packet. Root cause: aux_b64 (44B base64 = 32B raw, likely HMAC-SHA256) was kept from original ciphertext, doesn't match new ciphertext. v37.36: recompute aux_b64 = base64(HMAC-SHA256(AES_key, new_ciphertext)). Also logs ORIG aux vs NEW hmac for diagnostic. If HMAC-SHA256(key,cipher) is correct algorithm, server should accept and respond with 0x80FFF493 character data.");
+    DLOG(@"[VERSION] WangXianHook v37.37-DIST — v37.36 HMAC-SHA256(key,cipher) didn't help, same result as v37.35 (no 0x80FFF493/0x00A3B00E response). ROOT CAUSE: v37.35-36 saved AES key+iv from FFF493#1 ENC (inLen 200-500B) but used them to encrypt FFF493#2 extended plaintext. AES-CBC uses DIFFERENT IV per message! FFF493#1 IV ≠ FFF493#2 IV → server can't decrypt → silent drop. v37.37: save key+iv from the LATEST ENC call (up to 800B, covering both FFF493#1 AND #2). By the time send hook fires, g_saved_aes_iv contains FFF493#2's actual IV. Also logs IV hex for verification. Clean client flow: SEND FFF493#2(1432B) → RECV 0x00A3B00E(816B) → RECV 0x8000F012(71B) → SEND FFF493#3(320B) → RECV 0x80000013(835B) → RECV 0x80FFF490(27B) → RECV 0x80000016(180B) = ENTER GAME.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
