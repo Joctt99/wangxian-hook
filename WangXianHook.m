@@ -733,7 +733,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.54-DIST loaded ===");
+        _log(@"=== WangXianHook v37.55-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4151,31 +4151,23 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             //   "版本过低" (status=4) → we patch status=0 but NO real sessionId/ticket → FFF493#2
             //   has empty sessionId/ticket → server returns only heartbeats → stuck at "正在进入..."
             //
-            // v37.54 FIX: Send native EE121 packet (hash1/hash3 based on CURRENT session challenge,
-            //   hash2 already clean via CC_MD5 hook). Server should verify hash1/hash3 and return
-            //   0x8234AB89 with real sessionId+ticket. Channel name remains DY_MIESHI (short) but
-            //   server may accept it if hash verification passes.
+            // v37.55 FIX: Send native EE121 with TLV replacement (channel+deviceModel+GPU).
+            // hash1/hash3 based on current session challenge (correct, from native pkt).
+            // hash2 clean via CC_MD5 hook. Channel replaced DY_MIESHI→DYanyou0040_MIESHI.
+            // If hash1/hash3 don't include channel → server accepts → returns 0x8234AB89.
+            // If hash1/hash3 include channel → server CLOSE (same as v37.54, no loss).
             if (cmd == 0x002EE121) {
                 // Dump original packet tail for debugging
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-NATIVE] v37.54: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-TLV] v37.55: origLen=%zu tail80B: %@", len, tailHex);
                 }
-                // Dump full hex for first 60 bytes (header + accountId + username + password + SQAGE + IOS + channel)
-                if (len >= 60) {
-                    NSMutableString *headHex = [NSMutableString string];
-                    for (size_t i = 0; i < 60 && i < len; i++) [headHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-NATIVE] v37.54: head60B: %@", headHex);
-                }
-                // v37.54: Send native packet AS-IS (no replacement).
-                // hash1/hash3 are based on current session challenge (correct).
-                // hash2 is clean (CC_MD5 hook replaces 913a1d1a → ddcb91f4).
-                // Channel is DY_MIESHI (short, from 全能签 resigning) — server MAY accept
-                // if it only verifies hashes, not channel name.
-                DLOG(@"[EE121-NATIVE] v37.54: Sending native EE121 pkt len=%zu (NO replacement, hash1/3=current session, hash2=clean via CC_MD5 hook)", len);
-                ssize_t ret = orig_send(fd, buf, len, flags);
-                return ret;
+                // v37.55: DON'T send native packet directly. Fall through to EE007 TLV
+                // replacement logic below, which replaces channel+deviceModel+GPU.
+                // hash1/hash3 stay native (based on current session challenge).
+                DLOG(@"[EE121-TLV] v37.55: EE121 entering TLV replacement (channel+dm+gpu), hash1/3=native (NO replacement)");
+                // Fall through to TLV replacement logic below (don't return!)
             }
             // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
             // (short channel from resigning) + iPhone 16 Pro Max + A18 GPU.
@@ -8861,7 +8853,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.54 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-DISABLED L6=EE007-TLV+EE121-NATIVE+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.55 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-DISABLED L6=EE007-TLV+EE121-TLV-NATIVE+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -8989,7 +8981,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.54-DIST — CRITICAL FIX: v37.51-v37.53 sent clean 248B EE121 (hash1/hash3 from DIFFERENT session) → server returned '版本过低' → no real sessionId/ticket → FFF493#2 had empty sessionId/ticket → stuck at '正在进入...'. v37.54 sends NATIVE EE121 packet (hash1/hash3 based on CURRENT session challenge, hash2 clean via CC_MD5 hook). Server should return 0x8234AB89 with REAL sessionId+ticket. FFF493-REPL v2 DISABLED (no longer forging sessionId/ticket). CH-PATCH vm_protect kept (v37.53). Channel in EE121 remains DY_MIESHI (short) — server may accept if hash verification passes.");
+    DLOG(@"[VERSION] WangXianHook v37.55-DIST — v37.54 sent native EE121 (DY_MIESHI channel) → server CLOSED connection (hash1/hash3 verifiable but WRONG due to modified binary). v37.55 sends native EE121 with TLV replacement (channel DY_MIESHI→DYanyou0040_MIESHI, deviceModel→iPhone7Plus, GPU→Apple A10). hash1/hash3 stay NATIVE (based on current session challenge, NO replacement). If hash1/hash3 don't include channel → server accepts → returns 0x8234AB89 with real sessionId/ticket. FFF493-REPL v2 still DISABLED. CH-PATCH vm_protect kept.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
