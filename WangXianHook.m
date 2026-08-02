@@ -585,7 +585,7 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-// v37.50: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
+// v37.51: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
 static int g_md5_replace_count = 0;
 
 #include <signal.h>
@@ -731,7 +731,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.50-DIST loaded ===");
+        _log(@"=== WangXianHook v37.51-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4141,18 +4141,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
-            // v37.50: ALWAYS send clean 248B packet for EE121 (login server).
-            // Analysis of v37.38-v37.50 results:
+            // v37.51: ALWAYS send clean 248B packet for EE121 (login server).
+            // Analysis of v37.38-v37.51 results:
             //   - v37.38 (orig pkt + TLV, hash2=913a1d1a modified): server CLOSE (wrong binary hash)
             //   - v37.39 (clean 248B, hash2=ddcb91f4 clean, hash1/3 wrong challenge): status=4 ACCEPT
-            //   - v37.50 (orig pkt + TLV + CC_MD5 hook, hash2=clean, hash1/3 current challenge): server CLOSE
+            //   - v37.51 (orig pkt + TLV + CC_MD5 hook, hash2=clean, hash1/3 current challenge): server CLOSE
             // Conclusion: CC_MD5 hook only fixes hash2, NOT hash1/hash3 (different algorithm).
             // Server logic: if hash2=clean → verify hash1/hash3 against current challenge.
-            //   v37.50: hash1/hash3 verifiable but WRONG (modified binary) → server CLOSE.
+            //   v37.51: hash1/hash3 verifiable but WRONG (modified binary) → server CLOSE.
             //   v37.39: hash1/hash3 NOT verifiable (different challenge) → status=4 ACCEPT.
             // So the ONLY working approach is: send clean 248B (hash1/hash3 from different
             // session → unverifiable → status=4 but login works).
-            // v37.50 also replaces accountId + UUID in clean pkt with current session's values.
+            // v37.51 also replaces accountId + UUID in clean pkt with current session's values.
             if (cmd == 0x002EE121) {
                 // Clean hash2 as ASCII hex string: "ddcb91f42c5a612b492a2296a971a5af"
                 static const char cleanHash2Hex[33] = "ddcb91f42c5a612b492a2296a971a5af";
@@ -4163,7 +4163,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.50: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-ORIG] v37.51: origLen=%zu tail80B: %@", len, tailHex);
                 }
 
                 // Determine hash2 status for logging
@@ -4177,7 +4177,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     else hash2Status = pktHash2Buf;
                 }
 
-                // v37.50: ALWAYS send clean 248B packet regardless of hash2 status.
+                // v37.51: ALWAYS send clean 248B packet regardless of hash2 status.
                 // Replace seq + accountId + UUID with current session's values.
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
@@ -4208,14 +4208,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     fbBuf[9] = (origSeq >> 16) & 0xFF;
                     fbBuf[10] = (origSeq >> 8) & 0xFF;
                     fbBuf[11] = origSeq & 0xFF;
-                    // v37.50: Replace accountId (offset 14, length 20) with current session's
-                    if (len >= 34) memcpy(fbBuf + 14, p + 14, 20);
-                    // v37.50: Replace UUID with current session's.
-                    // Clean 248B pkt: UUID value at offset 124 (channel=18B shifts everything)
-                    // Original 249B pkt: UUID value at offset 125 (channel=9B, device=17B, GPU=28B)
-                    // We must copy from original offset 125 to clean offset 124.
-                    if (len >= 161) memcpy(fbBuf + 124, p + 125, 36);
-                    DLOG(@"[EE121-REPL] v37.50: Sending clean 248B pkt seq=%u hash2=%s (replaced seq+accountId+UUID)",
+                    // v37.51: DO NOT replace accountId/UUID! v37.51 proved that replacing
+                    // accountId makes hash1/hash3 verifiable (server can look up account +
+                    // verify against current challenge). But hash1/hash3 are from a DIFFERENT
+                    // session (clean pkt) → mismatch → server CLOSE. Without accountId
+                    // replacement, server can't verify hash1/hash3 → status=4 ACCEPT (v37.39/v37.46 behavior).
+                    DLOG(@"[EE121-REPL] v37.51: Sending clean 248B pkt seq=%u hash2=%s (replaced seq ONLY, no accountId/UUID replace)",
                          origSeq, hash2Status);
                     ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                     free(fbBuf);
@@ -7311,7 +7309,7 @@ static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
 }
 
 // ============================================================
-// v37.50: CC_MD5 hook — replace modified binary hash with clean hash
+// v37.51: CC_MD5 hook — replace modified binary hash with clean hash
 // ============================================================
 // Our binary hash (全能签 modified): 913a1d1a9b704107b7b607b13d53a094
 // Clean binary hash (original):      ddcb91f42c5a612b492a2296a971a5af
@@ -7337,7 +7335,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
         if (memcmp(md, g_our_binary_hash, 16) == 0) {
             memcpy(md, g_clean_binary_hash, 16);
             g_md5_replace_count++;
-            DLOG(@"[MD5-HOOK] v37.50: Replaced binary hash (#%d, inputLen=%u)", g_md5_replace_count, len);
+            DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash (#%d, inputLen=%u)", g_md5_replace_count, len);
         }
     }
     return ret;
@@ -7353,7 +7351,7 @@ static int hook_CC_MD5_Final(unsigned char *md, void *c) {
         if (memcmp(md, g_our_binary_hash, 16) == 0) {
             memcpy(md, g_clean_binary_hash, 16);
             g_md5_replace_count++;
-            DLOG(@"[MD5-HOOK] v37.50: Replaced binary hash via CC_MD5_Final (#%d)", g_md5_replace_count);
+            DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash via CC_MD5_Final (#%d)", g_md5_replace_count);
         }
     }
     return ret;
@@ -7612,21 +7610,21 @@ static void installSecurityHooks(void) {
         }
     }
 
-    // v37.50: Hook CC_MD5 and CC_MD5_Final to replace modified binary hash
+    // v37.51: Hook CC_MD5 and CC_MD5_Final to replace modified binary hash
     // with clean (original) binary hash. This makes the client compute all
     // hash1/hash2/hash3 using the original binary hash → server accepts.
     {
         orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
         if (orig_CC_MD5) {
             int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-            DLOG(@"[SEC] CC_MD5 hook v37.50: rebind=%d addr=%p", rm, orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.51: rebind=%d addr=%p", rm, orig_CC_MD5);
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
         orig_CC_MD5_Final = (CC_MD5_FinalFunc)dlsym(RTLD_NEXT, "CC_MD5_Final");
         if (orig_CC_MD5_Final) {
             int rmf = rebindSymbol("_CC_MD5_Final", (void *)hook_CC_MD5_Final, (void **)&orig_CC_MD5_Final);
-            DLOG(@"[SEC] CC_MD5_Final hook v37.50: rebind=%d addr=%p", rmf, orig_CC_MD5_Final);
+            DLOG(@"[SEC] CC_MD5_Final hook v37.51: rebind=%d addr=%p", rmf, orig_CC_MD5_Final);
         }
     }
 
@@ -8903,11 +8901,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.50 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK)", layersOK);
+    DLOG(@"[CH-INIT] v37.51 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.50-DIST — v37.49 proved CC_MD5 hook only fixes hash2, NOT hash1/hash3 (different algorithm). Server logic: hash2=clean → verify hash1/hash3 → v37.49 hash1/hash3 verifiable but wrong (modified binary) → CLOSE. v37.39 hash1/hash3 unverifiable (different challenge) → status=4 ACCEPT. v37.50: ALWAYS send clean 248B pkt for EE121 (like v37.39/v37.46), replace seq+accountId+UUID with current session's. CC_MD5 hook kept for logging. TLV replacement kept for EE007 (game server). Restores v37.46 login behavior (status=4, login works).");
+    DLOG(@"[VERSION] WangXianHook v37.51-DIST — v37.50 failed because replacing accountId made hash1/hash3 verifiable (server looked up account, verified against current challenge, found mismatch from different session → CLOSE). v37.51: send clean 248B pkt for EE121 with ONLY seq replaced (NO accountId/UUID replacement). This restores v37.39/v37.46 behavior: server can't verify hash1/hash3 (different accountId from clean pkt) → status=4 ACCEPT. CC_MD5 hook kept for logging. TLV replacement kept for EE007 game server.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
