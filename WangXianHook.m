@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.43-DIST loaded ===");
+        _log(@"=== WangXianHook v37.44-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2206,6 +2206,9 @@ static BOOL g_aes_key_saved = NO;
 static char *g_ext_plaintext = NULL;   // extended plaintext for FFF493#2
 static size_t g_ext_plaintext_len = 0;
 static uint32_t g_fff493_2_seq = 0;    // seqNum of FFF493#2 to match in send hook
+// v37.44: Save FFF493#2 native plaintext for send-hook field replacement
+static char *g_fff493_2_native_plain = NULL;
+static size_t g_fff493_2_native_len = 0;
 
 // v37.35: Forward declare CCCrypt types so send hook (line ~3873) can use orig_CCCrypt
 typedef int (*CCCryptFunc)(uint32_t op, uint32_t alg, uint32_t options,
@@ -4301,14 +4304,142 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[GAME-SEND-TAIL] cmd=0x%08X len=%zu tail[%zu-%zu]: %@", cmd, len, tailStart, len-1, tail);
             }
         }
-        // v37.43: FFF493-REPL DISABLED. Log proof: client's native FFF493#2 plaintext
-        // already contains full fields (username/password/channel DYanyou0040_MIESHI/
-        // clientId/md5/seqNum/__msg_clazz=NEW_USER_ENTER_SERVER_REQ, 611B). The "stub
-        // detection" (starts with {"username" && no accountId) was WRONG — real client
-        // JSON also matches this pattern. Replacing 896B native pkt with 1880B forged
-        // pkt (using fake accountId/hasRole/serverInfo) caused server to only return
-        // heartbeats (0x80000015) and no character/map data → stuck at "正在进入...".
-        // Now FFF493#2 (like FFF493#1) goes to orig_send directly.
+        // v37.44: FFF493-REPL v2 — Replace 5 fields in FFF493#2 with REAL clean client values.
+        // v37.43 disabled FFF493-REPL entirely, but server rejected FFF493#2 because
+        // sessionId="" and ticket="" (login server returned status=4, no 0x8234AB89).
+        // v37.44 uses REAL values captured from clean client:
+        //   sessionId: "zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh" (32B, from 0x8234AB89)
+        //   ticket: "kk994|1785665252271|236923||SwnLPVw4w..." (366B, from 0x8234AB89)
+        //   clientId: "65657881045335015151" (matches EE121-REPL clean packet)
+        //   MACADDRESS: "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8" (matches EE006-UUID)
+        //   md5: "bdf8dad65adff0f9fed3876640c9418d" (clean client binary hash)
+        // Flow: take saved native plaintext → replace 5 fields → re-encrypt with saved
+        // AES key+iv → Base64 → HMAC → build new packet (matches clean 1432B format).
+        if (cmd == 0x00FFF493 && len > 800 && g_aes_key_saved && g_fff493_2_native_plain && g_fff493_2_native_len > 500) {
+            // Parse original packet to extract seqNum and algo
+            if (len >= 20) {
+                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
+
+                // Build new plaintext by replacing 5 fields in native plaintext
+                // Use NSMutableString for easy replacement
+                NSString *nativeStr = [[NSString alloc] initWithBytes:g_fff493_2_native_plain
+                                                                length:g_fff493_2_native_len
+                                                              encoding:NSUTF8StringEncoding];
+                if (nativeStr) {
+                    NSString *newStr = [nativeStr mutableCopy];
+
+                    // 1. Replace sessionId: "" → "zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh"
+                    [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
+                                            withString:@"\"sessionId\": \"zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh\""
+                                               options:0 range:NSMakeRange(0, newStr.length)];
+
+                    // 2. Replace clientId: "73768221250855090904" → "65657881045335015151"
+                    //    (our clientId is 20 digits, clean clientId is also 20 digits)
+                    [newStr replaceOccurrencesOfString:@"\"clientId\": \"73768221250855090904\""
+                                            withString:@"\"clientId\": \"65657881045335015151\""
+                                               options:0 range:NSMakeRange(0, newStr.length)];
+
+                    // 3. Replace MACADDRESS: our UUID → clean UUID
+                    [newStr replaceOccurrencesOfString:@"\"MACADDRESS\": \"180C4F27-4414-4623-ACEB-0C12B30E48FD\""
+                                            withString:@"\"MACADDRESS\": \"66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8\""
+                                               options:0 range:NSMakeRange(0, newStr.length)];
+
+                    // 4. Replace md5: our md5 → clean md5
+                    [newStr replaceOccurrencesOfString:@"\"md5\": \"39044991b0e328353fea624c72400890\""
+                                            withString:@"\"md5\": \"bdf8dad65adff0f9fed3876640c9418d\""
+                                               options:0 range:NSMakeRange(0, newStr.length)];
+
+                    // 5. Replace ticket: "" → clean ticket (366B Base64 token from 0x8234AB89)
+                    NSString *cleanTicket = @"kk994|1785665252271|236923||SwnLPVw4wqtqXUfBX0JETQlXLrNxbb0TElk1YQvRmrKTNJG1ImA5eVtTnqY06XALBsKbKtCRJ7iRMUJcE+yZkboYVJ55k35zIxDeoLGoe/4TAo6nQjRD5obTaa18ObMyJaz6R0TUg8Oz78N1me5vBrU9c6sImsqv1QZEebEgfZO7KY2OdU35OV8Vb6rXRBwl1f78jA1OnkTRmf7ZthPpP1q3V1Y8OnzHnbHwq/xnZP3KtEXej3RCQX6zjJf+G81+W2XSpzUPynQXQ/Q/u9qn2N/5/db/8uMz68q/giuSAb9ikNYno+NYXTgn4FLsUbV15NTU5YIVqo9He/pYQCQ==";
+                    [newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
+                                            withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", cleanTicket]
+                                               options:0 range:NSMakeRange(0, newStr.length)];
+
+                    const char *newPlain = [newStr UTF8String];
+                    size_t newPlainLen = strlen(newPlain);
+                    DLOG(@"[FFF493-REPL] v37.44: Built new plaintext %zuB (native=%zuB, +sessionId+ticket)", newPlainLen, g_fff493_2_native_len);
+
+                    // Encrypt new plaintext with saved AES key+iv
+                    size_t cipherCap = ((newPlainLen + 1 + 15) / 16) * 16;
+                    uint8_t *cipherBuf = (uint8_t *)malloc(cipherCap + 32);
+                    size_t cipherOut = 0;
+                    if (cipherBuf) {
+                        int ccRet = orig_CCCrypt(0, g_saved_alg, g_saved_options,
+                                                  g_saved_aes_key, g_saved_key_len, g_saved_aes_iv,
+                                                  newPlain, newPlainLen,
+                                                  cipherBuf, cipherCap + 32, &cipherOut);
+                        if (ccRet == 0 && cipherOut > 0) {
+                            // Base64 encode ciphertext
+                            NSData *cipherData = [NSData dataWithBytes:cipherBuf length:cipherOut];
+                            NSString *b64Str = [cipherData base64EncodedStringWithOptions:0];
+                            const char *b64 = [b64Str UTF8String];
+                            size_t b64Len = strlen(b64);
+
+                            // Compute HMAC-SHA256(key=AES_key, msg=ciphertext) for aux_b64
+                            uint8_t hmacOut[32] = {0};
+                            CCHmac(kCCHmacAlgSHA256,
+                                   g_saved_aes_key, g_saved_key_len,
+                                   cipherBuf, cipherOut,
+                                   hmacOut);
+                            NSData *hmacData = [NSData dataWithBytes:hmacOut length:32];
+                            NSString *hmacB64 = [hmacData base64EncodedStringWithOptions:0];
+                            const char *hmacB64Bytes = [hmacB64 UTF8String];
+                            size_t hmacB64Len = strlen(hmacB64Bytes);
+
+                            // Build new packet:
+                            // [4B total_len][4B cmd][4B seqNum][2B flags=0001][2B algo]
+                            // [2B main_b64_len][main_b64][2B aux_b64_len][aux_b64]
+                            size_t newPktLen = 16 + 2 + b64Len + 2 + hmacB64Len;
+                            uint8_t *newPkt = (uint8_t *)malloc(newPktLen);
+                            if (newPkt) {
+                                // Header
+                                newPkt[0] = (newPktLen >> 24) & 0xFF;
+                                newPkt[1] = (newPktLen >> 16) & 0xFF;
+                                newPkt[2] = (newPktLen >> 8) & 0xFF;
+                                newPkt[3] = newPktLen & 0xFF;
+                                memcpy(newPkt + 4, p + 4, 4); // cmd
+                                newPkt[8] = (origSeq >> 24) & 0xFF; // seqNum
+                                newPkt[9] = (origSeq >> 16) & 0xFF;
+                                newPkt[10] = (origSeq >> 8) & 0xFF;
+                                newPkt[11] = origSeq & 0xFF;
+                                newPkt[12] = 0x00; newPkt[13] = 0x01; // flags
+                                newPkt[14] = (origAlgo >> 8) & 0xFF; // algo
+                                newPkt[15] = origAlgo & 0xFF;
+                                // main_b64
+                                newPkt[16] = (b64Len >> 8) & 0xFF;
+                                newPkt[17] = b64Len & 0xFF;
+                                memcpy(newPkt + 18, b64, b64Len);
+                                // aux_b64 (HMAC)
+                                size_t auxPos = 18 + b64Len;
+                                newPkt[auxPos] = (hmacB64Len >> 8) & 0xFF;
+                                newPkt[auxPos + 1] = hmacB64Len & 0xFF;
+                                memcpy(newPkt + auxPos + 2, hmacB64Bytes, hmacB64Len);
+
+                                // Send the new packet
+                                ssize_t rret = orig_send(fd, newPkt, newPktLen, flags);
+                                DLOG(@"[FFF493-REPL] v37.44: Replaced FFF493#2 origLen=%zu newLen=%zu plainLen=%zu cipherOut=%zu b64Len=%zu hmacLen=%zu seq=%u ret=%zd",
+                                     len, newPktLen, newPlainLen, cipherOut, b64Len, hmacB64Len, origSeq, rret);
+                                free(newPkt);
+                                free(cipherBuf);
+                                // Consume native plaintext (one-shot)
+                                free(g_fff493_2_native_plain);
+                                g_fff493_2_native_plain = NULL;
+                                g_fff493_2_native_len = 0;
+                                if (rret >= 0) return (ssize_t)len;
+                                return rret;
+                            }
+                        } else {
+                            DLOG(@"[FFF493-REPL] v37.44: CCCrypt FAILED ret=%d cipherOut=%zu", ccRet, cipherOut);
+                        }
+                        free(cipherBuf);
+                    }
+                }
+            }
+            // If replacement failed, fall through to normal send
+            DLOG(@"[FFF493-REPL] v37.44: Replacement skipped, sending original packet");
+        }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
         DLOG(@"[SEND-DIRECT] v37.27: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH L5/L6)", cmd, len, port, ret);
@@ -8516,6 +8647,24 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         }
     }
 
+    // v37.44: Save FFF493#2 native plaintext for send-hook field replacement.
+    // Detection: ENC op + plaintext contains "NEW_USER_ENTER_SERVER_REQ" + len>500.
+    // This is the client's native 619B JSON (with empty sessionId/ticket).
+    // Send hook will replace sessionId/ticket/clientId/MACADDRESS/md5 with clean
+    // client values, re-encrypt, and build a new 1432B packet.
+    if (op == 0 && realDataIn && realDataInLen > 500 && realDataInLen < 2048) {
+        if (memmem(realDataIn, realDataInLen, "NEW_USER_ENTER_SERVER_REQ", 25) != NULL) {
+            if (g_fff493_2_native_plain) { free(g_fff493_2_native_plain); }
+            g_fff493_2_native_len = realDataInLen;
+            g_fff493_2_native_plain = (char *)malloc(realDataInLen + 1);
+            if (g_fff493_2_native_plain) {
+                memcpy(g_fff493_2_native_plain, realDataIn, realDataInLen);
+                g_fff493_2_native_plain[realDataInLen] = '\0';
+                DLOG(@"[FFF493-REPL] v37.44: Saved FFF493#2 native plaintext %zuB for send-hook replacement", realDataInLen);
+            }
+        }
+    }
+
     // v37.31 CRITICAL FIX: If we expanded plaintext (patchedBuf != NULL), the
     // caller's dataOut buffer is sized for the ORIGINAL plaintext's AES output.
     // (CCFileUtils::aesEncryptData allocates a fixed stack/heap buffer based on
@@ -8647,11 +8796,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.43 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC L5=sendScan L6=EE007 — FFF493-REPL DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.44 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.43-DIST — v37.42 had FFF493-REPL logic that misdetected client's native FFF493#2 (611B plaintext with username/password/channel DYanyou0040_MIESHI/clientId/md5) as a 'stub' and replaced the native 896B packet with a 1880B forged packet (using fake accountId/hasRole/serverInfo). Server only returned heartbeats (0x80000015) and no character/map data → stuck at '正在进入...'. v37.43 DISABLES FFF493-REPL entirely: (1) removed send-hook replacement block in custom_send, (2) disabled isFFF493_2_stub detection in CCCrypt hook, (3) disabled extended-plaintext save block. Now FFF493#2 (like FFF493#1) passes through via orig_send unchanged. Login server packets (0x0000E002 TLV-SCAN + 0x002EE118 TLV-SCAN + 0x000EE006 UUID + 0x0002A018 full + 0x002EE121 EE121-REPL) remain unchanged from v37.42.");
+    DLOG(@"[VERSION] WangXianHook v37.44-DIST — v37.43 disabled FFF493-REPL entirely, but server rejected FFF493#2 (896B) because sessionId='' and ticket='' (login server returned status=4, no 0x8234AB89 response with sessionId/ticket). Frida capture of clean client confirmed: clean FFF493#2 plaintext is 1018B with sessionId='zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh' (32B) and ticket='kk994|1785665252271|236923||SwnLPVw4w...' (366B). Our native plaintext is 619B with both empty. v37.44 implements FFF493-REPL v2: (1) CCCrypt hook saves FFF493#2 native plaintext when detecting NEW_USER_ENTER_SERVER_REQ, (2) send hook replaces 5 fields (sessionId/ticket/clientId/MACADDRESS/md5) with REAL clean client values, re-encrypts with saved AES key+iv, computes HMAC, builds new packet matching clean 1432B format. Login server packets unchanged from v37.42.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
