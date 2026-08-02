@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.42-DIST loaded ===");
+        _log(@"=== WangXianHook v37.43-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4301,117 +4301,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[GAME-SEND-TAIL] cmd=0x%08X len=%zu tail[%zu-%zu]: %@", cmd, len, tailStart, len-1, tail);
             }
         }
-        // v37.35: FFF493#2 packet replacement — if we have extended plaintext saved,
-        // encrypt it ourselves and build a new packet with the correct format.
-        // Packet structure:
-        //   [4B total_len][4B cmd][4B seqNum][2B flags=0001][2B algo=067E]
-        //   [2B main_b64_len][main_b64][2B aux_b64_len][aux_b64]
-        // We keep the original aux_b64 (likely HMAC/signature — server may or may not validate).
-        if (cmd == 0x00FFF493 && len > 800 && g_ext_plaintext != NULL && g_aes_key_saved) {
-            // Parse original packet
-            if (len >= 20) {
-                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
-                uint16_t mainB64Len = ((uint16_t)p[16] << 8) | p[17];
-                // aux_b64 starts after header(16) + 2(main_len) + main_b64 + 2(aux_len)
-                size_t auxOffset = 18 + mainB64Len;
-                if (auxOffset + 2 <= len) {
-                    uint16_t auxB64Len = ((uint16_t)p[auxOffset] << 8) | p[auxOffset + 1];
-                    size_t auxDataStart = auxOffset + 2;
-                    if (auxDataStart + auxB64Len <= len) {
-                        // Encrypt extended plaintext with saved key+iv
-                        size_t cipherCap = ((g_ext_plaintext_len + 1 + 15) / 16) * 16;
-                        uint8_t *cipherBuf = (uint8_t *)malloc(cipherCap + 32);
-                        size_t cipherOut = 0;
-                        if (cipherBuf) {
-                            int ccRet = orig_CCCrypt(0, g_saved_alg, g_saved_options,
-                                                      g_saved_aes_key, g_saved_key_len, g_saved_aes_iv,
-                                                      g_ext_plaintext, g_ext_plaintext_len,
-                                                      cipherBuf, cipherCap + 32, &cipherOut);
-                            if (ccRet == 0 && cipherOut > 0) {
-                                // Base64 encode ciphertext
-                                NSData *cipherData = [NSData dataWithBytes:cipherBuf length:cipherOut];
-                                NSString *b64Str = [cipherData base64EncodedStringWithOptions:0];
-                                const char *b64 = [b64Str UTF8String];
-                                size_t b64Len = strlen(b64);
-                                // Build new packet
-                                size_t newPktLen = 16 + 2 + b64Len + 2 + auxB64Len;
-                                uint8_t *newPkt = (uint8_t *)malloc(newPktLen);
-                                if (newPkt) {
-                                    // Header: total_len(4) + cmd(4) + seqNum(4) + flags(2) + algo(2)
-                                    newPkt[0] = (newPktLen >> 24) & 0xFF;
-                                    newPkt[1] = (newPktLen >> 16) & 0xFF;
-                                    newPkt[2] = (newPktLen >> 8) & 0xFF;
-                                    newPkt[3] = newPktLen & 0xFF;
-                                    // cmd
-                                    memcpy(newPkt + 4, p + 4, 4);
-                                    // seqNum (keep original)
-                                    newPkt[8] = (origSeq >> 24) & 0xFF;
-                                    newPkt[9] = (origSeq >> 16) & 0xFF;
-                                    newPkt[10] = (origSeq >> 8) & 0xFF;
-                                    newPkt[11] = origSeq & 0xFF;
-                                    // flags
-                                    newPkt[12] = 0x00; newPkt[13] = 0x01;
-                                    // algo
-                                    newPkt[14] = (origAlgo >> 8) & 0xFF;
-                                    newPkt[15] = origAlgo & 0xFF;
-                                    // main_b64_len
-                                    newPkt[16] = (b64Len >> 8) & 0xFF;
-                                    newPkt[17] = b64Len & 0xFF;
-                                    // main_b64
-                                    memcpy(newPkt + 18, b64, b64Len);
-                                    // v37.36: Recompute aux_b64 as HMAC-SHA256(key=AES_key, msg=ciphertext)
-                                    // Original aux_b64 was for the old ciphertext — must recompute for new.
-                                    uint8_t hmacOut[32] = {0};
-                                    CCHmac(kCCHmacAlgSHA256,
-                                           g_saved_aes_key, g_saved_key_len,
-                                           cipherBuf, cipherOut,
-                                           hmacOut);
-                                    NSData *hmacData = [NSData dataWithBytes:hmacOut length:32];
-                                    NSString *hmacB64 = [hmacData base64EncodedStringWithOptions:0];
-                                    const char *hmacB64Bytes = [hmacB64 UTF8String];
-                                    size_t hmacB64Len = strlen(hmacB64Bytes);
-                                    // Log original vs recomputed aux for diagnostic
-                                    NSMutableString *origAuxHex = [NSMutableString string];
-                                    for (int i = 0; i < auxB64Len && i < 44; i++)
-                                        [origAuxHex appendFormat:@"%c", p[auxDataStart + i]];
-                                    DLOG(@"[FFF493-REPL] v37.36: aux ORIG(%dB): %@  NEW HMAC(%zuB): %@",
-                                         auxB64Len, origAuxHex, hmacB64Len, hmacB64);
-                                    // aux_b64_len (use recomputed length, should be 44)
-                                    size_t auxPos = 18 + b64Len;
-                                    newPkt[auxPos] = (hmacB64Len >> 8) & 0xFF;
-                                    newPkt[auxPos + 1] = hmacB64Len & 0xFF;
-                                    // Recomputed aux_b64 (HMAC-SHA256 of new ciphertext)
-                                    memcpy(newPkt + auxPos + 2, hmacB64Bytes, hmacB64Len);
-                                    // Update total packet length (may differ if hmacB64Len != auxB64Len)
-                                    size_t finalPktLen = 16 + 2 + b64Len + 2 + hmacB64Len;
-                                    newPkt[0] = (finalPktLen >> 24) & 0xFF;
-                                    newPkt[1] = (finalPktLen >> 16) & 0xFF;
-                                    newPkt[2] = (finalPktLen >> 8) & 0xFF;
-                                    newPkt[3] = finalPktLen & 0xFF;
-                                    // Send the new packet
-                                    ssize_t rret = orig_send(fd, newPkt, finalPktLen, flags);
-                                    DLOG(@"[FFF493-REPL] v37.36: Replaced FFF493#2 origLen=%zu newLen=%zu cipherOut=%zu b64Len=%zu hmacB64Len=%zu seq=%u ret=%zd",
-                                         len, finalPktLen, cipherOut, b64Len, hmacB64Len, origSeq, rret);
-                                    free(newPkt);
-                                    free(cipherBuf);
-                                    // Consume the extended plaintext (one-shot)
-                                    g_ext_plaintext = NULL; g_ext_plaintext_len = 0;
-                                    if (rret >= 0) return (ssize_t)len;
-                                    return rret;
-                                }
-                            } else {
-                                DLOG(@"[FFF493-REPL] v37.35: CCCrypt FAILED ret=%d cipherOut=%zu", ccRet, cipherOut);
-                            }
-                            free(cipherBuf);
-                        }
-                    }
-                }
-            }
-            // If replacement failed, fall through to normal send
-            DLOG(@"[FFF493-REPL] v37.35: Replacement skipped, sending original packet");
-        }
+        // v37.43: FFF493-REPL DISABLED. Log proof: client's native FFF493#2 plaintext
+        // already contains full fields (username/password/channel DYanyou0040_MIESHI/
+        // clientId/md5/seqNum/__msg_clazz=NEW_USER_ENTER_SERVER_REQ, 611B). The "stub
+        // detection" (starts with {"username" && no accountId) was WRONG — real client
+        // JSON also matches this pattern. Replacing 896B native pkt with 1880B forged
+        // pkt (using fake accountId/hasRole/serverInfo) caused server to only return
+        // heartbeats (0x80000015) and no character/map data → stuck at "正在进入...".
+        // Now FFF493#2 (like FFF493#1) goes to orig_send directly.
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
         DLOG(@"[SEND-DIRECT] v37.27: cmd=0x%08X len=%zu port=%d ret=%zd (ALL game server packets direct after CHANNEL-PATCH L5/L6)", cmd, len, port, ret);
@@ -8528,21 +8425,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             for (size_t i = 0; i < keyLen && i < 16; i++) [ivHex appendFormat:@"%02X", ((uint8_t*)iv)[i]];
             DLOG(@"[FFF493-REPL] v37.37: Updated AES key(%zuB)+iv=%@ alg=%u opt=%u from ENC inLen=%zu", keyLen, ivHex, alg, options, dataInLen);
         }
-        // v37.35: Detect FFF493#2 stub JSON — save EXTENDED plaintext for send-hook replacement.
-        // But DON'T extend patchedBuf (causes buffer overflow in CCCrypt). Instead, build
-        // the extended version separately and save it for the send hook to encrypt+send.
-        BOOL isFFF493_2_stub = NO;
-        if (op == 0 && dataInLen >= 500 && dataInLen <= 800) {
-            const char *dp = (const char *)dataIn;
-            if (dp[0] == '{' && dp[1] == '"') {
-                BOOL firstIsUsername = (memmem(dp, MIN(dataInLen, (size_t)100),
-                                           "\"username\"", 10) != NULL);
-                BOOL hasAccountId = (memmem(dp, dataInLen, "\"accountId\"", 11) != NULL);
-                if (firstIsUsername && !hasAccountId) {
-                    isFFF493_2_stub = YES;
-                }
-            }
-        }
+        // v37.43: isFFF493_2_stub detection DISABLED. The detection (starts with
+        // {"username" && no accountId) was wrong — real client FFF493#2 JSON also
+        // matches this pattern (611B native, no accountId field). This led to saving
+        // a forged "extended plaintext" (1350B with fake accountId/hasRole/serverInfo)
+        // which the send-hook then used to replace the native 896B packet with 1880B
+        // forged packet → server returned only heartbeats → stuck at "正在进入...".
+        // isFFF493_2_stub is now always NO; the extended-plaintext save block below
+        // is also disabled.
         if (patchCount > 0) {
             ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
@@ -8592,67 +8482,13 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 }
             }
         }
-        // v37.35: If this is FFF493#2 stub, build EXTENDED plaintext and save
-        // for send-hook replacement. CCCrypt runs with patched (non-extended)
-        // plaintext that fits in caller's buffer. Send hook will encrypt the
-        // extended version and replace the packet on the wire.
-        if (isFFF493_2_stub && g_aes_key_saved) {
-            // Start from the patched plaintext (dm/gp/ch already replaced)
-            const char *base = (const char *)realDataIn;
-            size_t baseLen = realDataInLen;
-            const char *ext =
-                ",\"accountId\":\"04957636686538473198\","
-                "\"hasRole\":\"0\","
-                "\"serverCode\":\"S100\","
-                "\"serverName\":\"%E6%B5%8B%E8%AF%95%E6%9C%8D%E5%8A%A1%E5%99%A8\","
-                "\"serverId\":\"100\","
-                "\"platform\":\"IOS\","
-                "\"verType\":\"FULL\","
-                "\"gameVer\":\"7.6.3\","
-                "\"userLevel\":\"0\","
-                "\"vipLevel\":\"0\","
-                "\"loginIp\":\"\","
-                "\"loginPort\":\"0\","
-                "\"zoneId\":\"0\","
-                "\"mergeId\":\"0\","
-                "\"lang\":\"zh\","
-                "\"country\":\"CN\","
-                "\"characterList\":[],"
-                "\"serverInfo\":{\"openTime\":\"\",\"state\":\"1\",\"maintainTip\":\"\"},"
-                "\"registerTime\":\"0\","
-                "\"deviceId\":\"04957636686538473198\","
-                "\"udid\":\"04957636686538473198\","
-                "\"idfa\":\"00000000-0000-0000-0000-000000000000\","
-                "\"idfv\":\"00000000-0000-0000-0000-000000000000\","
-                "\"osVer\":\"iOS 15.8\","
-                "\"jailBreak\":\"0\","
-                "\"carrier\":\"\u4e2d\u56fd\u8054\u901a\","
-                "\"mcc\":\"460\","
-                "\"mnc\":\"01\","
-                "\"cpuArch\":\"arm64\","
-                "\"memTotal\":\"3872\","
-                "\"diskTotal\":\"64\","
-                "\"batteryLevel\":\"100\","
-                "\"isEmulator\":\"0\""
-                "}";
-            size_t extLen = strlen(ext);
-            // Find last '}' in base, strip it, append ext (which ends with '}')
-            size_t trimLen = baseLen;
-            while (trimLen > 0 && (base[trimLen-1] == '}' || base[trimLen-1] == '\n' ||
-                                   base[trimLen-1] == '\r' || base[trimLen-1] == ' ')) {
-                trimLen--;
-            }
-            if (g_ext_plaintext) { free(g_ext_plaintext); g_ext_plaintext = NULL; }
-            g_ext_plaintext_len = trimLen + extLen;
-            g_ext_plaintext = (char *)malloc(g_ext_plaintext_len + 1);
-            if (g_ext_plaintext) {
-                memcpy(g_ext_plaintext, base, trimLen);
-                memcpy(g_ext_plaintext + trimLen, ext, extLen);
-                g_ext_plaintext[g_ext_plaintext_len] = '\0';
-                DLOG(@"[FFF493-REPL] v37.35: Saved extended plaintext %zuB (base=%zuB + ext=%zuB) for send-hook replacement",
-                     g_ext_plaintext_len, trimLen, extLen);
-            }
-        }
+        // v37.43: Extended plaintext save block DISABLED. With isFFF493_2_stub always
+        // NO, this block never executes. Kept as comment for reference. The forged
+        // extended plaintext (1350B with fake accountId/hasRole/serverInfo) was the
+        // root cause of "正在进入..." stuck — send-hook used it to replace native
+        // 896B FFF493#2 with 1880B forged packet, server rejected and only returned
+        // heartbeats (0x80000015). Now FFF493#2 passes through via orig_send.
+        // (Original block: build ext from base+trimLen, save to g_ext_plaintext)
     }
 
     DLOG(@"[CC-AES] %s inLen=%zu (real=%zu) keyLen=%zu", opStr, dataInLen, realDataInLen, keyLen);
@@ -8811,11 +8647,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.35 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-EXT L5=sendScan+FFF493-REPL L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.43 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC L5=sendScan L6=EE007 — FFF493-REPL DISABLED)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.42-DIST — v37.41 only patched 0x0000E002+0x002EE118 but 0x0002A018 still had DY_MIESHI with matching hash. Server still returned status=4. v37.42: full replacement of 0x0002A018 (223B clean packet with correct hash 82412726869f0fb24d24717c47566d63) and 0x000EE006 (UUID replacement to 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8). Now ALL login server packets match clean client: 0x0000E002(TLV-SCAN) + 0x002EE118(TLV-SCAN) + 0x000EE006(UUID) + 0x0002A018(full) + 0x002EE121(EE121-REPL). If server still returns status=4, the check is based on something else entirely (IP, TLS, binary hash via separate API).");
+    DLOG(@"[VERSION] WangXianHook v37.43-DIST — v37.42 had FFF493-REPL logic that misdetected client's native FFF493#2 (611B plaintext with username/password/channel DYanyou0040_MIESHI/clientId/md5) as a 'stub' and replaced the native 896B packet with a 1880B forged packet (using fake accountId/hasRole/serverInfo). Server only returned heartbeats (0x80000015) and no character/map data → stuck at '正在进入...'. v37.43 DISABLES FFF493-REPL entirely: (1) removed send-hook replacement block in custom_send, (2) disabled isFFF493_2_stub detection in CCCrypt hook, (3) disabled extended-plaintext save block. Now FFF493#2 (like FFF493#1) passes through via orig_send unchanged. Login server packets (0x0000E002 TLV-SCAN + 0x002EE118 TLV-SCAN + 0x000EE006 UUID + 0x0002A018 full + 0x002EE121 EE121-REPL) remain unchanged from v37.42.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
