@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.37-DIST loaded ===");
+        _log(@"=== WangXianHook v37.38-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3965,7 +3965,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *pp = (const unsigned char *)buf;
         uint32_t diagCmd = ((uint32_t)pp[4] << 24) | ((uint32_t)pp[5] << 16) |
                            ((uint32_t)pp[6] << 8)  | (uint32_t)pp[7];
-        if (diagCmd == 0x000EE007) {
+        if (diagCmd == 0x000EE007 || diagCmd == 0x002EE121) {
             NSMutableString *ehex = [NSMutableString stringWithCapacity:len * 3];
             for (size_t i = 0; i < len; i++) {
                 [ehex appendFormat:@"%02X ", pp[i]];
@@ -3996,7 +3996,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if (cmd == 0x000EE007 && len >= 100) {
+        if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
+            // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
+            // (short channel from resigning) + iPhone 16 Pro Max + A18 GPU.
+            // Server rejects with "version too low" → no real accountId →
+            // game server can't validate FFF493#2 → no response.
             // Locate each TLV field by scanning from offset 12 (after cmd+seq+pktLen)
             // EE007 header: pktLen(4) + cmd(4) + seq(4) = 12 bytes
             size_t off = 12;
@@ -4069,8 +4073,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[3] =  newPktLen        & 0xFF;
                     uint32_t oldPktLen = 0;
                     if (len >= 4) oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-                    DLOG(@"[EE007-ALIGN] v37.30 port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u)",
-                         port, oldPktLen, newPktLen, fieldsApplied,
+                    DLOG(@"[EE007-ALIGN] v37.38 cmd=0x%08X port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u)",
+                         cmd, port, oldPktLen, newPktLen, fieldsApplied,
                          (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0);
                     // Post-alignment hex dump for verification (first 100 bytes)
                     NSMutableString *ph = [NSMutableString stringWithCapacity:300];
@@ -8624,7 +8628,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.37-DIST — v37.36 HMAC-SHA256(key,cipher) didn't help, same result as v37.35 (no 0x80FFF493/0x00A3B00E response). ROOT CAUSE: v37.35-36 saved AES key+iv from FFF493#1 ENC (inLen 200-500B) but used them to encrypt FFF493#2 extended plaintext. AES-CBC uses DIFFERENT IV per message! FFF493#1 IV ≠ FFF493#2 IV → server can't decrypt → silent drop. v37.37: save key+iv from the LATEST ENC call (up to 800B, covering both FFF493#1 AND #2). By the time send hook fires, g_saved_aes_iv contains FFF493#2's actual IV. Also logs IV hex for verification. Clean client flow: SEND FFF493#2(1432B) → RECV 0x00A3B00E(816B) → RECV 0x8000F012(71B) → SEND FFF493#3(320B) → RECV 0x80000013(835B) → RECV 0x80FFF490(27B) → RECV 0x80000016(180B) = ENTER GAME.");
+    DLOG(@"[VERSION] WangXianHook v37.38-DIST — ROOT CAUSE FOUND: 0x002EE121 login request sends DY_MIESHI (9B short channel from resigning) + iPhone 16 Pro Max + A18 GPU. Server rejects with 'version too low' (actually channel/integrity check). We patch error response but never get real accountId → game server can't validate FFF493#2 → no response. FIX: extend EE007-ALIGN to also patch 0x002EE121 TLV fields (channel DYanyou0040_MIESHI 18B, deviceModel iPhone7Plus 11B, GPU Apple A10 GPU 24B). Net change -1B (249→248). If login succeeds, server returns real accountId in 0x802EE121 response, client includes it in FFF493#2 JSON, game server validates and responds with 0x00A3B00E. Also kept FFF493#2 send-hook replacement as fallback (in case login still returns error but client proceeds).");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
