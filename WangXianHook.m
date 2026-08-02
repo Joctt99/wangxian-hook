@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.46-DIST loaded ===");
+        _log(@"=== WangXianHook v37.47-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4138,60 +4138,104 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
-            // v37.39: For 0x002EE121, replace ENTIRE packet with clean client's
-            // version (correct channel+model+GPU+UUID+hashes). Only preserve seqNum.
-            // v37.38 only patched channel/model/GPU but hash fields stayed wrong →
-            // server detected mismatch → closed connection.
+            // v37.47: For 0x002EE121, take ORIGINAL packet and replace ONLY hash2
+            // (binary hash) with clean client's value. Keep our hash1/hash3 which
+            // are computed from our session's challenge (0x802EE120 nonce).
+            //
+            // Analysis from v37.46 EE121-ORIG hex dump:
+            //   - hash2 is static (same across sessions) = binary hash
+            //   - Our hash2 = 913a1d1a... (modified binary, 全能签 resigning)
+            //   - Clean hash2 = ddcb91f4... (original binary)
+            //   - hash1/hash3 change per session (depend on challenge nonce)
+            //   - v37.39 sent full clean packet → status=4 because clean hash1/hash3
+            //     were computed with a DIFFERENT challenge
+            //   - v37.47 sends original packet with only hash2 swapped → hash1/hash3
+            //     match our challenge, hash2 matches original binary
+            //
+            // Packet structure (tail): ...hash1(16) | 00 20 hash2(32) | 00 10 hash3(16)
+            // hash2 value offset = len - 50 (16+2 + 32 = 50 bytes from end to hash2 start)
             if (cmd == 0x002EE121) {
-                // Extract original seqNum (bytes 8-11)
-                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                // Clean client's 0x002EE121 packet (248B) from hook.txt SEND #18
-                // deviceId=656578810453350151551, channel=DYanyou0040_MIESHI,
-                // model=iPhone7Plus, GPU=A10, UUID=66B0EE01-..., hashes match
-                static const uint8_t cleanPkt[248] = {
-                    0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10, // len+cmd+seq(placeholder)
-                    0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31, // deviceId
-                    0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34, // username "kk994"
-                    0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34, // password "994624"
-                    0x00,0x05, 0x53,0x51,0x41,0x47,0x45, // "SQAGE"
-                    0x00,0x03, 0x49,0x4F,0x53, // "IOS"
-                    0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49, // "DYanyou0040_MIESHI"
-                    0x00,0x00, // empty
-                    0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73, // "iPhone7Plus"
-                    0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55, // "Apple Inc. Apple A10 GPU"
-                    0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38, // UUID
-                    0x00,0x04, 0x57,0x49,0x46,0x49, // "WIFI"
-                    0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33, // "7.6.3"
-                    0x00,0x03, 0x39,0x37,0x39, // "979"
-                    0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62, // hash1
-                    0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66, // hash2
-                    0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38, // hash3
-                };
-                // Copy clean packet and update seqNum
-                unsigned char *newBuf = (unsigned char *)malloc(248);
-                if (newBuf) {
-                    memcpy(newBuf, cleanPkt, 248);
-                    newBuf[8] = (origSeq >> 24) & 0xFF;
-                    newBuf[9] = (origSeq >> 16) & 0xFF;
-                    newBuf[10] = (origSeq >> 8) & 0xFF;
-                    newBuf[11] = origSeq & 0xFF;
-                DLOG(@"[EE121-REPL] v37.39: Replaced 0x002EE121 with clean 248B pkt, seq=%u (origLen=%zu)", origSeq, len);
-                    // v37.46: Dump original packet tail (last 80B) to analyze hash fields
-                    if (len >= 80) {
-                        NSMutableString *tailHex = [NSMutableString string];
-                        for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                        DLOG(@"[EE121-ORIG] v37.46: origLen=%zu tail80B: %@", len, tailHex);
-                    }
-                    ssize_t rret = orig_send(fd, newBuf, 248, flags);
-                    free(newBuf);
-                    if (rret >= 0) return (ssize_t)len;
-                    return rret;
+                // Clean client's hash2 (original binary hash, 32 ASCII hex bytes)
+                static const uint8_t cleanHash2[32] = {
+                    0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,
+                    0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66
+                }; // "ddcb91f42c5a612b492a2296a971a5af"
+
+                // v37.46: Dump original packet tail (last 80B) for debugging
+                if (len >= 80) {
+                    NSMutableString *tailHex = [NSMutableString string];
+                    for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
+                    DLOG(@"[EE121-ORIG] v37.46: origLen=%zu tail80B: %@", len, tailHex);
                 }
-                // If malloc failed, fall through to normal send (unpatched)
-                DLOG(@"[EE121-REPL] v37.39: malloc FAILED, sending original");
-                ssize_t ret = orig_send(fd, buf, len, flags);
-                return ret;
+
+                // Verify packet has hash2 at expected offset (len-50 to len-18)
+                // Pattern: [00 20] at len-52, [32 bytes hash2] at len-50, [00 10] at len-18
+                if (len >= 54 && p[len-52] == 0x00 && p[len-51] == 0x20 &&
+                    p[len-18] == 0x00 && p[len-17] == 0x10) {
+                    // Copy original packet
+                    unsigned char *newBuf = (unsigned char *)malloc(len);
+                    if (newBuf) {
+                        memcpy(newBuf, p, len);
+                        // Replace hash2 (32 bytes at offset len-50)
+                        memcpy(newBuf + len - 50, cleanHash2, 32);
+
+                        // Log the replacement
+                        NSMutableString *oldHash2 = [NSMutableString string];
+                        NSMutableString *newHash2 = [NSMutableString string];
+                        for (int i = 0; i < 32; i++) {
+                            [oldHash2 appendFormat:@"%c", p[len-50+i]];
+                            [newHash2 appendFormat:@"%c", newBuf[len-50+i]];
+                        }
+                        DLOG(@"[EE121-H2] v37.47: Replaced hash2 in orig pkt len=%zu: %@ -> %@", len, oldHash2, newHash2);
+
+                        ssize_t rret = orig_send(fd, newBuf, len, flags);
+                        free(newBuf);
+                        if (rret >= 0) return (ssize_t)len;
+                        return rret;
+                    }
+                    DLOG(@"[EE121-H2] v37.47: malloc FAILED, sending original");
+                    ssize_t ret = orig_send(fd, buf, len, flags);
+                    return ret;
+                } else {
+                    // Pattern not found — fall back to v37.39 full clean packet replacement
+                    DLOG(@"[EE121-H2] v37.47: hash2 pattern NOT found at expected offset, falling back to clean 248B replacement");
+                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    static const uint8_t cleanPkt[248] = {
+                        0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
+                        0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
+                        0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
+                        0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
+                        0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
+                        0x00,0x03, 0x49,0x4F,0x53,
+                        0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
+                        0x00,0x00,
+                        0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
+                        0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
+                        0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
+                        0x00,0x04, 0x57,0x49,0x46,0x49,
+                        0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
+                        0x00,0x03, 0x39,0x37,0x39,
+                        0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
+                        0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
+                        0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
+                    };
+                    unsigned char *fbBuf = (unsigned char *)malloc(248);
+                    if (fbBuf) {
+                        memcpy(fbBuf, cleanPkt, 248);
+                        fbBuf[8] = (origSeq >> 24) & 0xFF;
+                        fbBuf[9] = (origSeq >> 16) & 0xFF;
+                        fbBuf[10] = (origSeq >> 8) & 0xFF;
+                        fbBuf[11] = origSeq & 0xFF;
+                        DLOG(@"[EE121-REPL] v37.39 FALLBACK: Replaced 0x002EE121 with clean 248B pkt, seq=%u", origSeq);
+                        ssize_t rret = orig_send(fd, fbBuf, 248, flags);
+                        free(fbBuf);
+                        if (rret >= 0) return (ssize_t)len;
+                        return rret;
+                    }
+                    ssize_t ret = orig_send(fd, buf, len, flags);
+                    return ret;
+                }
             }
             // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
             // (short channel from resigning) + iPhone 16 Pro Max + A18 GPU.
@@ -8804,11 +8848,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.46 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.47 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.46-DIST — v37.45 hash replacement broke packet structure causing no network. v37.46: (1) Reverted EE121-REPL and A018-REPL hash replacement back to clean full-packet replacement (v37.42 behavior). (2) Added [EE121-ORIG] hex dump of original packet tail 80B to analyze hash field location. (3) Fixed FFF493-REPL v2 compile error (NSMutableString stringWithString: instead of mutableCopy). FFF493-REPL v2 still active (injects clean sessionId/ticket). Goal: get EE121-ORIG hex data to identify exact hash offset/length for future proper hash replacement.");
+    DLOG(@"[VERSION] WangXianHook v37.47-DIST — v37.46 EE121-ORIG hex analysis confirmed hash2 is static binary hash (913a1d1a... same across sessions), hash1/hash3 are challenge-dependent (change per session). v37.39 sent full clean packet but server returned status=4 because clean hash1/hash3 were computed with different challenge. v37.47: take ORIGINAL packet, replace ONLY hash2 (32B at offset len-50) with clean value ddcb91f4..., keep our hash1/hash3 which match our session challenge. Pattern verify: [00 20] at len-52, [00 10] at len-18. Fallback to v37.39 clean 248B if pattern not found.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
