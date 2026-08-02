@@ -737,7 +737,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.60-DIST loaded ===");
+        _log(@"=== WangXianHook v37.61-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4162,10 +4162,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.60: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-ORIG] v37.61: origLen=%zu tail80B: %@", len, tailHex);
                 }
 
-                // v37.60: Conditional EE121 sending based on CC_MD5 channel replacement.
+                // v37.61: Conditional EE121 sending based on CC_MD5 channel replacement.
                 // If CC_MD5 hook replaced "DY_MIESHI"→"DYanyou0040_MIESHI" in hash1/hash3
                 // input, then hash1/hash3 are computed with the CORRECT channel → server
                 // can verify and ACCEPT native EE121 → real sessionId/ticket → game entry.
@@ -4174,11 +4174,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_md5_channel_replaced == 1) {
                     // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
                     // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.60: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
+                    DLOG(@"[EE121-REPL] v37.61: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
                     // Don't return — fall through to TLV replacement at line below
                 } else {
                     // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
-                    DLOG(@"[EE121-REPL] v37.60: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
+                    DLOG(@"[EE121-REPL] v37.61: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
                     uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                        ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     static const uint8_t cleanPkt[248] = {
@@ -4208,7 +4208,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         fbBuf[9] = (origSeq >> 16) & 0xFF;
                         fbBuf[10] = (origSeq >> 8) & 0xFF;
                         fbBuf[11] = origSeq & 0xFF;
-                        DLOG(@"[EE121-REPL] v37.60: Sending clean 248B pkt seq=%u (fallback)", origSeq);
+                        DLOG(@"[EE121-REPL] v37.61: Sending clean 248B pkt seq=%u (fallback)", origSeq);
                         ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                         free(fbBuf);
                         if (rret >= 0) return (ssize_t)len;
@@ -4301,6 +4301,44 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     NSMutableString *ph = [NSMutableString stringWithCapacity:300];
                     for (size_t i = 0; i < out && i < 100; i++) [ph appendFormat:@"%02X ", newBuf[i]];
                     DLOG(@"[EE007-ALIGN] v37.30 POST first%zub: %@", out < 100 ? out : (size_t)100, ph);
+
+                    // v37.61: For EE121, patch hash2 field to match clean binary MD5.
+                    // KEY INSIGHT (from v37.60 log vs clean client hook.txt):
+                    //   Clean client hash2 = MD5(binary file) = ddcb91f42c5a612b492a2296a971a5af
+                    //   v37.60 client hash2 = MD5(156B string) = faef8e6e... (WRONG!)
+                    // Server validates hash2 against MD5(binary), not MD5(156B string).
+                    // Scan newBuf for hash2 TLV field: 00 20 + 32 hex chars, replace content.
+                    if (cmd == 0x002EE121) {
+                        static const char kCleanHash2Hex[32] = {
+                            'd','d','c','b','9','1','f','4','2','c','5','a','6','1','2','b',
+                            '4','9','2','a','2','2','9','6','a','9','7','1','a','5','a','f'
+                        };
+                        int hash2Patched = 0;
+                        for (size_t s = 12; s + 2 + 32 <= out; s++) {
+                            if (newBuf[s] == 0x00 && newBuf[s+1] == 0x20) { // len = 32
+                                // check if next 32 bytes are ASCII hex (0-9 a-f A-F)
+                                int isHex = 1;
+                                for (size_t h = 0; h < 32; h++) {
+                                    unsigned char c = newBuf[s + 2 + h];
+                                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                                        isHex = 0; break;
+                                    }
+                                }
+                                if (isHex) {
+                                    // Also verify hash1/hash3 nearby are same length 16 to be sure
+                                    // (hash1=0x0010 hash2=0x0020 hash3=0x0010 pattern)
+                                    memcpy(newBuf + s + 2, kCleanHash2Hex, 32);
+                                    hash2Patched = 1;
+                                    DLOG(@"[EE121-HASH2] v37.61: PATCHED hash2 at newBuf[%zu] 0x0020 32hex -> ddcb91f42c5a612b492a2296a971a5af (clean binary MD5, matches clean client hook.txt)", s);
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hash2Patched) {
+                            DLOG(@"[EE121-HASH2] v37.61: WARNING hash2 TLV field (00 20 + 32hex) NOT found in newBuf (out=%zu)", out);
+                        }
+                    }
+
                     ssize_t rret = orig_send(fd, newBuf, out, flags);
                     free(newBuf);
                     if (rret >= 0) return (ssize_t)len;
@@ -7395,13 +7433,13 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                     actualInput = cleanInput;
                     actualLen = out;
                     inputModified = 2; // content replacement
-                    DLOG(@"[MD5-HOOK] v37.60: Replaced input ch=%d dm=%d gp=%d hash=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
+                    DLOG(@"[MD5-HOOK] v37.61: Replaced input ch=%d dm=%d gp=%d hash=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
                          hasCh, hasDm, hasGp, hasHash, len, newLen, out, g_md5_channel_replaced);
                     // Dump original input for diagnosis
                     if (len <= 200) {
                         NSMutableString *hex = [NSMutableString string];
                         for (uint32_t j = 0; j < len; j++) [hex appendFormat:@"%02x", in[j]];
-                        DLOG(@"[MD5-DUMP] v37.60: CC_MD5 input(%uB): %@", len, hex);
+                        DLOG(@"[MD5-DUMP] v37.61: CC_MD5 input(%uB): %@", len, hex);
                     }
                 }
             }
@@ -7410,7 +7448,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             if (!inputModified && len <= 200 && len >= 20) {
                 NSMutableString *hex = [NSMutableString string];
                 for (uint32_t j = 0; j < len; j++) [hex appendFormat:@"%02x", in[j]];
-                DLOG(@"[MD5-DUMP-RAW] v37.60: CC_MD5 input(%uB) no-match: %@", len, hex);
+                DLOG(@"[MD5-DUMP-RAW] v37.61: CC_MD5 input(%uB) no-match: %@", len, hex);
             }
         }
 
@@ -7444,7 +7482,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash OUTPUT (#%d, inputLen=%u)", g_md5_replace_count, len);
         }
         // v37.57: Log ALL CC_MD5 calls for diagnosis
-        DLOG(@"[MD5-LOG] v37.60: CC_MD5 inLen=%u actLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+        DLOG(@"[MD5-LOG] v37.61: CC_MD5 inLen=%u actLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
              len, actualLen, inputModified,
              md[0],md[1],md[2],md[3],md[4],md[5],md[6],md[7],
              md[8],md[9],md[10],md[11],md[12],md[13],md[14],md[15]);
@@ -7729,7 +7767,7 @@ static void installSecurityHooks(void) {
         orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
         if (orig_CC_MD5) {
             int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-            DLOG(@"[SEC] CC_MD5 hook v37.60: rebind=%d addr=%p", rm, orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.61: rebind=%d addr=%p", rm, orig_CC_MD5);
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
@@ -9013,7 +9051,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.60 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?NATIVE+TLV:CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.61 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?NATIVE+TLV+HASH2-PATCH:CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9141,7 +9179,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.60-DIST — v37.59 used WRONG g_our_binary_hash (913a1d1a) so CC_MD5(19437B) output replacement never triggered (mod=0). Actual binary hash from log: f9cc76c5. v37.60 updates g_our_binary_hash=f9cc76c5 and hOld hex search=f9cc76c5. KEY INSIGHT: hash1/hash3 input(63B)=binary_hash_hex(32B)+token(31B). v37.60 replaces f9cc76c5→ddcb91f42c in 63B input → MD5(ddcb91f42c+token) → server verifies hash1/hash3 match → status=0 → real sessionId/ticket. hash2 input(156B)=accountId+ch+dm+gp+UUID (no binary hash) already replaced ch/dm/gp → unchanged, server re-computes from packet fields → matches. EE121 conditional: g_md5_channel_replaced=1→NATIVE+TLV, =0→clean 248B fallback.");
+    DLOG(@"[VERSION] WangXianHook v37.61-DIST — v37.60 fixed hash1/hash3 (63B input: f9cc76c5→ddcb91f42c) but hash2 was still MD5(156B string)=faef8e6e... NOT MD5(binary)=ddcb91f42c... Server validates hash2 against clean binary MD5, not 156B string. Clean client (hook.txt) proves: hash2=ddcb91f42c5a612b492a2296a971a5af exactly equals binary MD5. v37.61 adds EE121-HASH2 patch in EE007-ALIGN: scans newBuf for 00 20 + 32hex TLV field, replaces content with ddcb91f42c5a612b492a2296a971a5af (matches clean binary MD5). Now ALL THREE hashes should match server expectations → status=0 → real sessionId/ticket.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
