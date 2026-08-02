@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.47-DIST loaded ===");
+        _log(@"=== WangXianHook v37.48-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4138,103 +4138,93 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
-            // v37.47: For 0x002EE121, take ORIGINAL packet and replace ONLY hash2
-            // (binary hash) with clean client's value. Keep our hash1/hash3 which
-            // are computed from our session's challenge (0x802EE120 nonce).
+            // v37.48: For 0x002EE121, check if CC_MD5 hook already replaced binary hash.
+            // If hash2 in original packet == clean hash (ddcb91f4...), CC_MD5 hook worked:
+            //   client computed all hashes with clean binary hash → send original as-is.
+            // If hash2 still == our hash (913a1d1a...), CC_MD5 hook didn't catch it:
+            //   fall back to v37.39 full clean 248B packet replacement (status=4 but login works).
             //
-            // Analysis from v37.46 EE121-ORIG hex dump:
-            //   - hash2 is static (same across sessions) = binary hash
-            //   - Our hash2 = 913a1d1a... (modified binary, 全能签 resigning)
-            //   - Clean hash2 = ddcb91f4... (original binary)
-            //   - hash1/hash3 change per session (depend on challenge nonce)
-            //   - v37.39 sent full clean packet → status=4 because clean hash1/hash3
-            //     were computed with a DIFFERENT challenge
-            //   - v37.47 sends original packet with only hash2 swapped → hash1/hash3
-            //     match our challenge, hash2 matches original binary
-            //
-            // Packet structure (tail): ...hash1(16) | 00 20 hash2(32) | 00 10 hash3(16)
-            // hash2 value offset = len - 50 (16+2 + 32 = 50 bytes from end to hash2 start)
+            // v37.47 replaced ONLY hash2 → server disconnected (hash1/hash3 inconsistent with hash2).
+            // v37.48 lets CC_MD5 hook fix ALL hashes at the source → consistency guaranteed.
             if (cmd == 0x002EE121) {
-                // Clean client's hash2 (original binary hash, 32 ASCII hex bytes)
-                static const uint8_t cleanHash2[32] = {
-                    0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,
-                    0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66
-                }; // "ddcb91f42c5a612b492a2296a971a5af"
+                // Clean hash2 as ASCII hex string: "ddcb91f42c5a612b492a2296a971a5af"
+                static const char cleanHash2Hex[32] = "ddcb91f42c5a612b492a2296a971a5af";
+                // Our hash2 as ASCII hex string: "913a1d1a9b704107b7b607b13d53a094"
+                static const char ourHash2Hex[32] = "913a1d1a9b704107b7b607b13d53a094";
 
-                // v37.46: Dump original packet tail (last 80B) for debugging
+                // Dump original packet tail for debugging
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.46: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-ORIG] v37.48: origLen=%zu tail80B: %@", len, tailHex);
                 }
 
-                // Verify packet has hash2 at expected offset (len-50 to len-18)
-                // Pattern: [00 20] at len-52, [32 bytes hash2] at len-50, [00 10] at len-18
+                // Check if hash2 is at expected offset (len-50 to len-18)
                 if (len >= 54 && p[len-52] == 0x00 && p[len-51] == 0x20 &&
                     p[len-18] == 0x00 && p[len-17] == 0x10) {
-                    // Copy original packet
-                    unsigned char *newBuf = (unsigned char *)malloc(len);
-                    if (newBuf) {
-                        memcpy(newBuf, p, len);
-                        // Replace hash2 (32 bytes at offset len-50)
-                        memcpy(newBuf + len - 50, cleanHash2, 32);
+                    // Read hash2 from original packet (32 ASCII hex bytes at offset len-50)
+                    char pktHash2[33] = {0};
+                    memcpy(pktHash2, p + len - 50, 32);
 
-                        // Log the replacement
-                        NSMutableString *oldHash2 = [NSMutableString string];
-                        NSMutableString *newHash2 = [NSMutableString string];
-                        for (int i = 0; i < 32; i++) {
-                            [oldHash2 appendFormat:@"%c", p[len-50+i]];
-                            [newHash2 appendFormat:@"%c", newBuf[len-50+i]];
+                    if (strncmp(pktHash2, cleanHash2Hex, 32) == 0) {
+                        // CC_MD5 hook worked! hash2 is already clean.
+                        // hash1/hash3 were also computed with clean binary hash → all correct.
+                        // Send original packet as-is (our deviceId, our channel, correct hashes).
+                        DLOG(@"[EE121-H2] v37.48: hash2 already clean (CC_MD5 hook worked, #%d replacements). Sending original pkt len=%zu as-is",
+                             g_md5_replace_count, len);
+                        ssize_t rret = orig_send(fd, buf, len, flags);
+                        return rret;
+                    } else if (strncmp(pktHash2, ourHash2Hex, 32) == 0) {
+                        // CC_MD5 hook didn't catch it. Fall back to v37.39 full clean packet.
+                        DLOG(@"[EE121-H2] v37.48: hash2 still our value (CC_MD5 hook didn't catch). Falling back to clean 248B pkt", 0);
+                        uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                           ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                        static const uint8_t cleanPkt[248] = {
+                            0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
+                            0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
+                            0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
+                            0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
+                            0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
+                            0x00,0x03, 0x49,0x4F,0x53,
+                            0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
+                            0x00,0x00,
+                            0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
+                            0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
+                            0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
+                            0x00,0x04, 0x57,0x49,0x46,0x49,
+                            0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
+                            0x00,0x03, 0x39,0x37,0x39,
+                            0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
+                            0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
+                            0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
+                        };
+                        unsigned char *fbBuf = (unsigned char *)malloc(248);
+                        if (fbBuf) {
+                            memcpy(fbBuf, cleanPkt, 248);
+                            fbBuf[8] = (origSeq >> 24) & 0xFF;
+                            fbBuf[9] = (origSeq >> 16) & 0xFF;
+                            fbBuf[10] = (origSeq >> 8) & 0xFF;
+                            fbBuf[11] = origSeq & 0xFF;
+                            DLOG(@"[EE121-REPL] v37.39 FALLBACK: Replaced 0x002EE121 with clean 248B pkt, seq=%u", origSeq);
+                            ssize_t rret = orig_send(fd, fbBuf, 248, flags);
+                            free(fbBuf);
+                            if (rret >= 0) return (ssize_t)len;
+                            return rret;
                         }
-                        DLOG(@"[EE121-H2] v37.47: Replaced hash2 in orig pkt len=%zu: %@ -> %@", len, oldHash2, newHash2);
-
-                        ssize_t rret = orig_send(fd, newBuf, len, flags);
-                        free(newBuf);
-                        if (rret >= 0) return (ssize_t)len;
+                        ssize_t ret = orig_send(fd, buf, len, flags);
+                        return ret;
+                    } else {
+                        // hash2 is some other value — unknown binary. Send original as-is
+                        // and log for analysis.
+                        DLOG(@"[EE121-H2] v37.48: hash2 unknown value '%.32s'. Sending original pkt len=%zu as-is", pktHash2, len);
+                        ssize_t rret = orig_send(fd, buf, len, flags);
                         return rret;
                     }
-                    DLOG(@"[EE121-H2] v37.47: malloc FAILED, sending original");
-                    ssize_t ret = orig_send(fd, buf, len, flags);
-                    return ret;
                 } else {
-                    // Pattern not found — fall back to v37.39 full clean packet replacement
-                    DLOG(@"[EE121-H2] v37.47: hash2 pattern NOT found at expected offset, falling back to clean 248B replacement");
-                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                    static const uint8_t cleanPkt[248] = {
-                        0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
-                        0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
-                        0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
-                        0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
-                        0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
-                        0x00,0x03, 0x49,0x4F,0x53,
-                        0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
-                        0x00,0x00,
-                        0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
-                        0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
-                        0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
-                        0x00,0x04, 0x57,0x49,0x46,0x49,
-                        0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
-                        0x00,0x03, 0x39,0x37,0x39,
-                        0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
-                        0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
-                        0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
-                    };
-                    unsigned char *fbBuf = (unsigned char *)malloc(248);
-                    if (fbBuf) {
-                        memcpy(fbBuf, cleanPkt, 248);
-                        fbBuf[8] = (origSeq >> 24) & 0xFF;
-                        fbBuf[9] = (origSeq >> 16) & 0xFF;
-                        fbBuf[10] = (origSeq >> 8) & 0xFF;
-                        fbBuf[11] = origSeq & 0xFF;
-                        DLOG(@"[EE121-REPL] v37.39 FALLBACK: Replaced 0x002EE121 with clean 248B pkt, seq=%u", origSeq);
-                        ssize_t rret = orig_send(fd, fbBuf, 248, flags);
-                        free(fbBuf);
-                        if (rret >= 0) return (ssize_t)len;
-                        return rret;
-                    }
-                    ssize_t ret = orig_send(fd, buf, len, flags);
-                    return ret;
+                    // Pattern not found — send original as-is
+                    DLOG(@"[EE121-H2] v37.48: hash2 pattern NOT found. Sending original pkt len=%zu as-is", len);
+                    ssize_t rret = orig_send(fd, buf, len, flags);
+                    return rret;
                 }
             }
             // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
@@ -7322,6 +7312,55 @@ static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
                                dataIn, dataInLen, dataOut, dataOutAvailable, dataOutMoved);
 }
 
+// ============================================================
+// v37.48: CC_MD5 hook — replace modified binary hash with clean hash
+// ============================================================
+// Our binary hash (全能签 modified): 913a1d1a9b704107b7b607b13d53a094
+// Clean binary hash (original):      ddcb91f42c5a612b492a2296a971a5af
+// When CC_MD5 output matches our hash, replace with clean hash.
+// This makes client compute hash1/hash3 using clean binary hash → all 3 hashes consistent.
+
+typedef unsigned char *(*CC_MD5Func)(const void *data, uint32_t len, unsigned char *md);
+static CC_MD5Func orig_CC_MD5 = NULL;
+
+static const uint8_t g_our_binary_hash[16] = {
+    0x91,0x3a,0x1d,0x1a,0x9b,0x70,0x41,0x07,
+    0xb7,0xb6,0x07,0xb1,0x3d,0x53,0xa0,0x94
+};
+static const uint8_t g_clean_binary_hash[16] = {
+    0xdd,0xcb,0x91,0xf4,0x2c,0x5a,0x61,0x2b,
+    0x49,0x2a,0x22,0x96,0xa9,0x71,0xa5,0xaf
+};
+static int g_md5_replace_count = 0;
+
+static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
+    unsigned char *ret = orig_CC_MD5(data, len, md);
+    if (ret && md) {
+        if (memcmp(md, g_our_binary_hash, 16) == 0) {
+            memcpy(md, g_clean_binary_hash, 16);
+            g_md5_replace_count++;
+            DLOG(@"[MD5-HOOK] v37.48: Replaced binary hash (#%d, inputLen=%u)", g_md5_replace_count, len);
+        }
+    }
+    return ret;
+}
+
+// Also hook CC_MD5_Final for streaming MD5
+typedef int (*CC_MD5_FinalFunc)(unsigned char *md, void *c);
+static CC_MD5_FinalFunc orig_CC_MD5_Final = NULL;
+
+static int hook_CC_MD5_Final(unsigned char *md, void *c) {
+    int ret = orig_CC_MD5_Final(md, c);
+    if (ret == 1 && md) {
+        if (memcmp(md, g_our_binary_hash, 16) == 0) {
+            memcpy(md, g_clean_binary_hash, 16);
+            g_md5_replace_count++;
+            DLOG(@"[MD5-HOOK] v37.48: Replaced binary hash via CC_MD5_Final (#%d)", g_md5_replace_count);
+        }
+    }
+    return ret;
+}
+
 typedef OSStatus (*SecKeyEncryptFunc)(SecKeyRef key, SecPadding padding, const uint8_t *plainText, size_t plainTextLen, uint8_t *cipherText, size_t *cipherTextLen);
 static SecKeyEncryptFunc orig_SecKeyEncrypt = NULL;
 
@@ -7572,6 +7611,24 @@ static void installSecurityHooks(void) {
             DLOG(@"[SEC] CCCrypt hook v37.30: rebind=%d addr=%p (GATED after 0x80FFF495 per v37.28 safe)", r1, orig_CCCrypt);
         } else {
             DLOG(@"[SEC] CCCrypt not found via dlsym (L4 won't work!)");
+        }
+    }
+
+    // v37.48: Hook CC_MD5 and CC_MD5_Final to replace modified binary hash
+    // with clean (original) binary hash. This makes the client compute all
+    // hash1/hash2/hash3 using the original binary hash → server accepts.
+    {
+        orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
+        if (orig_CC_MD5) {
+            int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.48: rebind=%d addr=%p", rm, orig_CC_MD5);
+        } else {
+            DLOG(@"[SEC] CC_MD5 not found via dlsym");
+        }
+        orig_CC_MD5_Final = (CC_MD5_FinalFunc)dlsym(RTLD_NEXT, "CC_MD5_Final");
+        if (orig_CC_MD5_Final) {
+            int rmf = rebindSymbol("_CC_MD5_Final", (void *)hook_CC_MD5_Final, (void **)&orig_CC_MD5_Final);
+            DLOG(@"[SEC] CC_MD5_Final hook v37.48: rebind=%d addr=%p", rmf, orig_CC_MD5_Final);
         }
     }
 
@@ -8848,11 +8905,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.47 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.48 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007+MD5-HOOK)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.47-DIST — v37.46 EE121-ORIG hex analysis confirmed hash2 is static binary hash (913a1d1a... same across sessions), hash1/hash3 are challenge-dependent (change per session). v37.39 sent full clean packet but server returned status=4 because clean hash1/hash3 were computed with different challenge. v37.47: take ORIGINAL packet, replace ONLY hash2 (32B at offset len-50) with clean value ddcb91f4..., keep our hash1/hash3 which match our session challenge. Pattern verify: [00 20] at len-52, [00 10] at len-18. Fallback to v37.39 clean 248B if pattern not found.");
+    DLOG(@"[VERSION] WangXianHook v37.48-DIST — v37.47 hash2-only replacement caused server disconnect (hash1/hash3 inconsistent with clean hash2). v37.48: Hook CC_MD5 and CC_MD5_Final to replace our binary hash (913a1d1a...) with clean (ddcb91f4...) at the SOURCE. Client computes all hash1/hash2/hash3 using clean binary hash → consistency guaranteed. EE121-REPL checks: if hash2 already clean (CC_MD5 worked) → send original as-is; if hash2 still ours → fall back to v37.39 clean 248B (status=4 but login works).");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
