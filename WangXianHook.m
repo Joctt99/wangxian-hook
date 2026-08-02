@@ -589,6 +589,10 @@ static void installAllHooks(void);
 
 // v37.51: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
 static int g_md5_replace_count = 0;
+// v37.58: Flag set when CC_MD5 input had channel name "DY_MIESHI" replaced with
+// "DYanyou0040_MIESHI". Used to decide whether to send native EE121 (hash1/3 fixed)
+// or fall back to clean 248B (hash1/3 unverifiable).
+static int g_md5_channel_replaced = 0;
 
 #include <signal.h>
 #include <execinfo.h>
@@ -733,7 +737,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.57-DIST loaded ===");
+        _log(@"=== WangXianHook v37.58-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4158,47 +4162,61 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (len >= 80) {
                     NSMutableString *tailHex = [NSMutableString string];
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
-                    DLOG(@"[EE121-ORIG] v37.56: origLen=%zu tail80B: %@", len, tailHex);
+                    DLOG(@"[EE121-ORIG] v37.58: origLen=%zu tail80B: %@", len, tailHex);
                 }
 
-                // v37.56: Send clean 248B packet (seq-only replacement, v37.51 behavior).
-                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
-                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
-                static const uint8_t cleanPkt[248] = {
-                    0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
-                    0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
-                    0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
-                    0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
-                    0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
-                    0x00,0x03, 0x49,0x4F,0x53,
-                    0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
-                    0x00,0x00,
-                    0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
-                    0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
-                    0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
-                    0x00,0x04, 0x57,0x49,0x46,0x49,
-                    0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
-                    0x00,0x03, 0x39,0x37,0x39,
-                    0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
-                    0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
-                    0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
-                };
-                unsigned char *fbBuf = (unsigned char *)malloc(248);
-                if (fbBuf) {
-                    memcpy(fbBuf, cleanPkt, 248);
-                    // Replace seq (offset 8-11) ONLY — no accountId/UUID replacement (v37.51 behavior)
-                    fbBuf[8] = (origSeq >> 24) & 0xFF;
-                    fbBuf[9] = (origSeq >> 16) & 0xFF;
-                    fbBuf[10] = (origSeq >> 8) & 0xFF;
-                    fbBuf[11] = origSeq & 0xFF;
-                    DLOG(@"[EE121-REPL] v37.56: Sending clean 248B pkt seq=%u (v37.51 behavior, hash1/3 unverifiable → status=4 ACCEPT)", origSeq);
-                    ssize_t rret = orig_send(fd, fbBuf, 248, flags);
-                    free(fbBuf);
-                    if (rret >= 0) return (ssize_t)len;
-                    return rret;
+                // v37.58: Conditional EE121 sending based on CC_MD5 channel replacement.
+                // If CC_MD5 hook replaced "DY_MIESHI"→"DYanyou0040_MIESHI" in hash1/hash3
+                // input, then hash1/hash3 are computed with the CORRECT channel → server
+                // can verify and ACCEPT native EE121 → real sessionId/ticket → game entry.
+                // If not, fall back to clean 248B (hash1/3 unverifiable → status=4 ACCEPT
+                // but no real sessionId → stuck at '正在进入').
+                if (g_md5_channel_replaced == 1) {
+                    // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
+                    // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
+                    DLOG(@"[EE121-REPL] v37.58: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
+                    // Don't return — fall through to TLV replacement at line below
+                } else {
+                    // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
+                    DLOG(@"[EE121-REPL] v37.58: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
+                    uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                       ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                    static const uint8_t cleanPkt[248] = {
+                        0x00,0x00,0x00,0xF8, 0x00,0x2E,0xE1,0x21, 0x00,0x00,0x00,0x10,
+                        0x00,0x14, 0x36,0x35,0x36,0x35,0x37,0x38,0x38,0x31,0x30,0x34,0x35,0x33,0x33,0x35,0x30,0x31,0x35,0x31,0x35,0x31,
+                        0x00,0x05, 0x6B,0x6B,0x39,0x39,0x34,
+                        0x00,0x06, 0x39,0x39,0x34,0x36,0x32,0x34,
+                        0x00,0x05, 0x53,0x51,0x41,0x47,0x45,
+                        0x00,0x03, 0x49,0x4F,0x53,
+                        0x00,0x12, 0x44,0x59,0x61,0x6E,0x79,0x6F,0x75,0x30,0x30,0x34,0x30,0x5F,0x4D,0x49,0x45,0x53,0x48,0x49,
+                        0x00,0x00,
+                        0x00,0x0B, 0x69,0x50,0x68,0x6F,0x6E,0x65,0x37,0x50,0x6C,0x75,0x73,
+                        0x00,0x18, 0x41,0x70,0x70,0x6C,0x65,0x20,0x49,0x6E,0x63,0x2E,0x20,0x41,0x70,0x70,0x6C,0x65,0x20,0x41,0x31,0x30,0x20,0x47,0x50,0x55,
+                        0x00,0x24, 0x36,0x36,0x42,0x30,0x45,0x45,0x30,0x31,0x2D,0x35,0x44,0x32,0x42,0x2D,0x34,0x45,0x41,0x45,0x2D,0x42,0x46,0x42,0x33,0x2D,0x45,0x43,0x41,0x39,0x43,0x41,0x42,0x46,0x31,0x36,0x46,0x38,
+                        0x00,0x04, 0x57,0x49,0x46,0x49,
+                        0x00,0x05, 0x37,0x2E,0x36,0x2E,0x33,
+                        0x00,0x03, 0x39,0x37,0x39,
+                        0x00,0x10, 0x33,0x64,0x64,0x38,0x31,0x39,0x36,0x66,0x36,0x34,0x33,0x35,0x30,0x61,0x63,0x62,
+                        0x00,0x20, 0x64,0x64,0x63,0x62,0x39,0x31,0x66,0x34,0x32,0x63,0x35,0x61,0x36,0x31,0x32,0x62,0x34,0x39,0x32,0x61,0x32,0x32,0x39,0x36,0x61,0x39,0x37,0x31,0x61,0x35,0x61,0x66,
+                        0x00,0x10, 0x37,0x38,0x30,0x61,0x30,0x36,0x34,0x32,0x36,0x31,0x39,0x63,0x38,0x34,0x39,0x38,
+                    };
+                    unsigned char *fbBuf = (unsigned char *)malloc(248);
+                    if (fbBuf) {
+                        memcpy(fbBuf, cleanPkt, 248);
+                        // Replace seq (offset 8-11) ONLY — no accountId/UUID replacement (v37.51 behavior)
+                        fbBuf[8] = (origSeq >> 24) & 0xFF;
+                        fbBuf[9] = (origSeq >> 16) & 0xFF;
+                        fbBuf[10] = (origSeq >> 8) & 0xFF;
+                        fbBuf[11] = origSeq & 0xFF;
+                        DLOG(@"[EE121-REPL] v37.58: Sending clean 248B pkt seq=%u (fallback)", origSeq);
+                        ssize_t rret = orig_send(fd, fbBuf, 248, flags);
+                        free(fbBuf);
+                        if (rret >= 0) return (ssize_t)len;
+                        return rret;
+                    }
+                    ssize_t ret = orig_send(fd, buf, len, flags);
+                    return ret;
                 }
-                ssize_t ret = orig_send(fd, buf, len, flags);
-                return ret;
             }
             // v37.38: Also patch 0x002EE121 login request — it sends DY_MIESHI
             // (short channel from resigning) + iPhone 16 Pro Max + A18 GPU.
@@ -7302,47 +7320,70 @@ static const uint8_t g_clean_binary_hash[16] = {
 // g_md5_replace_count declared near top of file (line 589)
 
 static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
-    // v37.57: Scan INPUT for modified binary hash and replace with clean hash.
-    // hash1/hash3 are computed from session_data + binary_hash via CC_MD5.
-    // The v37.51 hook only replaced OUTPUT (when it matched 913a1d1a...), but
-    // hash1/hash3 outputs are session-specific (never match 913a1d1a...).
-    // v37.57 fixes this by replacing the modified hash IN THE INPUT, so
-    // hash1/hash3 are computed with the clean binary hash → correct values.
+    // v37.58: Scan INPUT for channel name "DY_MIESHI" and replace with
+    // "DYanyou0040_MIESHI" (length +9). hash1/hash3 = MD5(session + accountId
+    // + hash2 + channel). CH-PATCH fixes the C-string in binary but EE121
+    // reads channel from a different source (still "DY_MIESHI"). By replacing
+    // the channel name in the CC_MD5 input, hash1/hash3 are computed with the
+    // CORRECT channel → server accepts native EE121 → real sessionId/ticket.
     const void *actualInput = data;
     void *cleanInput = NULL;
+    uint32_t actualLen = len;
     int inputModified = 0;
 
-    if (data && len >= 16 && len <= 65536) {
+    if (data && len >= 9 && len <= 65536) {
         const uint8_t *in = (const uint8_t *)data;
 
-        // Search for 16-byte modified binary hash (raw bytes) in input
-        for (uint32_t i = 0; i + 16 <= len; i++) {
-            if (memcmp(in + i, g_our_binary_hash, 16) == 0) {
-                cleanInput = malloc(len);
+        // v37.58: Search for channel name "DY_MIESHI" (9 bytes) in input.
+        // ONLY search in SMALL inputs (<= 500B) — these are hash1/hash3
+        // computations (session+accountId+hash2+channel ≈ 100-300B).
+        // DO NOT search in large inputs (e.g., 19437B binary hash) — CH-PATCH
+        // already fixed the C-string, and replacing in binary input would
+        // break the hash2 output replacement logic.
+        static const char shortCh[] = "DY_MIESHI";       // 9 bytes
+        static const char fullCh[]  = "DYanyou0040_MIESHI"; // 18 bytes
+        if (len <= 500) {
+        for (uint32_t i = 0; i + 9 <= len; i++) {
+            if (memcmp(in + i, shortCh, 9) == 0) {
+                // Found short channel — replace with full channel (length +9)
+                uint32_t newLen = len + 9; // 18 - 9 = 9 extra bytes
+                cleanInput = malloc(newLen);
                 if (cleanInput) {
-                    memcpy(cleanInput, data, len);
-                    memcpy((uint8_t *)cleanInput + i, g_clean_binary_hash, 16);
+                    memcpy(cleanInput, data, i);                    // before
+                    memcpy((uint8_t *)cleanInput + i, fullCh, 18);  // full channel
+                    memcpy((uint8_t *)cleanInput + i + 18,
+                           (uint8_t *)data + i + 9, len - i - 9);   // after
                     actualInput = cleanInput;
-                    inputModified = 1;
-                    DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, len);
+                    actualLen = newLen;
+                    inputModified = 2; // channel replacement
+                    g_md5_channel_replaced = 1;
+                    DLOG(@"[MD5-HOOK] v37.58: Replaced channel 'DY_MIESHI'→'DYanyou0040_MIESHI' in input at offset %u (oldLen=%u newLen=%u)", i, len, newLen);
+                    // Dump input for diagnosis
+                    if (len <= 200) {
+                        NSMutableString *hex = [NSMutableString string];
+                        for (uint32_t j = 0; j < len; j++) [hex appendFormat:@"%02x", in[j]];
+                        DLOG(@"[MD5-DUMP] v37.58: CC_MD5 input(%uB): %@", len, hex);
+                    }
                 }
                 break;
             }
         }
+        } // end if (len <= 500)
 
-        // Also search for 32-char hex string "913a1d1a9b704107b7b607b13d53a094"
-        if (!inputModified && len >= 32) {
-            static const char modHex[] = "913a1d1a9b704107b7b607b13d53a094";
-            static const char clnHex[] = "ddcb91f42c5a612b492a2296a971a5af";
-            for (uint32_t i = 0; i + 32 <= len; i++) {
-                if (memcmp(in + i, modHex, 32) == 0) {
-                    cleanInput = malloc(len);
-                    if (cleanInput) {
-                        memcpy(cleanInput, data, len);
-                        memcpy((uint8_t *)cleanInput + i, clnHex, 32);
+        // v37.57: Also search for 16-byte modified binary hash (raw bytes)
+        if (!inputModified && actualLen >= 16) {
+            const uint8_t *ain = (const uint8_t *)actualInput;
+            for (uint32_t i = 0; i + 16 <= actualLen; i++) {
+                if (memcmp(ain + i, g_our_binary_hash, 16) == 0) {
+                    void *tmp = malloc(actualLen);
+                    if (tmp) {
+                        memcpy(tmp, actualInput, actualLen);
+                        memcpy((uint8_t *)tmp + i, g_clean_binary_hash, 16);
+                        if (cleanInput) { free(cleanInput); }
+                        cleanInput = tmp;
                         actualInput = cleanInput;
                         inputModified = 1;
-                        DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash HEX in input at offset %u (inputLen=%u)", i, len);
+                        DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, actualLen);
                     }
                     break;
                 }
@@ -7350,7 +7391,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
         }
     }
 
-    unsigned char *ret = orig_CC_MD5(actualInput, len, md);
+    unsigned char *ret = orig_CC_MD5(actualInput, actualLen, md);
     if (ret && md) {
         // Existing: check if output is our modified binary hash (hash2 case)
         if (memcmp(md, g_our_binary_hash, 16) == 0) {
@@ -7359,8 +7400,8 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash OUTPUT (#%d, inputLen=%u)", g_md5_replace_count, len);
         }
         // v37.57: Log ALL CC_MD5 calls for diagnosis
-        DLOG(@"[MD5-LOG] v37.57: CC_MD5 inLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-             len, inputModified,
+        DLOG(@"[MD5-LOG] v37.58: CC_MD5 inLen=%u actLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             len, actualLen, inputModified,
              md[0],md[1],md[2],md[3],md[4],md[5],md[6],md[7],
              md[8],md[9],md[10],md[11],md[12],md[13],md[14],md[15]);
     }
@@ -7644,7 +7685,7 @@ static void installSecurityHooks(void) {
         orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
         if (orig_CC_MD5) {
             int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-            DLOG(@"[SEC] CC_MD5 hook v37.51: rebind=%d addr=%p", rm, orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.58: rebind=%d addr=%p", rm, orig_CC_MD5);
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
@@ -8928,7 +8969,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.57 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CLEAN-248B-seq-only+MD5-HOOK-INPUT-SCAN+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.58 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?NATIVE+TLV:CLEAN-248B)+MD5-HOOK-INPUT-SCAN(channel≤500B)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9056,7 +9097,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.57-DIST — v37.56 login works but stuck at '正在进入' (FFF493-REPL uses fake sessionId/ticket from different session → server only returns heartbeats). v37.57: CC_MD5 hook now scans INPUT for modified binary hash (913a1d1a...) and replaces with clean hash (ddcb91f4...) BEFORE computing. If hash1/hash3 use CC_MD5 with binary hash in input → they'll be correct → next version can send native EE121 → real sessionId/ticket → game entry. This version logs ALL CC_MD5 calls (inputLen, modified?, output hash) for diagnosis. EE121 still sends clean 248B (login guaranteed). FFF493-REPL still replaces sessionId+ticket only.");
+    DLOG(@"[VERSION] WangXianHook v37.58-DIST — v37.57 fixed MD5 hash2 output but still sent fake EE121 (clean 248B) → no real sessionId/ticket → stuck at '正在进入'. v37.58: CC_MD5 hook now scans INPUT (≤500B) for channel name 'DY_MIESHI' and replaces with 'DYanyou0040_MIESHI' (+9B) BEFORE computing hash1/hash3. If replacement triggers (g_md5_channel_replaced=1) → send NATIVE EE121+TLV (hash1/3 correct → real sessionId/ticket → game entry). If not → fall back to clean 248B (login works but stuck). FFF493-REPL still replaces sessionId+ticket only. CH-PATCH vm_protect fixes C-string in binary.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
