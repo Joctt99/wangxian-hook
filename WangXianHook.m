@@ -566,6 +566,7 @@ extern "C" kern_return_t mach_vm_remap(
 #include <zlib.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonCryptor.h>
+#import <CommonCrypto/CommonHMAC.h>
 #import <Security/Security.h>
 
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
@@ -727,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.35-DIST loaded ===");
+        _log(@"=== WangXianHook v37.36-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4169,21 +4170,44 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                     newPkt[17] = b64Len & 0xFF;
                                     // main_b64
                                     memcpy(newPkt + 18, b64, b64Len);
-                                    // aux_b64_len
+                                    // v37.36: Recompute aux_b64 as HMAC-SHA256(key=AES_key, msg=ciphertext)
+                                    // Original aux_b64 was for the old ciphertext — must recompute for new.
+                                    uint8_t hmacOut[32] = {0};
+                                    CCHmac(kCCHmacAlgSHA256,
+                                           g_saved_aes_key, g_saved_key_len,
+                                           cipherBuf, cipherOut,
+                                           hmacOut);
+                                    NSData *hmacData = [NSData dataWithBytes:hmacOut length:32];
+                                    NSString *hmacB64 = [hmacData base64EncodedStringWithOptions:0];
+                                    const char *hmacB64Bytes = [hmacB64 UTF8String];
+                                    size_t hmacB64Len = strlen(hmacB64Bytes);
+                                    // Log original vs recomputed aux for diagnostic
+                                    NSMutableString *origAuxHex = [NSMutableString string];
+                                    for (int i = 0; i < auxB64Len && i < 44; i++)
+                                        [origAuxHex appendFormat:@"%c", p[auxDataStart + i]];
+                                    DLOG(@"[FFF493-REPL] v37.36: aux ORIG(%dB): %@  NEW HMAC(%zuB): %@",
+                                         auxB64Len, origAuxHex, hmacB64Len, hmacB64);
+                                    // aux_b64_len (use recomputed length, should be 44)
                                     size_t auxPos = 18 + b64Len;
-                                    newPkt[auxPos] = (auxB64Len >> 8) & 0xFF;
-                                    newPkt[auxPos + 1] = auxB64Len & 0xFF;
-                                    // aux_b64 (keep original)
-                                    memcpy(newPkt + auxPos + 2, p + auxDataStart, auxB64Len);
+                                    newPkt[auxPos] = (hmacB64Len >> 8) & 0xFF;
+                                    newPkt[auxPos + 1] = hmacB64Len & 0xFF;
+                                    // Recomputed aux_b64 (HMAC-SHA256 of new ciphertext)
+                                    memcpy(newPkt + auxPos + 2, hmacB64Bytes, hmacB64Len);
+                                    // Update total packet length (may differ if hmacB64Len != auxB64Len)
+                                    size_t finalPktLen = 16 + 2 + b64Len + 2 + hmacB64Len;
+                                    newPkt[0] = (finalPktLen >> 24) & 0xFF;
+                                    newPkt[1] = (finalPktLen >> 16) & 0xFF;
+                                    newPkt[2] = (finalPktLen >> 8) & 0xFF;
+                                    newPkt[3] = finalPktLen & 0xFF;
                                     // Send the new packet
-                                    ssize_t rret = orig_send(fd, newPkt, newPktLen, flags);
-                                    DLOG(@"[FFF493-REPL] v37.35: Replaced FFF493#2 origLen=%zu newLen=%zu cipherOut=%zu b64Len=%zu seq=%u ret=%zd",
-                                         len, newPktLen, cipherOut, b64Len, origSeq, rret);
+                                    ssize_t rret = orig_send(fd, newPkt, finalPktLen, flags);
+                                    DLOG(@"[FFF493-REPL] v37.36: Replaced FFF493#2 origLen=%zu newLen=%zu cipherOut=%zu b64Len=%zu hmacB64Len=%zu seq=%u ret=%zd",
+                                         len, finalPktLen, cipherOut, b64Len, hmacB64Len, origSeq, rret);
                                     free(newPkt);
                                     free(cipherBuf);
                                     // Consume the extended plaintext (one-shot)
                                     g_ext_plaintext = NULL; g_ext_plaintext_len = 0;
-                                    if (rret >= 0) return (ssize_t)len; // pretend we sent original
+                                    if (rret >= 0) return (ssize_t)len;
                                     return rret;
                                 }
                             } else {
@@ -8595,7 +8619,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.35-DIST — v37.34 STUB-EXT worked (612B→1390B) but CCCrypt caller buffer only 637B < needed 1392B → SAFE FALLBACK discarded patch → 896B packet sent → server disconnect. v37.35: SEND-HOOK PACKET REPLACEMENT. (A) CCCrypt hook saves AES key+iv+alg+options from FFF493#1 ENC call (first 200-500B ENC). (B) For FFF493#2 stub (500-800B ENC, starts with username, no accountId): build extended plaintext (~1300B) and save to g_ext_plaintext, but let CCCrypt run normally with patched 621B plaintext (fits in 637B caller buffer). (C) In send hook: when FFF493#2 (cmd=0x00FFF493, len>800) detected AND g_ext_plaintext available: parse original packet [4B len][4B cmd][4B seq][2B flags][2B algo][2B main_b64_len][main_b64][2B aux_b64_len][aux_b64], encrypt g_ext_plaintext with saved key/iv via orig_CCCrypt, base64 encode, build new packet with same header+seqNum+algo but larger main_b64 + original aux_b64, send via orig_send. Return original len to caller. Packet inflates 896B→~1900B matching clean 1432B+ format.");
+    DLOG(@"[VERSION] WangXianHook v37.36-DIST — v37.35 FFF493#2 replacement WORKED (896→1900B sent, no disconnect!) but server didn't respond with 0x80FFF493 — silently dropped packet. Root cause: aux_b64 (44B base64 = 32B raw, likely HMAC-SHA256) was kept from original ciphertext, doesn't match new ciphertext. v37.36: recompute aux_b64 = base64(HMAC-SHA256(AES_key, new_ciphertext)). Also logs ORIG aux vs NEW hmac for diagnostic. If HMAC-SHA256(key,cipher) is correct algorithm, server should accept and respond with 0x80FFF493 character data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
