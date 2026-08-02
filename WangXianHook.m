@@ -728,7 +728,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.39-DIST loaded ===");
+        _log(@"=== WangXianHook v37.40-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3956,6 +3956,79 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     
     const char *host = getHostForFd(fd);
     int port = getPortForFd(fd);
+
+    // v37.40: Generic TLV scanner for ALL port 5678 packets.
+    // Server sees DY_MIESHI in pre-login packets (0x0000E002, 0x002EE118,
+    // 0x0002A018 etc.) and flags client as invalid BEFORE 0x002EE121.
+    // Must fix ALL packets, not just EE007/EE121.
+    // Scans for TLV patterns: [2B len][string] and replaces channel/model/GPU.
+    if (port == 5678 && len >= 20 && len <= 4096) {
+        const unsigned char *p = (const unsigned char *)buf;
+        // Skip 0x002EE121 — handled by EE121-REPL with full clean packet
+        uint32_t tlvCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                          ((uint32_t)p[6] << 8) | (uint32_t)p[7];
+        if (tlvCmd != 0x002EE121) {
+        BOOL hasShort = (memmem(p, len, "DY_MIESHI", 9) != NULL);
+        BOOL hasDM = (memmem(p, len, "iPhone 16 Pro Max", 17) != NULL);
+        BOOL hasGPU = (memmem(p, len, "Apple Inc. Apple A18 Pro GPU", 28) != NULL);
+        if (hasShort || hasDM || hasGPU) {
+            // Reconstruct packet with TLV field replacements
+            size_t bufCap = len + 64;
+            unsigned char *newBuf = (unsigned char *)malloc(bufCap);
+            if (newBuf) {
+                // Copy header (first 12 bytes: pktLen+cmd+seq)
+                size_t hdrLen = (len >= 12) ? 12 : len;
+                memcpy(newBuf, p, hdrLen);
+                size_t out = hdrLen;
+                size_t in = hdrLen;
+                uint32_t fieldsApplied = 0;
+                while (in + 2 < len) {
+                    uint16_t fLen = ((uint16_t)p[in] << 8) | p[in + 1];
+                    if (in + 2 + fLen > len) {
+                        // Can't parse remaining as TLV — copy rest as-is
+                        memcpy(newBuf + out, p + in, len - in);
+                        out += len - in;
+                        break;
+                    }
+                    const unsigned char *val = p + in + 2;
+                    if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) {
+                        newBuf[out] = 0x00; newBuf[out+1] = 0x12;
+                        memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
+                        out += 20; in += 11; fieldsApplied |= 1;
+                    } else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) {
+                        newBuf[out] = 0x00; newBuf[out+1] = 0x0B;
+                        memcpy(newBuf + out + 2, "iPhone7Plus", 11);
+                        out += 13; in += 19; fieldsApplied |= 2;
+                    } else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
+                        newBuf[out] = 0x00; newBuf[out+1] = 0x18;
+                        memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
+                        out += 26; in += 30; fieldsApplied |= 4;
+                    } else {
+                        memcpy(newBuf + out, p + in, 2 + fLen);
+                        out += 2 + fLen; in += 2 + fLen;
+                    }
+                }
+                if (fieldsApplied > 0) {
+                    // Update total packet length (first 4 bytes BE)
+                    uint32_t newPktLen = (uint32_t)out;
+                    newBuf[0] = (newPktLen >> 24) & 0xFF;
+                    newBuf[1] = (newPktLen >> 16) & 0xFF;
+                    newBuf[2] = (newPktLen >> 8) & 0xFF;
+                    newBuf[3] = newPktLen & 0xFF;
+                    DLOG(@"[TLV-SCAN] v37.40: Patched port=5678 pkt origLen=%zu newLen=%zu fields=%u (ch=%u dm=%u gp=%u)",
+                         len, out, fieldsApplied,
+                         (fieldsApplied&1)!=0, (fieldsApplied&2)!=0, (fieldsApplied&4)!=0);
+                    ssize_t rret = orig_send(fd, newBuf, out, flags);
+                    free(newBuf);
+                    if (rret >= 0) return (ssize_t)len;
+                    return rret;
+                }
+                free(newBuf);
+                // Fall through if no fields applied
+            }
+        }
+        } // end if tlvCmd != 0x002EE121
+    }
 
     // v37.27: Dump EE007 ORIGINAL hex (before CHANNEL-PATCH) for byte-level
     // comparison with clean client (hook.txt SEND #28: 178B).
@@ -8677,7 +8750,7 @@ static void installChannelInterceptLayers(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.39-DIST — v37.38 patched channel/model/GPU in 0x002EE121 but hash fields (hash1/MD5/hash3) stayed from original → server detected mismatch → RECV-CLOSE. FIX: replace ENTIRE 0x002EE121 with clean client's 248B packet (from hook.txt SEND #18). Clean packet has ALL correct values: deviceId=656578810453350151551, channel=DYanyou0040_MIESHI, model=iPhone7Plus, GPU=A10, UUID=66B0EE01-..., hash1=3dd8196f64350acb, hash2=ddcb91f42c5a612b492a2296a971a5af, hash3=780a0642619c8498. Only preserve original seqNum. Same username/password (kk994/994624). If server accepts this as valid login, 0x802EE121 returns real accountId → client includes it in FFF493#2 → game server responds with 0x00A3B00E → enter game.");
+    DLOG(@"[VERSION] WangXianHook v37.40-DIST — v37.39 sent clean 0x002EE121 but server STILL returned status=4! Clean client gets 0x00A3B00E(816B) after 0x002EE121, we get 0x802EE121(94B error). ROOT CAUSE: server flagged us BEFORE 0x002EE121 based on pre-login packets. Clean SENDs: 0x0000E002=37B 0x002EE118=39B 0x0002A018=223B. Ours: 28B 30B 224B. ALL contain DY_MIESHI (9B vs 18B). FIX v37.40: generic TLV scanner for ALL port 5678 packets (except 0x002EE121 handled by EE121-REPL). Scans [2B len][string] patterns: DY_MIESHI→DYanyou0040_MIESHI, iPhone 16 Pro Max→iPhone7Plus, A18 Pro GPU→A10 GPU. Updates TLV lengths + total pktLen. Should fix 0x0000E002, 0x002EE118, 0x0002A018 etc.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
