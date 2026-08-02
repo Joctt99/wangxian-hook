@@ -727,7 +727,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.34-DIST loaded ===");
+        _log(@"=== WangXianHook v37.35-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2192,6 +2192,27 @@ static int g_forceValidDecryptFd = -1;
 // response (0x80FFF495) is received. Before that (login server phase),
 // CCCrypt calls pass through unchanged to avoid crashing JudgeApp.
 static BOOL g_cccrypt_l4_active = NO;
+
+// v37.35: Save AES key+iv from FFF493#1 ENC call, and extended plaintext
+// from FFF493#2 ENC call. In send hook, intercept FFF493#2 packet and
+// replace it with our own encrypted extended plaintext.
+static uint8_t g_saved_aes_key[32] = {0};
+static uint8_t g_saved_aes_iv[32] = {0};
+static size_t g_saved_key_len = 0;
+static uint32_t g_saved_alg = 0;
+static uint32_t g_saved_options = 0;
+static BOOL g_aes_key_saved = NO;
+static char *g_ext_plaintext = NULL;   // extended plaintext for FFF493#2
+static size_t g_ext_plaintext_len = 0;
+static uint32_t g_fff493_2_seq = 0;    // seqNum of FFF493#2 to match in send hook
+
+// v37.35: Forward declare CCCrypt types so send hook (line ~3873) can use orig_CCCrypt
+typedef int (*CCCryptFunc)(uint32_t op, uint32_t alg, uint32_t options,
+                           const void *key, size_t keyLen,
+                           const void *iv,
+                           const void *dataIn, size_t dataInLen,
+                           void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+static CCCryptFunc orig_CCCrypt = NULL;
 
 // v36.130: EncryptUtils bypass counter + original IMPs (defined here for forward access)
 static int g_bypassRemaining = 0;
@@ -4087,6 +4108,94 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 for (size_t i = tailStart; i < len; i++) [tail appendFormat:@"%02X ", p[i]];
                 DLOG(@"[GAME-SEND-TAIL] cmd=0x%08X len=%zu tail[%zu-%zu]: %@", cmd, len, tailStart, len-1, tail);
             }
+        }
+        // v37.35: FFF493#2 packet replacement — if we have extended plaintext saved,
+        // encrypt it ourselves and build a new packet with the correct format.
+        // Packet structure:
+        //   [4B total_len][4B cmd][4B seqNum][2B flags=0001][2B algo=067E]
+        //   [2B main_b64_len][main_b64][2B aux_b64_len][aux_b64]
+        // We keep the original aux_b64 (likely HMAC/signature — server may or may not validate).
+        if (cmd == 0x00FFF493 && len > 800 && g_ext_plaintext != NULL && g_aes_key_saved) {
+            // Parse original packet
+            if (len >= 20) {
+                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+                                   ((uint32_t)p[10] << 8) | (uint32_t)p[11];
+                uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
+                uint16_t mainB64Len = ((uint16_t)p[16] << 8) | p[17];
+                // aux_b64 starts after header(16) + 2(main_len) + main_b64 + 2(aux_len)
+                size_t auxOffset = 18 + mainB64Len;
+                if (auxOffset + 2 <= len) {
+                    uint16_t auxB64Len = ((uint16_t)p[auxOffset] << 8) | p[auxOffset + 1];
+                    size_t auxDataStart = auxOffset + 2;
+                    if (auxDataStart + auxB64Len <= len) {
+                        // Encrypt extended plaintext with saved key+iv
+                        size_t cipherCap = ((g_ext_plaintext_len + 1 + 15) / 16) * 16;
+                        uint8_t *cipherBuf = (uint8_t *)malloc(cipherCap + 32);
+                        size_t cipherOut = 0;
+                        if (cipherBuf) {
+                            int ccRet = orig_CCCrypt(0, g_saved_alg, g_saved_options,
+                                                      g_saved_aes_key, g_saved_key_len, g_saved_aes_iv,
+                                                      g_ext_plaintext, g_ext_plaintext_len,
+                                                      cipherBuf, cipherCap + 32, &cipherOut);
+                            if (ccRet == 0 && cipherOut > 0) {
+                                // Base64 encode ciphertext
+                                NSData *cipherData = [NSData dataWithBytes:cipherBuf length:cipherOut];
+                                NSString *b64Str = [cipherData base64EncodedStringWithOptions:0];
+                                const char *b64 = [b64Str UTF8String];
+                                size_t b64Len = strlen(b64);
+                                // Build new packet
+                                size_t newPktLen = 16 + 2 + b64Len + 2 + auxB64Len;
+                                uint8_t *newPkt = (uint8_t *)malloc(newPktLen);
+                                if (newPkt) {
+                                    // Header: total_len(4) + cmd(4) + seqNum(4) + flags(2) + algo(2)
+                                    newPkt[0] = (newPktLen >> 24) & 0xFF;
+                                    newPkt[1] = (newPktLen >> 16) & 0xFF;
+                                    newPkt[2] = (newPktLen >> 8) & 0xFF;
+                                    newPkt[3] = newPktLen & 0xFF;
+                                    // cmd
+                                    memcpy(newPkt + 4, p + 4, 4);
+                                    // seqNum (keep original)
+                                    newPkt[8] = (origSeq >> 24) & 0xFF;
+                                    newPkt[9] = (origSeq >> 16) & 0xFF;
+                                    newPkt[10] = (origSeq >> 8) & 0xFF;
+                                    newPkt[11] = origSeq & 0xFF;
+                                    // flags
+                                    newPkt[12] = 0x00; newPkt[13] = 0x01;
+                                    // algo
+                                    newPkt[14] = (origAlgo >> 8) & 0xFF;
+                                    newPkt[15] = origAlgo & 0xFF;
+                                    // main_b64_len
+                                    newPkt[16] = (b64Len >> 8) & 0xFF;
+                                    newPkt[17] = b64Len & 0xFF;
+                                    // main_b64
+                                    memcpy(newPkt + 18, b64, b64Len);
+                                    // aux_b64_len
+                                    size_t auxPos = 18 + b64Len;
+                                    newPkt[auxPos] = (auxB64Len >> 8) & 0xFF;
+                                    newPkt[auxPos + 1] = auxB64Len & 0xFF;
+                                    // aux_b64 (keep original)
+                                    memcpy(newPkt + auxPos + 2, p + auxDataStart, auxB64Len);
+                                    // Send the new packet
+                                    ssize_t rret = orig_send(fd, newPkt, newPktLen, flags);
+                                    DLOG(@"[FFF493-REPL] v37.35: Replaced FFF493#2 origLen=%zu newLen=%zu cipherOut=%zu b64Len=%zu seq=%u ret=%zd",
+                                         len, newPktLen, cipherOut, b64Len, origSeq, rret);
+                                    free(newPkt);
+                                    free(cipherBuf);
+                                    // Consume the extended plaintext (one-shot)
+                                    g_ext_plaintext = NULL; g_ext_plaintext_len = 0;
+                                    if (rret >= 0) return (ssize_t)len; // pretend we sent original
+                                    return rret;
+                                }
+                            } else {
+                                DLOG(@"[FFF493-REPL] v37.35: CCCrypt FAILED ret=%d cipherOut=%zu", ccRet, cipherOut);
+                            }
+                            free(cipherBuf);
+                        }
+                    }
+                }
+            }
+            // If replacement failed, fall through to normal send
+            DLOG(@"[FFF493-REPL] v37.35: Replacement skipped, sending original packet");
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
@@ -6900,13 +7009,6 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
 
 #pragma mark - CCCrypt / SecKey Hooks
 
-typedef int (*CCCryptFunc)(uint32_t op, uint32_t alg, uint32_t options,
-                           const void *key, size_t keyLen,
-                           const void *iv,
-                           const void *dataIn, size_t dataInLen,
-                           void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
-static CCCryptFunc orig_CCCrypt = NULL;
-
 // v37.26: Forward declaration for wrapper to avoid implicit declaration
 static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                                   const void *key, size_t keyLen,
@@ -8195,31 +8297,36 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             }
         }
         patchCount = chCount + dmCount + gpCount;
-        // v37.34: If plaintext looks like FFF493#2 stub JSON (starts with
-        // {"username": ..., "password": and does NOT contain "accountId"),
-        // then automatically append the missing fields that the canonical
-        // channel builder adds but our stub skips. This inflates 612B → ~1000B.
-        // We insert fields before the trailing '}' to keep valid JSON format.
-        BOOL addStubExt = NO;
-        if (op == 0 && dataInLen >= 200 && dataInLen <= 800) {
+        // v37.35: Save AES key+iv from FFF493#1 ENC (inLen 280-400).
+        // This is the first ENC after challenge response, used for FFF493#1.
+        if (op == 0 && !g_aes_key_saved && dataInLen >= 200 && dataInLen <= 500 && keyLen <= 32) {
+            memcpy(g_saved_aes_key, key, keyLen);
+            memcpy(g_saved_aes_iv, iv, keyLen);
+            g_saved_key_len = keyLen;
+            g_saved_alg = alg;
+            g_saved_options = options;
+            g_aes_key_saved = YES;
+            DLOG(@"[FFF493-REPL] v37.35: Saved AES key(%zuB)+iv+alg=%u+opt=%u from ENC inLen=%zu", keyLen, alg, options, dataInLen);
+        }
+        // v37.35: Detect FFF493#2 stub JSON — save EXTENDED plaintext for send-hook replacement.
+        // But DON'T extend patchedBuf (causes buffer overflow in CCCrypt). Instead, build
+        // the extended version separately and save it for the send hook to encrypt+send.
+        BOOL isFFF493_2_stub = NO;
+        if (op == 0 && dataInLen >= 500 && dataInLen <= 800) {
             const char *dp = (const char *)dataIn;
             if (dp[0] == '{' && dp[1] == '"') {
-                // First key should be username for our stub; canonical starts with accountId
                 BOOL firstIsUsername = (memmem(dp, MIN(dataInLen, (size_t)100),
                                            "\"username\"", 10) != NULL);
-                BOOL hasAccountId = (memmem(dp, dataInLen,
-                                            "\"accountId\"", 11) != NULL);
-                BOOL hasHasRole = (memmem(dp, dataInLen, "\"hasRole\"", 9) != NULL);
-                if (firstIsUsername && (!hasAccountId || !hasHasRole)) {
-                    addStubExt = YES;
+                BOOL hasAccountId = (memmem(dp, dataInLen, "\"accountId\"", 11) != NULL);
+                if (firstIsUsername && !hasAccountId) {
+                    isFFF493_2_stub = YES;
                 }
             }
         }
-        if (patchCount > 0 || addStubExt) {
+        if (patchCount > 0) {
             ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
-            size_t cap = newDataInLen + 800; // +800 for stub extension fields
-            patchedBuf = malloc(cap);
+            patchedBuf = malloc(newDataInLen + 32);
             if (patchedBuf) {
                 char *out = (char *)patchedBuf;
                 const char *p = (const char *)dataIn;
@@ -8254,70 +8361,76 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     }
                     *out++ = *p++;
                 }
-                // v37.34: If addStubExt, strip trailing '}' and append extended
-                // fields before re-adding '}'. Inflate ~612B → ~1000B.
-                if (addStubExt && out > (char *)patchedBuf + 2) {
-                    // Rewind trailing newline/whitespace and '}'
-                    char *end = out - 1;
-                    while (end > (char *)patchedBuf &&
-                           (*end == '}' || *end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
-                        end--;
-                    }
-                    // Now end points at last non-whitespace non-} char
-                    char *insertAt = end + 1;
-                    // Build extension string
-                    const char *ext =
-                        ",\"accountId\":\"04957636686538473198\","
-                        "\"hasRole\":\"0\","
-                        "\"serverCode\":\"S100\","
-                        "\"serverName\":\"%E6%B5%8B%E8%AF%95%E6%9C%8D%E5%8A%A1%E5%99%A8\","
-                        "\"serverId\":\"100\","
-                        "\"channel\":\"DYanyou0040_MIESHI\","
-                        "\"platform\":\"IOS\","
-                        "\"verType\":\"FULL\","
-                        "\"gameVer\":\"7.6.3\","
-                        "\"userLevel\":\"0\","
-                        "\"vipLevel\":\"0\","
-                        "\"loginIp\":\"\","
-                        "\"loginPort\":\"0\","
-                        "\"zoneId\":\"0\","
-                        "\"mergeId\":\"0\","
-                        "\"lang\":\"zh\","
-                        "\"country\":\"CN\","
-                        "\"characterList\":[],"
-                        "\"serverInfo\":{\"openTime\":\"\",\"state\":\"1\",\"maintainTip\":\"\"},"
-                        "\"registerTime\":\"0\","
-                        "\"deviceId\":\"04957636686538473198\","
-                        "\"udid\":\"04957636686538473198\","
-                        "\"idfa\":\"00000000-0000-0000-0000-000000000000\","
-                        "\"idfv\":\"00000000-0000-0000-0000-000000000000\","
-                        "\"osVer\":\"iOS 15.8\","
-                        "\"jailBreak\":\"0\","
-                        "\"carrier\":\"\u4e2d\u56fd\u8054\u901a\","
-                        "\"mcc\":\"460\","
-                        "\"mnc\":\"01\","
-                        "\"cpuArch\":\"arm64\","
-                        "\"memTotal\":\"3872\","
-                        "\"diskTotal\":\"64\","
-                        "\"batteryLevel\":\"100\","
-                        "\"isEmulator\":\"0\""
-                        "}";
-                    size_t extLen = strlen(ext);
-                    size_t remCap = cap - (size_t)(insertAt - (char *)patchedBuf);
-                    if (extLen <= remCap) {
-                        memcpy(insertAt, ext, extLen);
-                        out = insertAt + extLen;
-                    }
-                }
                 realDataIn = patchedBuf;
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
                 if (logged < 4) {
-                    DLOG(@"[CH-L4] v37.34 patchesTot=%d ch=%d dm=%d gp=%d stubExt=%d origLen=%zu newLen=%zu delta=%lld",
-                         patchCount, chCount, dmCount, gpCount, addStubExt ? 1 : 0, dataInLen, realDataInLen,
+                    DLOG(@"[CH-L4] v37.35 patchesTot=%d ch=%d dm=%d gp=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, dataInLen, realDataInLen,
                          (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
+            }
+        }
+        // v37.35: If this is FFF493#2 stub, build EXTENDED plaintext and save
+        // for send-hook replacement. CCCrypt runs with patched (non-extended)
+        // plaintext that fits in caller's buffer. Send hook will encrypt the
+        // extended version and replace the packet on the wire.
+        if (isFFF493_2_stub && g_aes_key_saved) {
+            // Start from the patched plaintext (dm/gp/ch already replaced)
+            const char *base = (const char *)realDataIn;
+            size_t baseLen = realDataInLen;
+            const char *ext =
+                ",\"accountId\":\"04957636686538473198\","
+                "\"hasRole\":\"0\","
+                "\"serverCode\":\"S100\","
+                "\"serverName\":\"%E6%B5%8B%E8%AF%95%E6%9C%8D%E5%8A%A1%E5%99%A8\","
+                "\"serverId\":\"100\","
+                "\"platform\":\"IOS\","
+                "\"verType\":\"FULL\","
+                "\"gameVer\":\"7.6.3\","
+                "\"userLevel\":\"0\","
+                "\"vipLevel\":\"0\","
+                "\"loginIp\":\"\","
+                "\"loginPort\":\"0\","
+                "\"zoneId\":\"0\","
+                "\"mergeId\":\"0\","
+                "\"lang\":\"zh\","
+                "\"country\":\"CN\","
+                "\"characterList\":[],"
+                "\"serverInfo\":{\"openTime\":\"\",\"state\":\"1\",\"maintainTip\":\"\"},"
+                "\"registerTime\":\"0\","
+                "\"deviceId\":\"04957636686538473198\","
+                "\"udid\":\"04957636686538473198\","
+                "\"idfa\":\"00000000-0000-0000-0000-000000000000\","
+                "\"idfv\":\"00000000-0000-0000-0000-000000000000\","
+                "\"osVer\":\"iOS 15.8\","
+                "\"jailBreak\":\"0\","
+                "\"carrier\":\"\u4e2d\u56fd\u8054\u901a\","
+                "\"mcc\":\"460\","
+                "\"mnc\":\"01\","
+                "\"cpuArch\":\"arm64\","
+                "\"memTotal\":\"3872\","
+                "\"diskTotal\":\"64\","
+                "\"batteryLevel\":\"100\","
+                "\"isEmulator\":\"0\""
+                "}";
+            size_t extLen = strlen(ext);
+            // Find last '}' in base, strip it, append ext (which ends with '}')
+            size_t trimLen = baseLen;
+            while (trimLen > 0 && (base[trimLen-1] == '}' || base[trimLen-1] == '\n' ||
+                                   base[trimLen-1] == '\r' || base[trimLen-1] == ' ')) {
+                trimLen--;
+            }
+            if (g_ext_plaintext) { free(g_ext_plaintext); g_ext_plaintext = NULL; }
+            g_ext_plaintext_len = trimLen + extLen;
+            g_ext_plaintext = (char *)malloc(g_ext_plaintext_len + 1);
+            if (g_ext_plaintext) {
+                memcpy(g_ext_plaintext, base, trimLen);
+                memcpy(g_ext_plaintext + trimLen, ext, extLen);
+                g_ext_plaintext[g_ext_plaintext_len] = '\0';
+                DLOG(@"[FFF493-REPL] v37.35: Saved extended plaintext %zuB (base=%zuB + ext=%zuB) for send-hook replacement",
+                     g_ext_plaintext_len, trimLen, extLen);
             }
         }
     }
@@ -8478,11 +8591,11 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.34 %d layers active (L0=dead/fishhook-rebind=0 L1=dead L2=NSString L3=dead L4=CCCryptENC+STUB-EXT L5=sendScan L6=EE007)", layersOK);
+    DLOG(@"[CH-INIT] v37.35 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-EXT L5=sendScan+FFF493-REPL L6=EE007)", layersOK);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.34-DIST — v37.33: L0 fishhooks ALL FAILED (strlen/strcmp/memcpy/CFString rebind=0: libSystem inline calls bypass lazy symbol table). FFF493#2 JSON remained stub 612B missing 400B fields. v37.34 two-pronged attack: (A) CC-AES-PLAIN-FULL dumps ENTIRE FFF493#1/#2 plaintext (hex+ascii, 8x) so we can compare fields byte-by-byte vs clean 1010B JSON. (B) Auto stub-extend: if ENC JSON starts with username first (stub signature) + NO accountId/hasRole, append all missing canonical fields (accountId, hasRole, serverCode/serverId/serverName, platform/IOS, verType, gameVer, userLevel, zoneId, characterList:[], serverInfo:{}, deviceId, jailBreak, carrier, cpuArch etc) before trailing }. Inflates 612B → ~1000B to match clean builder. Also L2×2 NSString hooks still work, L4 ch/dm/gp replace kept. Layers L0/L1/L3 were logged as rebind=0 forensically but removed from expectation of effect.");
+    DLOG(@"[VERSION] WangXianHook v37.35-DIST — v37.34 STUB-EXT worked (612B→1390B) but CCCrypt caller buffer only 637B < needed 1392B → SAFE FALLBACK discarded patch → 896B packet sent → server disconnect. v37.35: SEND-HOOK PACKET REPLACEMENT. (A) CCCrypt hook saves AES key+iv+alg+options from FFF493#1 ENC call (first 200-500B ENC). (B) For FFF493#2 stub (500-800B ENC, starts with username, no accountId): build extended plaintext (~1300B) and save to g_ext_plaintext, but let CCCrypt run normally with patched 621B plaintext (fits in 637B caller buffer). (C) In send hook: when FFF493#2 (cmd=0x00FFF493, len>800) detected AND g_ext_plaintext available: parse original packet [4B len][4B cmd][4B seq][2B flags][2B algo][2B main_b64_len][main_b64][2B aux_b64_len][aux_b64], encrypt g_ext_plaintext with saved key/iv via orig_CCCrypt, base64 encode, build new packet with same header+seqNum+algo but larger main_b64 + original aux_b64, send via orig_send. Return original len to caller. Packet inflates 896B→~1900B matching clean 1432B+ format.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
