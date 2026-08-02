@@ -733,7 +733,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.56-DIST loaded ===");
+        _log(@"=== WangXianHook v37.57-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7302,14 +7302,69 @@ static const uint8_t g_clean_binary_hash[16] = {
 // g_md5_replace_count declared near top of file (line 589)
 
 static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
-    unsigned char *ret = orig_CC_MD5(data, len, md);
+    // v37.57: Scan INPUT for modified binary hash and replace with clean hash.
+    // hash1/hash3 are computed from session_data + binary_hash via CC_MD5.
+    // The v37.51 hook only replaced OUTPUT (when it matched 913a1d1a...), but
+    // hash1/hash3 outputs are session-specific (never match 913a1d1a...).
+    // v37.57 fixes this by replacing the modified hash IN THE INPUT, so
+    // hash1/hash3 are computed with the clean binary hash → correct values.
+    const void *actualInput = data;
+    void *cleanInput = NULL;
+    int inputModified = 0;
+
+    if (data && len >= 16 && len <= 65536) {
+        const uint8_t *in = (const uint8_t *)data;
+
+        // Search for 16-byte modified binary hash (raw bytes) in input
+        for (uint32_t i = 0; i + 16 <= len; i++) {
+            if (memcmp(in + i, g_our_binary_hash, 16) == 0) {
+                cleanInput = malloc(len);
+                if (cleanInput) {
+                    memcpy(cleanInput, data, len);
+                    memcpy((uint8_t *)cleanInput + i, g_clean_binary_hash, 16);
+                    actualInput = cleanInput;
+                    inputModified = 1;
+                    DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, len);
+                }
+                break;
+            }
+        }
+
+        // Also search for 32-char hex string "913a1d1a9b704107b7b607b13d53a094"
+        if (!inputModified && len >= 32) {
+            static const char modHex[] = "913a1d1a9b704107b7b607b13d53a094";
+            static const char clnHex[] = "ddcb91f42c5a612b492a2296a971a5af";
+            for (uint32_t i = 0; i + 32 <= len; i++) {
+                if (memcmp(in + i, modHex, 32) == 0) {
+                    cleanInput = malloc(len);
+                    if (cleanInput) {
+                        memcpy(cleanInput, data, len);
+                        memcpy((uint8_t *)cleanInput + i, clnHex, 32);
+                        actualInput = cleanInput;
+                        inputModified = 1;
+                        DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash HEX in input at offset %u (inputLen=%u)", i, len);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    unsigned char *ret = orig_CC_MD5(actualInput, len, md);
     if (ret && md) {
+        // Existing: check if output is our modified binary hash (hash2 case)
         if (memcmp(md, g_our_binary_hash, 16) == 0) {
             memcpy(md, g_clean_binary_hash, 16);
             g_md5_replace_count++;
-            DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash (#%d, inputLen=%u)", g_md5_replace_count, len);
+            DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash OUTPUT (#%d, inputLen=%u)", g_md5_replace_count, len);
         }
+        // v37.57: Log ALL CC_MD5 calls for diagnosis
+        DLOG(@"[MD5-LOG] v37.57: CC_MD5 inLen=%u mod=%d out=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             len, inputModified,
+             md[0],md[1],md[2],md[3],md[4],md[5],md[6],md[7],
+             md[8],md[9],md[10],md[11],md[12],md[13],md[14],md[15]);
     }
+    if (cleanInput) free(cleanInput);
     return ret;
 }
 
@@ -8873,7 +8928,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.56 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CLEAN-248B-seq-only+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.57 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CLEAN-248B-seq-only+MD5-HOOK-INPUT-SCAN+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9001,7 +9056,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.56-DIST — v37.54/v37.55 sent native EE121 → server CLOSED (hash1/hash3 include channel, modified binary makes them WRONG). v37.56 RESTORES v37.51 behavior: send clean 248B EE121 (seq-only replace, hash1/3 unverifiable → status=4 ACCEPT). FFF493-REPL v2 RE-ENABLED but ONLY replaces sessionId+ticket (keeps clientId/MACADDRESS/md5 NATIVE to match current session). CH-PATCH vm_protect kept.");
+    DLOG(@"[VERSION] WangXianHook v37.57-DIST — v37.56 login works but stuck at '正在进入' (FFF493-REPL uses fake sessionId/ticket from different session → server only returns heartbeats). v37.57: CC_MD5 hook now scans INPUT for modified binary hash (913a1d1a...) and replaces with clean hash (ddcb91f4...) BEFORE computing. If hash1/hash3 use CC_MD5 with binary hash in input → they'll be correct → next version can send native EE121 → real sessionId/ticket → game entry. This version logs ALL CC_MD5 calls (inputLen, modified?, output hash) for diagnosis. EE121 still sends clean 248B (login guaranteed). FFF493-REPL still replaces sessionId+ticket only.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
