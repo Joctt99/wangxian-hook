@@ -733,7 +733,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.52-DIST loaded ===");
+        _log(@"=== WangXianHook v37.53-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8903,7 +8903,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.52 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK + CH-PATCH in-memory)", layersOK);
+    DLOG(@"[CH-INIT] v37.53 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -8919,11 +8919,21 @@ static void installChannelInterceptLayers(void) {
 // leaving 9 stale bytes after. We write back all 19 bytes — safe because the slot
 // was originally 19 bytes. construct_NEW_USER_ENTER_SERVER_REQER then reads the correct
 // long channel and builds the full ~994B JSON.
+//
+// v37.53: mprotect FAILS with EACCES on iOS (code signature protects __TEXT).
+// Use vm_protect with VM_PROT_COPY instead — this forces kernel to create a private
+// copy-on-write page, bypassing code signature restrictions. This is the standard
+// technique used by jailbreak tweaks (substrate, cycript) to patch code pages.
+// NOTE: Writing 19 bytes overwrites the first 9 bytes of the adjacent "DYquick_MI..."
+// string. This is acceptable — user uses DYanyou0040 channel, not DYquick.
+#ifndef VM_PROT_COPY
+#define VM_PROT_COPY 0x10
+#endif
 static void patchChannelStringInBinary(void) {
     const char shortCh[10] = "DY_MIESHI";         // 9 chars + NUL = 10
     const char longCh[19]  = "DYanyou0040_MIESHI"; // 18 chars + NUL = 19
 
-    DLOG(@"[CH-PATCH] v37.52: Scanning binary for channel string literal...");
+    DLOG(@"[CH-PATCH] v37.53: Scanning binary for channel string literal...");
 
     int imageCount = (int)_dyld_image_count();
     int patched = 0;
@@ -8938,7 +8948,7 @@ static void patchChannelStringInBinary(void) {
         intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
         if (!header || header->magic != MH_MAGIC_64) continue;
 
-        DLOG(@"[CH-PATCH] v37.52: Searching in %s (slide=0x%lx)", imageName, (unsigned long)slide);
+        DLOG(@"[CH-PATCH] v37.53: Searching in %s (slide=0x%lx)", imageName, (unsigned long)slide);
 
         const struct load_command *lc = (const struct load_command *)((uintptr_t)header + sizeof(struct mach_header_64));
         for (uint32_t i = 0; i < header->ncmds && patched == 0; i++) {
@@ -8969,26 +8979,46 @@ static void patchChannelStringInBinary(void) {
                     char beforeHex[64] = {0};
                     for (int k = 0; k < 20 && p + k < end; k++)
                         snprintf(beforeHex + k*3, 4, "%02X ", (unsigned char)p[k]);
-                    DLOG(@"[CH-PATCH] v37.52: Found in sect=%s offset=%ld before: %s",
+                    DLOG(@"[CH-PATCH] v37.53: Found in sect=%s offset=%ld before: %s",
                          sect[j].sectname, (long)(p - start), beforeHex);
 
-                    // mprotect to RWX (__TEXT is normally RX)
+                    // v37.53: Use vm_protect with VM_PROT_COPY to bypass iOS code signature.
+                    // mprotect returns EACCES on __TEXT pages; vm_protect with VM_PROT_COPY
+                    // forces kernel to create a private COW copy that we can write to.
                     uintptr_t pageAddr = (uintptr_t)p & ~((uintptr_t)0xFFF);
                     uintptr_t pageEnd  = ((uintptr_t)p + 19 + 0xFFF) & ~((uintptr_t)0xFFF);
                     size_t protSize = pageEnd - pageAddr;
 
-                    if (mprotect((void *)pageAddr, protSize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    kern_return_t kr = vm_protect(mach_task_self(),
+                                                   (vm_address_t)pageAddr, protSize,
+                                                   FALSE,
+                                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                    if (kr == KERN_SUCCESS) {
+                        // Write long channel (19 bytes — may overwrite first 9B of adjacent
+                        // "DYquick_MI..." string, acceptable since user uses DYanyou0040)
                         memcpy(p, longCh, 19);
-                        // Restore to RX (no W)
-                        mprotect((void *)pageAddr, protSize, PROT_READ | PROT_EXEC);
+                        // Restore to RX
+                        vm_protect(mach_task_self(),
+                                   (vm_address_t)pageAddr, protSize,
+                                   FALSE,
+                                   VM_PROT_READ | VM_PROT_EXECUTE);
 
                         char afterHex[64] = {0};
                         for (int k = 0; k < 20 && p + k < end; k++)
                             snprintf(afterHex + k*3, 4, "%02X ", (unsigned char)p[k]);
-                        DLOG(@"[CH-PATCH] v37.52: PATCHED! after: %s", afterHex);
+                        DLOG(@"[CH-PATCH] v37.53: PATCHED! after: %s", afterHex);
                         patched++;
                     } else {
-                        DLOG(@"[CH-PATCH] v37.52: mprotect FAILED errno=%d", errno);
+                        DLOG(@"[CH-PATCH] v37.53: vm_protect FAILED kr=%d", (int)kr);
+                        // Fallback: try mprotect (may work on some jailbreak setups)
+                        if (mprotect((void *)pageAddr, protSize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                            memcpy(p, longCh, 19);
+                            mprotect((void *)pageAddr, protSize, PROT_READ | PROT_EXEC);
+                            DLOG(@"[CH-PATCH] v37.53: mprotect fallback PATCHED!");
+                            patched++;
+                        } else {
+                            DLOG(@"[CH-PATCH] v37.53: mprotect also FAILED errno=%d", errno);
+                        }
                     }
                     break;
                 }
@@ -8997,11 +9027,11 @@ static void patchChannelStringInBinary(void) {
         }
     }
 
-    DLOG(@"[CH-PATCH] v37.52: Complete, patched=%d", patched);
+    DLOG(@"[CH-PATCH] v37.53: Complete, patched=%d", patched);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.52-DIST — v37.51 restored login (seq-only EE121) but stuck at '正在进入...'. Root cause: L0-L3 fishhook hooks (strlen/strcmp/strncmp/memcpy) NEVER trigger because these functions are INLINED by the compiler on modern iOS. So construct_NEW_USER_ENTER_SERVER_REQER still reads short 'DY_MIESHI' → builds truncated 621B JSON (missing accountId/hasRole/serverInfo/character) → FFF493-REPL can't fix → server returns only heartbeats. v37.52 FIX: directly patch the C-string literal IN-PLACE in __TEXT memory (DY_MIESHI→DYanyou0040_MIESHI, 19B writeback, safe because original slot was 19B). This makes construct_NEW_USER_ENTER_SERVER_REQER read the correct long channel → build full ~994B JSON → FFF493-REPL becomes no-op (sessionId/ticket already present) → server returns character/map data.");
+    DLOG(@"[VERSION] WangXianHook v37.53-DIST — v37.52 found the channel string in __TEXT.__cstring but mprotect FAILED (errno=13 EACCES — iOS code signature protects __TEXT). v37.53 uses vm_protect with VM_PROT_COPY to force kernel COW page, bypassing code signature. Writes 19B DYanyou0040_MIESHI over DY_MIESHI (may overwrite first 9B of adjacent DYquick string — acceptable, user uses DYanyou0040 channel). EE121 logic unchanged (seq-only, v37.51 behavior).");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
