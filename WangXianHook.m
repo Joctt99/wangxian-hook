@@ -585,6 +585,9 @@ static BOOL g_logEnabled = YES; // logging toggle
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
+// v37.48: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
+static int g_md5_replace_count = 0;
+
 #include <signal.h>
 #include <execinfo.h>
 
@@ -4148,9 +4151,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             // v37.48 lets CC_MD5 hook fix ALL hashes at the source → consistency guaranteed.
             if (cmd == 0x002EE121) {
                 // Clean hash2 as ASCII hex string: "ddcb91f42c5a612b492a2296a971a5af"
-                static const char cleanHash2Hex[32] = "ddcb91f42c5a612b492a2296a971a5af";
+                static const char cleanHash2Hex[33] = "ddcb91f42c5a612b492a2296a971a5af";
                 // Our hash2 as ASCII hex string: "913a1d1a9b704107b7b607b13d53a094"
-                static const char ourHash2Hex[32] = "913a1d1a9b704107b7b607b13d53a094";
+                static const char ourHash2Hex[33] = "913a1d1a9b704107b7b607b13d53a094";
 
                 // Dump original packet tail for debugging
                 if (len >= 80) {
@@ -4176,7 +4179,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         return rret;
                     } else if (strncmp(pktHash2, ourHash2Hex, 32) == 0) {
                         // CC_MD5 hook didn't catch it. Fall back to v37.39 full clean packet.
-                        DLOG(@"[EE121-H2] v37.48: hash2 still our value (CC_MD5 hook didn't catch). Falling back to clean 248B pkt", 0);
+                        DLOG(@"[EE121-H2] v37.48: hash2 still our value (CC_MD5 hook didn't catch). Falling back to clean 248B pkt");
                         uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                            ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                         static const uint8_t cleanPkt[248] = {
@@ -7331,7 +7334,7 @@ static const uint8_t g_clean_binary_hash[16] = {
     0xdd,0xcb,0x91,0xf4,0x2c,0x5a,0x61,0x2b,
     0x49,0x2a,0x22,0x96,0xa9,0x71,0xa5,0xaf
 };
-static int g_md5_replace_count = 0;
+// g_md5_replace_count declared near top of file (line 589)
 
 static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
     unsigned char *ret = orig_CC_MD5(data, len, md);
