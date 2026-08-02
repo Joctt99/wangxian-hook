@@ -560,6 +560,8 @@ extern "C" kern_return_t mach_vm_remap(
 #include <dlfcn.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <errno.h>
+#include <stdio.h>
 #include <execinfo.h>
 #include <poll.h>
 #include <sys/select.h>
@@ -731,7 +733,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.51-DIST loaded ===");
+        _log(@"=== WangXianHook v37.52-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -8901,12 +8903,112 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.51 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK)", layersOK);
+    DLOG(@"[CH-INIT] v37.52 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2 L6=EE007-TLV+EE121-CLEAN248B+MD5-HOOK + CH-PATCH in-memory)", layersOK);
+}
+
+// v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
+// L0-L3 fishhook hooks (strlen/strcmp/strncmp/memcpy) NEVER trigger because these
+// functions are inlined by the compiler on modern iOS — fishhook only rebinds symbol
+// pointers, not inlined call sites. So construct_NEW_USER_ENTER_SERVER_REQER still
+// reads the short "DY_MIESHI" channel → builds truncated 621B JSON (missing accountId,
+// hasRole, serverInfo, character data) → FFF493-REPL can't fix it → server returns only
+// heartbeats → stuck at "正在进入...".
+//
+// Root fix: patch the C-string literal IN-PLACE in __TEXT. Original binary had
+// "DYanyou0040_MIESHI\0" (19 bytes). 全能签 overwrote first 10 bytes with "DY_MIESHI\0",
+// leaving 9 stale bytes after. We write back all 19 bytes — safe because the slot
+// was originally 19 bytes. construct_NEW_USER_ENTER_SERVER_REQER then reads the correct
+// long channel and builds the full ~994B JSON.
+static void patchChannelStringInBinary(void) {
+    const char shortCh[10] = "DY_MIESHI";         // 9 chars + NUL = 10
+    const char longCh[19]  = "DYanyou0040_MIESHI"; // 18 chars + NUL = 19
+
+    DLOG(@"[CH-PATCH] v37.52: Scanning binary for channel string literal...");
+
+    int imageCount = (int)_dyld_image_count();
+    int patched = 0;
+
+    for (int idx = 0; idx < imageCount && patched == 0; idx++) {
+        const char *imageName = _dyld_get_image_name(idx);
+        if (!imageName) continue;
+        // Only search in main binary (wangxian), not dylibs/frameworks
+        if (!strstr(imageName, "wangxian") && !strstr(imageName, "WangXian")) continue;
+
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(idx);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
+        if (!header || header->magic != MH_MAGIC_64) continue;
+
+        DLOG(@"[CH-PATCH] v37.52: Searching in %s (slide=0x%lx)", imageName, (unsigned long)slide);
+
+        const struct load_command *lc = (const struct load_command *)((uintptr_t)header + sizeof(struct mach_header_64));
+        for (uint32_t i = 0; i < header->ncmds && patched == 0; i++) {
+            if (lc->cmd != LC_SEGMENT_64) { lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize); continue; }
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__TEXT") != 0) { lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize); continue; }
+
+            const struct section_64 *sect = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+            for (uint32_t j = 0; j < seg->nsects && patched == 0; j++) {
+                // Search all __TEXT sections (string literal may be in __cstring or __const)
+                size_t sectSize = sect[j].size;
+                if (sectSize < 19) continue;
+
+                char *start = (char *)(sect[j].addr + slide);
+                char *end = start + sectSize;
+                for (char *p = start; p <= end - 19; p++) {
+                    // Match first 9 bytes "DY_MIESHI" (not 10 — 全能签 may not have
+                    // written a NUL terminator; p[9] could be stale original data).
+                    if (memcmp(p, shortCh, 9) != 0) continue;
+                    // Boundary check: char before must be NUL or non-alphanumeric
+                    // (ensures "DY_MIESHI" is the start of a string, not a substring).
+                    if (p > start) {
+                        char prev = *(p - 1);
+                        if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+                            (prev >= '0' && prev <= '9') || prev == '_') continue;
+                    }
+                    // Found "DY_MIESHI" at a string boundary. Dump context.
+                    char beforeHex[64] = {0};
+                    for (int k = 0; k < 20 && p + k < end; k++)
+                        snprintf(beforeHex + k*3, 4, "%02X ", (unsigned char)p[k]);
+                    DLOG(@"[CH-PATCH] v37.52: Found in sect=%s offset=%ld before: %s",
+                         sect[j].sectname, (long)(p - start), beforeHex);
+
+                    // mprotect to RWX (__TEXT is normally RX)
+                    uintptr_t pageAddr = (uintptr_t)p & ~((uintptr_t)0xFFF);
+                    uintptr_t pageEnd  = ((uintptr_t)p + 19 + 0xFFF) & ~((uintptr_t)0xFFF);
+                    size_t protSize = pageEnd - pageAddr;
+
+                    if (mprotect((void *)pageAddr, protSize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        memcpy(p, longCh, 19);
+                        // Restore to RX (no W)
+                        mprotect((void *)pageAddr, protSize, PROT_READ | PROT_EXEC);
+
+                        char afterHex[64] = {0};
+                        for (int k = 0; k < 20 && p + k < end; k++)
+                            snprintf(afterHex + k*3, 4, "%02X ", (unsigned char)p[k]);
+                        DLOG(@"[CH-PATCH] v37.52: PATCHED! after: %s", afterHex);
+                        patched++;
+                    } else {
+                        DLOG(@"[CH-PATCH] v37.52: mprotect FAILED errno=%d", errno);
+                    }
+                    break;
+                }
+            }
+            lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+        }
+    }
+
+    DLOG(@"[CH-PATCH] v37.52: Complete, patched=%d", patched);
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.51-DIST — v37.50 failed because replacing accountId made hash1/hash3 verifiable (server looked up account, verified against current challenge, found mismatch from different session → CLOSE). v37.51: send clean 248B pkt for EE121 with ONLY seq replaced (NO accountId/UUID replacement). This restores v37.39/v37.46 behavior: server can't verify hash1/hash3 (different accountId from clean pkt) → status=4 ACCEPT. CC_MD5 hook kept for logging. TLV replacement kept for EE007 game server.");
+    DLOG(@"[VERSION] WangXianHook v37.52-DIST — v37.51 restored login (seq-only EE121) but stuck at '正在进入...'. Root cause: L0-L3 fishhook hooks (strlen/strcmp/strncmp/memcpy) NEVER trigger because these functions are INLINED by the compiler on modern iOS. So construct_NEW_USER_ENTER_SERVER_REQER still reads short 'DY_MIESHI' → builds truncated 621B JSON (missing accountId/hasRole/serverInfo/character) → FFF493-REPL can't fix → server returns only heartbeats. v37.52 FIX: directly patch the C-string literal IN-PLACE in __TEXT memory (DY_MIESHI→DYanyou0040_MIESHI, 19B writeback, safe because original slot was 19B). This makes construct_NEW_USER_ENTER_SERVER_REQER read the correct long channel → build full ~994B JSON → FFF493-REPL becomes no-op (sessionId/ticket already present) → server returns character/map data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
+
+    // v37.52: Patch channel string literal in binary memory FIRST, before any
+    // hook installation. This is the ROOT fix — L0-L3 fishhook hooks are dead
+    // (inlined functions), so in-memory patch is the only way to ensure
+    // construct_NEW_USER_ENTER_SERVER_REQER sees the correct long channel.
+    patchChannelStringInBinary();
 
     // v37.26: Install ALL 6 channel intercept layers FIRST.
     // This runs before any network code so the replacement propagates through
