@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.69-DIST loaded ===");
+        _log(@"=== WangXianHook v37.70-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4302,7 +4302,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_md5_channel_replaced == 1) {
                     // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
                     // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.62: g_md5_channel_replaced=1 → NATIVE EE121+TLV (hash1/3 should be correct → real sessionId/ticket)");
+                    DLOG(@"[EE121-REPL] v37.70: g_md5_channel_replaced=1 → EE007-ALIGN only (CANON rebuild DISABLED, native structure preserved)");
                     // Don't return — fall through to TLV replacement at line below
                 } else {
                     // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
@@ -4446,12 +4446,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // hash1/hash3 = MD5(clean_binary_MD5 + current_token) already computed correctly by
                     // CC_MD5 hook (63B input[0:32] already = clean hash via output replacement at 19437B).
                     // RESULT: EE121 hashes ALL valid → server returns REAL status=0 + sessionId/ticket.
-                    if (cmd == 0x002EE121) {
-                        // v37.67: Use REAL accountId from original packet (not CANONICAL).
-                        // Server authenticated REAL accountId during EE100/EE113 → EE121 must match.
-                        // Only channel/model/GPU/UUID are replaced with CANONICAL values.
-                        // hash2 forced = clean_binary_MD5 (ddcb91f42c...) via CC_MD5 hook — this is
-                        // a binary integrity check, NOT MD5(fields). Server doesn't recompute hash2.
+                    // v37.70: DISABLED EE121-CANON rebuild entirely.
+                    // Root cause: v37.69 log showed origLen=213B (NO UUID field) but CANON
+                    // rebuild forced 248B (WITH UUID) → packet structure mismatch → server
+                    // closed connection immediately (RECV-CLOSE ret=0, no 0x802EE121 response).
+                    // v37.66 had origLen=249B (WITH UUID) so CANON 248B worked (got status=4).
+                    // v37.69 device's native EE121 has NO UUID field → CANON rebuild breaks it.
+                    // FIX: Skip CANON rebuild. EE007-ALIGN already replaced ch/dm/gp in-place.
+                    // hash2 stays as CC_MD5 hook computed (based on replaced fields) → correct.
+                    // hash1/hash3 stay as CC_MD5 hook computed (based on ddcb91f42c... + token) → correct.
+                    if (cmd == 0x002EE121 && false) { // DISABLED in v37.70
                         static const char kUser[]     = "kk994";               // 5 bytes,  00 05
                         static const char kPass[]     = "994624";              // 6 bytes,  00 06
                         static const char kChannel[]  = "DYanyou0040_MIESHI";  // 18 bytes, 00 12
@@ -9509,7 +9513,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.69 %d layers active (v37.67-REAL-accId+TLV-SCAN-DIRECT-BYTE+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.70 %d layers active (EE121-CANON-DISABLED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9637,7 +9641,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.69-DIST — v37.67: EE121 uses REAL accountId (matching EE100/EE113) with CANONICAL ch/dm/gp/UUID. v37.68: EE100 DIRECT-BYTE-PATCH bypasses broken TLV parser for 4-byte prefix format. v37.69: ADDED 0x8234AB89 SESSION-CAPTURE to extract real sessionId/ticket from login server response. FFF493-REPL now uses CAPTURED sessionId/ticket when available, falls back to hardcoded values. KEY INSIGHT: Login server must return REAL status=0 (not patched) AND send 0x8234AB89 with sessionId/ticket for game server to accept FFF493#2. v37.67 accountId consistency + CORRECT hashes should enable REAL status=0 response. TESTING: check [SESSION-CAPTURE] v37.69: 0x8234AB89 received, sessionId/ticket extracted, 0x802EE121 REAL status=0, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.70-DIST — v37.70: DISABLED EE121-CANON rebuild. v37.69 log showed origLen=213B (NO UUID field in native EE121) but CANON rebuild forced 248B (WITH UUID) → packet structure mismatch → server closed connection immediately (RECV-CLOSE ret=0, no 0x802EE121 response). v37.66 had origLen=249B (WITH UUID) so CANON 248B worked (got status=4). FIX: Skip CANON rebuild entirely. EE007-ALIGN already replaces ch/dm/gp in-place. hash2 stays as CC_MD5 hook computed (based on replaced fields). hash1/hash3 stay as CC_MD5 hook computed (based on ddcb91f42c... + token). TESTING: check 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] v37.69: 0x8234AB89 received, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
