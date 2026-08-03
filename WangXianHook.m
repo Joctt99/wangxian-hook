@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.64-DIST loaded ===");
+        _log(@"=== WangXianHook v37.65-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7818,17 +7818,19 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
 }
 
 static void installIDFVHook(void) {
-    // Use a fixed reproducible UUID (matches what injectUUIDIntoDeviceInfo uses)
-    const char *fixedUUIDStr = "D4896737-1234-5678-ABCD-0123456789AB";
+    // v37.65: Use clean-client CANONICAL UUID so EE006/EE121/IDFV all match.
+    // Server rejects status=4 if UUID mismatch (IDFV=D4896737... but EE121=66B0EE01...).
+    const char *fixedUUIDStr = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
     @try {
-        g_fixedIDFV = [[NSUUID alloc] initWithUUIDBytes:(const unsigned char *)"\xD4\x89\x67\x37\x12\x34\x56\x78\xAB\xCD\x01\x23\x45\x67\x89\xAB"];
+        // Bytes for 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
+        g_fixedIDFV = [[NSUUID alloc] initWithUUIDBytes:(const unsigned char *)"\x66\xB0\xEE\x01\x5D\x2B\x4E\xAE\xBF\xB3\xEC\xA9\xCA\xBF\x16\xF8"];
     } @catch (NSException *e) {
         g_fixedIDFV = [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:fixedUUIDStr]];
     }
     if (!g_fixedIDFV) {
         g_fixedIDFV = [NSUUID UUID];  // last resort: random
     }
-    DLOG(@"[IDFV-HOOK] v36.123: Fixed UUID = %@", [g_fixedIDFV UUIDString]);
+    DLOG(@"[IDFV-HOOK] v37.65: Fixed UUID = %@ (CANONICAL match EE121)", [g_fixedIDFV UUIDString]);
 
     // Now swizzle UIDevice's identifierForVendor
     Class uiDeviceCls = NSClassFromString(@"UIDevice");
@@ -9241,7 +9243,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.64 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.65 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+IDFV-CANONICAL(66B0EE01)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9369,7 +9371,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.64-DIST — v37.63 added EE006-INJECT/A018-INJECT (intercept heartbeat→EE006, resourceCheck→A018) but v37.62 log shows client ALREADY sends A018 (origLen=186, A018-REPL→223B at line 360) AND short EE006 (20B at line 805). INJECT logic would cause DUPLICATE sends. v37.64 REMOVES EE006-INJECT and A018-INJECT, KEEPS only EE006-EXPAND (20B→56B with clean UUID) which is the actual fix for status=4. v37.62 log confirms: hash1/hash2/hash3 ALL correct (hash2=ddcb91f42c..., hash1/hash3 from CC_MD5 63B input=cleanhash+token), EE121-CANON pktLen=248, but 0x802EE121 still status=4 → root cause is short EE006 (20B, no UUID) → server rejects as incomplete device info. EE006-EXPAND fixes this by extending 20B→56B with UUID=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8.");
+    DLOG(@"[VERSION] WangXianHook v37.65-DIST — v37.64 removed EE006-INJECT/A018-INJECT but status=4 persists. v37.64 log shows IDFV-HOOK returns D4896737-... but EE121-CANON uses 66B0EE01-... → UUID mismatch! Server rejects because client sends EE006 with IDFV UUID (D4896737...) but EE121 has different UUID (66B0EE01...). v37.65 fixes IDFV-HOOK to return CANONICAL UUID (66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8) so ALL UUID sources match: IDFV, EE006, EE121, CC_MD5 input. TESTING: check [IDFV-HOOK] v37.65: Fixed UUID = 66B0EE01... (CANONICAL match EE121), [EE006-UUID] uses same UUID, [EE121-CANON] uses same UUID, 0x802EE121 status=0 (real success), 0x8234AB89 real sessionId/ticket, 0x0CB0A300 role data, enter game scene.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
