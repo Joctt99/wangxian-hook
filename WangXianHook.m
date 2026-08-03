@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.66-DIST loaded ===");
+        _log(@"=== WangXianHook v37.69-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2246,6 +2246,14 @@ static uint32_t g_fff493_2_seq = 0;    // seqNum of FFF493#2 to match in send ho
 // v37.44: Save FFF493#2 native plaintext for send-hook field replacement
 static char *g_fff493_2_native_plain = NULL;
 static size_t g_fff493_2_native_len = 0;
+
+// v37.69: Store REAL sessionId/ticket captured from login server's 0x8234AB89 response
+// These are needed for FFF493#2 packet — server validates sessionId/ticket before
+// returning role data (0x0CB0A300). Without real values, server only sends heartbeats.
+static char g_sessionId[64] = {0};   // 32B sessionId + null
+static char g_ticket[512] = {0};     // 366B ticket + null
+static int g_sessionValid = 0;       // 1 = captured successfully, 0 = not yet
+static int g_ticketLen = 0;          // actual ticket length
 
 // v37.35: Forward declare CCCrypt types so send hook (line ~3873) can use orig_CCCrypt
 typedef int (*CCCryptFunc)(uint32_t op, uint32_t alg, uint32_t options,
@@ -4073,83 +4081,156 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         }
     }
 
-    // v37.40: Generic TLV scanner for ALL port 5678 packets.
-    // Server sees DY_MIESHI in pre-login packets (0x0000E002, 0x002EE118,
-    // 0x0002A018 etc.) and flags client as invalid BEFORE 0x002EE121.
-    // Must fix ALL packets, not just EE007/EE121.
-    // Scans for TLV patterns: [2B len][string] and replaces channel/model/GPU/accountId.
+    // v37.68: Generic TLV scanner for ALL port 5678 packets.
+    // v37.68 FIX: EE100/EE113 MUST be patched (channel→clean). v37.66 log showed
+    // TLV-SCAN only patched 28B/30B pkts (0x0000E002/0x002EE118) but NOT 63B EE100.
+    // Root cause: (1) memmem("DY_MIESHI") filter skipped EE113 (no DY_MIESHI),
+    // (2) loop `in+2<len` missed last 2 bytes of multi-field pkts,
+    // (3) accountId replacement disabled (v37.67 strategy: REAL accountId EVERYWHERE).
+    // (4) EE100 has 4-byte prefixes (00 00 00 XX) that break TLV parser.
+    // v37.68: For EE100/EE113, ALWAYS process them (no memmem filter).
+    // For EE100, use DIRECT BYTE REPLACEMENT instead of TLV parser (prefix issue).
     if (port == 5678 && len >= 20 && len <= 4096) {
         const unsigned char *p = (const unsigned char *)buf;
-        // v37.66: Extended to patch 0x002EE100 (accountId+channel) and 0x002EE113 (password+channel+accountId).
-        // These pre-login packets contain REAL accountId (80607584802281872727) and DY_MIESHI channel
-        // which server cross-references with EE121 — mismatch causes status=4.
-        // 0x0000E002 and 0x002EE118 already patched. 0x002EE121 handled by EE121-REPL.
-        // 0x0002A018 has MD5 hash at end — can't recompute after patching.
         uint32_t tlvCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                           ((uint32_t)p[6] << 8) | (uint32_t)p[7];
-        BOOL needsPatch = (tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118 ||
-                           tlvCmd == 0x002EE100 || tlvCmd == 0x002EE113);
-        if (needsPatch &&
-            memmem(p, len, "DY_MIESHI", 9) != NULL) {
-            // Reconstruct packet with TLV field replacements
-            size_t bufCap = len + 64;
-            unsigned char *newBuf = (unsigned char *)malloc(bufCap);
-            if (newBuf) {
-                // Copy header (first 12 bytes: pktLen+cmd+seq)
-                size_t hdrLen = (len >= 12) ? 12 : len;
-                memcpy(newBuf, p, hdrLen);
-                size_t out = hdrLen;
-                size_t in = hdrLen;
-                uint32_t fieldsApplied = 0;
-                while (in + 2 < len) {
-                    uint16_t fLen = ((uint16_t)p[in] << 8) | p[in + 1];
-                    if (in + 2 + fLen > len) {
-                        // Can't parse remaining as TLV — copy rest as-is
-                        memcpy(newBuf + out, p + in, len - in);
-                        out += len - in;
-                        break;
+
+        // v37.68: SPECIAL CASE for EE100 — direct byte replacement bypassing TLV parser.
+        // EE100 has non-standard 4-byte prefixes (00 00 00 XX) before field groups:
+        //   00 00 00 05 00 14 [20B accId] 00 00 00 05 [5B kk994] 00 03 [3B IOS] 00 09 [9B DY_MIESHI]
+        // The standard TLV parser fails because it reads 00 00 as fLen=0, then 00 05 as fLen=5,
+        // completely misaligning all subsequent fields. Fix: direct string replacement.
+        if (tlvCmd == 0x002EE100) {
+            // Search for "DY_MIESHI" in the packet
+            unsigned char *dyPos = (unsigned char *)memmem(p, len, "DY_MIESHI", 9);
+            if (dyPos && dyPos >= p + 2) {
+                // Found DY_MIESHI at offset dyPos-p.
+                // Structure around it: [TLVlen:2B][DY_MIESHI:9B][rest of packet]
+                // Need to: replace 9B with 18B "DYanyou0040_MIESHI", update TLVlen (09→12),
+                // shift remaining bytes, update total pktLen.
+                size_t dyOffset = (size_t)(dyPos - p);
+                size_t bufCap = len + 64;
+                unsigned char *newBuf = (unsigned char *)malloc(bufCap);
+                if (newBuf) {
+                    size_t newLen = len + 9; // +9 for longer channel
+                    size_t pos = 0;
+                    // Copy everything BEFORE the TLV length field (dyOffset - 2)
+                    if (dyOffset >= 2) {
+                        memcpy(newBuf, p, dyOffset - 2);
+                        pos = dyOffset - 2;
                     }
-                    const unsigned char *val = p + in + 2;
-                    if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) {
-                        newBuf[out] = 0x00; newBuf[out+1] = 0x12;
-                        memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
-                        out += 20; in += 11; fieldsApplied |= 1;
-                    } else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) {
-                        newBuf[out] = 0x00; newBuf[out+1] = 0x0B;
-                        memcpy(newBuf + out + 2, "iPhone7Plus", 11);
-                        out += 13; in += 19; fieldsApplied |= 2;
-                    } else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
-                        newBuf[out] = 0x00; newBuf[out+1] = 0x18;
-                        memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
-                        out += 26; in += 30; fieldsApplied |= 4;
-                    } else if (fLen == 20 && memcmp(val, "80607584802281872727", 20) == 0) {
-                        // v37.66: Replace real accountId with CANONICAL accountId
-                        // Server cross-references accountId across EE100/EE113/EE121 → mismatch causes status=4
-                        newBuf[out] = 0x00; newBuf[out+1] = 0x14;
-                        memcpy(newBuf + out + 2, "65657881045335015151", 20);
-                        out += 22; in += 22; fieldsApplied |= 8;
-                    } else {
-                        memcpy(newBuf + out, p + in, 2 + fLen);
-                        out += 2 + fLen; in += 2 + fLen;
+                    // Write new TLV length (00 12 = 18)
+                    newBuf[pos++] = 0x00;
+                    newBuf[pos++] = 0x12;
+                    // Write new channel string (18 bytes)
+                    memcpy(newBuf + pos, "DYanyou0040_MIESHI", 18);
+                    pos += 18;
+                    // Copy remaining bytes (everything after original DY_MIESHI)
+                    size_t restStart = dyOffset + 9; // after "DY_MIESHI"
+                    if (restStart < len) {
+                        memcpy(newBuf + pos, p + restStart, len - restStart);
+                        pos += (len - restStart);
                     }
-                }
-                if (fieldsApplied > 0) {
                     // Update total packet length (first 4 bytes BE)
-                    uint32_t newPktLen = (uint32_t)out;
-                    newBuf[0] = (newPktLen >> 24) & 0xFF;
-                    newBuf[1] = (newPktLen >> 16) & 0xFF;
-                    newBuf[2] = (newPktLen >> 8) & 0xFF;
-                    newBuf[3] = newPktLen & 0xFF;
-                    DLOG(@"[TLV-SCAN] v37.66: Patched port=5678 pkt origLen=%zu newLen=%zu fields=%u (ch=%u dm=%u gp=%u accId=%u)",
-                         len, out, fieldsApplied,
-                         (fieldsApplied&1)!=0, (fieldsApplied&2)!=0, (fieldsApplied&4)!=0, (fieldsApplied&8)!=0);
-                    ssize_t rret = orig_send(fd, newBuf, out, flags);
+                    newBuf[0] = (pos >> 24) & 0xFF;
+                    newBuf[1] = (pos >> 16) & 0xFF;
+                    newBuf[2] = (pos >> 8) & 0xFF;
+                    newBuf[3] = pos & 0xFF;
+                    DLOG(@"[TLV-SCAN] v37.68: EE100 DIRECT-BYTE-PATCH port=5678 origLen=%zu newLen=%zu ch=1 cmd=0x%08X",
+                         len, pos, tlvCmd);
+                    ssize_t rret = orig_send(fd, newBuf, pos, flags);
                     free(newBuf);
                     if (rret >= 0) return (ssize_t)len;
                     return rret;
                 }
-                free(newBuf);
-                // Fall through if no fields applied
+            } else {
+                DLOG(@"[TLV-SCAN] v37.68: EE100 no DY_MIESHI found, skip patch");
+            }
+        }
+
+        // Standard TLV scan for other packets (0x0000E002, 0x002EE118, 0x002EE113)
+        // Note: EE113 has no DY_MIESHI/device fields, so it will pass through unchanged (REAL accId preserved).
+        BOOL isSmallPkt = (tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118);
+        BOOL isEE113 = (tlvCmd == 0x002EE113);
+        BOOL needsPatch = isSmallPkt || isEE113;
+
+        BOOL hasDY_MIESHI = (memmem(p, len, "DY_MIESHI", 9) != NULL);
+        if (needsPatch && (isEE113 || hasDY_MIESHI)) {
+            // For EE113: pass through (no DY_MIESHI/device fields to patch, REAL accId preserved)
+            if (isEE113 && !hasDY_MIESHI) {
+                // EE113 has no DY_MIESHI — just forward as-is
+                // REAL accountId is preserved (v37.67 strategy)
+                DLOG(@"[TLV-SCAN] v37.68: EE113 pass-through (no DY_MIESHI, REAL accId preserved) cmd=0x%08X", tlvCmd);
+            } else {
+                // Reconstruct packet with TLV field replacements
+                size_t bufCap = len + 64;
+                unsigned char *newBuf = (unsigned char *)malloc(bufCap);
+                if (newBuf) {
+                    // Copy header (first 12 bytes: pktLen+cmd+seq)
+                    size_t hdrLen = (len >= 12) ? 12 : len;
+                    memcpy(newBuf, p, hdrLen);
+                    size_t out = hdrLen;
+                    size_t in = hdrLen;
+                    uint32_t fieldsApplied = 0;
+                    // v37.68: Fixed loop condition `in+2<=len` to handle last 2 bytes
+                    while (in + 2 <= len) {
+                        uint16_t fLen = ((uint16_t)p[in] << 8) | p[in + 1];
+                        if (fLen == 0 && in + 2 >= len) {
+                            // Trailing zero-padding — copy and stop
+                            memcpy(newBuf + out, p + in, len - in);
+                            out += len - in;
+                            break;
+                        }
+                        if (in + 2 + fLen > len) {
+                            // Can't parse remaining as TLV — copy rest as-is
+                            memcpy(newBuf + out, p + in, len - in);
+                            out += len - in;
+                            break;
+                        }
+                        const unsigned char *val = p + in + 2;
+                        if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) {
+                            newBuf[out] = 0x00; newBuf[out+1] = 0x12;
+                            memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
+                            out += 20; in += 11; fieldsApplied |= 1;
+                        } else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) {
+                            newBuf[out] = 0x00; newBuf[out+1] = 0x0B;
+                            memcpy(newBuf + out + 2, "iPhone7Plus", 11);
+                            out += 13; in += 19; fieldsApplied |= 2;
+                        } else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
+                            newBuf[out] = 0x00; newBuf[out+1] = 0x18;
+                            memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
+                            out += 26; in += 30; fieldsApplied |= 4;
+                        }
+                        // v37.68: DISABLED accountId replacement (v37.67 strategy: REAL accountId
+                        // everywhere — server authenticated REAL accId during login, so game server
+                        // must see same REAL accId in EE121/FFF493 packets).
+                        else {
+                            memcpy(newBuf + out, p + in, 2 + fLen);
+                            out += 2 + fLen; in += 2 + fLen;
+                        }
+                    }
+                    // Copy any remaining bytes (safety net for off-by-one)
+                    if (in < len) {
+                        memcpy(newBuf + out, p + in, len - in);
+                        out += len - in;
+                    }
+                    if (fieldsApplied > 0) {
+                        // Update total packet length (first 4 bytes BE)
+                        uint32_t newPktLen = (uint32_t)out;
+                        newBuf[0] = (newPktLen >> 24) & 0xFF;
+                        newBuf[1] = (newPktLen >> 16) & 0xFF;
+                        newBuf[2] = (newPktLen >> 8) & 0xFF;
+                        newBuf[3] = newPktLen & 0xFF;
+                        DLOG(@"[TLV-SCAN] v37.68: Patched port=5678 pkt origLen=%zu newLen=%zu fields=%u (ch=%u dm=%u gp=%u) cmd=0x%08X",
+                             len, out, fieldsApplied,
+                             (fieldsApplied&1)!=0, (fieldsApplied&2)!=0, (fieldsApplied&4)!=0, tlvCmd);
+                        ssize_t rret = orig_send(fd, newBuf, out, flags);
+                        free(newBuf);
+                        if (rret >= 0) return (ssize_t)len;
+                        return rret;
+                    }
+                    free(newBuf);
+                }
             }
         }
     }
@@ -4366,14 +4447,31 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // CC_MD5 hook (63B input[0:32] already = clean hash via output replacement at 19437B).
                     // RESULT: EE121 hashes ALL valid → server returns REAL status=0 + sessionId/ticket.
                     if (cmd == 0x002EE121) {
-                        // Canonical (clean-client) TLV values — DO NOT CHANGE!
-                        static const char kAccId[]    = "65657881045335015151"; // 20 bytes, 00 14
+                        // v37.67: Use REAL accountId from original packet (not CANONICAL).
+                        // Server authenticated REAL accountId during EE100/EE113 → EE121 must match.
+                        // Only channel/model/GPU/UUID are replaced with CANONICAL values.
+                        // hash2 forced = clean_binary_MD5 (ddcb91f42c...) via CC_MD5 hook — this is
+                        // a binary integrity check, NOT MD5(fields). Server doesn't recompute hash2.
                         static const char kUser[]     = "kk994";               // 5 bytes,  00 05
                         static const char kPass[]     = "994624";              // 6 bytes,  00 06
                         static const char kChannel[]  = "DYanyou0040_MIESHI";  // 18 bytes, 00 12
                         static const char kDModel[]   = "iPhone7Plus";         // 11 bytes, 00 0B
                         static const char kGPU[]      = "Apple Inc. Apple A10 GPU"; // 24 bytes, 00 18
                         static const char kUUID[]     = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // 36 bytes, 00 24
+
+                        // v37.67: Extract REAL accountId from original packet (first TLV field after header).
+                        // EE121 structure: header(12B) + accountId(TLV) + user(TLV) + pass(TLV) + ...
+                        size_t accIdOff = 12;
+                        unsigned char realAccId[21] = {0}; // 20B + null
+                        if (accIdOff + 22 <= len) {
+                            uint16_t accLen = ((uint16_t)p[accIdOff] << 8) | p[accIdOff+1];
+                            if (accLen == 20) {
+                                memcpy(realAccId, p + accIdOff + 2, 20);
+                                realAccId[20] = 0;
+                            }
+                        }
+                        const char *kAccId = (char *)realAccId;
+                        if (strlen(kAccId) != 20) kAccId = "80607584802281872727"; // fallback
 
                         // Rebuild newBuf from scratch (after header 12B) with ONLY canonical values.
                         // Length: 2(0014)+20 + 2(0005)+5 + 2(0006)+6 + 2(0005)+5 + 2(0003)+3
@@ -4444,8 +4542,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.62: Rebuilt EE121 with CANONICAL fields (accId=65657881045335015151/kk994/994624/UUID=66B0EE01/ch=DYanyou0040/dm=iPhone7Plus/gp=A10) so MD5(fields)==clean_binary_MD5 (ddcb91f42c). pktLen=%u (expect 248) h1Found=%u h3Found=%u tail80: %@",
-                             newPL, (h1!=0), (h3!=0), rt);
+                        DLOG(@"[EE121-CANON] v37.67: Rebuilt EE121 with REAL accId=%s + CANONICAL ch/dm/gp/UUID. hash2=clean_binary_MD5 (ddcb91f42c). pktLen=%u h1Found=%u h3Found=%u tail80: %@",
+                             kAccId, newPL, (h1!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
 
@@ -4516,9 +4614,28 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // (compiler inferred NSString instead of NSMutableString from mutableCopy)
                     NSMutableString *newStr = [NSMutableString stringWithString:nativeStr];
 
-                    // 1. Replace sessionId: "" → "zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh"
+                    // v37.69: Use REAL sessionId/ticket captured from 0x8234AB89 if available.
+                    // If g_sessionValid=1 (login server returned real session), use those values.
+                    // Otherwise fall back to hardcoded clean-client values.
+                    NSString *realSessionId = nil;
+                    NSString *realTicket = nil;
+                    
+                    if (g_sessionValid && g_sessionId[0] != 0 && g_ticket[0] != 0) {
+                        // Use captured real sessionId/ticket from login server
+                        realSessionId = [NSString stringWithUTF8String:g_sessionId];
+                        realTicket = [NSString stringWithUTF8String:g_ticket];
+                        DLOG(@"[FFF493-REPL] v37.69: Using CAPTURED sessionId/ticket (valid=%d, ticketLen=%d)",
+                             g_sessionValid, g_ticketLen);
+                    } else {
+                        // Fallback: hardcoded clean-client values
+                        realSessionId = @"zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh";
+                        realTicket = @"kk994|1785665252271|236923||SwnLPVw4wqtqXUfBX0JETQlXLrNxbb0TElk1YQvRmrKTNJG1ImA5eVtTnqY06XALBsKbKtCRJ7iRMUJcE+yZkboYVJ55k35zIxDeoLGoe/4TAo6nQjRD5obTaa18ObMyJaz6R0TUg8Oz78N1me5vBrU9c6sImsqv1QZEebEgfZO7KY2OdU35OV8Vb6rXRBwl1f78jA1OnkTRmf7ZthPpP1q3V1Y8OnzHnbHwq/xnZP3KtEXej3RCQX6zjJf+G81+W2XSpzUPynQXQ/Q/u9qn2N/5/db/8uMz68q/giuSAb9ikNYno+NYXTgn4FLsUbV15NTU5YIVqo9He/pYQCQ==";
+                        DLOG(@"[FFF493-REPL] v37.69: Using FALLBACK hardcoded sessionId/ticket (sessionValid=%d)", g_sessionValid);
+                    }
+                    
+                    // 1. Replace sessionId: "" → captured or fallback
                     [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
-                                            withString:@"\"sessionId\": \"zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh\""
+                                            withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
                                                options:0 range:NSMakeRange(0, newStr.length)];
 
                     // v37.56: DO NOT replace clientId/MACADDRESS/md5! Keep them NATIVE.
@@ -4527,10 +4644,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // native (matches current session/binary). If server validates these
                     // fields against current session → should pass.
 
-                    // 5. Replace ticket: "" → clean ticket (366B Base64 token from 0x8234AB89)
-                    NSString *cleanTicket = @"kk994|1785665252271|236923||SwnLPVw4wqtqXUfBX0JETQlXLrNxbb0TElk1YQvRmrKTNJG1ImA5eVtTnqY06XALBsKbKtCRJ7iRMUJcE+yZkboYVJ55k35zIxDeoLGoe/4TAo6nQjRD5obTaa18ObMyJaz6R0TUg8Oz78N1me5vBrU9c6sImsqv1QZEebEgfZO7KY2OdU35OV8Vb6rXRBwl1f78jA1OnkTRmf7ZthPpP1q3V1Y8OnzHnbHwq/xnZP3KtEXej3RCQX6zjJf+G81+W2XSpzUPynQXQ/Q/u9qn2N/5/db/8uMz68q/giuSAb9ikNYno+NYXTgn4FLsUbV15NTU5YIVqo9He/pYQCQ==";
+                    // 5. Replace ticket: "" → captured or fallback
                     [newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
-                                            withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", cleanTicket]
+                                            withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
                                                options:0 range:NSMakeRange(0, newStr.length)];
 
                     const char *newPlain = [newStr UTF8String];
@@ -6231,6 +6347,110 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[PROTO-R-PATCH] v36.114: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", p[12], cmd, ret);
                 ((unsigned char *)buf)[12] = 0;
             }
+        } else if (cmd == 0x8234AB89 && port == 5678) {
+            // v37.69: Parse 0x8234AB89 — login server's sessionId/ticket response.
+            // This is sent after 0x802EE121 (status=0) to confirm successful login.
+            // Without real sessionId/ticket, game server rejects FFF493#2 (only heartbeats).
+            DLOG(@"[SESSION-CAPTURE] v37.69: 0x8234AB89 received pktLen=%u ret=%zd", pktLenBE, ret);
+            
+            // Dump first 200 bytes for format analysis
+            size_t dumpLen = (ret > 200) ? 200 : (size_t)ret;
+            NSMutableString *hex = [NSMutableString stringWithCapacity:dumpLen * 3];
+            for (size_t i = 0; i < dumpLen; i++) [hex appendFormat:@"%02X ", p[i]];
+            DLOG(@"[SESSION-CAPTURE] HEX: %@", hex);
+            
+            // Try JSON decode first
+            NSString *bodyStr = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+            if (bodyStr && bodyStr.length > 0) {
+                DLOG(@"[SESSION-CAPTURE] BODY: %@", bodyStr);
+                
+                // Extract sessionId from JSON: "sessionId": "..."
+                NSRange sidRange = [bodyStr rangeOfString:@"\"sessionId\": \""];
+                if (sidRange.location != NSNotFound) {
+                    NSUInteger start = sidRange.location + sidRange.length;
+                    NSRange endRange = [bodyStr rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr.length - start)];
+                    if (endRange.location != NSNotFound) {
+                        NSUInteger sidLen = endRange.location - start;
+                        if (sidLen > 0 && sidLen < sizeof(g_sessionId)) {
+                            memcpy(g_sessionId, [bodyStr UTF8String] + start, sidLen);
+                            g_sessionId[sidLen] = 0;
+                            DLOG(@"[SESSION-CAPTURE] sessionId extracted: %s (len=%lu)", g_sessionId, (unsigned long)sidLen);
+                        }
+                    }
+                }
+                
+                // Extract ticket from JSON: "ticket": "..."
+                NSRange tikRange = [bodyStr rangeOfString:@"\"ticket\": \""];
+                if (tikRange.location != NSNotFound) {
+                    NSUInteger start = tikRange.location + tikRange.length;
+                    NSRange endRange = [bodyStr rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr.length - start)];
+                    if (endRange.location != NSNotFound) {
+                        NSUInteger tikLen = endRange.location - start;
+                        if (tikLen > 0 && tikLen < sizeof(g_ticket)) {
+                            memcpy(g_ticket, [bodyStr UTF8String] + start, tikLen);
+                            g_ticket[tikLen] = 0;
+                            g_ticketLen = (int)tikLen;
+                            g_sessionValid = 1;
+                            DLOG(@"[SESSION-CAPTURE] ticket extracted: len=%d (first 40 chars: %s...)", g_ticketLen, g_ticket);
+                        }
+                    }
+                }
+            }
+            
+            // Also try TLV format: scan body for sessionId/ticket patterns
+            // TLV format: [2B len][data] — sessionId is 32 chars, ticket is ~366 chars
+            if (!g_sessionValid && ret >= 44) {
+                size_t off = 12;
+                while (off + 2 <= (size_t)ret) {
+                    uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
+                    if (off + 2 + fLen > (size_t)ret) break;
+                    const unsigned char *val = p + off + 2;
+                    
+                    // sessionId: exactly 32 bytes, printable ASCII
+                    if (fLen == 32 && g_sessionId[0] == 0) {
+                        int isPrintable = 1;
+                        for (int i = 0; i < 32; i++) {
+                            if (val[i] < 0x20 || val[i] > 0x7e) { isPrintable = 0; break; }
+                        }
+                        if (isPrintable) {
+                            memcpy(g_sessionId, val, 32);
+                            g_sessionId[32] = 0;
+                            DLOG(@"[SESSION-CAPTURE] TLV sessionId (32B): %s", g_sessionId);
+                        }
+                    }
+                    
+                    // ticket: long Base64 string, typical length 300-400 bytes
+                    if (fLen > 200 && fLen < 500 && g_ticket[0] == 0) {
+                        int isBase64 = 1;
+                        int printableCount = 0;
+                        for (uint16_t i = 0; i < fLen; i++) {
+                            unsigned char c = val[i];
+                            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
+                                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' ||
+                                c == '|' || c == '-' || c == '_') {
+                                printableCount++;
+                            } else if (c < 0x20 || c > 0x7e) {
+                                isBase64 = 0;
+                                break;
+                            }
+                        }
+                        if (isBase64 && printableCount > (int)(fLen * 0.8)) {
+                            if (fLen < sizeof(g_ticket)) {
+                                memcpy(g_ticket, val, fLen);
+                                g_ticket[fLen] = 0;
+                                g_ticketLen = (int)fLen;
+                                g_sessionValid = 1;
+                                DLOG(@"[SESSION-CAPTURE] TLV ticket (%uB) extracted, valid=%d", fLen, g_sessionValid);
+                            }
+                        }
+                    }
+                    
+                    off += 2 + fLen;
+                }
+            }
+            
+            DLOG(@"[SESSION-CAPTURE] v37.69: Final state — sessionValid=%d sessionId=%s ticketLen=%d", 
+                 g_sessionValid, g_sessionId[0] ? g_sessionId : "(empty)", g_ticketLen);
         }
         
         // v36.114: TCP STICKY PACKET DETECTION for login server (port 5678)
@@ -6259,6 +6479,46 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     DLOG(@"[LOGIN-STICKY-PATCH] v36.114: Patching sticky sub-packet cmd=0x%08X status %u -> 0", 
                          subCmd, p[offset + 12]);
                     ((unsigned char *)buf)[offset + 12] = 0;
+                }
+                
+                // v37.69: Also handle 0x8234AB89 in sticky sub-packets
+                if (subCmd == 0x8234AB89 && remaining >= 44) {
+                    DLOG(@"[SESSION-CAPTURE] v37.69: Found 0x8234AB89 in sticky sub-packet");
+                    // Attempt to extract sessionId/ticket from sticky sub-packet body
+                    const unsigned char *sp = p + offset;
+                    size_t sRet = (size_t)remaining;
+                    
+                    // JSON decode attempt
+                    NSString *sBody = [[NSString alloc] initWithBytes:sp+12 length:(sRet > 12) ? sRet - 12 : 0 encoding:NSUTF8StringEncoding];
+                    if (sBody && sBody.length > 0) {
+                        NSRange sidR = [sBody rangeOfString:@"\"sessionId\": \""];
+                        if (sidR.location != NSNotFound && g_sessionId[0] == 0) {
+                            NSUInteger s = sidR.location + sidR.length;
+                            NSRange eR = [sBody rangeOfString:@"\"" options:0 range:NSMakeRange(s, sBody.length - s)];
+                            if (eR.location != NSNotFound) {
+                                NSUInteger l = eR.location - s;
+                                if (l > 0 && l < sizeof(g_sessionId)) {
+                                    memcpy(g_sessionId, [sBody UTF8String] + s, l);
+                                    g_sessionId[l] = 0;
+                                }
+                            }
+                        }
+                        NSRange tikR = [sBody rangeOfString:@"\"ticket\": \""];
+                        if (tikR.location != NSNotFound && g_ticket[0] == 0) {
+                            NSUInteger s = tikR.location + tikR.length;
+                            NSRange eR = [sBody rangeOfString:@"\"" options:0 range:NSMakeRange(s, sBody.length - s)];
+                            if (eR.location != NSNotFound) {
+                                NSUInteger l = eR.location - s;
+                                if (l > 0 && l < sizeof(g_ticket)) {
+                                    memcpy(g_ticket, [sBody UTF8String] + s, l);
+                                    g_ticket[l] = 0;
+                                    g_ticketLen = (int)l;
+                                    g_sessionValid = 1;
+                                    DLOG(@"[SESSION-CAPTURE] Sticky ticket extracted len=%d valid=%d", g_ticketLen, g_sessionValid);
+                                }
+                            }
+                        }
+                    }
                 }
                 
                 offset += subPktLen;
@@ -7574,17 +7834,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 }
             }
 
-            // CANONICAL accId replacement ONLY in EE121-ctx 156/168B inputs:
-            // Input starts with 20-digit decimal accId. Confirm with hasEE121Ctx==1 and
-            // first 20 bytes are all digits 0-9. If accId != canonical, replace.
+            // v37.67: DISABLED accId replacement — keep REAL accountId in ALL packets.
+            // Server authenticated REAL accountId during login → must match in EE121.
             int hasAccId = 0;
-            if (hasEE121Ctx == 1 && len >= 20) {
-                int allDigits = 1;
-                for (uint32_t i = 0; i < 20; i++) { if (in[i] < '0' || in[i] > '9') { allDigits = 0; break; } }
-                if (allDigits) {
-                    if (memcmp(in, kCanonAccId, 20) != 0) hasAccId = 1;
-                }
-            }
 
             if (hasCh || hasDm || hasGp || hasHash || hasUUID || hasAccId) {
                 // Calculate new length:
@@ -9055,6 +9307,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             memcpy(out, "Apple Inc. Apple A10 GPU", 24);
                             out += 24; p += 28; continue;
                         }
+                    } else if (rem >= 51 && memcmp(p, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) == 0) {
+                        // v37.67: Replace MAC-address-derived UUID with CANONICAL UUID
+                        // Server cross-checks UUID across login+game server packets
+                        memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 51);
+                        out += 51; p += 51; continue;
                     }
                     *out++ = *p++;
                 }
@@ -9252,7 +9509,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.66 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+IDFV-CANONICAL(66B0EE01)+TLV-SCAN(EE100/EE113+accId)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.69 %d layers active (v37.67-REAL-accId+TLV-SCAN-DIRECT-BYTE+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9380,7 +9637,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.66-DIST — v37.65 fixed IDFV UUID (66B0EE01) but status=4 persists. v37.65 log reveals TWO critical issues: (1) UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD in CC-AES encrypted game server packet (derived from MAC address, not IDFV), (2) accountId mismatch: pre-login packets 0x002EE100/0x002EE113 contain REAL accountId (80607584802281872727) and DY_MIESHI channel, while EE121 uses CANONICAL accountId (65657881045335015151). Server cross-references accountId across ALL pre-login packets → mismatch causes status=4. v37.66 extends TLV scanner to also patch 0x002EE100 and 0x002EE113, replacing accountId (80607584802281872727→65657881045335015151) and channel (DY_MIESHI→DYanyou0040_MIESHI). This ensures ALL pre-login packets use consistent CANONICAL values. TESTING: check [TLV-SCAN] v37.66: Patched port=5678 pkt fields=X (ch=1 accId=1), 0x802EE121 status=0 (real success), 0x8234AB89 real sessionId/ticket, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.69-DIST — v37.67: EE121 uses REAL accountId (matching EE100/EE113) with CANONICAL ch/dm/gp/UUID. v37.68: EE100 DIRECT-BYTE-PATCH bypasses broken TLV parser for 4-byte prefix format. v37.69: ADDED 0x8234AB89 SESSION-CAPTURE to extract real sessionId/ticket from login server response. FFF493-REPL now uses CAPTURED sessionId/ticket when available, falls back to hardcoded values. KEY INSIGHT: Login server must return REAL status=0 (not patched) AND send 0x8234AB89 with sessionId/ticket for game server to accept FFF493#2. v37.67 accountId consistency + CORRECT hashes should enable REAL status=0 response. TESTING: check [SESSION-CAPTURE] v37.69: 0x8234AB89 received, sessionId/ticket extracted, 0x802EE121 REAL status=0, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
