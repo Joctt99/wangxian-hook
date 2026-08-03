@@ -7141,7 +7141,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 if (scanRemaining >= 13) {
                     uint8_t scanStatus = p[scanOffset + 12];
                     if (scanStatus != 0 && (scanCmd == 0x80FFF494 || scanCmd == 0x80FFF495)) {
-                        DLOG(@"[STICKY-PATCH] v36.93 OBSERVATION: NOT patching status %u for %s sub-packet at offset %zd",
+                        DLOG(@"[STICKY-PATCH] v36.93 OBSERVATION: NOT patching status %u for %@ sub-packet at offset %zd",
                              scanStatus,
                              scanCmd == 0x80FFF495 ? @"0x80FFF495" : @"0x80FFF494",
                              scanOffset);
@@ -9876,11 +9876,14 @@ static void installAllHooks(void) {
     tryHookMieshiServerInfo(0);
 
     // === KEEP: UIAlertView.show hook (in capture_real.js) ===
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     Class alertCls = [UIAlertView class];
     if (alertCls) {
         Method m = class_getInstanceMethod(alertCls, @selector(show));
         if (m) { orig_alertViewShow = (void (*)(id, SEL))method_getImplementation(m); method_setImplementation(m, (IMP)hook_alertViewShow); _log(@"[INIT] UIAlertView.show: hook"); }
     }
+#pragma clang diagnostic pop
 
     // === KEEP: SignatureKit hooks (in capture_real.js) ===
     Class skCls = NSClassFromString(@"SignatureKit");
