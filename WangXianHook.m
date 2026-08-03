@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.81-DIST loaded ===");
+        _log(@"=== WangXianHook v37.82-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6483,29 +6483,68 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 ((unsigned char *)buf)[12] = 0;
             }
 
-            // v37.81: Extract token from EE120 response (0x802EE120) for hash3/hash1 recalculation.
-            // Timing issue in v37.80: 63B CC_MD5 (which contains token) is called AFTER EE121 send,
-            // so token isn't captured when EE121 rebuild happens. Server closes immediately.
-            // FIX: Extract from 0x802EE120 response body (13 bytes status+type + TLV fields).
-            // Format: [12B header][status 1B][00 1F][31B token] (observed in v37.80 log line 125: 00 1F 32 43...36 66, len=31)
+            // v37.82: Extract token from EE120 response (0x802EE120) for hash3/hash1 recalculation.
+            // CRITICAL BUG in v37.81: Treated TLV length as 2-byte uint16_t (0x1F47=8007 bytes!)
+            // But EE120 response format is [12B hdr][1B status][1B len=0x1F][31B token]
+            // Evidence: v37.81 log line 588 hex:
+            //   [12] = 00 (status OK), [13] = 1F (len=31, 1 byte!), [14..44] = 31B ASCII token
+            //   Expected 'Gr1YYlXG0dcXb2yOgdjMRKGU6gl7DN7' starts at byte 14.
+            // Also handle variant with optional 2-byte leading 00 1F (some servers may prefix it).
             if (cmd == 0x802EE120 && ret >= 13) {
                 size_t pos = 13; // after 12B header + 1B status
-                while (pos + 2 <= (size_t)ret) {
-                    uint16_t tlvLen = ((uint16_t)p[pos] << 8) | p[pos+1];
-                    pos += 2;
-                    if (tlvLen == 31 && pos + 31 <= (size_t)ret) {
-                        // 31-byte field = token (matches 63B MD5 input: 32B hash2_hex + 31B token)
-                        memcpy(g_hashToken, p + pos, 31);
-                        g_hashToken[31] = 0;
-                        g_hashTokenValid = 1;
-                        DLOG(@"[EE120-TOKEN] v37.81: Extracted token(31B) from 0x802EE120 response: %s (pos=%zu)", g_hashToken, pos-2);
-                        break;
-                    } else if (tlvLen == 0) {
-                        // 0x0000 separator, skip
-                    } else if (pos + tlvLen > (size_t)ret) {
-                        break; // malformed, stop
+                while (pos + 1 < (size_t)ret) {
+                    // Strategy: Check 1-byte length first (most common in EE120).
+                    // If 1-byte length is 31 and next 31 bytes are printable ASCII token, accept it.
+                    // Otherwise try 2-byte big-endian length (legacy/fallback).
+                    uint8_t  len1b = p[pos];
+                    uint16_t len2b = ((uint16_t)p[pos] << 8) | p[pos+1];
+                    uint8_t *dataPtr = NULL;
+                    size_t dataLen = 0;
+                    size_t lenBytes = 0;
+
+                    // Try 1-byte length first
+                    if (len1b >= 1 && len1b < 128 && pos + 1 + len1b <= (size_t)ret) {
+                        dataPtr = (uint8_t *)(p + pos + 1);
+                        dataLen = len1b;
+                        lenBytes = 1;
                     }
-                    pos += tlvLen;
+                    // Try 2-byte length as fallback (for variants)
+                    else if (len2b >= 1 && len2b < 2048 && pos + 2 + len2b <= (size_t)ret) {
+                        dataPtr = (uint8_t *)(p + pos + 2);
+                        dataLen = len2b;
+                        lenBytes = 2;
+                    }
+                    // No valid TLV field, break to avoid infinite loop
+                    else {
+                        break;
+                    }
+
+                    // Check if 31-byte ASCII printable token (the only length we care about)
+                    if (dataLen == 31) {
+                        int allPrint = 1;
+                        for (size_t i = 0; i < 31; i++) {
+                            uint8_t c = dataPtr[i];
+                            if (!( (c >= 0x30 && c <= 0x39) || // 0-9
+                                   (c >= 0x41 && c <= 0x5A) || // A-Z
+                                   (c >= 0x61 && c <= 0x7A) )) { // a-z
+                                allPrint = 0; break;
+                            }
+                        }
+                        if (allPrint) {
+                            memcpy(g_hashToken, dataPtr, 31);
+                            g_hashToken[31] = 0;
+                            g_hashTokenValid = 1;
+                            DLOG(@"[EE120-TOKEN] v37.82: Extracted 31B token (lenBytes=%zu from pos=%zu): %s",
+                                 lenBytes, pos, g_hashToken);
+                            break;
+                        }
+                    }
+                    // Skip non-31 or non-printable 31 field to continue scanning
+                    pos += lenBytes + dataLen;
+                }
+                if (!g_hashTokenValid) {
+                    DLOG(@"[EE120-TOKEN] v37.82: WARNING no 31B token field found (ret=%zd, firstBodyBytes: %02X %02X %02X %02X %02X)",
+                         (ssize_t)ret, p[13], p[14], p[15], p[16], p[17]);
                 }
             }
         } else if (cmd == 0x8234AB89 && port == 5678) {
@@ -9754,7 +9793,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.81 %d layers active (REAL-accId+FORCED-hash2=ddcb91f42c+hash1/hash3=RECALCULATED(hash2+EE120_token)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.82 %d layers active (REAL-accId+FORCED-hash2=ddcb91f42c+hash1/hash3=RECALCULATED(hash2+EE120_token,1BYTELEN)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9882,7 +9921,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.81-DIST — v37.81: EE120 token extraction fixes timing issue. v37.80 hash1/hash3 RECALCULATED correctly BUT token was captured TOO LATE (63B CC_MD5 called AFTER EE121 rebuild). First 2 EE121 sends had g_hashTokenValid=0 (FALLBACK, orig hash3/hash1 with new hash2 → still inconsistent → server closes immediately). FIX: Extract 31B token from 0x802EE120 response (recv hook, BEFORE EE121 is constructed and sent). v37.80 log evidence: EE120 response (line 125: 00 1F + 31B token) arrives 2 steps BEFORE EE121 is sent, but token was captured only when 63B CC_MD5 is called (which happens during EE121 build, AFTER we have already started rebuilding in send hook). TESTING: [EE120-TOKEN] appears BEFORE [EE121-HASH-RECALC], [EE121-HASH-RECALC] RECALCULATED not FALLBACK, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300.");
+    DLOG(@"[VERSION] WangXianHook v37.82-DIST — v37.82: FIX EE120 token TLV length field (1-byte NOT 2-byte!). v37.81 parsed length as 2-byte uint16_t: p[13]=0x1F, p[14]=0x47('G') → got 0x1F47=8007 bytes → impossible condition → [EE120-TOKEN] never executed. CORRECT FORMAT from v37.81 log line 588 hex: [12B hdr][status=1B=00][len=1B=0x1F=31][31B token at byte 14..44='Gr1YYlXG0dcXb2yOgdjMRKGU6gl7DN7']. Also print WARNING if token not found. TESTING: [EE120-TOKEN] v37.82 appears 4 times (once per EE120 response), lenBytes=1, token matches MD5-TOKEN-CAPTURE, [EE121-HASH-RECALC] RECALCULATED not FALLBACK on first try, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, [0x0CB0A300].");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
