@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.70-DIST loaded ===");
+        _log(@"=== WangXianHook v37.71-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4446,15 +4446,39 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // hash1/hash3 = MD5(clean_binary_MD5 + current_token) already computed correctly by
                     // CC_MD5 hook (63B input[0:32] already = clean hash via output replacement at 19437B).
                     // RESULT: EE121 hashes ALL valid → server returns REAL status=0 + sessionId/ticket.
+                    // v37.71: Force hash2 = ddcb91f42c5a612b492a2296a971a5af in EE121 packet.
+                    // v37.70 log showed server CLOSES connection when hash2 != ddcb91f42c...
+                    // Server validates hash2 == clean_binary_MD5 (binary integrity check).
+                    // CC_MD5 hook computes hash2 = MD5(replaced_fields) which is NOT ddcb91f42c...
+                    // because real accountId/UUID differ from CANONICAL values.
+                    // FIX: After EE007-ALIGN, scan newBuf for 32B TLV (00 20 [32B hex]) and
+                    // replace with ddcb91f42c5a612b492a2296a971a5af.
+                    if (cmd == 0x002EE121) {
+                        static const char kCleanHash2Hex[] = "ddcb91f42c5a612b492a2296a971a5af";
+                        int hash2Replaced = 0;
+                        for (size_t sp = 12; sp + 2 + 32 <= out; ) {
+                            uint16_t sl = ((uint16_t)newBuf[sp] << 8) | newBuf[sp + 1];
+                            if (sl == 32) {
+                                // Found 32B TLV field — this is hash2
+                                memcpy(newBuf + sp + 2, kCleanHash2Hex, 32);
+                                hash2Replaced = 1;
+                                DLOG(@"[EE121-HASH2] v37.71: Forced hash2=ddcb91f42c... at offset %zu", sp);
+                                break;
+                            }
+                            sp += 2 + sl;
+                        }
+                        if (!hash2Replaced) {
+                            DLOG(@"[EE121-HASH2] v37.71: WARNING - hash2 TLV (32B) not found in EE121!");
+                        }
+                    }
+
                     // v37.70: DISABLED EE121-CANON rebuild entirely.
-                    // Root cause: v37.69 log showed origLen=213B (NO UUID field) but CANON
+                    // v37.69 log showed origLen=213B (NO UUID field) but CANON
                     // rebuild forced 248B (WITH UUID) → packet structure mismatch → server
                     // closed connection immediately (RECV-CLOSE ret=0, no 0x802EE121 response).
                     // v37.66 had origLen=249B (WITH UUID) so CANON 248B worked (got status=4).
                     // v37.69 device's native EE121 has NO UUID field → CANON rebuild breaks it.
-                    // FIX: Skip CANON rebuild. EE007-ALIGN already replaced ch/dm/gp in-place.
-                    // hash2 stays as CC_MD5 hook computed (based on replaced fields) → correct.
-                    // hash1/hash3 stay as CC_MD5 hook computed (based on ddcb91f42c... + token) → correct.
+                    // v37.71: CANON rebuild still disabled, but hash2 is now forced separately.
                     if (cmd == 0x002EE121 && false) { // DISABLED in v37.70
                         static const char kUser[]     = "kk994";               // 5 bytes,  00 05
                         static const char kPass[]     = "994624";              // 6 bytes,  00 06
@@ -9513,7 +9537,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.70 %d layers active (EE121-CANON-DISABLED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.71 %d layers active (EE121-HASH2-FORCED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9641,7 +9665,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.70-DIST — v37.70: DISABLED EE121-CANON rebuild. v37.69 log showed origLen=213B (NO UUID field in native EE121) but CANON rebuild forced 248B (WITH UUID) → packet structure mismatch → server closed connection immediately (RECV-CLOSE ret=0, no 0x802EE121 response). v37.66 had origLen=249B (WITH UUID) so CANON 248B worked (got status=4). FIX: Skip CANON rebuild entirely. EE007-ALIGN already replaces ch/dm/gp in-place. hash2 stays as CC_MD5 hook computed (based on replaced fields). hash1/hash3 stay as CC_MD5 hook computed (based on ddcb91f42c... + token). TESTING: check 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] v37.69: 0x8234AB89 received, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.71-DIST — v37.71: Force hash2=ddcb91f42c... in EE121 after EE007-ALIGN. v37.70 log showed server CLOSES connection when hash2 != ddcb91f42c... (server validates hash2 == clean_binary_MD5). CC_MD5 hook computes hash2 = MD5(replaced_fields) which is NOT ddcb91f42c... because real accountId/UUID differ from CANONICAL. FIX: After EE007-ALIGN replaces ch/dm/gp, scan newBuf for 32B TLV (hash2) and replace with ddcb91f42c5a612b492a2296a971a5af. CANON rebuild still disabled (v37.70). TESTING: check [EE121-HASH2] v37.71: Forced hash2, 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
