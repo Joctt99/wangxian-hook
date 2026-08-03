@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.83-DIST loaded ===");
+        _log(@"=== WangXianHook v37.84-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4310,14 +4310,22 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // can verify and ACCEPT native EE121 → real sessionId/ticket → game entry.
                 // If not, fall back to clean 248B (hash1/3 unverifiable → status=4 ACCEPT
                 // but no real sessionId → stuck at '正在进入').
-                if (g_md5_channel_replaced == 1) {
-                    // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
-                    // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.83: g_md5_channel_replaced=1 → CANON rebuild with REAL accId + CANONICAL ch/dm/gp/UUID + hash2=ORIG(bodyMD5) + hash1/hash3=RECALCULATED(origHash2+captured_token)");
-                    // Don't return — fall through to TLV replacement at line below
-                } else {
-                    // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
-                    DLOG(@"[EE121-REPL] v37.62: g_md5_channel_replaced=0 → clean 248B fallback (hash1/3 unverifiable → status=4 ACCEPT, no real sessionId)");
+                if (1) {
+                    // v37.84: ALWAYS use clean 248B EE121 packet + dynamic hash1/hash3 recalc.
+                    // ROOT CAUSE: Two server checks conflict:
+                    //   Check A: hash2 field MUST == ddcb91f42c (expected binary hash, app integrity)
+                    //   Check B: hash3||hash1 MUST == MD5(hash2 + current_session_token) (anti-replay)
+                    // v37.76-v37.82 forced hash2=ddcb91f42c but RECALC hash1/hash3 with REAL body fields
+                    //   → packet bytes changed (channel/dm/gp TLV rewrites) → BREAKS some low-level packet
+                    //     checksum/integrity field we don't know about → server IMMEDIATELY closes.
+                    // v37.83 used REAL body + hash2=MD5(body) + MD5(body+token) recalc
+                    //   → Check A fails → status=4 版本过低 patched to 0 but body still "登录失败"
+                    //     → NO REAL sessionId/ticket → SESSION-CAPTURE count=0 → FFF493 sessionId=""
+                    //     → server ignores FFF493 → stuck at 正在进入.
+                    // SOLUTION: Use HARD-CODED clean 248B (preserves all byte structure, check A passes)
+                    //           + ONLY modify seq + hash1/hash3 with CURRENT session token
+                    // Username/password/accId in clean packet match real user (kk994/994624/65657881045335015151).
+                    DLOG(@"[EE121-REPL] v37.84: CLEAN 248B pkt + seq + hash1/hash3 RECALC(token_from_EE120)");
                     uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                        ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     static const uint8_t cleanPkt[248] = {
@@ -4342,12 +4350,59 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     unsigned char *fbBuf = (unsigned char *)malloc(248);
                     if (fbBuf) {
                         memcpy(fbBuf, cleanPkt, 248);
-                        // Replace seq (offset 8-11) ONLY — no accountId/UUID replacement (v37.51 behavior)
+                        // Mod 1: seq at [8..11]
                         fbBuf[8] = (origSeq >> 24) & 0xFF;
                         fbBuf[9] = (origSeq >> 16) & 0xFF;
                         fbBuf[10] = (origSeq >> 8) & 0xFF;
                         fbBuf[11] = origSeq & 0xFF;
-                        DLOG(@"[EE121-REPL] v37.62: Sending clean 248B pkt seq=%u (fallback)", origSeq);
+
+                        // Mod 2: hash1/hash3 recalc with hash2 + captured token from EE120.
+                        // hash2 in cleanPkt is FIXED binary hash ddcb91f42c at [199..232].
+                        // hash1 at [181..196] = 16 hex chars = 16 bytes value after 00 10 prefix.
+                        // hash3 at [233..248] = 16 hex chars.
+                        if (g_hashTokenValid && strlen(g_hashToken) == 31) {
+                            static const char kCleanHash2Hex_v80[] = "ddcb91f42c5a612b492a2296a971a5af";
+                            char md5In[64];
+                            memcpy(md5In, kCleanHash2Hex_v80, 32);
+                            memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
+                            unsigned char md5Out[16];
+                            memset(md5Out, 0, sizeof(md5Out));
+                            typedef unsigned char *(*RawCCID5)(const void *, unsigned long, unsigned char *);
+                            static RawCCID5 s_rawMD5 = NULL;
+                            if (!s_rawMD5) s_rawMD5 = (RawCCID5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                            if (s_rawMD5) s_rawMD5(md5In, 63, md5Out);
+                            static const char kHex[] = "0123456789abcdef";
+                            char md5Hex[33];
+                            for (int hi = 0; hi < 16; hi++) {
+                                md5Hex[hi*2]   = kHex[(md5Out[hi] >> 4) & 0xF];
+                                md5Hex[hi*2+1] = kHex[md5Out[hi] & 0xF];
+                            }
+                            md5Hex[32] = 0;
+                            // hash3 = first 16 hex chars of md5Hex, hash1 = last 16
+                            unsigned char hash3Val[16], hash1Val[16];
+                            memcpy(hash3Val, md5Hex, 16);
+                            memcpy(hash1Val, md5Hex+16, 16);
+                            // Write to fbBuf: hash1 prefix at [180] 00 10, value at [182..197]
+                            // Scan to find exact offsets dynamically (safer than hard-coded)
+                            size_t h1 = (size_t)-1, h3 = (size_t)-1;
+                            size_t scan = 170; // start search inside body after "979" field
+                            while (scan + 18 <= 248) {
+                                uint16_t tlvLen_be = ((uint16_t)fbBuf[scan] << 8) | fbBuf[scan+1];
+                                if (tlvLen_be == 16 && h1 == (size_t)-1) { h1 = scan; scan += 18; continue; }
+                                if (tlvLen_be == 32)                         { scan += 34; continue; } // skip hash2
+                                if (tlvLen_be == 16 && h1 != (size_t)-1)     { h3 = scan; break; }
+                                scan++;
+                            }
+                            if (h1 != (size_t)-1) memcpy(fbBuf+h1+2, hash1Val, 16);
+                            if (h3 != (size_t)-1) memcpy(fbBuf+h3+2, hash3Val, 16);
+                            DLOG(@"[EE121-HASH-RECALC] v37.84: MD5(cleanHash2_hex+EE120_token)=%s → hash1=%.*s hash3=%.*s (token=%s h1@%zu h3@%zu)",
+                                 md5Hex, 16, hash1Val, 16, hash3Val, g_hashToken, h1, h3);
+                        } else {
+                            DLOG(@"[EE121-HASH-RECALC] v37.84: FALLBACK g_hashTokenValid=%d token invalid — using STALE hash1/hash3 from cleanPkt. Server will probably close!",
+                                 g_hashTokenValid);
+                        }
+                        DLOG(@"[EE121-REPL] v37.84: Sending clean 248B seq=%u hash2=FORCED_ddcb91f42c hash1/hash3=%@",
+                             origSeq, g_hashTokenValid?@"RECALC_DYNAMIC":@"STALE_FALLBACK");
                         ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                         free(fbBuf);
                         if (rret >= 0) return (ssize_t)len;
@@ -9798,7 +9853,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.83 %d layers active (REAL-accId+ORIG-hash2=bodyMD5+hash1/hash3=RECALCULATED(origHash2+EE120_token)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.84 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9926,7 +9981,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.83-DIST — v37.83: STOP forcing hash2=binary hash! Use ORIGINAL body MD5 instead. v37.74 comment says 'server expects MD5(fields+salt), NOT binary hash'. v37.76-v37.82 all forced hash2=ddcb91f42c → server ALWAYS closed connection immediately after EE121 send. v37.82 log PROVES hash3/hash1 recompute was correct (identical to client's 63B CC_MD5 output) but server still closed → hash2 was the problem. EVIDENCE: client 63B MD5 input already has ddcb91f42c as hash2 (CC_MD5 hook replaced binary hash), client computes hash3||hash1=MD5(ddcb91f42c+token). But EE121 packet hash2=body MD5 (8fadb1bf... from 120B CC_MD5). Client uses DIFFERENT hash2 for hash2 field vs hash3/hash1 computation! For clean client: body MD5==binary hash (engineered at build), so no conflict. For us: body MD5!=binary hash (different accountId), so forcing hash2=binary breaks server check hash2==MD5(body_fields+salt). FIX: (1) Use original packet hash2 (body MD5), (2) Recompute hash3||hash1=MD5(body_MD5+token) with body MD5, NOT binary hash. TESTING: [EE121-HASH-RECALC] v37.83 shows origHash2=8fadb1bf... (NOT ddcb91f42c), [EE121-CANON] hash2=ORIG(bodyMD5), [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, [0x0CB0A300].");
+    DLOG(@"[VERSION] WangXianHook v37.84-DIST — v37.84: FORCE clean 248B EE121 packet (preserves binary byte structure) + seq + hash1/hash3 RECALCULATED with CURRENT EE120_token. Two server checks conflict: Check A=hash2 must equal ddcb91f42c (expected binary hash — app integrity), Check B=hash3||hash1 must equal MD5(hash2+session_token) (anti-replay). v37.76-82 forced hash2=ddcb91f42c but changed TLV bytes (channel/dm/gp) → breaks some low-level packet integrity → server IMMEDIATELY closes (RECV-CLOSE, not even a response). v37.83 hash2=body MD5 + keep TLV bytes original → Check A fails → status=4 版本过低 → patch to 0 but body='登录失败' no real sessionId → SESSION-CAPTURE count=0 → FFF493 has sessionId='' → server ignores FFF493 → stuck at 正在进入. SOLUTION: Send EXACT hard-coded clean 248B (all byte offsets, TLV lengths, field values identical to clean app that produces hash2=ddcb91f42c), ONLY overwrite seq + hash1/hash3 with freshly computed MD5(hash2=binary + EE120 captured token). No TLV replacement at all for EE121. Clean packet has matching real user fields: accId=65657881045335015151, username=kk994, password=994624, channel=DYanyou0040_MIESHI, device=iPhone7Plus, GPU=Apple A10, UUID=66B0EE01-... TESTING: [EE121-REPL] v37.84, [EE121-HASH-RECALC] v37.84 RECALC not FALLBACK, [EE121-RESP] body contains SUCCESS not 版本过低, status=0 without patch, [SESSION-CAPTURE] 0x8234AB89 sessionId non-empty, SERVER SENDS 0x0CB0A300 character data NOT just 0x80000015 heartbeat.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
