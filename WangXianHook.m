@@ -1,4 +1,4 @@
-﻿﻿#import "ProtocolPatcher.h"
+#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
@@ -7202,7 +7202,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     if (remaining >= 13) {
                         uint8_t subStatus = p[offset + 12];
                         if (subStatus != 0 && (subCmd == 0x80FFF494 || subCmd == 0x80FFF495)) {
-                            DLOG(@"[STICKY-PACKET] v36.93 OBSERVATION: NOT patching status %u for %s sub-packet at offset %zd",
+                            DLOG(@"[STICKY-PACKET] v36.93 OBSERVATION: NOT patching status %u for %@ sub-packet at offset %zd",
                                  subStatus,
                                  subCmd == 0x80FFF495 ? @"0x80FFF495" : @"0x80FFF494",
                                  offset);
