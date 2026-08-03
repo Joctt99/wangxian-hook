@@ -4594,6 +4594,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 origHash2Hex[32] = 0;
                             }
                             // Build MD5 input: origHash2_hex(32) + token(31) = 63 bytes
+                            unsigned char hash1Val[16];
+                            unsigned char hash3Val[16];
+                            int hashComputed = 0;
+                            if (g_hashTokenValid && strlen(g_hashToken) == 31) {
                                 char md5In[64];
                                 memcpy(md5In, origHash2Hex, 32);
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
@@ -4623,7 +4627,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 // Fallback: copy from original packet
                                 if (h1) memcpy(hash1Val, p+h1+2, 16);
                                 if (h3) memcpy(hash3Val, p+h3+2, 16);
-                                DLOG(@"[EE121-HASH-RECALC] v37.80: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
+                                DLOG(@"[EE121-HASH-RECALC] v37.83: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
                                      g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
                                      16, h3?p+h3+2:(const unsigned char*)"????????????????");
                             }
