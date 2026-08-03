@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.71-DIST loaded ===");
+        _log(@"=== WangXianHook v37.72-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4469,6 +4469,41 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
                         if (!hash2Replaced) {
                             DLOG(@"[EE121-HASH2] v37.71: WARNING - hash2 TLV (32B) not found in EE121!");
+                        }
+
+                        // v37.72: Insert UUID TLV if missing.
+                        // v37.71 log showed origLen=213B (NO UUID field) → server closed connection.
+                        // v37.66 had origLen=249B (WITH UUID) → server returned status=4.
+                        // Native EE121 has empty TLV (00 00) where UUID should go (after GPU, before network).
+                        // FIX: Find empty TLV after GPU field, replace with UUID TLV (00 24 + 36B).
+                        // Net change: +36 bytes (38B UUID TLV - 2B empty TLV).
+                        static const char kCleanUUID[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
+                        int hasUUID = 0;
+                        size_t lastEmptyTLV = (size_t)-1;
+                        for (size_t sp = 12; sp + 2 <= out; ) {
+                            uint16_t sl = ((uint16_t)newBuf[sp] << 8) | newBuf[sp + 1];
+                            if (sl == 36) { hasUUID = 1; break; } // UUID already present
+                            if (sl == 0) { lastEmptyTLV = sp; } // Track last empty TLV
+                            if (sp + 2 + sl > out) break;
+                            sp += 2 + sl;
+                        }
+                        if (!hasUUID && lastEmptyTLV != (size_t)-1 && out + 36 <= (size_t)(len + 64)) {
+                            // Replace last empty TLV (2B) with UUID TLV (38B): shift +36
+                            size_t tailLen = out - (lastEmptyTLV + 2);
+                            memmove(newBuf + lastEmptyTLV + 38, newBuf + lastEmptyTLV + 2, tailLen);
+                            newBuf[lastEmptyTLV] = 0x00; newBuf[lastEmptyTLV + 1] = 0x24; // len=36
+                            memcpy(newBuf + lastEmptyTLV + 2, kCleanUUID, 36);
+                            out += 36;
+                            // Update packet length (first 4 bytes, big-endian)
+                            uint32_t newPktLen = (uint32_t)out;
+                            newBuf[0] = (newPktLen >> 24) & 0xFF;
+                            newBuf[1] = (newPktLen >> 16) & 0xFF;
+                            newBuf[2] = (newPktLen >> 8) & 0xFF;
+                            newBuf[3] = newPktLen & 0xFF;
+                            DLOG(@"[EE121-UUID] v37.72: Inserted UUID TLV at offset %zu, pktLen %zu→%u",
+                                 lastEmptyTLV, out - 36, newPktLen);
+                        } else if (!hasUUID) {
+                            DLOG(@"[EE121-UUID] v37.72: WARNING - no empty TLV found for UUID insertion!");
                         }
                     }
 
@@ -9537,7 +9572,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.71 %d layers active (EE121-HASH2-FORCED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.72 %d layers active (EE121-UUID-INSERT+EE121-HASH2-FORCED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9665,7 +9700,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.71-DIST — v37.71: Force hash2=ddcb91f42c... in EE121 after EE007-ALIGN. v37.70 log showed server CLOSES connection when hash2 != ddcb91f42c... (server validates hash2 == clean_binary_MD5). CC_MD5 hook computes hash2 = MD5(replaced_fields) which is NOT ddcb91f42c... because real accountId/UUID differ from CANONICAL. FIX: After EE007-ALIGN replaces ch/dm/gp, scan newBuf for 32B TLV (hash2) and replace with ddcb91f42c5a612b492a2296a971a5af. CANON rebuild still disabled (v37.70). TESTING: check [EE121-HASH2] v37.71: Forced hash2, 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.72-DIST — v37.72: Insert UUID TLV into EE121 if missing. v37.71 log showed origLen=213B (NO UUID field, has empty TLV 00 00) → server closed connection. v37.66 had origLen=249B (WITH UUID) → server returned status=4. FIX: After hash2 replacement, scan for empty TLV (00 00), replace with UUID TLV (00 24 + 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8), shift bytes, update pktLen. Net +36B. TESTING: check [EE121-UUID] v37.72: Inserted UUID TLV, 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
