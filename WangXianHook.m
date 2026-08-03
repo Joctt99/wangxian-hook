@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.74-DIST loaded ===");
+        _log(@"=== WangXianHook v37.75-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4101,12 +4101,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         // The standard TLV parser fails because it reads 00 00 as fLen=0, then 00 05 as fLen=5,
         // completely misaligning all subsequent fields. Fix: direct string replacement.
         if (tlvCmd == 0x002EE100) {
-            // v37.74: Log accountId from EE100 for cross-checking with EE121.
+            // v37.75: Log accountId from EE100 for cross-checking with EE121.
             // EE100 format: [12B header][00 00 00 05][00 14][20B accId]...
             if (len >= 38) {
                 char ee100AccId[21] = {0};
                 memcpy(ee100AccId, p + 18, 20); ee100AccId[20] = 0;
-                DLOG(@"[EE100-ACCID] v37.74: EE100 accountId=%s (len=%zu)", ee100AccId, len);
+                DLOG(@"[EE100-ACCID] v37.75: EE100 accountId=%s (len=%zu)", ee100AccId, len);
             }
             // Search for "DY_MIESHI" in the packet
             unsigned char *dyPos = (unsigned char *)memmem(p, len, "DY_MIESHI", 9);
@@ -4309,7 +4309,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_md5_channel_replaced == 1) {
                     // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
                     // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.74: g_md5_channel_replaced=1 → CANON rebuild with REAL accId (from orig pkt) + CANONICAL ch/dm/gp/UUID + hash2=ddcb91f42c...");
+                    DLOG(@"[EE121-REPL] v37.75: g_md5_channel_replaced=1 → CANON rebuild with REAL accId + CANONICAL ch/dm/gp/UUID + hash2=ORIG(client MD5)");
                     // Don't return — fall through to TLV replacement at line below
                 } else {
                     // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
@@ -4460,20 +4460,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // because real accountId/UUID differ from CANONICAL values.
                     // FIX: After EE007-ALIGN, scan newBuf for 32B TLV (00 20 [32B hex]) and
                     // replace with ddcb91f42c5a612b492a2296a971a5af.
-                    // v37.74: CANON rebuild with REAL accountId/user/pass (from orig pkt) +
-                    // CANONICAL channel/dm/gp/UUID + hash2=ddcb91f42c... (binary hash).
+                    // v37.75: CANON rebuild with REAL accountId/user/pass (from orig pkt) +
+                    // CANONICAL channel/dm/gp/UUID + hash2=ORIG(client-computed MD5).
                     // v37.73 used CANONICAL accountId → status=4 (mismatch with EE100/EE113 REAL accId).
-                    // v37.74 extracts REAL accId/user/pass from original packet to match EE100/EE113.
-                    // hash2=ddcb91f42c... is the clean binary hash (NOT MD5 of fields — verified by
-                    // Python script: MD5(canonical_fields) ≠ ddcb91f42c... for all field combos).
-                    // Server checks hash2 == binary_hash, NOT hash2 == MD5(fields).
+                    // v37.74 used REAL accountId + forced hash2=ddcb91f42c → server closed connection
+                    //   (hash2 mismatch: server expects MD5(fields+salt), NOT binary hash).
+                    // v37.75: copy hash2 from original packet — client already computed
+                    //   MD5(canonical_fields+salt) via CC_MD5 hook (replaces ch/dm/gp/uuid in input).
+                    //   Evidence: MD5-LOG out=6e46921d... == EE121-ORIG hash2.
                     if (cmd == 0x002EE121) {
                         static const char kChannel[]  = "DYanyou0040_MIESHI";  // 18 bytes, 00 12
                         static const char kDModel[]   = "iPhone7Plus";         // 11 bytes, 00 0B
                         static const char kGPU[]      = "Apple Inc. Apple A10 GPU"; // 24 bytes, 00 18
                         static const char kUUID[]     = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // 36 bytes, 00 24
 
-                        // v37.74: Extract REAL accountId/user/pass from original packet.
+                        // v37.75: Extract REAL accountId/user/pass from original packet.
                         // Original packet TLV: [00 14][20B accId][00 05][5B user][00 06][6B pass]...
                         char realAccId[32] = {0}; uint16_t realAccIdLen = 20; // default 20
                         char realUser[32]  = {0}; uint16_t realUserLen  = 5;  // default 5
@@ -4504,7 +4505,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 }
                             }
                         }
-                        DLOG(@"[EE121-CANON] v37.74: Extracted REAL accId=%s(%uB) user=%s(%uB) pass=%s(%uB)",
+                        DLOG(@"[EE121-CANON] v37.75: Extracted REAL accId=%s(%uB) user=%s(%uB) pass=%s(%uB)",
                              realAccId, realAccIdLen, realUser, realUserLen, realPass, realPassLen);
 
                         // Rebuild newBuf from scratch (after header 12B).
@@ -4553,10 +4554,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                         if (h1) memcpy(newBuf+rebuildOut+2, p+h1+2, 16);
                         rebuildOut += 18;
-                        // hash2 block: FORCE = clean binary hash hex (ddcb91f42c...).
+                        // v37.75: hash2 = MD5(field_data + salt), computed by client.
+                        // DO NOT force hash2=ddcb91f42c (binary hash) — server validates
+                        // hash2 == MD5(fields+salt), NOT hash2 == binary_hash.
+                        // Evidence: MD5-LOG out=6e46921d... matches EE121-ORIG hash2.
+                        // v37.75 forced ddcb91f42c → server closed connection immediately.
+                        // v37.75 copies hash2 from original packet (client-computed MD5).
                         newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                        static const char kCleanHash2Hex[] = "ddcb91f42c5a612b492a2296a971a5af";
-                        memcpy(newBuf+rebuildOut+2, kCleanHash2Hex, 32);
+                        if (h2) memcpy(newBuf+rebuildOut+2, p+h2+2, 32);
                         rebuildOut += 34;
                         // hash3 block: 00 10 + 16hex chars (18B) — from original packet
                         newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
@@ -4570,8 +4575,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.74: Rebuilt EE121 REAL accId=%s + CANONICAL ch/dm/gp/UUID. hash2=ddcb91f42c. pktLen=%u h1Found=%u h3Found=%u tail80: %@",
-                             realAccId, newPL, (h1!=0), (h3!=0), rt);
+                        DLOG(@"[EE121-CANON] v37.75: Rebuilt EE121 REAL accId=%s + CANONICAL ch/dm/gp/UUID. hash2=ORIG(client MD5). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                             realAccId, newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
 
@@ -6369,17 +6374,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
-            // v37.74: Dump full response body for diagnosis (especially when status=4).
+            // v37.75: Dump full response body for diagnosis (especially when status=4).
             if (cmd == 0x802EE121 && ret >= 13) {
                 size_t dumpLen = (ret > 200) ? 200 : (size_t)ret;
                 NSMutableString *respHex = [NSMutableString stringWithCapacity:dumpLen * 3];
                 for (size_t i = 0; i < dumpLen; i++) [respHex appendFormat:@"%02X ", p[i]];
-                DLOG(@"[EE121-RESP] v37.74: Full response hex (%zuB): %@", dumpLen, respHex);
+                DLOG(@"[EE121-RESP] v37.75: Full response hex (%zuB): %@", dumpLen, respHex);
                 // Try to decode body as UTF-8 string (may contain error message)
                 if (ret > 13) {
                     NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
                     if (bodyStr && bodyStr.length > 0) {
-                        DLOG(@"[EE121-RESP] v37.74: Body string: %@", bodyStr);
+                        DLOG(@"[EE121-RESP] v37.75: Body string: %@", bodyStr);
                     }
                 }
             }
@@ -6387,7 +6392,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // v36.114: Patch status byte for ALL version/auth responses (0x802EE118/120/121)
             // v36.49: ALWAYS patch status byte for 0x802EE121 - KEEP original ret (don't truncate!)
             if ((cmd == 0x802EE121 || cmd == 0x802EE118 || cmd == 0x802EE120) && ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-R-PATCH] v37.74: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", p[12], cmd, ret);
+                DLOG(@"[PROTO-R-PATCH] v37.75: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", p[12], cmd, ret);
                 ((unsigned char *)buf)[12] = 0;
             }
         } else if (cmd == 0x8234AB89 && port == 5678) {
@@ -7233,16 +7238,16 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
         } else if (cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) {
             DLOG(@"[PROTO-R] Version/auth response 0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
 
-            // v37.74: Dump full response body for diagnosis (especially when status=4).
+            // v37.75: Dump full response body for diagnosis (especially when status=4).
             if (cmd == 0x802EE121 && ret >= 13) {
                 size_t dumpLen = (ret > 200) ? 200 : (size_t)ret;
                 NSMutableString *respHex = [NSMutableString stringWithCapacity:dumpLen * 3];
                 for (size_t i = 0; i < dumpLen; i++) [respHex appendFormat:@"%02X ", p[i]];
-                DLOG(@"[EE121-RESP2] v37.74: Full response hex (%zuB): %@", dumpLen, respHex);
+                DLOG(@"[EE121-RESP2] v37.75: Full response hex (%zuB): %@", dumpLen, respHex);
                 if (ret > 13) {
                     NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
                     if (bodyStr && bodyStr.length > 0) {
-                        DLOG(@"[EE121-RESP2] v37.74: Body string: %@", bodyStr);
+                        DLOG(@"[EE121-RESP2] v37.75: Body string: %@", bodyStr);
                     }
                 }
             }
@@ -7250,7 +7255,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             // v36.50: ONLY patch on login server (port=5678), and NEVER truncate!
             if (cmd == 0x802EE121 && ret >= 13 && port == 5678) {
                 if (p[12] != 0) {
-                    DLOG(@"[PROTO-R-PATCH] v37.74: Status %u -> 0 (read hook, keeping %zd bytes)", p[12], ret);
+                    DLOG(@"[PROTO-R-PATCH] v37.75: Status %u -> 0 (read hook, keeping %zd bytes)", p[12], ret);
                     ((unsigned char *)buf)[12] = 0;
                     // v36.50: Do NOT truncate! Game needs full response with sessionId
                 }
@@ -9566,7 +9571,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.74 %d layers active (CANON-REBUILD-REAL-accId+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.75 %d layers active (CANON-REBUILD-REAL-accId+ORIG-hash2+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9694,7 +9699,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.74-DIST — v37.74: CANON rebuild with REAL accountId/user/pass (extracted from orig pkt) + CANONICAL ch/dm/gp/UUID + hash2=ddcb91f42c... (binary hash). v37.73 used CANONICAL accountId → status=4 (mismatch with EE100/EE113 REAL accId). Python script verified MD5(canonical_fields) ≠ ddcb91f42c... for ALL field combos → hash2 is binary hash, NOT MD5(fields). Server checks hash2==binary_hash, NOT hash2==MD5(fields). v37.67 used REAL accId + forced hash2=ddcb91f42c → connection closed (may have been hash1/hash3 issue, not hash2). v37.74 adds EE121-RESP body dump + EE100-ACCID log for diagnosis. TESTING: check [EE121-CANON] REAL accId matches [EE100-ACCID], [EE121-RESP] body, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.75-DIST — v37.75: CRITICAL FIX — hash2=ORIG(client MD5), NOT forced ddcb91f42c. v37.74 forced hash2=ddcb91f42c → server closed connection (hash2 mismatch). Evidence: MD5-LOG out=6e46921d... == EE121-ORIG hash2 → hash2=MD5(fields+salt), NOT binary hash. v37.75 copies hash2 from original packet (client-computed). Still uses REAL accountId (matches EE100/EE113) + CANONICAL ch/dm/gp/UUID. TESTING: check [EE121-CANON] h2Found=1, hash2=6e46921d... (NOT ddcb91f42c), 0x802EE121 status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
