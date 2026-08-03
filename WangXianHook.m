@@ -4598,7 +4598,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
                                 // Compute MD5 using CC_MD5
                                 unsigned char md5Out[16]; // 16 bytes binary
+#ifdef __cplusplus
+                                extern "C" unsigned char *CC_MD5(const void *data, unsigned long len, unsigned char *md);
+#else
                                 extern unsigned char *CC_MD5(const void *data, unsigned long len, unsigned char *md);
+#endif
                                 CC_MD5(md5In, 63, md5Out);
                                 // Convert binary MD5 to 32 hex chars
                                 static const char kHex[] = "0123456789abcdef";
