@@ -4597,16 +4597,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 memcpy(md5In, kCleanHash2Hex_v80, 32);
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
                                 // Compute MD5 using system CC_MD5 (via CommonCrypto already imported).
-                                // Use orig_CC_MD5 if available (avoids hook interference), else fallback.
+                                // Avoid using our CC_MD5 hook (which changes outputs) — use dlsym directly.
                                 unsigned char md5Out[16]; // 16 bytes binary
-                                if (orig_CC_MD5) {
-                                    orig_CC_MD5(md5In, 63, md5Out);
-                                } else {
-                                    // Use direct CommonCrypto function (extern in CommonDigest.h)
-                                    typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
-                                    RawCCMD5 rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
-                                    if (rawMD5) rawMD5(md5In, 63, md5Out);
-                                }
+                                memset(md5Out, 0, sizeof(md5Out));
+                                typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                                static RawCCMD5 s_rawMD5 = NULL;
+                                if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                                if (s_rawMD5) s_rawMD5(md5In, 63, md5Out);
                                 // Convert binary MD5 to 32 hex chars
                                 static const char kHex[] = "0123456789abcdef";
                                 char md5Hex[33];
