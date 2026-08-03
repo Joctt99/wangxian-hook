@@ -1,4 +1,4 @@
-﻿﻿#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
@@ -2275,7 +2275,7 @@ static size_t g_fff493_1_plain_len = 0;     // length
 // Save AES key+iv for encrypting the forged 0x0CB0A300 too (reuse saved session key)
 extern uint8_t g_saved_aes_key[256/8];
 extern size_t  g_saved_key_len;
-extern uint8_t g_saved_aes_iv[128/8];
+extern uint8_t g_saved_aes_iv[32];
 extern uint32_t g_saved_alg;
 extern uint32_t g_saved_options;
 
@@ -7429,12 +7429,20 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // we inject 1632B forged 0x0CB0A300 role-data as TCP sticky packet.
         // This pushes client state machine to role-selection UI even if server
         // silently ignores (sessionId invalid because EE121 server reply was 版本过低).
+        // v37.86 FIX: 'rcmd' is defined inside @try block (line ~6882, out of scope here).
+        // Also unistd.h declares int rcmd(...) as a deprecated function — would conflict!
+        // → Re-parse cmd from header bytes 4-7 into a distinct local name (curRespCmd).
+        uint32_t curRespCmd = 0;
+        if (ret >= 8 && p != NULL) {
+            curRespCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                         ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+        }
         if (g_fff493_1_sent && g_fff493_2_sent && !g_injected_0CB0A300 && isGamePort) {
-            if (rcmd == 0x0CB0A300) {
+            if (curRespCmd == 0x0CB0A300) {
                 g_role_0CB0A300_seen = 1;
                 g_consec_heartbeats = 0;
                 DLOG(@"[0CB0A300-REAL] v37.86: Server returned real 0x0CB0A300 role data! No forgery needed (ret=%zd)", ret);
-            } else if (rcmd == 0x80000015) {
+            } else if (curRespCmd == 0x80000015) {
                 g_consec_heartbeats++;
                 DLOG(@"[HB-COUNT] v37.86: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=2", g_consec_heartbeats);
                 if (g_consec_heartbeats >= 2 && !g_role_0CB0A300_seen) {
@@ -7470,8 +7478,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         DLOG(@"[FORGE-0CB0A300] v37.86: generateFakeResponse FAILED len=%u (expected >=12, <2048). Try next heartbeat.", forgedLen);
                     }
                 }
-            } else if (rcmd != 0x00FFFF01 && rcmd != 0x80FFF494 && rcmd != 0x00FFFF02 && rcmd != 0x80FFF495 &&
-                       rcmd != 0x00FFF495 && (rcmd & 0xFF000000) != 0x76000000 && (rcmd & 0xFF000000) != 0x66000000) {
+            } else if (curRespCmd != 0x00FFFF01 && curRespCmd != 0x80FFF494 && curRespCmd != 0x00FFFF02 && curRespCmd != 0x80FFF495 &&
+                       curRespCmd != 0x00FFF495 && (curRespCmd & 0xFF000000) != 0x76000000 && (curRespCmd & 0xFF000000) != 0x66000000) {
                 // Non-heartbeat, non-handshake, non-vffi packet → reset counter (but not 0CB0A300-seen)
                 // Keep counter; only explicit 0CB0A300 clears it
             }
