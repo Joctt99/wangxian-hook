@@ -1,4 +1,4 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v36.155: DYNAMIC ROLE GENERATION PER SERVER
@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.77-DIST loaded ===");
+        _log(@"=== WangXianHook v37.78-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4604,10 +4604,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         static const char kCleanHash2Hex[] = "ddcb91f42c5a612b492a2296a971a5af";
                         memcpy(newBuf+rebuildOut+2, kCleanHash2Hex, 32);
                         rebuildOut += 34;
-                        // hash3 block: 00 10 + 16hex chars (18B) — from original packet
-                        newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
-                        if (h3) memcpy(newBuf+rebuildOut+2, p+h3+2, 16);
-                        rebuildOut += 18;
+                        // v37.78: hash1 (post-hash2 field) FORCE to clean client value.
+                        // ROOT CAUSE: hash1 is NOT computed via CC_MD5 — no MD5-LOG output
+                        // matches our hash1 "379bd6...". All CC_MD5 outputs checked:
+                        // 278c06fb(44B) 6218cacf(168B) ddcb91f4(156B) 8d440927(63B=hash3)
+                        // 1050c467(148B) 334577da(162B) — NONE produce hash1.
+                        // CC_MD5_Final hook rebind=0 (not intercepted). hash1 likely uses
+                        // custom C++ hash or CC_SHA1 on MODIFIED binary → wrong value.
+                        // Clean client hash1 = "b111dc71219a39d8" (hook.txt line 403-404).
+                        // If hash1 is binary-dependent (constant), forcing resolves status=4.
+                        {
+                            char origHash1[17] = {0};
+                            if (h3) memcpy(origHash1, p+h3+2, 16);
+                            static const char kCleanHash1Hex[] = "b111dc71219a39d8";
+                            newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
+                            memcpy(newBuf+rebuildOut+2, kCleanHash1Hex, 16);
+                            rebuildOut += 18;
+                            DLOG(@"[EE121-HASH1] v37.78: Forced hash1 orig=%s → CLEAN=%s", origHash1, kCleanHash1Hex);
+                        }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
                         newBuf[0] = (newPL >> 24) & 0xFF; newBuf[1] = (newPL >> 16) & 0xFF;
@@ -4616,7 +4630,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.76: Rebuilt EE121 CANON accId=65657881045335015151 + CANONICAL ch/dm/gp/UUID. hash2=ddcb91f42c(FORCED BINARY). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.78: Rebuilt EE121 CANON accId=65657881045335015151 + CANONICAL ch/dm/gp/UUID. hash2=ddcb91f42c(FORCED) hash1=b111dc71219a39d8(FORCED v37.78). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -9700,7 +9714,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.77 %d layers active (UNIVERSAL-accId-replace-ALL-inputs+FORCED-hash2=ddcb91f42c+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.78 %d layers active (UNIVERSAL-accId-replace+FORCED-hash1=b111dc71+FORCED-hash2=ddcb91f42c+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9828,7 +9842,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.77-DIST — v37.77: UNIVERSAL accountId replacement in ALL inputs (CC_MD5 hash1/2/3, EE007, F013, FFF493 plaintext). v37.76 only replaced accId in EE121 ctx (156B/168B) → hash1 (44B=token+accId) still used REAL accId → server recomputed MD5(token+CANON) != hash1(REAL) → status=4. v37.77 scans ALL CC_MD5 inputs for 20-digit accountId and replaces with CANONICAL. Also adds accId replacement to EE007-ALIGN, F013 server-select, and CCCrypt CH-L4 plaintext (FFF493 clientId). TESTING: check [MD5-HOOK] accId=1 for 44B input, [EE007-ALIGN] acc=1, [F013-ACCID], [CH-L4] acc=1, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.78-DIST — v37.78: FORCE hash1=b111dc71219a39d8 in EE121 (post-hash2 field). v37.77 proved accId replacement works (all CC_MD5 accId=1) but server STILL returns status=4. Root cause: hash1 is NOT computed via CC_MD5 (no MD5-LOG output matches). hash1 likely uses custom hash or CC_SHA1 on modified binary → wrong value. Clean client hash1=b111dc71219a39d8 (hook.txt). v37.78 forces hash1=CLEAN in EE121-CANON rebuild, same approach as hash2 forcing. If hash1 is binary-dependent (constant), server accepts EE121 → status=0 → 0x8234AB89 session → 0x0CB0A300 role data. TESTING: check [EE121-HASH1] orig→CLEAN, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
