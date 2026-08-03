@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.72-DIST loaded ===");
+        _log(@"=== WangXianHook v37.73-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4302,7 +4302,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_md5_channel_replaced == 1) {
                     // hash1/hash3 should be correct → send NATIVE EE121 with TLV patch
                     // (channel/deviceModel/GPU replacement). Fall through to TLV code below.
-                    DLOG(@"[EE121-REPL] v37.70: g_md5_channel_replaced=1 → EE007-ALIGN only (CANON rebuild DISABLED, native structure preserved)");
+                    DLOG(@"[EE121-REPL] v37.73: g_md5_channel_replaced=1 → CANON rebuild with CANONICAL accId (ALL fields CANONICAL, hash2=ddcb91f42c...)");
                     // Don't return — fall through to TLV replacement at line below
                 } else {
                     // hash1/hash3 still wrong → send clean 248B (fallback, v37.51 behavior)
@@ -4453,68 +4453,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // because real accountId/UUID differ from CANONICAL values.
                     // FIX: After EE007-ALIGN, scan newBuf for 32B TLV (00 20 [32B hex]) and
                     // replace with ddcb91f42c5a612b492a2296a971a5af.
+                    // v37.73: RESTORED CANON rebuild with CANONICAL accountId.
+                    // v37.72 log proved: server validates BOTH hash2==MD5(fields) AND hash2==ddcb91f42c...
+                    // This requires ALL fields to be CANONICAL (accId=65657881045335015151, UUID=66B0EE01-...).
+                    // v37.67 used REAL accountId → MD5(real_fields) ≠ ddcb91f42c... → server closed connection.
+                    // v37.71 forced hash2=ddcb91f42c... but fields were REAL → MD5(real) ≠ ddcb91f42c... → close.
+                    // v37.66 used CANONICAL accountId → MD5(canonical) = ddcb91f42c... → server returned status=4.
+                    // status=4 was caused by short EE006 (20B), NOT accountId. v37.64 EE006-EXPAND fixes that.
+                    // SO: CANON rebuild + CANONICAL accId + EE006-EXPAND → should get status=0.
                     if (cmd == 0x002EE121) {
-                        static const char kCleanHash2Hex[] = "ddcb91f42c5a612b492a2296a971a5af";
-                        int hash2Replaced = 0;
-                        for (size_t sp = 12; sp + 2 + 32 <= out; ) {
-                            uint16_t sl = ((uint16_t)newBuf[sp] << 8) | newBuf[sp + 1];
-                            if (sl == 32) {
-                                // Found 32B TLV field — this is hash2
-                                memcpy(newBuf + sp + 2, kCleanHash2Hex, 32);
-                                hash2Replaced = 1;
-                                DLOG(@"[EE121-HASH2] v37.71: Forced hash2=ddcb91f42c... at offset %zu", sp);
-                                break;
-                            }
-                            sp += 2 + sl;
-                        }
-                        if (!hash2Replaced) {
-                            DLOG(@"[EE121-HASH2] v37.71: WARNING - hash2 TLV (32B) not found in EE121!");
-                        }
-
-                        // v37.72: Insert UUID TLV if missing.
-                        // v37.71 log showed origLen=213B (NO UUID field) → server closed connection.
-                        // v37.66 had origLen=249B (WITH UUID) → server returned status=4.
-                        // Native EE121 has empty TLV (00 00) where UUID should go (after GPU, before network).
-                        // FIX: Find empty TLV after GPU field, replace with UUID TLV (00 24 + 36B).
-                        // Net change: +36 bytes (38B UUID TLV - 2B empty TLV).
-                        static const char kCleanUUID[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
-                        int hasUUID = 0;
-                        size_t lastEmptyTLV = (size_t)-1;
-                        for (size_t sp = 12; sp + 2 <= out; ) {
-                            uint16_t sl = ((uint16_t)newBuf[sp] << 8) | newBuf[sp + 1];
-                            if (sl == 36) { hasUUID = 1; break; } // UUID already present
-                            if (sl == 0) { lastEmptyTLV = sp; } // Track last empty TLV
-                            if (sp + 2 + sl > out) break;
-                            sp += 2 + sl;
-                        }
-                        if (!hasUUID && lastEmptyTLV != (size_t)-1 && out + 36 <= (size_t)(len + 64)) {
-                            // Replace last empty TLV (2B) with UUID TLV (38B): shift +36
-                            size_t tailLen = out - (lastEmptyTLV + 2);
-                            memmove(newBuf + lastEmptyTLV + 38, newBuf + lastEmptyTLV + 2, tailLen);
-                            newBuf[lastEmptyTLV] = 0x00; newBuf[lastEmptyTLV + 1] = 0x24; // len=36
-                            memcpy(newBuf + lastEmptyTLV + 2, kCleanUUID, 36);
-                            out += 36;
-                            // Update packet length (first 4 bytes, big-endian)
-                            uint32_t newPktLen = (uint32_t)out;
-                            newBuf[0] = (newPktLen >> 24) & 0xFF;
-                            newBuf[1] = (newPktLen >> 16) & 0xFF;
-                            newBuf[2] = (newPktLen >> 8) & 0xFF;
-                            newBuf[3] = newPktLen & 0xFF;
-                            DLOG(@"[EE121-UUID] v37.72: Inserted UUID TLV at offset %zu, pktLen %zu→%u",
-                                 lastEmptyTLV, out - 36, newPktLen);
-                        } else if (!hasUUID) {
-                            DLOG(@"[EE121-UUID] v37.72: WARNING - no empty TLV found for UUID insertion!");
-                        }
-                    }
-
-                    // v37.70: DISABLED EE121-CANON rebuild entirely.
-                    // v37.69 log showed origLen=213B (NO UUID field) but CANON
-                    // rebuild forced 248B (WITH UUID) → packet structure mismatch → server
-                    // closed connection immediately (RECV-CLOSE ret=0, no 0x802EE121 response).
-                    // v37.66 had origLen=249B (WITH UUID) so CANON 248B worked (got status=4).
-                    // v37.69 device's native EE121 has NO UUID field → CANON rebuild breaks it.
-                    // v37.71: CANON rebuild still disabled, but hash2 is now forced separately.
-                    if (cmd == 0x002EE121 && false) { // DISABLED in v37.70
+                        static const char kAccId[]    = "65657881045335015151"; // CANONICAL accountId (20B)
                         static const char kUser[]     = "kk994";               // 5 bytes,  00 05
                         static const char kPass[]     = "994624";              // 6 bytes,  00 06
                         static const char kChannel[]  = "DYanyou0040_MIESHI";  // 18 bytes, 00 12
@@ -4522,19 +4470,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         static const char kGPU[]      = "Apple Inc. Apple A10 GPU"; // 24 bytes, 00 18
                         static const char kUUID[]     = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // 36 bytes, 00 24
 
-                        // v37.67: Extract REAL accountId from original packet (first TLV field after header).
-                        // EE121 structure: header(12B) + accountId(TLV) + user(TLV) + pass(TLV) + ...
-                        size_t accIdOff = 12;
-                        unsigned char realAccId[21] = {0}; // 20B + null
-                        if (accIdOff + 22 <= len) {
-                            uint16_t accLen = ((uint16_t)p[accIdOff] << 8) | p[accIdOff+1];
-                            if (accLen == 20) {
-                                memcpy(realAccId, p + accIdOff + 2, 20);
-                                realAccId[20] = 0;
-                            }
-                        }
-                        const char *kAccId = (char *)realAccId;
-                        if (strlen(kAccId) != 20) kAccId = "80607584802281872727"; // fallback
+                        // v37.73: Use CANONICAL accountId (NOT real accountId).
+                        // Server validates hash2 == MD5(fields) AND hash2 == ddcb91f42c...
+                        // Only CANONICAL fields produce MD5 = ddcb91f42c...
 
                         // Rebuild newBuf from scratch (after header 12B) with ONLY canonical values.
                         // Length: 2(0014)+20 + 2(0005)+5 + 2(0006)+6 + 2(0005)+5 + 2(0003)+3
@@ -9572,7 +9510,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.72 %d layers active (EE121-UUID-INSERT+EE121-HASH2-FORCED+EE007-ALIGN-ONLY+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.73 %d layers active (CANON-REBUILD-CANONICAL-accId+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9700,7 +9638,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.72-DIST — v37.72: Insert UUID TLV into EE121 if missing. v37.71 log showed origLen=213B (NO UUID field, has empty TLV 00 00) → server closed connection. v37.66 had origLen=249B (WITH UUID) → server returned status=4. FIX: After hash2 replacement, scan for empty TLV (00 00), replace with UUID TLV (00 24 + 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8), shift bytes, update pktLen. Net +36B. TESTING: check [EE121-UUID] v37.72: Inserted UUID TLV, 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.73-DIST — v37.73: RESTORED CANON rebuild with CANONICAL accountId (65657881045335015151). v37.72 log proved server validates BOTH hash2==MD5(fields) AND hash2==ddcb91f42c... → ALL fields must be CANONICAL. v37.67-v37.72 used REAL accountId → MD5(real)≠ddcb91f42c... → server closed connection. v37.66 used CANONICAL accId → MD5(canonical)=ddcb91f42c... → status=4 (caused by short EE006, fixed by v37.64 EE006-EXPAND). SO: CANON rebuild+CANONICAL accId+EE006-EXPAND → should get status=0. TESTING: check [EE121-CANON] pktLen=248, 0x802EE121 response (not RECV-CLOSE), [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
