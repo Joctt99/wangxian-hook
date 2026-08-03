@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.76-DIST loaded ===");
+        _log(@"=== WangXianHook v37.77-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4393,6 +4393,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             size_t chOff = (size_t)-1; // channel TLV
             size_t dmOff = (size_t)-1; // deviceModel TLV
             size_t gpOff = (size_t)-1; // GPU TLV
+            size_t accOff = (size_t)-1; // v37.77: accountId TLV (20-digit numeric)
+            static const char kCanonAccIdEE007[] = "65657881045335015151"; // 20 bytes
             while (off + 2 < len) {
                 uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
                 if (off + 2 + fLen > len) break;
@@ -4401,13 +4403,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
                 else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) dmOff = off;
                 else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) gpOff = off;
+                // v37.77: Detect 20-digit accountId (first TLV field, offset 12)
+                else if (fLen == 20 && accOff == (size_t)-1) {
+                    BOOL allDigits = YES;
+                    for (int di = 0; di < 20; di++) {
+                        if (val[di] < '0' || val[di] > '9') { allDigits = NO; break; }
+                    }
+                    if (allDigits && memcmp(val, kCanonAccIdEE007, 20) != 0) accOff = off;
+                }
                 // or fallback: if value contains known strings
                 else if (chOff == (size_t)-1 && fLen >= 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
                 else if (dmOff == (size_t)-1 && fLen >= 11 && (memmem(val, fLen, "iPhone", 6) != NULL)) dmOff = off;
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
                 off += 2 + fLen;
             }
-            if (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1) {
+            if (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1) {
                 // Reconstruct packet by replacing all 3 fields found
                 // Use dynamic buffer, write from 0 sequentially
                 size_t bufCap = len + 64;
@@ -4439,6 +4449,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[out] = 0x00; newBuf[out + 1] = 0x18;
                             memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
                             out += 26; in += 2 + fLen; fieldsApplied |= 4;
+                        } else if (in == accOff && fLen == 20) {
+                            // v37.77: replace accountId with CANONICAL (20→20, length-neutral)
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x14;
+                            memcpy(newBuf + out + 2, kCanonAccIdEE007, 20);
+                            out += 22; in += 2 + fLen; fieldsApplied |= 8;
                         } else {
                             // unchanged field: copy as-is
                             memcpy(newBuf + out, p + in, 2 + fLen);
@@ -4459,9 +4474,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[3] =  newPktLen        & 0xFF;
                     uint32_t oldPktLen = 0;
                     if (len >= 4) oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-                    DLOG(@"[EE007-ALIGN] v37.38 cmd=0x%08X port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u)",
+                    DLOG(@"[EE007-ALIGN] v37.38 cmd=0x%08X port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u acc=%u)",
                          cmd, port, oldPktLen, newPktLen, fieldsApplied,
-                         (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0);
+                         (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0, (fieldsApplied & 8) != 0);
                     // Post-alignment hex dump for verification (first 100 bytes)
                     NSMutableString *ph = [NSMutableString stringWithCapacity:300];
                     for (size_t i = 0; i < out && i < 100; i++) [ph appendFormat:@"%02X ", newBuf[i]];
@@ -5114,6 +5129,33 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"%@", detail);
             } @catch (NSException *e) {
                 DLOG(@"[SERVER-SELECT] Analysis exception: %@", e.reason);
+            }
+
+            // v37.77: Replace REAL accountId with CANONICAL in F013 (server-select).
+            // F013 format: [12B header][00 14][20B accId][00 05][5B user][00 06][6B pass][00 00]
+            // EE100/EE113/EE121 all use CANONICAL accId → F013 must match for login server consistency.
+            if (len >= 34) {
+                const unsigned char *fp2 = (const unsigned char *)buf;
+                uint16_t accLen = ((uint16_t)fp2[12] << 8) | fp2[13];
+                if (accLen == 20) {
+                    BOOL allDigits = YES;
+                    for (int di = 0; di < 20; di++) {
+                        if (fp2[14+di] < '0' || fp2[14+di] > '9') { allDigits = NO; break; }
+                    }
+                    static const char kCanonAccIdF013[] = "65657881045335015151";
+                    if (allDigits && memcmp(fp2+14, kCanonAccIdF013, 20) != 0) {
+                        unsigned char *fBuf = (unsigned char *)malloc(len);
+                        if (fBuf) {
+                            memcpy(fBuf, buf, len);
+                            memcpy(fBuf+14, kCanonAccIdF013, 20);
+                            DLOG(@"[F013-ACCID] v37.77: F013 accId replaced → CANONICAL (len=%zu)", len);
+                            ssize_t rret = orig_send(fd, fBuf, len, flags);
+                            free(fBuf);
+                            if (rret >= 0) return (ssize_t)len;
+                            return rret;
+                        }
+                    }
+                }
             }
         }
     }
@@ -7922,19 +7964,26 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 }
             }
 
-            // v37.76: RE-ENABLE accId replacement in EE121 context (156B/168B inputs).
-            // v37.67 disabled it, but v37.76 uses CANONICAL accId in ALL packets (EE100/EE113/EE121).
-            // CC_MD5 input must also use CANONICAL accId so hash2 matches packet content.
-            // accId is 20-digit numeric string at position 0 in 156B/168B inputs.
-            // CANONICAL accId = "65657881045335015151" (20 bytes, same length → no length change).
+            // v37.77: Scan ENTIRE input for 20-digit accountId (NOT just EE121 ctx).
+            // v37.76 only replaced accId in EE121 ctx (156B/168B with SQAGEIOS marker).
+            // But hash1 input (44B = token+accId) has NO EE121 marker → accId NOT replaced.
+            // Server recomputes MD5(token+CANONICAL_accId) != hash1(REAL_accId) → status=4.
+            // Also 162B FFF493 hash input has REAL accId preceded by password digits →
+            // must NOT require previous char to be non-digit (pass "994624" ends with '4').
+            // FIX: Scan for 20-digit run, only check NEXT char is non-digit (or end).
             int hasAccId = 0;
-            if (hasEE121Ctx == 1 && len >= 20) {
-                BOOL allDigits = YES;
-                for (uint32_t i = 0; i < 20; i++) {
-                    if (in[i] < '0' || in[i] > '9') { allDigits = NO; break; }
-                }
-                if (allDigits && memcmp(in, kCanonAccId, 20) != 0) {
-                    hasAccId = 1;
+            if (len >= 20) {
+                for (uint32_t i = 0; i + 20 <= len; i++) {
+                    // Next char must NOT be a digit (avoid matching part of longer number)
+                    if (i + 20 < len && in[i+20] >= '0' && in[i+20] <= '9') continue;
+                    BOOL allDigits = YES;
+                    for (uint32_t j = 0; j < 20; j++) {
+                        if (in[i+j] < '0' || in[i+j] > '9') { allDigits = NO; break; }
+                    }
+                    if (allDigits && memcmp(in+i, kCanonAccId, 20) != 0) {
+                        hasAccId = 1;
+                        break;
+                    }
                 }
             }
 
@@ -7952,11 +8001,6 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                     // Build new buffer by scanning input and replacing matches
                     uint32_t out = 0;
                     uint32_t pos = 0;
-                    // CANONICAL accId at position 0 (only when hasAccId==1)
-                    if (hasAccId && pos == 0) {
-                        memcpy((uint8_t *)cleanInput + out, kCanonAccId, 20);
-                        out += 20; pos += 20;
-                    }
                     while (pos < len) {
                         if (hasCh && pos + 9 <= len && memcmp(in + pos, chOld, 9) == 0) {
                             memcpy((uint8_t *)cleanInput + out, chNew, 18);
@@ -7977,6 +8021,22 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             // clobbering UUIDs in other MD5 inputs (e.g., SK/HTTP).
                             memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
                             out += 36; pos += 36;
+                        } else if (hasAccId && pos + 20 <= len
+                                   && (pos+20 >= len || in[pos+20] < '0' || in[pos+20] > '9')) {
+                            // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20).
+                            // Handles hash1(44B)=token+accId, hash2(156B/168B)=fields+accId,
+                            // FFF493 hash(162B)=user+pass+accId+..., any MD5 input with 20-digit accId.
+                            // Only check NEXT char (previous may be digit from password "994624").
+                            BOOL allDig = YES;
+                            for (uint32_t j = 0; j < 20; j++) {
+                                if (in[pos+j] < '0' || in[pos+j] > '9') { allDig = NO; break; }
+                            }
+                            if (allDig && memcmp(in+pos, kCanonAccId, 20) != 0) {
+                                memcpy((uint8_t *)cleanInput + out, kCanonAccId, 20);
+                                out += 20; pos += 20;
+                            } else {
+                                ((uint8_t *)cleanInput)[out++] = in[pos++];
+                            }
                         } else {
                             ((uint8_t *)cleanInput)[out++] = in[pos++];
                         }
@@ -9313,6 +9373,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     void   *patchedBuf = NULL;
     int patchCount = 0;
     int chCount = 0, dmCount = 0, gpCount = 0;
+    int accCount = 0; // v37.77: 20-digit accountId occurrences
+    static const char kCanonAccIdAES[] = "65657881045335015151"; // 20 bytes
     if (op == 0 && dataIn && dataInLen >= 9) {
         // First pass: count ALL replacements
         const char *scanP = (const char *)dataIn;
@@ -9343,11 +9405,26 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
                 if (bounded) gpCount++;
                 pcur += 28;
+            } else if (rem >= 20) {
+                // v37.77: Check for 20-digit accountId (length-neutral 20→20)
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 20 < scanEnd) ? *(pcur+20) : 0;
+                if ((prev < '0' || prev > '9') && (next < '0' || next > '9')) {
+                    BOOL allDig = YES;
+                    for (int j = 0; j < 20; j++) {
+                        if (pcur[j] < '0' || pcur[j] > '9') { allDig = NO; break; }
+                    }
+                    if (allDig && memcmp(pcur, kCanonAccIdAES, 20) != 0) {
+                        accCount++;
+                        pcur += 20; continue;
+                    }
+                }
+                pcur++;
             } else {
                 pcur++;
             }
         }
-        patchCount = chCount + dmCount + gpCount;
+        patchCount = chCount + dmCount + gpCount + accCount;
         // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
         // v37.37 CRITICAL FIX: Must save from FFF493#2 (inLen 500-800B) NOT FFF493#1!
         // AES-CBC uses different IV per message. Using FFF493#1's IV to encrypt FFF493#2
@@ -9412,6 +9489,20 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         // Server cross-checks UUID across login+game server packets
                         memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 51);
                         out += 51; p += 51; continue;
+                    } else if (rem >= 20) {
+                        // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20)
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 20 < e) ? *(p+20) : 0;
+                        if ((prev < '0' || prev > '9') && (next < '0' || next > '9')) {
+                            BOOL allDig = YES;
+                            for (int j = 0; j < 20; j++) {
+                                if (p[j] < '0' || p[j] > '9') { allDig = NO; break; }
+                            }
+                            if (allDig && memcmp(p, kCanonAccIdAES, 20) != 0) {
+                                memcpy(out, kCanonAccIdAES, 20);
+                                out += 20; p += 20; continue;
+                            }
+                        }
                     }
                     *out++ = *p++;
                 }
@@ -9419,8 +9510,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
                 if (logged < 4) {
-                    DLOG(@"[CH-L4] v37.35 patchesTot=%d ch=%d dm=%d gp=%d origLen=%zu newLen=%zu delta=%lld",
-                         patchCount, chCount, dmCount, gpCount, dataInLen, realDataInLen,
+                    DLOG(@"[CH-L4] v37.77 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, accCount, dataInLen, realDataInLen,
                          (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
@@ -9609,7 +9700,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.76 %d layers active (CANON-REBUILD-CANON-accId+FORCED-hash2=ddcb91f42c+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.77 %d layers active (UNIVERSAL-accId-replace-ALL-inputs+FORCED-hash2=ddcb91f42c+EE006-EXPAND+FFF493-REPL-CAPTURED-SESSION+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9737,7 +9828,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.76-DIST — v37.76: ALL packets (EE100/EE113/EE121) use CANONICAL accId=65657881045335015151 + FORCED hash2=ddcb91f42c (binary hash). v37.75 used REAL accId + client MD5 hash2=6e46921d → status=4. Clean client capture confirms: ALL packets use CANONICAL accId + hash2=ddcb91f42c. v37.76 also re-enables CC_MD5 accId replacement in EE121 context (156B/168B inputs). TESTING: check [EE100-ACCID] orig→CANONICAL, [EE121-CANON] accId=65657881045335015151, [MD5-HOOK] accId=1, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
+    DLOG(@"[VERSION] WangXianHook v37.77-DIST — v37.77: UNIVERSAL accountId replacement in ALL inputs (CC_MD5 hash1/2/3, EE007, F013, FFF493 plaintext). v37.76 only replaced accId in EE121 ctx (156B/168B) → hash1 (44B=token+accId) still used REAL accId → server recomputed MD5(token+CANON) != hash1(REAL) → status=4. v37.77 scans ALL CC_MD5 inputs for 20-digit accountId and replaces with CANONICAL. Also adds accId replacement to EE007-ALIGN, F013 server-select, and CCCrypt CH-L4 plaintext (FFF493 clientId). TESTING: check [MD5-HOOK] accId=1 for 44B input, [EE007-ALIGN] acc=1, [F013-ACCID], [CH-L4] acc=1, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
