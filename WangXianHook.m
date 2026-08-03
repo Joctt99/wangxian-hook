@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.80-DIST loaded ===");
+        _log(@"=== WangXianHook v37.81-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -6482,6 +6482,32 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[PROTO-R-PATCH] v37.76: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", p[12], cmd, ret);
                 ((unsigned char *)buf)[12] = 0;
             }
+
+            // v37.81: Extract token from EE120 response (0x802EE120) for hash3/hash1 recalculation.
+            // Timing issue in v37.80: 63B CC_MD5 (which contains token) is called AFTER EE121 send,
+            // so token isn't captured when EE121 rebuild happens. Server closes immediately.
+            // FIX: Extract from 0x802EE120 response body (13 bytes status+type + TLV fields).
+            // Format: [12B header][status 1B][00 1F][31B token] (observed in v37.80 log line 125: 00 1F 32 43...36 66, len=31)
+            if (cmd == 0x802EE120 && ret >= 13) {
+                size_t pos = 13; // after 12B header + 1B status
+                while (pos + 2 <= (size_t)ret) {
+                    uint16_t tlvLen = ((uint16_t)p[pos] << 8) | p[pos+1];
+                    pos += 2;
+                    if (tlvLen == 31 && pos + 31 <= (size_t)ret) {
+                        // 31-byte field = token (matches 63B MD5 input: 32B hash2_hex + 31B token)
+                        memcpy(g_hashToken, p + pos, 31);
+                        g_hashToken[31] = 0;
+                        g_hashTokenValid = 1;
+                        DLOG(@"[EE120-TOKEN] v37.81: Extracted token(31B) from 0x802EE120 response: %s (pos=%zu)", g_hashToken, pos-2);
+                        break;
+                    } else if (tlvLen == 0) {
+                        // 0x0000 separator, skip
+                    } else if (pos + tlvLen > (size_t)ret) {
+                        break; // malformed, stop
+                    }
+                    pos += tlvLen;
+                }
+            }
         } else if (cmd == 0x8234AB89 && port == 5678) {
             // v37.69: Parse 0x8234AB89 — login server's sessionId/ticket response.
             // This is sent after 0x802EE121 (status=0) to confirm successful login.
@@ -9728,7 +9754,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.80 %d layers active (REAL-accId+FORCED-hash2=ddcb91f42c+hash1/hash3=RECALCULATED(hash2+token)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
+    DLOG(@"[CH-INIT] v37.81 %d layers active (REAL-accId+FORCED-hash2=ddcb91f42c+hash1/hash3=RECALCULATED(hash2+EE120_token)+EE006-EXPAND+FFF493-REPL+SESSION-CAPTURE-0x8234AB89)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9856,7 +9882,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.80-DIST — v37.80: REAL accId + hash2 FORCED + hash1/hash3 RECALCULATED with captured token. v37.79 server closed connection immediately after EE121 send. ROOT CAUSE: hash2 forced to ddcb91f42c but hash1/hash3 were PASSTHROUGH (computed with OLD hash2 6e46921d...) — hash triplet inconsistent. Server detects MD5(hash2+token) mismatch and closes. v37.80: (1) capture token(31B) from 63B CC_MD5 input (hash2_hex+token), (2) EE121 rebuild: force hash2=ddcb91f42c, then RECOMPUTE hash3=first16hex(MD5(hash2_forced+token)), hash1=last16hex(MD5(...)). Verified hash1/hash3 relation: v37.78 log MD5(63B)=fcd4a0a058dd37ef409561ff8d99687d, hash3=fcd4a0a058dd37ef, hash1=409561ff8d99687d. TESTING: [MD5-TOKEN-CAPTURE] token=, [EE121-HASH-RECALC] RECALCULATED (not FALLBACK), [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300.");
+    DLOG(@"[VERSION] WangXianHook v37.81-DIST — v37.81: EE120 token extraction fixes timing issue. v37.80 hash1/hash3 RECALCULATED correctly BUT token was captured TOO LATE (63B CC_MD5 called AFTER EE121 rebuild). First 2 EE121 sends had g_hashTokenValid=0 (FALLBACK, orig hash3/hash1 with new hash2 → still inconsistent → server closes immediately). FIX: Extract 31B token from 0x802EE120 response (recv hook, BEFORE EE121 is constructed and sent). v37.80 log evidence: EE120 response (line 125: 00 1F + 31B token) arrives 2 steps BEFORE EE121 is sent, but token was captured only when 63B CC_MD5 is called (which happens during EE121 build, AFTER we have already started rebuilding in send hook). TESTING: [EE120-TOKEN] appears BEFORE [EE121-HASH-RECALC], [EE121-HASH-RECALC] RECALCULATED not FALLBACK, [EE121-RESP] status=0, [SESSION-CAPTURE] 0x8234AB89, 0x0CB0A300.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
