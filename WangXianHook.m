@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.65-DIST loaded ===");
+        _log(@"=== WangXianHook v37.66-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4077,16 +4077,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     // Server sees DY_MIESHI in pre-login packets (0x0000E002, 0x002EE118,
     // 0x0002A018 etc.) and flags client as invalid BEFORE 0x002EE121.
     // Must fix ALL packets, not just EE007/EE121.
-    // Scans for TLV patterns: [2B len][string] and replaces channel/model/GPU.
+    // Scans for TLV patterns: [2B len][string] and replaces channel/model/GPU/accountId.
     if (port == 5678 && len >= 20 && len <= 4096) {
         const unsigned char *p = (const unsigned char *)buf;
-        // v37.41: Only patch 0x0000E002 and 0x002EE118 (simple packets, no hash).
-        // Skip 0x002EE121 (handled by EE121-REPL) and 0x0002A018 (has MD5 hash
-        // at end that we can't recompute — patching channel/model/GPU without
-        // updating hash causes server to detect tampering).
+        // v37.66: Extended to patch 0x002EE100 (accountId+channel) and 0x002EE113 (password+channel+accountId).
+        // These pre-login packets contain REAL accountId (80607584802281872727) and DY_MIESHI channel
+        // which server cross-references with EE121 — mismatch causes status=4.
+        // 0x0000E002 and 0x002EE118 already patched. 0x002EE121 handled by EE121-REPL.
+        // 0x0002A018 has MD5 hash at end — can't recompute after patching.
         uint32_t tlvCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                           ((uint32_t)p[6] << 8) | (uint32_t)p[7];
-        if ((tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118) &&
+        BOOL needsPatch = (tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118 ||
+                           tlvCmd == 0x002EE100 || tlvCmd == 0x002EE113);
+        if (needsPatch &&
             memmem(p, len, "DY_MIESHI", 9) != NULL) {
             // Reconstruct packet with TLV field replacements
             size_t bufCap = len + 64;
@@ -4119,6 +4122,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[out] = 0x00; newBuf[out+1] = 0x18;
                         memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
                         out += 26; in += 30; fieldsApplied |= 4;
+                    } else if (fLen == 20 && memcmp(val, "80607584802281872727", 20) == 0) {
+                        // v37.66: Replace real accountId with CANONICAL accountId
+                        // Server cross-references accountId across EE100/EE113/EE121 → mismatch causes status=4
+                        newBuf[out] = 0x00; newBuf[out+1] = 0x14;
+                        memcpy(newBuf + out + 2, "65657881045335015151", 20);
+                        out += 22; in += 22; fieldsApplied |= 8;
                     } else {
                         memcpy(newBuf + out, p + in, 2 + fLen);
                         out += 2 + fLen; in += 2 + fLen;
@@ -4131,9 +4140,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[1] = (newPktLen >> 16) & 0xFF;
                     newBuf[2] = (newPktLen >> 8) & 0xFF;
                     newBuf[3] = newPktLen & 0xFF;
-                    DLOG(@"[TLV-SCAN] v37.40: Patched port=5678 pkt origLen=%zu newLen=%zu fields=%u (ch=%u dm=%u gp=%u)",
+                    DLOG(@"[TLV-SCAN] v37.66: Patched port=5678 pkt origLen=%zu newLen=%zu fields=%u (ch=%u dm=%u gp=%u accId=%u)",
                          len, out, fieldsApplied,
-                         (fieldsApplied&1)!=0, (fieldsApplied&2)!=0, (fieldsApplied&4)!=0);
+                         (fieldsApplied&1)!=0, (fieldsApplied&2)!=0, (fieldsApplied&4)!=0, (fieldsApplied&8)!=0);
                     ssize_t rret = orig_send(fd, newBuf, out, flags);
                     free(newBuf);
                     if (rret >= 0) return (ssize_t)len;
@@ -9243,7 +9252,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.65 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+IDFV-CANONICAL(66B0EE01)+LOG + CH-PATCH vm_protect)", layersOK);
+    DLOG(@"[CH-INIT] v37.66 %d layers active (L0=dead L1=dead L2=NSString L3=dead L4=CCCryptENC+SAVE-PLAIN L5=sendScan+FFF493-REPL-v2-ENABLED(sessionId+ticket-ONLY) L6=EE007-TLV+EE121-CONDITIONAL(g_md5_channel_replaced?CANONICAL-FULL-REBUILD(accId/uuId/ch/dm/gp=clean-client-values hash2=clean-binary-MD5 hash1/hash3=copied-from-native-pkt):CLEAN-248B)+MD5-HOOK-INPUT-SCAN(ch+dm+gp+hashhex≤500B)+EE006-EXPAND(20B→56B+UUID)+IDFV-CANONICAL(66B0EE01)+TLV-SCAN(EE100/EE113+accId)+LOG + CH-PATCH vm_protect)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -9371,7 +9380,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.65-DIST — v37.64 removed EE006-INJECT/A018-INJECT but status=4 persists. v37.64 log shows IDFV-HOOK returns D4896737-... but EE121-CANON uses 66B0EE01-... → UUID mismatch! Server rejects because client sends EE006 with IDFV UUID (D4896737...) but EE121 has different UUID (66B0EE01...). v37.65 fixes IDFV-HOOK to return CANONICAL UUID (66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8) so ALL UUID sources match: IDFV, EE006, EE121, CC_MD5 input. TESTING: check [IDFV-HOOK] v37.65: Fixed UUID = 66B0EE01... (CANONICAL match EE121), [EE006-UUID] uses same UUID, [EE121-CANON] uses same UUID, 0x802EE121 status=0 (real success), 0x8234AB89 real sessionId/ticket, 0x0CB0A300 role data, enter game scene.");
+    DLOG(@"[VERSION] WangXianHook v37.66-DIST — v37.65 fixed IDFV UUID (66B0EE01) but status=4 persists. v37.65 log reveals TWO critical issues: (1) UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD in CC-AES encrypted game server packet (derived from MAC address, not IDFV), (2) accountId mismatch: pre-login packets 0x002EE100/0x002EE113 contain REAL accountId (80607584802281872727) and DY_MIESHI channel, while EE121 uses CANONICAL accountId (65657881045335015151). Server cross-references accountId across ALL pre-login packets → mismatch causes status=4. v37.66 extends TLV scanner to also patch 0x002EE100 and 0x002EE113, replacing accountId (80607584802281872727→65657881045335015151) and channel (DY_MIESHI→DYanyou0040_MIESHI). This ensures ALL pre-login packets use consistent CANONICAL values. TESTING: check [TLV-SCAN] v37.66: Patched port=5678 pkt fields=X (ch=1 accId=1), 0x802EE121 status=0 (real success), 0x8234AB89 real sessionId/ticket, 0x0CB0A300 role data.");
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
