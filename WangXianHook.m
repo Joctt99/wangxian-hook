@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.93-UUID-FIX loaded ===");
+        _log(@"=== WangXianHook v37.94-HASH2-CONSISTENCY loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4683,39 +4683,45 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // Server validates: hash3 == first16hex(MD5(binaryHash + token))
                         //                   hash1 == last16hex(MD5(binaryHash + token))
                         {
-                            // v37.83: Use ORIGINAL hash2 (body MD5) from packet, NOT forced binary hash.
-                            // Server expects hash2 == MD5(body_fields+salt), NOT binary hash.
-                            // v37.76-v37.82 forced hash2=ddcb91f42c → always connection close.
+                            // v37.94 FIX: Force hash2 = binary hash (ddcb91f42c...) to MATCH
+                            // hash1/hash3 computation. ROOT CAUSE of status=4:
+                            //   hash1/hash3 = MD5(ddcb91f42c + token)  [using binary hash]
+                            //   hash2 = 640a8eab...                     [using orig body MD5]
+                            //   → Server validates hash1/hash3 = MD5(hash2 + token)
+                            //   → MD5(640a8eab + token) ≠ MD5(ddcb91f42c + token) = our hash1/hash3
+                            //   → MISMATCH → status=4!
+                            // Clean 248B packet has hash2=ddcb91f42c (binary hash), confirming
+                            // hash2 IS the binary hash, NOT body MD5.
+                            // v37.76-v37.82 forced hash2=ddcb91f42c but used WRONG hash1/hash3
+                            // (stale from different session) → connection close. Now with correct
+                            // token from EE120 + MD5(ddcb91f42c+token) recalc, all 3 match.
+                            static const char kBinaryHashHex_v94[] = "ddcb91f42c5a612b492a2296a971a5af";
                             char origHash2Hex[33] = {0};
                             if (h2 && h2 + 2 + 32 <= len) {
                                 memcpy(origHash2Hex, p + h2 + 2, 32);
                                 origHash2Hex[32] = 0;
                             } else {
-                                memcpy(origHash2Hex, "ddcb91f42c5a612b492a2296a971a5af", 32);
+                                memcpy(origHash2Hex, kBinaryHashHex_v94, 32);
                                 origHash2Hex[32] = 0;
                             }
-                            // Build MD5 input: origHash2_hex(32) + token(31) = 63 bytes
+                            // Build MD5 input: binaryHash_hex(32) + token(31) = 63 bytes
                             unsigned char hash1Val[16];
                             unsigned char hash3Val[16];
                             int hashComputed = 0;
                             if (g_hashTokenValid && strlen(g_hashToken) == 31) {
                                 char md5In[64];
-                                // v37.91: Use BINARY_HASH (ddcb91f42c...) for hash1/hash3 calc,
-                                // NOT origHash2 (640a8eab... fields MD5). Client natively computes
-                                // hash1/hash3 = MD5(binary_hash + token), confirmed by log match:
-                                // MD5(ddcb91f42c...+token) == native hash1/hash3.
-                                static const char kBinaryHashHex_v91[] = "ddcb91f42c5a612b492a2296a971a5af";
-                                memcpy(md5In, kBinaryHashHex_v91, 32);
+                                // Use BINARY_HASH (ddcb91f42c...) for hash1/hash3 calc.
+                                // Client natively computes hash1/hash3 = MD5(binary_hash + token),
+                                // confirmed by 63B MD5 input log: ddcb91f42c...+token.
+                                memcpy(md5In, kBinaryHashHex_v94, 32);
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
-                                // Compute MD5 using system CC_MD5 (via CommonCrypto already imported).
-                                // Avoid using our CC_MD5 hook (which changes outputs) — use dlsym directly.
-                                unsigned char md5Out[16]; // 16 bytes binary
+                                // Compute MD5 using system CC_MD5 (via dlsym to avoid our hook).
+                                unsigned char md5Out[16];
                                 memset(md5Out, 0, sizeof(md5Out));
                                 typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
                                 static RawCCMD5 s_rawMD5 = NULL;
                                 if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
                                 if (s_rawMD5) s_rawMD5(md5In, 63, md5Out);
-                                // Convert binary MD5 to 32 hex chars
                                 static const char kHex[] = "0123456789abcdef";
                                 char md5Hex[33];
                                 for (int hi = 0; hi < 16; hi++) {
@@ -4723,38 +4729,36 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                     md5Hex[hi*2+1] = kHex[md5Out[hi] & 0xF];
                                 }
                                 md5Hex[32] = 0;
-                                // hash3 = first 16 hex chars of md5Hex, hash1 = last 16
                                 memcpy(hash3Val, md5Hex, 16);
                                 memcpy(hash1Val, md5Hex+16, 16);
                                 hashComputed = 1;
-                                DLOG(@"[EE121-HASH-RECALC] v37.91: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
-                                     md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v91, g_hashToken);
+                                DLOG(@"[EE121-HASH-RECALC] v37.94: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
+                                     md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v94, g_hashToken);
                             } else {
-                                // Fallback: copy from original packet
                                 if (h1) memcpy(hash1Val, p+h1+2, 16);
                                 if (h3) memcpy(hash3Val, p+h3+2, 16);
-                                DLOG(@"[EE121-HASH-RECALC] v37.83: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
+                                DLOG(@"[EE121-HASH-RECALC] v37.94: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
                                      g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
                                      16, h3?p+h3+2:(const unsigned char*)"????????????????");
                             }
                             // v37.92 FIX: Write hash3 FIRST, then hash2, then hash1.
-                            // Native packet order (confirmed from L444 tail80B):
-                            //   hash3 → hash2 → hash1 (hash1 is LAST, closest to packet end)
-                            // Previous code wrote hash1→hash2→hash3 (WRONG ORDER) → status=4.
+                            // Native packet order: hash3 → hash2 → hash1
                             // Write hash3 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            // Write hash2 field (ORIGINAL fields MD5, NOT binary hash)
+                            // v37.94 FIX: Write hash2 = BINARY HASH (ddcb91f42c), NOT origHash2 (640a8eab).
+                            // This makes hash2 CONSISTENT with hash1/hash3 = MD5(ddcb91f42c + token).
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
+                            memcpy(newBuf+rebuildOut+2, kBinaryHashHex_v94, 32);
                             rebuildOut += 34;
+                            DLOG(@"[EE121-HASH2] v37.94: hash2=%s (FORCED binary hash, was orig=%s)", kBinaryHashHex_v94, origHash2Hex);
                             // Write hash1 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.93: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.93: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH1] v37.94: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH3] v37.94: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -4764,7 +4768,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.91: Rebuilt EE121 REAL accId + CANONICAL ch/dm/gp/UUID. hash2=ORIG(fieldsMD5) hash1/hash3=MD5(binaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.94: Rebuilt EE121 REAL accId + CANONICAL ch/dm/gp/UUID. hash2=FORCED(ddcb91f42c) hash1/hash3=MD5(binaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -10085,7 +10089,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.93 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+HASH_ORDER_FIX(hash3→hash2→hash1)+UUID_REPLACE_IN_ALL_HASHES+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.94 %d layers active (NATIVE_EE121+hash2=FORCED_ddcb91f42c+hash1/hash3=MD5(binaryHash+token)+HASH_CONSISTENCY+UUID_REPLACE_IN_ALL_HASHES+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
