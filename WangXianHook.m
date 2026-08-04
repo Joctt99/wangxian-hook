@@ -4994,17 +4994,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                             withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
                                                options:0 range:NSMakeRange(0, newStr.length)] > 0);
                     // v37.99 FIX: Track whether JSON was ACTUALLY modified.
-                    // Only recompute md5 if we changed something. If original JSON already has
-                    // correct sessionId/ticket, DON'T touch it — original md5 is valid.
-                    BOOL jsonModified = (didReplaceSession || didReplaceTicket);
+                    // v37.100 FIX: volatile — prevent -O2 from determining jsonModified is always YES
+                    // and eliminating the jsonModified==NO path (SKIP insert, else branch, etc.)
+                    volatile BOOL jsonModified = (didReplaceSession || didReplaceTicket);
                     // v37.88 FIX: #1 (IOS_CLIENT_MSG_REQ) has NO sessionId/ticket fields in JSON!
                     // v37.99 FIX: ONLY insert if the field is truly ABSENT from JSON!
                     // FFF493#2 (NEW_USER_ENTER_SERVER_REQ) already HAS non-empty sessionId/ticket
                     // from the login flow. Previous code inserted DUPLICATE fields → JSON corruption
                     // → server validation failure → connection CLOSE!
                     if (!didReplaceSession || !didReplaceTicket) {
-                        BOOL hasSessionId = ([newStr rangeOfString:@"\"sessionId\""].location != NSNotFound);
-                        BOOL hasTicket = ([newStr rangeOfString:@"\"ticket\""].location != NSNotFound);
+                        // v37.100: volatile to prevent -O2 dead code elimination of SKIP branch
+                        volatile BOOL hasSessionId = ([newStr rangeOfString:@"\"sessionId\""].location != NSNotFound);
+                        volatile BOOL hasTicket = ([newStr rangeOfString:@"\"ticket\""].location != NSNotFound);
                         if (!hasSessionId || !hasTicket) {
                             NSUInteger lastBrace = [newStr rangeOfString:@"}" options:NSBackwardsSearch].location;
                             if (lastBrace != NSNotFound) {
