@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.107-DIST-NATIVE-UUID-AUTH loaded ===");
+        _log(@"=== WangXianHook v37.108-DIST-NATIVE-ACCID loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4222,39 +4222,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         if (tlvCmd == 0x002EE100) {
             // v37.97 FIX: EE100 MUST use CANONICAL accId!
             // ROOT CAUSE: EE100 sent REAL accId (393256...) to login server,
-            // but EE121-CANON/game-server use CANONICAL (656578...). Server
-            // cross-validates IDs across login flow → session failure.
+            // v37.108-DIST: Use NATIVE accountId in EE100 — each user's REAL account ID!
+            // ROOT CAUSE: Forcing CANONICAL accId (65657881045335015151, kk994's ID) caused
+            // ALL users to enter kk994's game character regardless of their login account.
+            // FIX: Skip accId replacement. Users with different credentials use their OWN accId
+            // assigned by the server after successful login.
             // EE100 format: [12B header][00 00 00 05][00 14][20B accId]...
             // accId is at offset 18, 20 bytes.
-            static const char kCanonEE100_v97[] = "65657881045335015151";
-            unsigned char *ee100Buf = NULL;
-            size_t ee100OutLen = len;
-            BOOL ee100AccReplaced = NO;
-            if (len >= 38) {
-                char origAccId[21] = {0};
-                memcpy(origAccId, p + 18, 20); origAccId[20] = 0;
-                // v37.97 FIX: Use strcmp on stack buffer (origAccId).
-                // DO NOT use memcmp(p+18, static_array, N) — -O2 optimizer
-                // incorrectly considers that "always equal" and deletes REPLACED
-                // branch as dead code, leaving only already-CANONICAL branch.
-                if (strcmp(origAccId, kCanonEE100_v97) != 0) {
-                    ee100Buf = (unsigned char *)malloc(len + 64);
-                    if (ee100Buf) {
-                        memcpy(ee100Buf, p, len);
-                        memcpy(ee100Buf + 18, kCanonEE100_v97, 20);
-                        ee100OutLen = len;
-                        ee100AccReplaced = YES;
-                        DLOG(@"[EE100-ACCID] v37.97: EE100 REPLACED accId: orig=%s → canon=%s (len=%zu)",
-                             origAccId, kCanonEE100_v97, len);
-                    }
-                } else {
-                    DLOG(@"[EE100-ACCID] v37.97: EE100 accId already CANONICAL=%s (len=%zu)",
-                         kCanonEE100_v97, len);
-                }
-            }
-            // v37.97: Replace channel DY_MIESHI → DYanyou0040_MIESHI (on top of accId replace)
-            unsigned char *workBuf = ee100Buf ? ee100Buf : (unsigned char *)p;
-            size_t workLen = ee100OutLen;
+            unsigned char *workBuf = (unsigned char *)p;
+            size_t workLen = len;
             unsigned char *dyPos = (unsigned char *)memmem(workBuf, workLen, "DY_MIESHI", 9);
             if (dyPos && dyPos >= workBuf + 2) {
                 size_t dyOffset = (size_t)(dyPos - workBuf);
@@ -4310,39 +4286,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         BOOL hasDY_MIESHI = (memmem(p, len, "DY_MIESHI", 9) != NULL);
         if (needsPatch && (isEE113 || hasDY_MIESHI)) {
             if (isEE113 && !hasDY_MIESHI) {
-                // v37.97 FIX: EE113 — MUST replace accId with CANONICAL!
-                // ROOT CAUSE: EE113 sent REAL accId (393256...) to login server.
+                // v37.108-DIST: Use NATIVE accountId in EE113 — each user's REAL account ID!
+                // ROOT CAUSE: Forcing CANONICAL accId caused ALL users to enter kk994's character.
                 // EE113 structure (51B): [12B header][00 14][20B accId][00 05][5B user][00 06][6B pass][00 00]
-                // accId is at offset 14, 20 bytes. No channel field.
-                static const char kCanonEE113_v97[] = "65657881045335015151";
-                if (len >= 34) { // 12 header + 2 (0014) + 20 accId = 34
+                // accId is at offset 14, 20 bytes. No channel field → no TLV reconstruction needed.
+                // Just pass through original packet.
+                if (len >= 34) {
                     uint16_t accFlen = ((uint16_t)p[12] << 8) | p[13];
-                    // v37.97 FIX: Read orig into stack buffer FIRST, then compare.
-                    // AVOID memcmp(p+14, static_array, 20) — -O2 optimizer
-                    // mis-deduces "always equal" and drops REPLACED branch.
                     char orig113[21] = {0};
                     if (accFlen == 20) memcpy(orig113, p + 14, 20);
                     orig113[20] = 0;
-                    if (accFlen == 20 && strcmp(orig113, kCanonEE113_v97) != 0) {
-                        unsigned char *newBuf113 = (unsigned char *)malloc(len + 8);
-                        if (newBuf113) {
-                            memcpy(newBuf113, p, len);
-                            memcpy(newBuf113 + 14, kCanonEE113_v97, 20);
-                            // pktLen unchanged (20B→20B)
-                            DLOG(@"[TLV-SCAN] v37.97: EE113 REPLACED accId orig=%s → canon=%s (len=%zu cmd=0x%08X)",
-                                 orig113, kCanonEE113_v97, len, tlvCmd);
-                            ssize_t rret = orig_send(fd, newBuf113, len, flags);
-                            free(newBuf113);
-                            if (rret >= 0) return (ssize_t)len;
-                            return rret;
-                        }
-                    } else {
-                        if (accFlen == 20) {
-                            DLOG(@"[TLV-SCAN] v37.97: EE113 accId already CANONICAL (len=%zu cmd=0x%08X)", len, tlvCmd);
-                        } else {
-                            DLOG(@"[TLV-SCAN] v37.97: EE113 too short for accId (len=%zu cmd=0x%08X)", len, tlvCmd);
-                        }
-                    }
+                    DLOG(@"[TLV-SCAN] v37.108: EE113 NATIVE accId=%s (passing through, len=%zu cmd=0x%08X)",
+                         orig113, len, tlvCmd);
                 }
             } else {
                 // Reconstruct packet with TLV field replacements
@@ -4756,15 +4711,37 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                              realAccId, realUser, realUserLen, realPass, realPassLen);
 
                         // Rebuild newBuf from scratch (after header 12B).
-                        // v37.97: Use CANONICAL accId + CANONICAL ch/dm/gp/UUID + ORIGINAL hash2 (body MD5).
+                        // v37.108-DIST: Use NATIVE accId + CANONICAL ch/dm/gp + REAL device UUID + ORIGINAL hash2 (body MD5).
                         size_t rebuildOut = 12;
-                        // v37.97: Use CANONICAL accId (65657881045335015151) to match clean client.
-                        // hash2 = MD5(body) is computed by CC_MD5 hook with accId replacement.
-                        // hash1/hash3 = MD5(real_binary_hash + token) where binary_hash = 906e707ec...
-                        // CANONICAL account (65657881045335015151) has character data, REAL account doesn't.
-                        static const char kCanonAccId_v96[] = "65657881045335015151"; // 20 bytes
-                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x14;
-                        memcpy(newBuf+rebuildOut+2, kCanonAccId_v96, 20); rebuildOut += 22;
+                        // v37.108: Use REAL accId extracted from original packet — NOT CANONICAL!
+                        // ROOT CAUSE: Forcing kk994's accId (65657881045335015151) caused ALL users
+                        // to enter kk994's game character regardless of their login account.
+                        // realAccId was already extracted from the original 00 14 [20B accId] TLV above.
+                        {
+                            char nativeAcc[21] = {0};
+                            if (realAccId && strlen(realAccId) == 20) {
+                                memcpy(nativeAcc, realAccId, 20);
+                            } else {
+                                // Fallback: try to extract 20-digit accId from body area again
+                                const char *scanStart = (const char *)p + 14;
+                                const char *scanEnd = (const char *)p + ((len > 40) ? 40 : len);
+                                for (const char *s = scanStart; s + 20 <= scanEnd; s++) {
+                                    BOOL isDigits = YES;
+                                    for (int k = 0; k < 20 && isDigits; k++) {
+                                        if (s[k] < '0' || s[k] > '9') isDigits = NO;
+                                    }
+                                    if (isDigits) { memcpy(nativeAcc, s, 20); break; }
+                                }
+                                // Last resort: copy whatever was in position 14 if it's 20 printable chars
+                                if (nativeAcc[0] == 0 && len >= 34) {
+                                    memcpy(nativeAcc, p + 14, 20);
+                                }
+                            }
+                            nativeAcc[20] = 0;
+                            DLOG(@"[EE121-CANON] v37.108: Using NATIVE accId=%s (NOT CANONICAL 6565788...)", nativeAcc);
+                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x14;
+                            memcpy(newBuf+rebuildOut+2, nativeAcc, 20); rebuildOut += 22;
+                        }
                         // user (REAL, variable length)
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)(realUserLen&0xFF);
                         memcpy(newBuf+rebuildOut+2, realUser, realUserLen); rebuildOut += 2+realUserLen;
@@ -5643,36 +5620,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[SERVER-SELECT] Analysis exception: %@", e.reason);
             }
 
-            // v37.97 FIX: F013 MUST use CANONICAL accId!
-            // ROOT CAUSE: F013 sent REAL accId (393256...) to login server.
+            // v37.108-DIST: Use NATIVE accountId in F013 — each user's REAL account ID!
+            // ROOT CAUSE: Forcing CANONICAL accId caused ALL users to enter kk994's character.
             // F013 format: [12B header][00 14][20B accId][00 05][5B user][00 06][6B pass][00 00]
-            // accId at offset 14, 20 bytes.
-            static const char kCanonF013_v97[] = "65657881045335015151";
+            // accId at offset 14, 20 bytes. Pass through original packet without modification.
             if (len >= 34) {
                 const unsigned char *fp2 = (const unsigned char *)buf;
                 uint16_t accLen = ((uint16_t)fp2[12] << 8) | fp2[13];
-                // v37.97 FIX: Read orig F013 accId into stack first, then strcmp.
-                // DO NOT use memcmp(fp2+14, static_array, 20) — -O2 optimizer
-                // treats memcmp(mem_ptr, static_str, N) as predictable, drops REPLACE branch.
                 char origF013[21] = {0};
                 if (accLen == 20) memcpy(origF013, fp2 + 14, 20);
                 origF013[20] = 0;
-                if (accLen == 20 && strcmp(origF013, kCanonF013_v97) != 0) {
-                    unsigned char *f013New = (unsigned char *)malloc(len + 8);
-                    if (f013New) {
-                        memcpy(f013New, fp2, len);
-                        memcpy(f013New + 14, kCanonF013_v97, 20);
-                        DLOG(@"[F013-ACCID] v37.97: F013 REPLACED accId orig=%s → canon=%s (len=%zu)",
-                             origF013, kCanonF013_v97, len);
-                        ssize_t rret = orig_send(fd, f013New, len, flags);
-                        free(f013New);
-                        if (rret >= 0) return (ssize_t)len;
-                        return rret;
-                    }
-                } else if (accLen == 20) {
-                    DLOG(@"[F013-ACCID] v37.97: F013 accId already CANONICAL=%s (len=%zu)",
-                         kCanonF013_v97, len);
-                }
+                DLOG(@"[F013-ACCID] v37.108: F013 NATIVE accId=%s (passing through, len=%zu)",
+                     origF013, len);
             }
         }
     }
@@ -8694,16 +8653,17 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             out += 36; pos += 36;
                         } else if (hasAccId && pos + 20 <= len
                                    && (pos+20 >= len || in[pos+20] < '0' || in[pos+20] > '9')) {
-                            // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20).
-                            // Handles hash1(44B)=token+accId, hash2(156B/168B)=fields+accId,
-                            // FFF493 hash(162B)=user+pass+accId+..., any MD5 input with 20-digit accId.
-                            // Only check NEXT char (previous may be digit from password "994624").
-                            BOOL allDig = YES;
-                            for (uint32_t j = 0; j < 20; j++) {
-                                if (in[pos+j] < '0' || in[pos+j] > '9') { allDig = NO; break; }
+                            // v37.108-DIST: Do NOT replace 20-digit accountId in MD5 input!
+                            // ROOT CAUSE: Forcing CANONICAL accId in MD5 → hash mismatch
+                            // for users with different credentials. Server validates
+                            // hashes against their REAL accountId.
+                            // Just copy original 20-digit through.
+                            uint8_t allDigNative = 1;
+                            for (uint32_t j = 0; j < 20 && allDigNative; j++) {
+                                if (in[pos+j] < '0' || in[pos+j] > '9') allDigNative = 0;
                             }
-                            if (allDig && memcmp(in+pos, kCanonAccId, 20) != 0) {
-                                memcpy((uint8_t *)cleanInput + out, kCanonAccId, 20);
+                            if (allDigNative) {
+                                memcpy((uint8_t *)cleanInput + out, in + pos, 20);
                                 out += 20; pos += 20;
                             } else {
                                 ((uint8_t *)cleanInput)[out++] = in[pos++];
@@ -10146,16 +10106,19 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
                         // v37.107-DIST: Do NOT replace bare UUID either — same reason as above.
                     } else if (rem >= 20) {
-                        // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20)
+                        // v37.108-DIST: Do NOT replace 20-digit accountId in CCCrypt plaintext!
+                        // ROOT CAUSE: Forcing CANONICAL accId caused ALL users to enter kk994's game
+                        // character regardless of their login account.
+                        // Keep the boundary check but copy original 20-digit number as-is.
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 20 < e) ? *(p+20) : 0;
                         if ((prev < '0' || prev > '9') && (next < '0' || next > '9')) {
-                            BOOL allDig = YES;
+                            BOOL allDigNative = YES;
                             for (int j = 0; j < 20; j++) {
-                                if (p[j] < '0' || p[j] > '9') { allDig = NO; break; }
+                                if (p[j] < '0' || p[j] > '9') { allDigNative = NO; break; }
                             }
-                            if (allDig && memcmp(p, kCanonAccIdAES, 20) != 0) {
-                                memcpy(out, kCanonAccIdAES, 20);
+                            if (allDigNative) {
+                                memcpy(out, p, 20); // Pass through REAL accountId
                                 out += 20; p += 20; continue;
                             }
                         }
@@ -10382,7 +10345,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.107-DIST %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp+NATIVE_UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+NO_UUID_REPLACE+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+NO_EE121_STATUS_PATCH+NO_BODY_OVERWRITE+FORGE_DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.108-DIST %d layers active (NATIVE_ACCID+CANONICAL_ch/dm/gp+NATIVE_UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+NO_ACCID_REPLACE+NO_UUID_REPLACE+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+NO_EE121_STATUS_PATCH+NO_BODY_OVERWRITE+FORGE_DISABLED)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
