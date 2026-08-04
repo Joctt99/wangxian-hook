@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.87-DIST loaded ===");
+        _log(@"=== WangXianHook v37.88-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4834,12 +4834,26 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         realTicket = @"kk994|1785665252271|236923||SwnLPVw4wqtqXUfBX0JETQlXLrNxbb0TElk1YQvRmrKTNJG1ImA5eVtTnqY06XALBsKbKtCRJ7iRMUJcE+yZkboYVJ55k35zIxDeoLGoe/4TAo6nQjRD5obTaa18ObMyJaz6R0TUg8Oz78N1me5vBrU9c6sImsqv1QZEebEgfZO7KY2OdU35OV8Vb6rXRBwl1f78jA1OnkTRmf7ZthPpP1q3V1Y8OnzHnbHwq/xnZP3KtEXej3RCQX6zjJf+G81+W2XSpzUPynQXQ/Q/u9qn2N/5/db/8uMz68q/giuSAb9ikNYno+NYXTgn4FLsUbV15NTU5YIVqo9He/pYQCQ==";
                         DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Using FALLBACK sessionId/ticket (sessionValid=%d)", fffWhich, g_sessionValid);
                     }
-                    [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
+                    BOOL didReplaceSession = ([newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
                                             withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
-                                               options:0 range:NSMakeRange(0, newStr.length)];
-                    [newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
+                                               options:0 range:NSMakeRange(0, newStr.length)] > 0);
+                    BOOL didReplaceTicket = ([newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
                                             withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
-                                               options:0 range:NSMakeRange(0, newStr.length)];
+                                               options:0 range:NSMakeRange(0, newStr.length)] > 0);
+                    // v37.88 FIX: #1 (IOS_CLIENT_MSG_REQ) has NO sessionId/ticket fields in JSON!
+                    // The plaintext is: {"msgs": [...], "time": ..., "seqNum": ..., "randStr": ..., "__msg_clazz": "IOS_CLIENT_MSG_REQ", "msgtype": ...}
+                    // So replaceOccurrencesOfString above finds nothing. We must INSERT the fields.
+                    if (!didReplaceSession || !didReplaceTicket) {
+                        // Insert sessionId and ticket into #1 JSON
+                        // Strategy: find the last "}" and insert before it
+                        NSUInteger lastBrace = [newStr rangeOfString:@"}" options:NSBackwardsSearch].location;
+                        if (lastBrace != NSNotFound) {
+                            NSString *insertStr = [NSString stringWithFormat:@"\"sessionId\": \"%@\", \"ticket\": \"%@\"", realSessionId, realTicket];
+                            [newStr insertString:insertStr atIndex:lastBrace];
+                            DLOG(@"[FFF493-REPL] v37.88: #%d INSERTED sessionId+ticket into JSON (was missing) at pos=%lu",
+                                 fffWhich, (unsigned long)lastBrace);
+                        }
+                    }
                     const char *newPlain = [newStr UTF8String];
                     size_t newPlainLen = strlen(newPlain);
                     DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket)",
@@ -4911,18 +4925,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 }
                 DLOG(@"[FFF493-REPL] v37.87: FFF493#%d replacement internal substep skipped", fffWhich);
             }
-            // v37.87 FALLBACK: Even if replacement was skipped (no plaintext), mark #1 sent
-            // if it's in the len range — this triggers heartbeat counting in recv hook.
-            if (cmd == 0x00FFF493 && !g_fff493_1_sent && len >= 350 && len <= 800) {
-                g_fff493_1_sent = 1;
-                DLOG(@"[FFF493-REPL] v37.87: FALLBACK mark #1 sent (len=%zu, no plaintext replacement)", len);
             }
-            if (cmd == 0x00FFF493 && !g_fff493_2_sent && len > 800) {
-                g_fff493_2_sent = 1;
-                g_consec_heartbeats = 0;
-                g_role_0CB0A300_seen = 0;
-                DLOG(@"[FFF493-REPL] v37.87: FALLBACK mark #2 sent (len=%zu, no plaintext replacement)", len);
-            }
+        // v37.88 FALLBACK: Moved OUTSIDE g_aes_key_saved gating! Even if AES key not saved
+        // or replacement was skipped (no plaintext), mark #1/#2 sent based on len range.
+        // This triggers heartbeat counting in recv hook for forged 0x0CB0A300 injection.
+        if (cmd == 0x00FFF493 && !g_fff493_1_sent && len >= 350 && len <= 800) {
+            g_fff493_1_sent = 1;
+            DLOG(@"[FFF493-REPL] v37.88: FALLBACK mark #1 sent (len=%zu, no plaintext replacement)", len);
+        }
+        if (cmd == 0x00FFF493 && !g_fff493_2_sent && len > 800) {
+            g_fff493_2_sent = 1;
+            g_consec_heartbeats = 0;
+            g_role_0CB0A300_seen = 0;
+            DLOG(@"[FFF493-REPL] v37.88: FALLBACK mark #2 sent (len=%zu, no plaintext replacement)", len);
         }
         // Direct orig_send for ALL game server commands — no processing at all
         ssize_t ret = orig_send(fd, buf, len, flags);
@@ -10029,7 +10044,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.87 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.88 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10157,7 +10172,7 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.87-DIST — v37.87: v37.87 log revealed 3 fatal bugs! (1) CCCrypt save threshold >400 was too HIGH: #1 (IOS_CLIENT_MSG_REQ) has realDataInLen=316 (316>400=false) so it was NEVER captured → g_fff493_1_plain_buf=NULL → send hook couldn't detect #1. Fix: lowered to >200. (2) Send hook #1 detection required g_fff493_1_plain_buf (>300) but that buffer was never filled. Fix: now detect #1 by LEN RANGE (350-800) FIRST, then plaintext. (3) When #1/2 replacement skipped (no plaintext), g_fff493_1_sent/g_fff493_2_sent stayed 0 → heartbeat counter (and forgery injection) NEVER triggered. Fix: FALLBACK mark — even if replacement skipped, mark #1 sent if len 350-800, mark #2 sent if len>800. Plus all v37.87 log labels bumped to v37.87.");
+    DLOG(@"[VERSION] WangXianHook v37.88-DIST — v37.88: 2 MORE ROOT CAUSES fixed! (1) FFF493#1 (IOS_CLIENT_MSG_REQ) JSON has NO sessionId/ticket fields! Previous code tried to REPLACE \"sessionId\": \"\" and \"ticket\": \"\" — these don't exist in #1's JSON (which has: msgs[], time, seqNum, randStr, __msg_clazz, msgtype). Fix: if replacement did nothing (field not found), INSERT sessionId+ticket into JSON before closing brace. (2) FALLBACK marking was INSIDE g_aes_key_saved gating — if AES key wasn't saved for any reason, #1/#2 never marked as sent → heartbeat counter and forged 0x0CB0A300 injection NEVER triggered. Fix: moved FALLBACK marking OUTSIDE g_aes_key_saved gating. Also bumped all v37.87 labels to v37.88.");
     // v37.87: Force session valid global immediately on hook init. This is the single most
     // important change — 100% of v37.12-84 FFF493-REPL went to FALLBACK (sessionValid=0)
     // because no real 0x8234AB89 was ever received (login server gave 版本过低, no session).
@@ -10171,7 +10186,7 @@ static void installAllHooks(void) {
         if (tikLen < sizeof(g_ticket))  { memcpy(g_ticket,    kDefaultTicket,    tikLen); g_ticket[tikLen] = 0; g_ticketLen = (int)tikLen; }
         g_sessionValid = 1;
         g_hashTokenValid = 0; // reset per-session
-        DLOG(@"[GLOBALS-INIT] v37.87: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
+        DLOG(@"[GLOBALS-INIT] v37.88: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
     }
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
