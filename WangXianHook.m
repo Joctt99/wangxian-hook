@@ -846,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.111-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.112-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3932,6 +3932,10 @@ static int hook_close(int fd) {
 // and reconnects. Without this, g_fff493_1_sent/g_fff493_2_sent/g_injected_0CB0A300
 // etc. remain set from the 1st session → 2nd connect skips FFF493 replacement,
 // skips handshake, skips role injection → "连接中断异常".
+// v37.112 SAFETY FIX: DO NOT free() malloc'd plaintext buffers here. Old socket
+// background threads / delayed callbacks may still be accessing them → use-after-free
+// CRASH on returning from role page. Just zero the length fields; the next CCCrypt
+// capture will call free() before re-malloc'ing (safe, serialized on main thread).
 static void resetGameStateForReconnect(void) {
     // --- FFF493 / login flow state ---
     g_fff493_1_sent = 0;
@@ -3942,9 +3946,7 @@ static void resetGameStateForReconnect(void) {
     g_fff493_1_plain_len = 0;
     g_fff493_2_native_len = 0;
     g_ext_plaintext_len = 0;
-    if (g_fff493_2_native_plain) { free(g_fff493_2_native_plain); g_fff493_2_native_plain = NULL; }
-    if (g_fff493_1_plain_buf)   { free(g_fff493_1_plain_buf);   g_fff493_1_plain_buf = NULL; }
-    if (g_ext_plaintext)        { free(g_ext_plaintext);        g_ext_plaintext = NULL; }
+    // v37.112: FREE DELETED — buffers recycled by CCCrypt next capture
     // session/ticket: keep defaults from installAllHooks — they'll be re-captured
     g_hashTokenValid = 0;
 
@@ -3996,7 +3998,7 @@ static void resetGameStateForReconnect(void) {
     g_bypassRemaining = 0;
     resetCmdQueue();
 
-    DLOG(@"[RECONNECT-RESET] v37.111: ALL per-connection state cleared for new game server connection");
+    DLOG(@"[RECONNECT-RESET] v37.112: ALL per-connection state cleared (no free for thread safety)");
 }
 
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -10418,7 +10420,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.111-DIST SILENT_MODE=%d %d layers active (v37.111 FIX: resetGameStateForReconnect() — clears ALL per-connection state on every game server connect. Fixes 2nd connect after returning from role page. v37.110 FIX: DLOG args EVALUATED via comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.112-DIST SILENT_MODE=%d %d layers active (v37.112 FIX: resetGameStateForReconnect — no free() inside (use-after-free crash fix). v37.111: full state reset on every game server connect. v37.110: DLOG args EVALUATED via comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
