@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.106-CHL4-UUID-REPLACE loaded ===");
+        _log(@"=== WangXianHook v37.107-DIST-NATIVE-UUID-AUTH loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4782,8 +4782,42 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x0B; memcpy(newBuf+rebuildOut+2,kDModel,11); rebuildOut+=13;
                         // GPU 24B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x18; memcpy(newBuf+rebuildOut+2,kGPU,24);     rebuildOut+=26;
-                        // UUID 36B
-                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x24; memcpy(newBuf+rebuildOut+2,kUUID,36);   rebuildOut+=38;
+                        // UUID 36B — v37.107-DIST: Use REAL device UUID from original packet!
+                        // Each user uses their OWN device UUID for device whitelist authorization.
+                        // Extract real UUID from original packet (TLV: 00 24 [36B UUID]).
+                        char realDevUUID[37] = {0};
+                        BOOL gotRealUUID = NO;
+                        for (size_t sp = 12; sp + 2 + 36 <= len; ) {
+                            uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
+                            if (sp + 2 + sl > len) break;
+                            if (sl == 36) {
+                                // Check if it looks like a UUID (8-4-4-4-12 hex format)
+                                const char *u = (const char *)(p + sp + 2);
+                                BOOL isUUID = YES;
+                                for (int ui = 0; ui < 36; ui++) {
+                                    char c = u[ui];
+                                    if (ui == 8 || ui == 13 || ui == 18 || ui == 23) {
+                                        if (c != '-') { isUUID = NO; break; }
+                                    } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                                        isUUID = NO; break;
+                                    }
+                                }
+                                if (isUUID) {
+                                    memcpy(realDevUUID, u, 36);
+                                    realDevUUID[36] = 0;
+                                    gotRealUUID = YES;
+                                    break;
+                                }
+                            }
+                            sp += 2 + sl;
+                        }
+                        if (gotRealUUID) {
+                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x24; memcpy(newBuf+rebuildOut+2,realDevUUID,36);
+                        } else {
+                            // Fallback: use fixed UUID (should not happen normally)
+                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x24; memcpy(newBuf+rebuildOut+2,kUUID,36);
+                        }
+                        rebuildOut+=38;
                         // WIFI 4B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x04; memcpy(newBuf+rebuildOut+2,"WIFI",4);   rebuildOut+=6;
                         // 7.6.3 5B
@@ -6947,53 +6981,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             // Chinese error strings, client state machine BLOCKS even when header says OK.
             // This is the single biggest bug of v37.12-84. Fix: overwrite body bytes IN-PLACE
             // (keep same pktLen=94, same ret=94, no truncation needed — safe).
+            // v37.107-DIST: Do NOT patch EE121 status or body!
+            // ROOT CAUSE: Previous code forced status 4→0 AND overwrote body text
+            // "未授权此手机" → "登录成功". This TRICKED the client into thinking login
+            // succeeded, but the server's session state was still "未authorized" →
+            // game server (12003) immediately closed connection.
+            // FIX: Let the REAL server response pass through unchanged.
+            //   - If status=0 (authorized): client proceeds normally.
+            //   - If status=4 (未授权): client shows the authorization prompt,
+            //     user completes authorization on master device, then re-logs in.
+            // This way the device whitelist authorization system works NORMALLY.
+            // NOTE: We still LOG the response for debugging, but do NOT modify it.
             if ((cmd == 0x802EE121 || cmd == 0x802EE118 || cmd == 0x802EE120) && ret >= 13) {
-                unsigned char *bp = (unsigned char *)buf;
-                uint8_t oldStatus = p[12];
-                if (oldStatus != 0) {
-                    DLOG(@"[PROTO-R-PATCH] v37.87: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", oldStatus, cmd, ret);
-                    bp[12] = 0;
-                }
-                if (cmd == 0x802EE121 && ret >= 93) {
-                    // v37.87 CRITICAL: Completely overwrite body text.
-                    // Server gave 94B: [0..11 hdr][12 status][13..93 body=81B error Chinese text]
-                    // Replace bytes [13..93] with SUCCESS message + canonic accountId.
-                    // Target pattern (UTF-8, 81 bytes total):
-                    //   TLV: len=0x14(20) + 20B canonic accId (numeric ASCII)
-                    //   TLV: len=0x0C(12) + "登录成功" (6 UTF8 codeunits × 2 chars? 6 bytes)
-                    //   Tail: padding NUL bytes to reach 81
-                    static const char kCanonicAcc[] = "65657881045335015151"; // 20 chars
-                    static const char kSuccess[]   = "\xE7\x99\xBB\xE5\xBD\x95\xE6\x88\x90\xE5\x8A\x9F"; // 登录成功 (12B UTF8)
-                    size_t bodyStart = 13;
-                    size_t bodyEnd   = (size_t)ret;
-                    size_t bodyCap   = bodyEnd - bodyStart; // 81B for ret=94
-                    // 1) Zero the whole body area first (wipe all error Chinese text)
-                    memset(bp + bodyStart, 0, bodyCap);
-                    // 2) Write first TLV (type=0x14 accountId tag used in EE121 send; 2B tag-less len prefix here)
-                    size_t w = bodyStart;
-                    if (w + 2 + 20 <= bodyEnd) {
-                        bp[w++] = 0x00;
-                        bp[w++] = 0x14; // 20
-                        memcpy(bp + w, kCanonicAcc, 20); w += 20;
-                        DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Wrote accountId TLV (20B: %s)", kCanonicAcc);
+                uint8_t status = p[12];
+                DLOG(@"[EE121-RESP] v37.107-DIST: cmd=0x%08X status=%u (NOT patched, let client handle)", cmd, status);
+                if (cmd == 0x802EE121 && ret > 13) {
+                    NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
+                    if (bodyStr && bodyStr.length > 0) {
+                        DLOG(@"[EE121-RESP] v37.107-DIST: Body: %@", bodyStr);
                     }
-                    // 3) Write second TLV: success status text (len=12 bytes UTF8)
-                    if (w + 2 + 12 <= bodyEnd) {
-                        bp[w++] = 0x00;
-                        bp[w++] = 0x0C; // len=12
-                        memcpy(bp + w, kSuccess, 12); w += 12;
-                        DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Wrote SUCCESS text TLV (12B: 登录成功)");
-                    }
-                    // 4) Any remaining body bytes are already 0 (NUL padding)
-                    // Also zero the pktLen field (bytes 0-3) update — NO keep pktLen = 94 original, ret unchanged.
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87: EE121 body OVERWRITTEN! Old body had error text. New: bodyStart=%zu bodyEnd=%zu written=%zu padding=%zu",
-                         bodyStart, bodyEnd, w - bodyStart, (bodyEnd >= w) ? (bodyEnd - w) : 0);
-                    // 5) Dump the new full response for verification
-                    NSMutableString *verHex = [NSMutableString stringWithCapacity:94*3];
-                    for (size_t i = 0; i < 94 && i < (size_t)ret; i++) [verHex appendFormat:@"%02X ", bp[i]];
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Post-patch EE121 HEX: %@", verHex);
-                    NSString *bodyStrAfter = [[NSString alloc] initWithBytes:bp+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
-                    if (bodyStrAfter) DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Post-patch body UTF8: %@", bodyStrAfter);
                 }
             }
 
@@ -7981,26 +7987,11 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                 }
             }
 
-            // v36.50: ONLY patch on login server (port=5678), and NEVER truncate!
-            // v37.87: Same body replacement logic as recv hook (keep identical in both hooks)
+            // v37.107-DIST: Do NOT patch EE121 in read hook either!
+            // Same logic as recv hook — let real server response pass through.
             if (cmd == 0x802EE121 && ret >= 13 && port == 5678) {
-                unsigned char *bp = (unsigned char *)buf;
-                uint8_t oldStatus = p[12];
-                if (oldStatus != 0) {
-                    DLOG(@"[PROTO-R-PATCH] v37.87: Status %u -> 0 (read hook, keeping %zd bytes)", oldStatus, ret);
-                    bp[12] = 0;
-                }
-                if (ret >= 93) {
-                    static const char kCanonicAcc[] = "65657881045335015151";
-                    static const char kSuccess[]   = "\xE7\x99\xBB\xE5\xBD\x95\xE6\x88\x90\xE5\x8A\x9F"; // 登录成功
-                    size_t bodyStart = 13, bodyEnd = (size_t)ret, bodyCap = bodyEnd - bodyStart;
-                    memset(bp + bodyStart, 0, bodyCap);
-                    size_t w = bodyStart;
-                    if (w + 2 + 20 <= bodyEnd) { bp[w++] = 0x00; bp[w++] = 0x14; memcpy(bp+w, kCanonicAcc, 20); w += 20; }
-                    if (w + 2 + 12 <= bodyEnd) { bp[w++] = 0x00; bp[w++] = 0x0C; memcpy(bp+w, kSuccess, 12);   w += 12; }
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87 (read hook): EE121 body rewritten. written=%zu padding=%zu",
-                         w-bodyStart, (bodyEnd>=w)?(bodyEnd-w):0);
-                }
+                uint8_t status = p[12];
+                DLOG(@"[EE121-RESP2] v37.107-DIST: status=%u (NOT patched, read hook)", status);
             }
         }
     }
@@ -8055,24 +8046,14 @@ static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags, struct so
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RF] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // RESTORED: Patch injection-detection error responses
+        // v37.107-DIST: Do NOT patch EE121 status in recvfrom either!
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RF] Version/auth response 0x%08X", cmd);
-            if (ret >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RF-PATCH] Status %u -> 0 (injection detection)", p[12]);
-                ((unsigned char *)buf)[12] = 0;
-            }
+            DLOG(@"[PROTO-RF] v37.107-DIST: Version/auth response 0x%08X status=%u (NOT patched)", cmd, ret >= 13 ? p[12] : 0);
         }
     }
-    
-    // RESTORED: Clear '版本过低' messages
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-RF] Cleared '版本过低' at offset %zd", i);
-            memset((unsigned char *)buf + i, ' ', sizeof(verLow));
-        }
-    }
+
+    // v37.107-DIST: Do NOT clear '版本过低' messages — let client show real server errors!
+    // (Previous code cleared '版本过低' which hid real authorization failures from the user.)
     
     return ret;
 }
@@ -8126,24 +8107,13 @@ static ssize_t hook_recvmsg(int fd, struct msghdr *msg, int flags) {
                             ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         DLOG(@"[PROTO-DBG-RM] cmd=0x%08X pktLen=%u ret=%zd", cmd, pktLenBE, ret);
         
-        // RESTORED: Patch injection-detection error responses
+        // v37.107-DIST: Do NOT patch EE121 status in recvmsg either!
         if (cmd == 0x802EE120 || cmd == 0x802EE121 || cmd == 0x802EE118) {
-            DLOG(@"[PROTO-RM] Version/auth response 0x%08X", cmd);
-            if (iov->iov_len >= 13 && p[12] != 0) {
-                DLOG(@"[PROTO-RM-PATCH] Status %u -> 0 (injection detection)", p[12]);
-                ((unsigned char *)iov->iov_base)[12] = 0;
-            }
+            DLOG(@"[PROTO-RM] v37.107-DIST: Version/auth response 0x%08X status=%u (NOT patched)", cmd, (iov->iov_len >= 13) ? p[12] : 0);
         }
     }
-    
-    // RESTORED: Clear '版本过低' messages
-    static const unsigned char verLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
-    for (ssize_t i = 0; i <= ret - (ssize_t)sizeof(verLow) && i <= (ssize_t)iov->iov_len - (ssize_t)sizeof(verLow); i++) {
-        if (memcmp(p + i, verLow, sizeof(verLow)) == 0) {
-            DLOG(@"[PATCH-RM] Cleared '版本过低' at offset %zd", i);
-            memset((unsigned char *)iov->iov_base + i, ' ', sizeof(verLow));
-        }
-    }
+
+    // v37.107-DIST: Do NOT clear '版本过低' messages in recvmsg — let client show real errors!
     
     return ret;
 }
@@ -8718,10 +8688,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             memcpy((uint8_t *)cleanInput + out, hNew, 32);
                             out += 32; pos += 32;
                         } else if (hasUUID && pos == uuidPos) {
-                            // v37.62: Replace ANY generic device-UUID-format with clean-client CANONICAL UUID.
-                            // ONLY when hasEE121Ctx==1 (between SQAGEIOS and WIFI7.6.3979) to avoid
-                            // clobbering UUIDs in other MD5 inputs (e.g., SK/HTTP).
-                            memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                            // v37.107-DIST: Do NOT replace UUID in MD5 input!
+                            // Each user uses their OWN device UUID. Copy original bytes.
+                            memcpy((uint8_t *)cleanInput + out, in + pos, 36);
                             out += 36; pos += 36;
                         } else if (hasAccId && pos + 20 <= len
                                    && (pos+20 >= len || in[pos+20] < '0' || in[pos+20] > '9')) {
@@ -8941,19 +8910,14 @@ static NSUUID* hook_identifierForVendor(UIDevice *self, SEL _cmd) {
 }
 
 static void installIDFVHook(void) {
-    // v37.65: Use clean-client CANONICAL UUID so EE006/EE121/IDFV all match.
-    // Server rejects status=4 if UUID mismatch (IDFV=D4896737... but EE121=66B0EE01...).
-    const char *fixedUUIDStr = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
-    @try {
-        // Bytes for 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
-        g_fixedIDFV = [[NSUUID alloc] initWithUUIDBytes:(const unsigned char *)"\x66\xB0\xEE\x01\x5D\x2B\x4E\xAE\xBF\xB3\xEC\xA9\xCA\xBF\x16\xF8"];
-    } @catch (NSException *e) {
-        g_fixedIDFV = [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:fixedUUIDStr]];
-    }
-    if (!g_fixedIDFV) {
-        g_fixedIDFV = [NSUUID UUID];  // last resort: random
-    }
-    DLOG(@"[IDFV-HOOK] v37.65: Fixed UUID = %@ (CANONICAL match EE121)", [g_fixedIDFV UUIDString]);
+    // v37.107-DIST: Use NATIVE IDFV — each user's own device UUID!
+    // ROOT CAUSE: Fixed CANONICAL UUID (66B0EE01-...) caused ALL users to share
+    // the same device fingerprint. Old accounts bound to their REAL device UUID
+    // → server's device whitelist check FAILS → "未授权此手机" error.
+    // FIX: Call original identifierForVendor so each user uses their OWN UUID.
+    // This way: old accounts match their bound device UUID → no authorization needed.
+    // New accounts on new devices → normal authorization flow (master device approves).
+    DLOG(@"[IDFV-HOOK] v37.107-DIST: Using NATIVE IDFV (NOT fixed, distributable safe)");
 
     // Now swizzle UIDevice's identifierForVendor
     Class uiDeviceCls = NSClassFromString(@"UIDevice");
@@ -8969,7 +8933,7 @@ static void installIDFVHook(void) {
     orig_identifierForVendor = (NSUUID* (*)(UIDevice*, SEL))method_getImplementation(m);
     IMP newImp = (IMP)hook_identifierForVendor;
     method_setImplementation(m, newImp);
-    DLOG(@"[IDFV-HOOK] v36.123: SUCCESS - [UIDevice identifierForVendor] now returns fixed UUID");
+    DLOG(@"[IDFV-HOOK] v37.107-DIST: SUCCESS - [UIDevice identifierForVendor] returns NATIVE UUID");
 }
 
 // SecKeyCreateEncryptedData hook (iOS 10+)
@@ -10176,16 +10140,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             out += 24; p += 28; continue;
                         }
                     } else if (rem >= 51 && memcmp(p, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) == 0) {
-                        // v37.67: Replace MAC-address-derived UUID with CANONICAL UUID
-                        // Server cross-checks UUID across login+game server packets
-                        memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 51);
-                        out += 51; p += 51; continue;
+                        // v37.107-DIST: Do NOT replace UUID — each user uses their OWN device UUID!
+                        // Old accounts are bound to their real device UUID on the server.
+                        // Replacing it with a fixed CANONICAL UUID breaks device whitelist auth.
                     } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
-                        // v37.106: Replace bare REAL device UUID with CANONICAL UUID
-                        // FFF493#2 JSON has "MACADDRESS": "180C4F27-..." (different format than #1)
-                        // This catches the UUID at the bare position (after the quote)
-                        memcpy(out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
-                        out += 36; p += 36; continue;
+                        // v37.107-DIST: Do NOT replace bare UUID either — same reason as above.
                     } else if (rem >= 20) {
                         // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
@@ -10423,7 +10382,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.106 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL_IN_CCCRYPT+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+CHL4_BARE_UUID_REPLACE+FORGE_DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.107-DIST %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp+NATIVE_UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+NO_UUID_REPLACE+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+NO_EE121_STATUS_PATCH+NO_BODY_OVERWRITE+FORGE_DISABLED)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
