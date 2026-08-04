@@ -846,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.112-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.113-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3936,6 +3936,11 @@ static int hook_close(int fd) {
 // background threads / delayed callbacks may still be accessing them → use-after-free
 // CRASH on returning from role page. Just zero the length fields; the next CCCrypt
 // capture will call free() before re-malloc'ing (safe, serialized on main thread).
+// v37.113 CRITICAL FIX: DO NOT reset crypto-chain state (g_aes_key_saved, g_cccrypt_l4_active,
+// g_pubKeyCaptured, g_hashTokenValid). These are entry conditions for FFF493 replacement
+// (g_aes_key_saved), L4 channel patch (g_cccrypt_l4_active), challenge response
+// (g_pubKeyCaptured). Resetting them = 2nd connect skips ALL crypto hooks → server
+// gets unpatched packets → "连接中断异常". These are app-lifetime state, NOT per-connection.
 static void resetGameStateForReconnect(void) {
     // --- FFF493 / login flow state ---
     g_fff493_1_sent = 0;
@@ -3947,8 +3952,9 @@ static void resetGameStateForReconnect(void) {
     g_fff493_2_native_len = 0;
     g_ext_plaintext_len = 0;
     // v37.112: FREE DELETED — buffers recycled by CCCrypt next capture
-    // session/ticket: keep defaults from installAllHooks — they'll be re-captured
-    g_hashTokenValid = 0;
+    // v37.113: Crypto-chain state PRESERVED (g_aes_key_saved, g_cccrypt_l4_active,
+    //          g_pubKeyCaptured, g_pubKeyBase64Len, g_hashTokenValid, g_saved_key_len)
+    //          — these are app-lifetime, NOT per-connection.
 
     // --- Handshake / connection state ---
     g_handshakeComplete = NO;
@@ -3958,17 +3964,17 @@ static void resetGameStateForReconnect(void) {
     g_forceHandshakeLen = 0;
     g_challengeResponded = NO;
     g_challengeFd = -1;
-    g_pubKeyCaptured = NO;
-    g_pubKeyBase64Len = 0;
+    // v37.113: g_pubKeyCaptured NOT reset — public key is app-lifetime
+    // v37.113: g_pubKeyBase64Len NOT reset
     g_stickyLeftoverFd = -1;
     g_stickyLeftoverLen = 0;
     g_localHeartbeatAckFd = -1;
     g_localHeartbeatAckLen = 0;
 
-    // --- Crypto state (must re-establish on new connection) ---
-    g_cccrypt_l4_active = NO;
-    g_aes_key_saved = NO;
-    g_saved_key_len = 0;
+    // --- Crypto state ---
+    // v37.113: g_cccrypt_l4_active NOT reset — L4 channel patch entry condition
+    // v37.113: g_aes_key_saved NOT reset — FFF493 replacement entry condition
+    // v37.113: g_saved_key_len NOT reset
     g_forceValidDecryptFd = -1;
 
     // --- Fake response / command queue ---
@@ -3998,7 +4004,7 @@ static void resetGameStateForReconnect(void) {
     g_bypassRemaining = 0;
     resetCmdQueue();
 
-    DLOG(@"[RECONNECT-RESET] v37.112: ALL per-connection state cleared (no free for thread safety)");
+    DLOG(@"[RECONNECT-RESET] v37.113: per-connection state cleared, crypto-chain PRESERVED");
 }
 
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -10420,7 +10426,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.112-DIST SILENT_MODE=%d %d layers active (v37.112 FIX: resetGameStateForReconnect — no free() inside (use-after-free crash fix). v37.111: full state reset on every game server connect. v37.110: DLOG args EVALUATED via comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.113-DIST SILENT_MODE=%d %d layers active (v37.113: preserve crypto-chain state across reconnects — g_aes_key_saved/g_cccrypt_l4_active/g_pubKeyCaptured NOT reset. v37.112: no free(). v37.111: full per-connection reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
