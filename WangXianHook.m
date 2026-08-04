@@ -4993,6 +4993,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     BOOL didReplaceTicket = ([newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
                                             withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
                                                options:0 range:NSMakeRange(0, newStr.length)] > 0);
+                    // v37.100 FIX: #pragma clang optimize off — DISABLE -O2 for this entire block!
+                    // -O2 optimizer incorrectly assumes rangeOfString/strstr return NSNotFound/NULL,
+                    // eliminating ALL jsonModified==NO paths (SKIP insert, md5 guard, else branch).
+                    // This causes FFF493#2 to ALWAYS be re-encrypted even when JSON is unchanged,
+                    // producing different ciphertext → server validation FAIL → connection CLOSE!
+                    #pragma clang optimize off
                     // v37.99 FIX: Track whether JSON was ACTUALLY modified.
                     // v37.100 FIX: volatile — prevent -O2 from determining jsonModified is always YES
                     // and eliminating the jsonModified==NO path (SKIP insert, else branch, etc.)
@@ -5196,6 +5202,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
                     }
                 }
+                    #pragma clang optimize on
                 DLOG(@"[FFF493-REPL] v37.87: FFF493#%d replacement internal substep skipped", fffWhich);
             }
             }
