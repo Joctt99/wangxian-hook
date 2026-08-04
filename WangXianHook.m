@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.103-SKIP-FFF493#1-DISABLE-FORGE loaded ===");
+        _log(@"=== WangXianHook v37.104-NO-MD5-RECOMPUTE-ON-UUID loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5082,10 +5082,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     }
                     // v37.97 FIX: After modifying sessionId/ticket, RE-COMPUTE "md5" field!
                     // v37.99 FIX: ONLY recompute if JSON was ACTUALLY modified (jsonModified flag).
-                    // If JSON unchanged, original md5 is correct — DON'T touch it!
-                    // (Our MD5(JSON_without_md5) formula differs from client's MD5(concat_values) formula,
-                    //  so recomputing on unmodified JSON would CORRUPT a valid md5.)
-                    if (jsonModified) {
+                    // v37.104 FIX: ONLY recompute md5 when sessionId/ticket changed (didReplaceSession||didReplaceTicket)!
+                    // DO NOT recompute when only UUID changed (didReplaceUUID) — because:
+                    // (1) Client computes md5 as MD5(concat_of_field_VALUES), NOT MD5(JSON_string)!
+                    //     CC_MD5 hook already replaced accountId/channel/device in the concat → md5 is CORRECT.
+                    // (2) MACADDRESS UUID is NOT part of the md5 concat → UUID change doesn't affect md5!
+                    // (3) Our MD5(JSON_without_md5) formula is WRONG — it produces a DIFFERENT md5 than
+                    //     the client's MD5(concat_values) → server sees md5 mismatch → silent reject!
+                    // v37.103 log proof: old=6aa64a9b(client correct) → new=c3b190db(our WRONG formula)
+                    //   Server kept connection alive (14+ heartbeats) but NEVER sent role data 0x0CB0A300!
+                    if (didReplaceSession || didReplaceTicket) {
                         NSString *kMd5Key = @"\"md5\": \"";
                         NSRange md5KeyRange = [newStr rangeOfString:kMd5Key];
                         if (md5KeyRange.location != NSNotFound &&
@@ -10407,7 +10413,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.103 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#2_ONLY_UUID_REPLACE+SKIP_FFF493#1_REPLACEMENT+FORGE_DISABLED_WAIT_REAL_DATA)", layersOK);
+    DLOG(@"[CH-INIT] v37.104 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#2_UUID_REPLACE_ONLY+SKIP_MD5_RECOMPUTE_ON_UUID+SKIP_FFF493#1+FORGE_DISABLED)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
