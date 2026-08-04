@@ -800,7 +800,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.97-HASH2-FORCE-MD5RECALC loaded ===");
+        _log(@"=== WangXianHook v37.98-HASH2-REVERT-ORIG+MD5RECALC+ACCID-SAFE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4843,19 +4843,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            // v37.97 FIX: FORCE hash2 = clean client value c59199e10e56714b8b08c64676cc1610.
-                            // ROOT CAUSE: Our client uses DIFFERENT hash2 computation path!
-                            //   Clean 7.6.3 hash2 = MD5(170B starting with binary_hash_hex: 906e707ec + DYanyou0040_MIESHI + CANONICAL_accId + ...)
-                            //   Our hooked client computes hash2 from 156B starting with REAL_accId: MD5(39325649477735437374 + DYanyou0040_MIESHI + ...)
-                            //   These produce DIFFERENT values (c59199e1 vs ddcb91f42c). Server expects clean-path hash2.
-                            // Also: even if accId replacement worked in 156B, the 170B clean path includes
-                            // binary_hash_hex prefix that the 156B path doesn't have — results will never match.
-                            // FIX: Always force hash2 to the known clean value (binary_hash + channel + fields all match).
-                            static const char kCleanHash2Hex_v97[] = "c59199e10e56714b8b08c64676cc1610";
+                            // v37.98 FIX: REVERT hash2 to ORIGINAL value (ddcb91f42c...).
+                            // ROOT CAUSE: v37.97 forced hash2=c59199e10e (clean 170B path) but our
+                            // client sends 156B body (REAL accId path). Server validates hash2 against
+                            // the ACTUAL body we send, NOT the clean client body. v37.96 used origHash2Hex
+                            // and login SUCCEEDED. v37.97 forced c59199e1 → server REJECTED → connection CLOSE.
+                            // FIX: Use origHash2Hex (MD5 of our actual 156B body with CANONICAL accId).
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                            memcpy(newBuf+rebuildOut+2, kCleanHash2Hex_v97, 32);
+                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
                             rebuildOut += 34;
-                            DLOG(@"[EE121-HASH2] v37.97: hash2=%s (FORCED clean-path value, was orig=%s)", kCleanHash2Hex_v97, origHash2Hex);
+                            DLOG(@"[EE121-HASH2] v37.98: hash2=%s (ORIGINAL body MD5, v37.97 forced c59199e1 REVERTED)", origHash2Hex);
                             // Write hash1 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
@@ -4871,7 +4868,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.97: Rebuilt EE121 CANONICAL accId + CANONICAL ch/dm/gp/UUID. hash2=FORCED(c59199e1 clean-path) hash1/hash3=MD5(realBinaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.98: Rebuilt EE121 CANONICAL accId + CANONICAL ch/dm/gp/UUID. hash2=ORIGINAL(bodyMD5) hash1/hash3=MD5(realBinaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -10294,7 +10291,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.97 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
+    DLOG(@"[CH-INIT] v37.98 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
