@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.89-DIST loaded ===");
+        _log(@"=== WangXianHook v37.90-CMDFIX loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1837,12 +1837,30 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
     //   bytes 8-11  : seq    = 0x08887D80 (server-side seq, kept from real capture)
     //   bytes 12-15 : count  = 0x00000064 (100 attribute entries)
     //   bytes 16+   : 100 x uint64 attribute values (big-endian)
+    // v37.90 FIX: Corrected cmd bytes based on real 7.6.3 capture (hook.txt v3).
+    //   sub1 cmd = 0x00A3B010 (was 0x00A3B00C — WRONG last byte 0C vs 10)
+    //   sub2 cmd = 0x0002A310 (was 0x0002A30C — WRONG last byte 0C vs 10)
+    //   seq = dynamic (was static 0x08887D80)
+    // The wrong cmd meant the client never recognised the forged response,
+    // causing the "正在进入..." freeze. Real capture confirmed via Frida v3.
+    //
+    // Real captured response (hook.txt v3, recv len=1632) is composed of
+    // two 816-byte sub-packets:
+    //   sub1: pktLen=0x330, cmd=0x00A3B010 (100 entries x 8 bytes)
+    //   sub2: pktLen=0x330, cmd=0x0002A310 (100 entries x 8 bytes)
+    //
+    // Layout of sub1:
+    //   bytes 0-3   : pktLen = 0x00000330 (816) big-endian
+    //   bytes 4-7   : cmd    = 0x00A3B010 big-endian (wire bytes 00 A3 B0 10)
+    //   bytes 8-11  : seq    = dynamic (from request seqNum)
+    //   bytes 12-15 : count  = 0x00000064 (100 attribute entries)
+    //   bytes 16+   : 100 x uint64 attribute values (big-endian)
     if (requestCmd == 0x00FFF493) {
-        // Sub-packet 1 header (16 bytes) from real capture (hook.txt RECV #19)
+        // Sub-packet 1 header (16 bytes) — v37.90 corrected cmd 0x00A3B010
         static const uint8_t roleHeader[16] = {
             0x00, 0x00, 0x03, 0x30,  // pktLen = 816
-            0x00, 0xA3, 0xB0, 0x0C,  // cmd = 0x00A3B00C (0x0CB0A300 response)
-            0x08, 0x88, 0x7D, 0x80,  // server seq (from real capture)
+            0x00, 0xA3, 0xB0, 0x10,  // cmd = 0x00A3B010 (CORRECTED from 0x00A3B00C)
+            0x00, 0x00, 0x00, 0x00,  // seq placeholder (overwritten below with dynamic seq)
             0x00, 0x00, 0x00, 0x64   // count = 100 entries
         };
         // 100 attribute entries (8 bytes each) copied verbatim from the real
@@ -1912,14 +1930,24 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
                 DLOG(@"[FAKE-RESP] v36.140: 0x0CB0A300 needs 816 bytes, bufSize=%u — skip", bufSize);
                 return 0;
             }
-            DLOG(@"[FAKE-RESP] v36.140: 0x0CB0A300 partial (sub1 only, 816 bytes) bufSize=%u", bufSize);
+            DLOG(@"[FAKE-RESP] v37.90: 0x00A3B010 partial (sub1 only, 816 bytes) bufSize=%u", bufSize);
             memcpy(respBuf, roleHeader, 16);
             memcpy(respBuf + 16, roleAttrs, 800);
+            // v37.90: dynamic seq
+            respBuf[8]  = (seqNum >> 24) & 0xFF;
+            respBuf[9]  = (seqNum >> 16) & 0xFF;
+            respBuf[10] = (seqNum >> 8) & 0xFF;
+            respBuf[11] = seqNum & 0xFF;
             return 816;
         }
         // Sub-packet 1 (816 bytes): role attribute table
         memcpy(respBuf, roleHeader, 16);
         memcpy(respBuf + 16, roleAttrs, 800);
+        // v37.90: Write dynamic seq for sub1 (from request seqNum)
+        respBuf[8]  = (seqNum >> 24) & 0xFF;
+        respBuf[9]  = (seqNum >> 16) & 0xFF;
+        respBuf[10] = (seqNum >> 8) & 0xFF;
+        respBuf[11] = seqNum & 0xFF;
         // v36.155: Dynamic role attributes based on g_roleIndex.
         // Modify key attribute entries so each server gets unique character
         // stats (roleId, level, profession, etc.). Without this, all servers
@@ -1952,20 +1980,25 @@ static uint32_t generateFakeResponse(uint32_t requestCmd, uint8_t *respBuf, uint
                  rid, level, prof, maxHp, g_roleIndex);
         }
         // Sub-packet 2 (816 bytes): companion table.
-        // Real capture (hook.txt line 921) header: 00 00 03 30 00 02 a3 0c
-        // 08 88 7d 81 00 00 00 64. The 100 attribute entries were truncated
-        // by the 1024-byte capture limit, so zero-pad them here. The client
-        // sees a well-formed 816-byte sub-packet and can advance.
+        // v37.90 FIX: Corrected cmd from 0x0002A30C to 0x0002A310 (real capture).
+        // Real capture (hook.txt v3) header: 00 00 03 30 00 02 a3 10
+        // seq is dynamic (sub1 seq + 1).
         static const uint8_t sub2Header[16] = {
             0x00, 0x00, 0x03, 0x30,  // pktLen = 816
-            0x00, 0x02, 0xA3, 0x0C,  // cmd = 0x00A30200 (wire bytes 00 02 A3 0C)
-            0x08, 0x88, 0x7D, 0x81,  // server seq (sub1 seq + 1)
+            0x00, 0x02, 0xA3, 0x10,  // cmd = 0x0002A310 (CORRECTED from 0x0002A30C)
+            0x00, 0x00, 0x00, 0x00,  // seq placeholder (overwritten below)
             0x00, 0x00, 0x00, 0x64   // count = 100 entries
         };
         memcpy(respBuf + 816, sub2Header, 16);
+        // v37.90: Use dynamic seq for sub2 (sub1 seq + 1)
+        uint32_t sub2Seq = seqNum + 1;
+        respBuf[824] = (sub2Seq >> 24) & 0xFF;
+        respBuf[825] = (sub2Seq >> 16) & 0xFF;
+        respBuf[826] = (sub2Seq >> 8) & 0xFF;
+        respBuf[827] = sub2Seq & 0xFF;
         memset(respBuf + 832, 0, 800);  // zero-padded attribute entries
 
-        DLOG(@"[FAKE-RESP] v36.155: 0x0CB0A300 role-data response built (1632 bytes, 2 sub-packets: 0x00A3B00C + 0x00A30200) for req=0x%08X seq=0x%08X roleIndex=%d",
+        DLOG(@"[FAKE-RESP] v37.90: 0x00A3B010 role-data response built (1632 bytes, 2 sub-packets: 0x00A3B010 + 0x0002A310) for req=0x%08X seq=0x%08X roleIndex=%d",
              requestCmd, seqNum, g_roleIndex);
         return 1632;
     }
@@ -7472,10 +7505,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                          ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
         }
         if (g_fff493_1_sent && g_fff493_2_sent && !g_injected_0CB0A300 && isGamePort) {
-            if (curRespCmd == 0x0CB0A300) {
+            // v37.90 FIX: Real cmd is 0x00A3B010 (not 0x0CB0A300 — byte order was wrong)
+            if (curRespCmd == 0x00A3B010 || curRespCmd == 0x0002A310) {
                 g_role_0CB0A300_seen = 1;
                 g_consec_heartbeats = 0;
-                DLOG(@"[0CB0A300-REAL] v37.87: Server returned real 0x0CB0A300 role data! No forgery needed (ret=%zd)", ret);
+                DLOG(@"[0CB0A300-REAL] v37.90: Server returned real 0x00A3B010 role data! No forgery needed (ret=%zd)", ret);
             } else if (curRespCmd == 0x80000015) {
                 g_consec_heartbeats++;
                 DLOG(@"[HB-COUNT] v37.87: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=2", g_consec_heartbeats);
