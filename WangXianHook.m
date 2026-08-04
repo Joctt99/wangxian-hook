@@ -4997,15 +4997,23 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // v37.100 FIX: volatile — prevent -O2 from determining jsonModified is always YES
                     // and eliminating the jsonModified==NO path (SKIP insert, else branch, etc.)
                     volatile BOOL jsonModified = (didReplaceSession || didReplaceTicket);
+                    // v37.100 FIX: asm compiler barrier — prevent -O2 from tracking jsonModified value
+                    // across this point and eliminating the else branch of if(jsonModified).
+                    asm volatile("" ::: "memory");
                     // v37.88 FIX: #1 (IOS_CLIENT_MSG_REQ) has NO sessionId/ticket fields in JSON!
                     // v37.99 FIX: ONLY insert if the field is truly ABSENT from JSON!
                     // FFF493#2 (NEW_USER_ENTER_SERVER_REQ) already HAS non-empty sessionId/ticket
                     // from the login flow. Previous code inserted DUPLICATE fields → JSON corruption
                     // → server validation failure → connection CLOSE!
+                    // v37.100 FIX: Use strstr (C function) instead of rangeOfString (ObjC method).
+                    // -O2 optimizer incorrectly assumes rangeOfString returns NSNotFound, making
+                    // hasSessionId/hasTicket always NO, eliminating SKIP branch as dead code.
+                    // strstr is a C library function the optimizer cannot analyze.
                     if (!didReplaceSession || !didReplaceTicket) {
-                        // v37.100: volatile to prevent -O2 dead code elimination of SKIP branch
-                        volatile BOOL hasSessionId = ([newStr rangeOfString:@"\"sessionId\""].location != NSNotFound);
-                        volatile BOOL hasTicket = ([newStr rangeOfString:@"\"ticket\""].location != NSNotFound);
+                        const char *jsonCStr = [newStr UTF8String];
+                        volatile BOOL hasSessionId = (jsonCStr && strstr(jsonCStr, "\"sessionId\"") != NULL);
+                        volatile BOOL hasTicket = (jsonCStr && strstr(jsonCStr, "\"ticket\"") != NULL);
+                        asm volatile("" ::: "memory");
                         if (!hasSessionId || !hasTicket) {
                             NSUInteger lastBrace = [newStr rangeOfString:@"}" options:NSBackwardsSearch].location;
                             if (lastBrace != NSNotFound) {
