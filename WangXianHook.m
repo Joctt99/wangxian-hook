@@ -846,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.110-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.111-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3928,6 +3928,77 @@ static int hook_close(int fd) {
     return orig_close ? orig_close(fd) : -1;
 }
 
+// v37.111: Reset ALL per-connection state when user returns to server selection
+// and reconnects. Without this, g_fff493_1_sent/g_fff493_2_sent/g_injected_0CB0A300
+// etc. remain set from the 1st session → 2nd connect skips FFF493 replacement,
+// skips handshake, skips role injection → "连接中断异常".
+static void resetGameStateForReconnect(void) {
+    // --- FFF493 / login flow state ---
+    g_fff493_1_sent = 0;
+    g_fff493_2_sent = 0;
+    g_consec_heartbeats = 0;
+    g_role_0CB0A300_seen = 0;
+    g_injected_0CB0A300 = 0;
+    g_fff493_1_plain_len = 0;
+    g_fff493_2_native_len = 0;
+    g_ext_plaintext_len = 0;
+    if (g_fff493_2_native_plain) { free(g_fff493_2_native_plain); g_fff493_2_native_plain = NULL; }
+    if (g_fff493_1_plain_buf)   { free(g_fff493_1_plain_buf);   g_fff493_1_plain_buf = NULL; }
+    if (g_ext_plaintext)        { free(g_ext_plaintext);        g_ext_plaintext = NULL; }
+    // session/ticket: keep defaults from installAllHooks — they'll be re-captured
+    g_hashTokenValid = 0;
+
+    // --- Handshake / connection state ---
+    g_handshakeComplete = NO;
+    g_heartbeatCount = 0;
+    g_forceHandshakeComplete = NO;
+    g_forceHandshakeFd = -1;
+    g_forceHandshakeLen = 0;
+    g_challengeResponded = NO;
+    g_challengeFd = -1;
+    g_pubKeyCaptured = NO;
+    g_pubKeyBase64Len = 0;
+    g_stickyLeftoverFd = -1;
+    g_stickyLeftoverLen = 0;
+    g_localHeartbeatAckFd = -1;
+    g_localHeartbeatAckLen = 0;
+
+    // --- Crypto state (must re-establish on new connection) ---
+    g_cccrypt_l4_active = NO;
+    g_aes_key_saved = NO;
+    g_saved_key_len = 0;
+    g_forceValidDecryptFd = -1;
+
+    // --- Fake response / command queue ---
+    g_loginPacketsSent = NO;
+    g_fakeRespInjected = NO;
+    g_fakeRespActive = NO;
+    g_fakeRespDelivered = NO;
+    g_fakeRespFd = -1;
+    g_fakeRespSentCount = 0;
+    g_triggerFakeNextRecv = NO;
+    g_triggerFakeFd = -1;
+    g_burstInjectAfterPatch = NO;
+    g_burstInjectFd = -1;
+    g_postBurstState = 0;
+    g_postBurstFd = -1;
+    g_postBurstDone = NO;
+    g_phase2TriggerCount = 0;
+    g_waitingForClientCmds = NO;
+    g_waitingFd = -1;
+    g_lastGameCmd = 0;
+    g_lastSeqNum = 0;
+    g_lastGameCmdFd = -1;
+    g_lastRespCmd = 0;
+    g_respCount = 0;
+    g_ee006_sent = 0;
+    g_a018_sent = 0;
+    g_bypassRemaining = 0;
+    resetCmdQueue();
+
+    DLOG(@"[RECONNECT-RESET] v37.111: ALL per-connection state cleared for new game server connection");
+}
+
 static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
     char host[64] = "unknown";
@@ -3936,8 +4007,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
         struct sockaddr_in *in = (struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
         port = ntohs(in->sin_port);
-        
-        // v36.63: REVERT to port 12003 (the only port confirmed to connect and complete handshake)
+                // v36.63: REVERT to port 12003 (the only port confirmed to connect and complete handshake)
         // Port 58158 is unreachable - ALL tests since v36.51 showed timeout/hang
         // If game uses non-standard port (like 11776), rewrite to 12003
         BOOL isGameServerPort = (port == 12003 || port == 58158 || 
@@ -4007,22 +4077,13 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 DLOG(@"[GAME-CONNECT] Game server connected fd=%d target=%s:%d (confirmed working port)", 
                      sockfd, host, port);
                 
-                // v36.98: Reset fake response state on new game server connection
-                // This ensures the new connection can trigger fake response injection
-                if (g_fakeRespInjected || g_fakeRespActive) {
-                    DLOG(@"[GAME-CONNECT] v36.101: Resetting fake response state on new connection (old fd=%d, new fd=%d)", g_fakeRespFd, sockfd);
-                    g_fakeRespInjected = NO;
-                    g_fakeRespActive = NO;
-                    g_fakeRespDelivered = NO;  // v36.101: Reset delivered flag
-                    g_fakeRespFd = -1;
-                    g_fakeRespSentCount = 0;
-                    g_loginPacketsSent = NO;
-                    g_handshakeComplete = NO;
-                    g_heartbeatCount = 0;
-                    g_lastGameCmd = 0;
-                    g_lastSeqNum = 0;  // v36.107: Reset sequence number on new connect
-                    g_lastGameCmdFd = -1;
-                }
+                // v37.111: UNCONDITIONAL full state reset on every game server connect.
+                // Previous v36.101 only reset when g_fakeRespInjected||g_fakeRespActive was true,
+                // which MISSED the case where user returns to server selection after entering
+                // role page (those flags were already NO by then). This left g_fff493_1_sent=1,
+                // g_fff493_2_sent=1, g_injected_0CB0A300=1 etc. set → 2nd connect skipped ALL
+                // login flow hooks → "连接中断异常".
+                resetGameStateForReconnect();
             }
             DLOG(@"[SOCK] connect END fd=%d SUCCESS target=%s:%d origPort=%d elapsed=%.3fs",
                  sockfd, host, port, origPort, elapsed);
@@ -10357,7 +10418,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.110-DIST SILENT_MODE=%d %d layers active (v37.110 FIX: DLOG args now EVALUATED via comma-op (void)((fmt),##__VA_ARGS__); side effects preserved. ALL core hooks intact.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.111-DIST SILENT_MODE=%d %d layers active (v37.111 FIX: resetGameStateForReconnect() — clears ALL per-connection state on every game server connect. Fixes 2nd connect after returning from role page. v37.110 FIX: DLOG args EVALUATED via comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
