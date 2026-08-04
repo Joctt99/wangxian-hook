@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.102-MD5-COMMA-FIX loaded ===");
+        _log(@"=== WangXianHook v37.103-SKIP-FFF493#1-DISABLE-FORGE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4979,7 +4979,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_fff493_2_native_plain) { nativePlain=g_fff493_2_native_plain; nativeLen=g_fff493_2_native_len; fffWhich=2; }
                 else if (g_fff493_1_plain_buf) { nativePlain=g_fff493_1_plain_buf; nativeLen=g_fff493_1_plain_len; fffWhich=1; }
             }
-            if (fffWhich != 0 && nativePlain && nativeLen > 300 && len >= 20) {
+            // v37.103 FIX: Only replace FFF493#2 (NEW_USER_ENTER_SERVER_REQ)!
+            // FFF493#1 (IOS_CLIENT_MSG_REQ) is device-info — clean client does NOT include
+            // sessionId/ticket in it. Previous code INSERTED them → server confused → no role data!
+            // Now skip #1 replacement entirely: let original packet (with CH-L4 patches) go through.
+            if (fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                 uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
@@ -7829,8 +7833,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 DLOG(@"[0CB0A300-REAL] v37.90: Server returned real 0x00A3B010 role data! No forgery needed (ret=%zd)", ret);
             } else if (curRespCmd == 0x80000015) {
                 g_consec_heartbeats++;
-                DLOG(@"[HB-COUNT] v37.87: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=2", g_consec_heartbeats);
-                if (g_consec_heartbeats >= 2 && !g_role_0CB0A300_seen) {
+                DLOG(@"[HB-COUNT] v37.103: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=999 (forgery DISABLED, waiting for real role data)", g_consec_heartbeats);
+                if (g_consec_heartbeats >= 999 && !g_role_0CB0A300_seen) {
                     // Inject forged 0x0CB0A300 as TCP sticky packet (append to this recv's buf)
                     // Use generateFakeResponse() from v36 (returns 1632B: sub1=816B + sub2=816B)
                     // Ensure room: recv buf is typically 524288B (see log "len=524288"), so 1632B is fine.
@@ -10403,7 +10407,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.101 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_UUID_REPLACE+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
+    DLOG(@"[CH-INIT] v37.103 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#2_ONLY_UUID_REPLACE+SKIP_FFF493#1_REPLACEMENT+FORGE_DISABLED_WAIT_REAL_DATA)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
