@@ -1,6 +1,20 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v37.100-NOREENCRYPT: SKIP re-encryption when JSON unchanged
+ *
+ * v37.100 ROOT CAUSE FIX (服务器在收到FFF493#2后关闭连接):
+ *   v37.99 SKIP了sessionId/ticket的重复插入(jsonModified=NO), 但代码仍然
+ *   重新加密并替换FFF493#2包! 重新加密产生的密文/HMAC与原始包不同 → 服务器校验失败.
+ *   原始FFF493#2包已通过CH-L4 CCCrypt hook在加密前patch了channel/device/gpu,
+ *   且已包含正确的sessionId/ticket/md5. 不需要重新加密!
+ *
+ *   FIX: 用 if(jsonModified) 包裹整个重新加密块. 当JSON未修改时:
+ *   - 跳过重新加密 (不发新密文)
+ *   - 释放native plaintext缓冲区 (避免内存泄漏)
+ *   - fall through到 direct orig_send 发送原始包
+ *   - FALLBACK marking 仍然设置 g_fff493_2_sent 标志 (触发心跳计数)
+ *
  * WangXianHook v37.97-HASH2-FORCE-MD5RECALC: EE121 hash2 forced + FFF493 md5 recomputed + EE100/EE113/F013 CANONICAL accId
  *
  * v37.97 CHANGES (fixes 3 ROOT CAUSES of "连接异常中断" after server select):
@@ -800,7 +814,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.99-FFF493-NODUP+MD5GUARD loaded ===");
+        _log(@"=== WangXianHook v37.100-NOREENCRYPT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5081,6 +5095,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             }
                         }
                     }
+                    // v37.100 FIX: ONLY re-encrypt if JSON was ACTUALLY modified!
+                    // If jsonModified=NO (sessionId/ticket already present, no insertion needed),
+                    // the original packet already has correct channel/device/gpu (via CH-L4 CCCrypt hook
+                    // patched plaintext BEFORE client encryption) and correct md5 (matches original JSON).
+                    // Re-encrypting would produce different ciphertext (different IV/seq/HMAC) → server REJECT!
+                    // SKIP re-encryption entirely, fall through to direct orig_send of original packet.
+                    if (jsonModified) {
                     const char *newPlain = [newStr UTF8String];
                     size_t newPlainLen = strlen(newPlain);
                     DLOG(@"[FFF493-REPL] v37.97: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket+md5_recompute)",
@@ -5148,6 +5169,22 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                  fffWhich, ccRet, cipherOut);
                         }
                         free(cipherBuf);
+                    }
+                    } else {
+                        // v37.100: JSON unchanged — send original packet as-is (NO re-encryption!)
+                        // Original packet already has correct channel/device/gpu (CH-L4 patched before
+                        // client encryption) + correct sessionId/ticket + correct md5. Don't touch it!
+                        DLOG(@"[FFF493-REPL] v37.100: #%d JSON unchanged — SKIP re-encrypt, send original %zuB packet as-is",
+                             fffWhich, len);
+                        // Free native plaintext buffers to avoid leak (will be re-captured on next call)
+                        if (fffWhich == 2 && g_fff493_2_native_plain) {
+                            free(g_fff493_2_native_plain);
+                            g_fff493_2_native_plain = NULL;
+                            g_fff493_2_native_len = 0;
+                        }
+                        if (fffWhich == 1) {
+                            g_fff493_1_plain_len = 0;
+                        }
                     }
                 }
                 DLOG(@"[FFF493-REPL] v37.87: FFF493#%d replacement internal substep skipped", fffWhich);
@@ -10299,7 +10336,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.98 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
+    DLOG(@"[CH-INIT] v37.100 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_NOREENCRYPT_if_unchanged+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
