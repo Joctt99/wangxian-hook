@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.86-DIST loaded ===");
+        _log(@"=== WangXianHook v37.87-DIST loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2259,7 +2259,7 @@ static int g_ticketLen = 0;          // actual ticket length
 static char g_hashToken[32] = {0};   // 31B token + null
 static int  g_hashTokenValid = 0;    // 1 = captured
 
-// v37.86: Forged 0x0CB0A300 role-data injection — last-resort if server ignores FFF493.
+// v37.87: Forged 0x0CB0A300 role-data injection — last-resort if server ignores FFF493.
 // Strategy: After BOTH FFF493#1 and FFF493#2 are sent (with sessionId+ticket replaced),
 // if game server returns >=2 consecutive 0x80000015 heartbeats with NO 0x0CB0A300 in between,
 // next recv() call injects a forged 0x0CB0A300 response so client shows role selection UI.
@@ -2268,7 +2268,7 @@ static int g_fff493_2_sent = 0;      // 1 after FFF493#2 replacement
 static int g_consec_heartbeats = 0;  // counts 0x80000015 without 0x0CB0A300 after FFF493#2
 static int g_role_0CB0A300_seen = 0; // set to 1 if we ever receive real 0x0CB0A300 (no forgery)
 static int g_injected_0CB0A300 = 0;  // prevent double-inject
-// v37.86: FFF493#1 native plaintext buffer (IOS_CLIENT_MSG_REQ). Previously only #2 was captured
+// v37.87: FFF493#1 native plaintext buffer (IOS_CLIENT_MSG_REQ). Previously only #2 was captured
 // and replaced, but #1 went with sessionId="", ticket="" → server rejected silently.
 static char  *g_fff493_1_plain_buf = NULL;  // native plaintext of FFF493#1
 static size_t g_fff493_1_plain_len = 0;     // length
@@ -4345,7 +4345,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // SOLUTION: Use HARD-CODED clean 248B (preserves all byte structure, check A passes)
                     //           + ONLY modify seq + hash1/hash3 with CURRENT session token
                     // Username/password/accId in clean packet match real user (kk994/994624/65657881045335015151).
-                    DLOG(@"[EE121-REPL] v37.86: CLEAN 248B pkt + seq + hash1/hash3 RECALC(token_from_EE120)");
+                    DLOG(@"[EE121-REPL] v37.87: CLEAN 248B pkt + seq + hash1/hash3 RECALC(token_from_EE120)");
                     uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                        ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                     static const uint8_t cleanPkt[248] = {
@@ -4415,13 +4415,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             }
                             if (h1 != (size_t)-1) memcpy(fbBuf+h1+2, hash1Val, 16);
                             if (h3 != (size_t)-1) memcpy(fbBuf+h3+2, hash3Val, 16);
-                            DLOG(@"[EE121-HASH-RECALC] v37.86: MD5(cleanHash2_hex+EE120_token)=%s → hash1=%.*s hash3=%.*s (token=%s h1@%zu h3@%zu)",
+                            DLOG(@"[EE121-HASH-RECALC] v37.87: MD5(cleanHash2_hex+EE120_token)=%s → hash1=%.*s hash3=%.*s (token=%s h1@%zu h3@%zu)",
                                  md5Hex, 16, hash1Val, 16, hash3Val, g_hashToken, h1, h3);
                         } else {
-                            DLOG(@"[EE121-HASH-RECALC] v37.86: FALLBACK g_hashTokenValid=%d token invalid — using STALE hash1/hash3 from cleanPkt. Server will probably close!",
+                            DLOG(@"[EE121-HASH-RECALC] v37.87: FALLBACK g_hashTokenValid=%d token invalid — using STALE hash1/hash3 from cleanPkt. Server will probably close!",
                                  g_hashTokenValid);
                         }
-                        DLOG(@"[EE121-REPL] v37.86: Sending clean 248B seq=%u hash2=FORCED_ddcb91f42c hash1/hash3=%@",
+                        DLOG(@"[EE121-REPL] v37.87: Sending clean 248B seq=%u hash2=FORCED_ddcb91f42c hash1/hash3=%@",
                              origSeq, g_hashTokenValid?@"RECALC_DYNAMIC":@"STALE_FALLBACK");
                         ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                         free(fbBuf);
@@ -4784,7 +4784,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         // rejected FFF493#2 (only heartbeats). v37.56 ONLY replaces sessionId+ticket, keeps
         // clientId/MACADDRESS/md5 NATIVE (matches current session/binary).
         // If server only validates sessionId/ticket format (not cross-session validity) → works.
-        // v37.86: DO BOTH FFF493#1 AND FFF493#2 replacement! Previous versions only did
+        // v37.87: DO BOTH FFF493#1 AND FFF493#2 replacement! Previous versions only did
         // #2 (len>800), #1 went with sessionId=""/ticket="" → server checked #1 first → ignored.
         if (cmd == 0x00FFF493 && g_aes_key_saved) {
             // Figure out which FFF493 this is (#1 IOS_CLIENT_MSG or #2 NEW_USER)
@@ -4795,14 +4795,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 nativeLen   = g_fff493_2_native_len;
                 fffWhich = 2;
             }
-            // FFF493#1 detection (len usually 472-876, saved #1 plaintext with IOS_CLIENT_MSG)
-            else if (g_fff493_1_plain_buf && g_fff493_1_plain_len > 300) {
-                nativePlain = g_fff493_1_plain_buf;
-                nativeLen   = g_fff493_1_plain_len;
+            // v37.87 FIX: #1 detection also via len range (350-800) — don't require plaintext saved first!
+            // v37.87 required g_fff493_1_plain_buf (>300) but that buffer was NEVER filled because
+            // the CCCrypt save threshold was >400 (and #1's realDataInLen=316 < 400).
+            // Now detect #1 by len range first, then plaintext (saved with reduced >200 threshold).
+            else if ((len >= 350 && len <= 800) || (g_fff493_1_plain_buf && g_fff493_1_plain_len > 200)) {
+                if (g_fff493_1_plain_buf && g_fff493_1_plain_len > 200) {
+                    nativePlain = g_fff493_1_plain_buf;
+                    nativeLen   = g_fff493_1_plain_len;
+                }
                 fffWhich = 1;
+                DLOG(@"[FFF493-REPL] v37.87: FFF493#1 detected (len=%zu, plainSaved=%d plainLen=%zu)",
+                     len, g_fff493_1_plain_buf != NULL, g_fff493_1_plain_len);
             }
             // Fallback: also attempt if len>400 even if we don't know which
-            if (!nativePlain && len > 400) {
+            if (!nativePlain && len > 400 && fffWhich == 0) {
                 if (g_fff493_2_native_plain) { nativePlain=g_fff493_2_native_plain; nativeLen=g_fff493_2_native_len; fffWhich=2; }
                 else if (g_fff493_1_plain_buf) { nativePlain=g_fff493_1_plain_buf; nativeLen=g_fff493_1_plain_len; fffWhich=1; }
             }
@@ -4820,12 +4827,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     if (g_sessionValid && g_sessionId[0] != 0 && g_ticket[0] != 0) {
                         realSessionId = [NSString stringWithUTF8String:g_sessionId];
                         realTicket = [NSString stringWithUTF8String:g_ticket];
-                        DLOG(@"[FFF493-REPL] v37.86: FFF493#%d Using CAPTURED sessionId/ticket (valid=%d ticketLen=%d)",
+                        DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Using CAPTURED sessionId/ticket (valid=%d ticketLen=%d)",
                              fffWhich, g_sessionValid, g_ticketLen);
                     } else {
                         realSessionId = @"zmURQCP7xCg4ejMcPEPj2rc61mFfb0Fh";
                         realTicket = @"kk994|1785665252271|236923||SwnLPVw4wqtqXUfBX0JETQlXLrNxbb0TElk1YQvRmrKTNJG1ImA5eVtTnqY06XALBsKbKtCRJ7iRMUJcE+yZkboYVJ55k35zIxDeoLGoe/4TAo6nQjRD5obTaa18ObMyJaz6R0TUg8Oz78N1me5vBrU9c6sImsqv1QZEebEgfZO7KY2OdU35OV8Vb6rXRBwl1f78jA1OnkTRmf7ZthPpP1q3V1Y8OnzHnbHwq/xnZP3KtEXej3RCQX6zjJf+G81+W2XSpzUPynQXQ/Q/u9qn2N/5/db/8uMz68q/giuSAb9ikNYno+NYXTgn4FLsUbV15NTU5YIVqo9He/pYQCQ==";
-                        DLOG(@"[FFF493-REPL] v37.86: FFF493#%d Using FALLBACK sessionId/ticket (sessionValid=%d)", fffWhich, g_sessionValid);
+                        DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Using FALLBACK sessionId/ticket (sessionValid=%d)", fffWhich, g_sessionValid);
                     }
                     [newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
                                             withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
@@ -4835,7 +4842,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                                options:0 range:NSMakeRange(0, newStr.length)];
                     const char *newPlain = [newStr UTF8String];
                     size_t newPlainLen = strlen(newPlain);
-                    DLOG(@"[FFF493-REPL] v37.86: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket)",
+                    DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket)",
                          fffWhich, newPlainLen, nativeLen);
                     size_t cipherCap = ((newPlainLen + 1 + 15) / 16) * 16;
                     uint8_t *cipherBuf = (uint8_t *)malloc(cipherCap + 32);
@@ -4872,10 +4879,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 newPkt[auxPos]=(hmacB64Len>>8)&0xFF; newPkt[auxPos+1]=hmacB64Len&0xFF;
                                 memcpy(newPkt+auxPos+2, hmacB64Bytes, hmacB64Len);
                                 ssize_t rret = orig_send(fd, newPkt, newPktLen, flags);
-                                DLOG(@"[FFF493-REPL] v37.86: Replaced FFF493#%d origLen=%zu newLen=%zu plainLen=%zu cipherOut=%zu b64Len=%zu seq=%u ret=%zd",
+                                DLOG(@"[FFF493-REPL] v37.87: Replaced FFF493#%d origLen=%zu newLen=%zu plainLen=%zu cipherOut=%zu b64Len=%zu seq=%u ret=%zd",
                                      fffWhich, len, newPktLen, newPlainLen, cipherOut, b64Len, origSeq, rret);
                                 free(newPkt); free(cipherBuf);
-                                // v37.86: Set sent flags (trigger heartbeat counting for 0x0CB0A300 forgery)
+                                // v37.87: Set sent flags (trigger heartbeat counting for 0x0CB0A300 forgery)
                                 if (fffWhich == 1) g_fff493_1_sent = 1;
                                 if (fffWhich == 2) {
                                     g_fff493_2_sent = 1;
@@ -4896,13 +4903,25 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 return rret;
                             }
                         } else {
-                            DLOG(@"[FFF493-REPL] v37.86: FFF493#%d CCCrypt FAILED ret=%d cipherOut=%zu",
+                            DLOG(@"[FFF493-REPL] v37.87: FFF493#%d CCCrypt FAILED ret=%d cipherOut=%zu",
                                  fffWhich, ccRet, cipherOut);
                         }
                         free(cipherBuf);
                     }
                 }
-                DLOG(@"[FFF493-REPL] v37.86: FFF493#%d replacement internal substep skipped", fffWhich);
+                DLOG(@"[FFF493-REPL] v37.87: FFF493#%d replacement internal substep skipped", fffWhich);
+            }
+            // v37.87 FALLBACK: Even if replacement was skipped (no plaintext), mark #1 sent
+            // if it's in the len range — this triggers heartbeat counting in recv hook.
+            if (cmd == 0x00FFF493 && !g_fff493_1_sent && len >= 350 && len <= 800) {
+                g_fff493_1_sent = 1;
+                DLOG(@"[FFF493-REPL] v37.87: FALLBACK mark #1 sent (len=%zu, no plaintext replacement)", len);
+            }
+            if (cmd == 0x00FFF493 && !g_fff493_2_sent && len > 800) {
+                g_fff493_2_sent = 1;
+                g_consec_heartbeats = 0;
+                g_role_0CB0A300_seen = 0;
+                DLOG(@"[FFF493-REPL] v37.87: FALLBACK mark #2 sent (len=%zu, no plaintext replacement)", len);
             }
         }
         // Direct orig_send for ALL game server commands — no processing at all
@@ -6544,7 +6563,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
             // v36.114: Patch status byte for ALL version/auth responses (0x802EE118/120/121)
             // v36.49: ALWAYS patch status byte for 0x802EE121 - KEEP original ret (don't truncate!)
-            // v37.86: ROOT FIX! Previous versions only patched byte[12] status 4→0.
+            // v37.87: ROOT FIX! Previous versions only patched byte[12] status 4→0.
             // But client ALSO parses body UTF-8 text — if body contains "登录失败"/"版本过低"
             // Chinese error strings, client state machine BLOCKS even when header says OK.
             // This is the single biggest bug of v37.12-84. Fix: overwrite body bytes IN-PLACE
@@ -6553,11 +6572,11 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 unsigned char *bp = (unsigned char *)buf;
                 uint8_t oldStatus = p[12];
                 if (oldStatus != 0) {
-                    DLOG(@"[PROTO-R-PATCH] v37.86: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", oldStatus, cmd, ret);
+                    DLOG(@"[PROTO-R-PATCH] v37.87: Status %u -> 0 for cmd=0x%08X (keeping %zd bytes)", oldStatus, cmd, ret);
                     bp[12] = 0;
                 }
                 if (cmd == 0x802EE121 && ret >= 93) {
-                    // v37.86 CRITICAL: Completely overwrite body text.
+                    // v37.87 CRITICAL: Completely overwrite body text.
                     // Server gave 94B: [0..11 hdr][12 status][13..93 body=81B error Chinese text]
                     // Replace bytes [13..93] with SUCCESS message + canonic accountId.
                     // Target pattern (UTF-8, 81 bytes total):
@@ -6577,25 +6596,25 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         bp[w++] = 0x00;
                         bp[w++] = 0x14; // 20
                         memcpy(bp + w, kCanonicAcc, 20); w += 20;
-                        DLOG(@"[PROTO-R-PATCH-BODY] v37.86: Wrote accountId TLV (20B: %s)", kCanonicAcc);
+                        DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Wrote accountId TLV (20B: %s)", kCanonicAcc);
                     }
                     // 3) Write second TLV: success status text (len=12 bytes UTF8)
                     if (w + 2 + 12 <= bodyEnd) {
                         bp[w++] = 0x00;
                         bp[w++] = 0x0C; // len=12
                         memcpy(bp + w, kSuccess, 12); w += 12;
-                        DLOG(@"[PROTO-R-PATCH-BODY] v37.86: Wrote SUCCESS text TLV (12B: 登录成功)");
+                        DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Wrote SUCCESS text TLV (12B: 登录成功)");
                     }
                     // 4) Any remaining body bytes are already 0 (NUL padding)
                     // Also zero the pktLen field (bytes 0-3) update — NO keep pktLen = 94 original, ret unchanged.
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.86: EE121 body OVERWRITTEN! Old body had error text. New: bodyStart=%zu bodyEnd=%zu written=%zu padding=%zu",
+                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87: EE121 body OVERWRITTEN! Old body had error text. New: bodyStart=%zu bodyEnd=%zu written=%zu padding=%zu",
                          bodyStart, bodyEnd, w - bodyStart, (bodyEnd >= w) ? (bodyEnd - w) : 0);
                     // 5) Dump the new full response for verification
                     NSMutableString *verHex = [NSMutableString stringWithCapacity:94*3];
                     for (size_t i = 0; i < 94 && i < (size_t)ret; i++) [verHex appendFormat:@"%02X ", bp[i]];
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.86: Post-patch EE121 HEX: %@", verHex);
+                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Post-patch EE121 HEX: %@", verHex);
                     NSString *bodyStrAfter = [[NSString alloc] initWithBytes:bp+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
-                    if (bodyStrAfter) DLOG(@"[PROTO-R-PATCH-BODY] v37.86: Post-patch body UTF8: %@", bodyStrAfter);
+                    if (bodyStrAfter) DLOG(@"[PROTO-R-PATCH-BODY] v37.87: Post-patch body UTF8: %@", bodyStrAfter);
                 }
             }
 
@@ -7423,13 +7442,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
         // (client sends commands with real seq, we intercept in hook_send,
         //  generate matching responses in hook_recv)
 
-        // v37.86: HEARTBEAT COUNT + FORGED 0x0CB0A300 INJECTION (last-resort)
+        // v37.87: HEARTBEAT COUNT + FORGED 0x0CB0A300 INJECTION (last-resort)
         // After both FFF493#1 and #2 replaced (with non-empty sessionId/ticket),
         // if server returns >=2 heartbeats (0x80000015) in a row without 0x0CB0A300,
         // we inject 1632B forged 0x0CB0A300 role-data as TCP sticky packet.
         // This pushes client state machine to role-selection UI even if server
         // silently ignores (sessionId invalid because EE121 server reply was 版本过低).
-        // v37.86 FIX: 'rcmd' is defined inside @try block (line ~6882, out of scope here).
+        // v37.87 FIX: 'rcmd' is defined inside @try block (line ~6882, out of scope here).
         // Also unistd.h declares int rcmd(...) as a deprecated function — would conflict!
         // → Re-parse cmd from header bytes 4-7 into a distinct local name (curRespCmd).
         uint32_t curRespCmd = 0;
@@ -7441,10 +7460,10 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (curRespCmd == 0x0CB0A300) {
                 g_role_0CB0A300_seen = 1;
                 g_consec_heartbeats = 0;
-                DLOG(@"[0CB0A300-REAL] v37.86: Server returned real 0x0CB0A300 role data! No forgery needed (ret=%zd)", ret);
+                DLOG(@"[0CB0A300-REAL] v37.87: Server returned real 0x0CB0A300 role data! No forgery needed (ret=%zd)", ret);
             } else if (curRespCmd == 0x80000015) {
                 g_consec_heartbeats++;
-                DLOG(@"[HB-COUNT] v37.86: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=2", g_consec_heartbeats);
+                DLOG(@"[HB-COUNT] v37.87: Consecutive heartbeats = %d (after FFF493#1+#2). Threshold=2", g_consec_heartbeats);
                 if (g_consec_heartbeats >= 2 && !g_role_0CB0A300_seen) {
                     // Inject forged 0x0CB0A300 as TCP sticky packet (append to this recv's buf)
                     // Use generateFakeResponse() from v36 (returns 1632B: sub1=816B + sub2=816B)
@@ -7465,17 +7484,17 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                         ssize_t maxAppend = (ssize_t)len - ret;
                         if (maxAppend >= (ssize_t)forgedLen && p != NULL) {
                             memcpy((void *)(p + ret), tmpForged, forgedLen);
-                            DLOG(@"[FORGE-0CB0A300] v37.86: INJECTED forged role-data as sticky packet! forgedLen=%u appended after ret=%zd (total new ret=%zd) seq=0x%08X roleIndex=%d",
+                            DLOG(@"[FORGE-0CB0A300] v37.87: INJECTED forged role-data as sticky packet! forgedLen=%u appended after ret=%zd (total new ret=%zd) seq=0x%08X roleIndex=%d",
                                  forgedLen, ret, ret + forgedLen, fakeSeq, g_roleIndex);
                             ret += forgedLen;
                             g_injected_0CB0A300 = 1;
                             g_consec_heartbeats = 0;
                         } else {
-                            DLOG(@"[FORGE-0CB0A300] v37.86: BUFFER FULL — cannot append forgedLen=%u to ret=%zd (len=%zu, maxAppend=%zd). Skipping.",
+                            DLOG(@"[FORGE-0CB0A300] v37.87: BUFFER FULL — cannot append forgedLen=%u to ret=%zd (len=%zu, maxAppend=%zd). Skipping.",
                                  forgedLen, ret, len, maxAppend);
                         }
                     } else {
-                        DLOG(@"[FORGE-0CB0A300] v37.86: generateFakeResponse FAILED len=%u (expected >=12, <2048). Try next heartbeat.", forgedLen);
+                        DLOG(@"[FORGE-0CB0A300] v37.87: generateFakeResponse FAILED len=%u (expected >=12, <2048). Try next heartbeat.", forgedLen);
                     }
                 }
             } else if (curRespCmd != 0x00FFFF01 && curRespCmd != 0x80FFF494 && curRespCmd != 0x00FFFF02 && curRespCmd != 0x80FFF495 &&
@@ -7583,12 +7602,12 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
             }
 
             // v36.50: ONLY patch on login server (port=5678), and NEVER truncate!
-            // v37.86: Same body replacement logic as recv hook (keep identical in both hooks)
+            // v37.87: Same body replacement logic as recv hook (keep identical in both hooks)
             if (cmd == 0x802EE121 && ret >= 13 && port == 5678) {
                 unsigned char *bp = (unsigned char *)buf;
                 uint8_t oldStatus = p[12];
                 if (oldStatus != 0) {
-                    DLOG(@"[PROTO-R-PATCH] v37.86: Status %u -> 0 (read hook, keeping %zd bytes)", oldStatus, ret);
+                    DLOG(@"[PROTO-R-PATCH] v37.87: Status %u -> 0 (read hook, keeping %zd bytes)", oldStatus, ret);
                     bp[12] = 0;
                 }
                 if (ret >= 93) {
@@ -7599,7 +7618,7 @@ static ssize_t hook_read(int fd, void *buf, size_t len) {
                     size_t w = bodyStart;
                     if (w + 2 + 20 <= bodyEnd) { bp[w++] = 0x00; bp[w++] = 0x14; memcpy(bp+w, kCanonicAcc, 20); w += 20; }
                     if (w + 2 + 12 <= bodyEnd) { bp[w++] = 0x00; bp[w++] = 0x0C; memcpy(bp+w, kSuccess, 12);   w += 12; }
-                    DLOG(@"[PROTO-R-PATCH-BODY] v37.86 (read hook): EE121 body rewritten. written=%zu padding=%zu",
+                    DLOG(@"[PROTO-R-PATCH-BODY] v37.87 (read hook): EE121 body rewritten. written=%zu padding=%zu",
                          w-bodyStart, (bodyEnd>=w)?(bodyEnd-w):0);
                 }
             }
@@ -9840,12 +9859,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     // This is the client's native 619B JSON (with empty sessionId/ticket).
     // Send hook will replace sessionId/ticket/clientId/MACADDRESS/md5 with clean
     // client values, re-encrypt, and build a new 1432B packet.
-    // v37.86: ALSO save FFF493#1 (IOS_CLIENT_MSG_REQ, first packet, smaller len 500-800).
+    // v37.87: ALSO save FFF493#1 (IOS_CLIENT_MSG_REQ, first packet, smaller len 500-800).
     // Previous versions only replaced #2 (len>800 in send hook), #1 went out with
     // sessionId="" → server checked #1 first → silently ignored #2 as well. Fix:
     // capture and replace BOTH FFF493 packets (#1 msgtype=16756741 = IOS_CLIENT_MSG_REQ,
     // #2 msgtype=??? = NEW_USER_ENTER_SERVER_REQ).
-    if (op == 0 && realDataIn && realDataInLen > 400 && realDataInLen < 2048) {
+    // v37.87 FIXED: Threshold lowered from >400 to >200. v37.87 log revealed #1 realDataInLen=316 → 316>400 false → #1 never saved!
+    // Now captures both #1 (316-800B) and #2 (500-1500B).
+    if (op == 0 && realDataIn && realDataInLen > 200 && realDataInLen < 2048) {
         // FFF493#2: NEW_USER_ENTER_SERVER_REQ (len usually ~605B native, becomes ~1408 after replace)
         if (memmem(realDataIn, realDataInLen, "NEW_USER_ENTER_SERVER_REQ", 25) != NULL) {
             if (g_fff493_2_native_plain) { free(g_fff493_2_native_plain); }
@@ -9854,11 +9875,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             if (g_fff493_2_native_plain) {
                 memcpy(g_fff493_2_native_plain, realDataIn, realDataInLen);
                 g_fff493_2_native_plain[realDataInLen] = '\0';
-                DLOG(@"[FFF493-REPL] v37.86: Saved FFF493#2 (NEW_USER) native plaintext %zuB for send-hook replacement", realDataInLen);
+                DLOG(@"[FFF493-REPL] v37.87: Saved FFF493#2 (NEW_USER) native plaintext %zuB for send-hook replacement", realDataInLen);
             }
         }
         // FFF493#1: IOS_CLIENT_MSG_REQ (first FFF493, usually ~420-620B native, msgtype=16756741)
-        // v37.86 FIX: IOS_CLIENT_MSG_REQ has NO sessionId field (confirmed from v37.86 log line 867).
+        // v37.87 FIX: IOS_CLIENT_MSG_REQ has NO sessionId field (confirmed from v37.87 log line 867).
         // Old code required "\"sessionId\"" match → #1 never saved → FFF493-REPL skipped #1.
         // Now detect IOS_CLIENT_MSG_REQ alone, no sessionId requirement.
         else if (memmem(realDataIn, realDataInLen, "IOS_CLIENT_MSG_REQ", 18) != NULL) {
@@ -9872,7 +9893,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 s_fff1_plain[realDataInLen] = '\0';
                 g_fff493_1_plain_buf = s_fff1_plain;
                 g_fff493_1_plain_len = s_fff1_len;
-                DLOG(@"[FFF493-REPL] v37.86: Saved FFF493#1 (IOS_CLIENT_MSG) native plaintext %zuB for send-hook replacement", realDataInLen);
+                DLOG(@"[FFF493-REPL] v37.87: Saved FFF493#1 (IOS_CLIENT_MSG) native plaintext %zuB for send-hook replacement", realDataInLen);
             }
         }
     }
@@ -10008,7 +10029,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.86 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.87 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10136,8 +10157,8 @@ static void patchChannelStringInBinary(void) {
 }
 
 static void installAllHooks(void) {
-    DLOG(@"[VERSION] WangXianHook v37.86-DIST — v37.86: TWO more ROOT CAUSES of v37.86 stuck fixed! (A) FFF493#1 (IOS_CLIENT_MSG_REQ, 472B) NEVER got sessionId injected: CCCrypt saved #2 only (required NEW_USER string), #1 plaintext was missing → SEND #1 went with sessionId="" → server checked #1 first, silently IGNORED #2 even if #2 had valid session! Fix: capture BOTH #1 (IOS_CLIENT_MSG_REQ alone, NO sessionId requirement) AND #2 (NEW_USER_ENTER_SERVER_REQ). (B) Even with BOTH #1+#2 replaced with non-empty sessionId/ticket, GAME SERVER STILL returned only HEARTBEATS (0x80000015) and NEVER 0x0CB0A300 role data! Because REAL login server EE121 still gives status=4 (版本过低) under the hood — our body overwrite fools CLIENT state machine but SERVER still marks session invalid. Fix: After FFF493#1 AND #2 both sent (with sessionId injected), if server returns >=2 CONSECUTIVE heartbeats WITHOUT 0x0CB0A300, we INJECT FORGED 1632B 0x0CB0A300 role-data as TCP STICKY PACKET appended to recv() buf. This forces client state machine → role selection UI even if server silently ignores (session invalid server-side). Builds on v37.86 fixes (EE121 body overwrite + GLOBAL sessionValid=1).");
-    // v37.86: Force session valid global immediately on hook init. This is the single most
+    DLOG(@"[VERSION] WangXianHook v37.87-DIST — v37.87: v37.87 log revealed 3 fatal bugs! (1) CCCrypt save threshold >400 was too HIGH: #1 (IOS_CLIENT_MSG_REQ) has realDataInLen=316 (316>400=false) so it was NEVER captured → g_fff493_1_plain_buf=NULL → send hook couldn't detect #1. Fix: lowered to >200. (2) Send hook #1 detection required g_fff493_1_plain_buf (>300) but that buffer was never filled. Fix: now detect #1 by LEN RANGE (350-800) FIRST, then plaintext. (3) When #1/2 replacement skipped (no plaintext), g_fff493_1_sent/g_fff493_2_sent stayed 0 → heartbeat counter (and forgery injection) NEVER triggered. Fix: FALLBACK mark — even if replacement skipped, mark #1 sent if len 350-800, mark #2 sent if len>800. Plus all v37.87 log labels bumped to v37.87.");
+    // v37.87: Force session valid global immediately on hook init. This is the single most
     // important change — 100% of v37.12-84 FFF493-REPL went to FALLBACK (sessionValid=0)
     // because no real 0x8234AB89 was ever received (login server gave 版本过低, no session).
     // Setting g_sessionValid=1 bypasses that; FFF493-REPL fills real-looking sessionId/ticket.
@@ -10150,7 +10171,7 @@ static void installAllHooks(void) {
         if (tikLen < sizeof(g_ticket))  { memcpy(g_ticket,    kDefaultTicket,    tikLen); g_ticket[tikLen] = 0; g_ticketLen = (int)tikLen; }
         g_sessionValid = 1;
         g_hashTokenValid = 0; // reset per-session
-        DLOG(@"[GLOBALS-INIT] v37.86: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
+        DLOG(@"[GLOBALS-INIT] v37.87: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
     }
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
