@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.104-NO-MD5-RECOMPUTE-ON-UUID loaded ===");
+        _log(@"=== WangXianHook v37.105-NO-FFF493-REPLACEMENT-ATALL loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4979,11 +4979,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 if (g_fff493_2_native_plain) { nativePlain=g_fff493_2_native_plain; nativeLen=g_fff493_2_native_len; fffWhich=2; }
                 else if (g_fff493_1_plain_buf) { nativePlain=g_fff493_1_plain_buf; nativeLen=g_fff493_1_plain_len; fffWhich=1; }
             }
-            // v37.103 FIX: Only replace FFF493#2 (NEW_USER_ENTER_SERVER_REQ)!
-            // FFF493#1 (IOS_CLIENT_MSG_REQ) is device-info — clean client does NOT include
-            // sessionId/ticket in it. Previous code INSERTED them → server confused → no role data!
-            // Now skip #1 replacement entirely: let original packet (with CH-L4 patches) go through.
-            if (fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
+            // v37.105 TEST: Skip ALL FFF493 modifications! Send original packets as-is.
+            // v37.104 proved: md5 NOT recomputed (correct), but server still only sends heartbeats.
+            // FFF493#2 plaintext already has CANONICAL values (clientId, channel from CH-L4).
+            // CC_MD5 hook already computes correct md5 over field concat (with replacements).
+ //             // v37.103 FIX: Only replace FFF493#2 (NEW_USER_ENTER_SERVER_REQ)!
+//            // FFF493#1 (IOS_CLIENT_MSG_REQ) is device-info — clean client does NOT include
+//            // sessionId/ticket in it. Previous code INSERTED them → server confused → no role data!
+//            // Now skip #1 replacement entirely: let original packet (with CH-L4 patches) go through.
+            if (0 && fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                 uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
@@ -10413,7 +10417,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.104 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#2_UUID_REPLACE_ONLY+SKIP_MD5_RECOMPUTE_ON_UUID+SKIP_FFF493#1+FORGE_DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.105 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+NO_FFF493_REPLACEMENT+ORIGINAL_PACKETS_ASIS+FORGE_DISABLED)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
