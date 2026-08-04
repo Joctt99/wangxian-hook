@@ -633,7 +633,17 @@ extern "C" kern_return_t mach_vm_remap(
 #import <CommonCrypto/CommonHMAC.h>
 #import <Security/Security.h>
 
+// v37.109-DIST: SILENT MODE for public distribution.
+// When SILENT_DIST_MODE=1, all DLOG() calls are compiled out (zero runtime cost, no file I/O).
+// Only critical startup/crash messages via direct _log() calls survive.
+// Set to 0 during development to re-enable full diagnostics for future app version updates.
+#define SILENT_DIST_MODE 1
+
+#if SILENT_DIST_MODE
+#define DLOG(fmt, ...) do { /* SILENT: compiled out */ } while(0)
+#else
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+#endif
 
 // v36.57: FULL MODE - Enable all hooks including game server analysis, crypto hooks
 // v36.47: EXTREME MINIMAL MODE - Only 0x802EE121 patch, NO crypto hooks, NO socket modifications
@@ -645,7 +655,11 @@ extern "C" kern_return_t mach_vm_remap(
 #define DISABLE_UI_HOOKS 0
 
 static NSString *g_logPath = nil;
-static BOOL g_logEnabled = YES; // logging toggle
+#if SILENT_DIST_MODE
+static BOOL g_logEnabled = NO;  // v37.109-SILENT: Zero file I/O, no NSLog — completely undetectable.
+#else
+static BOOL g_logEnabled = YES; // Development mode: full diagnostics.
+#endif
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
@@ -827,7 +841,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.108-DIST-NATIVE-ACCID loaded ===");
+        _log(@"=== WangXianHook v37.109-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10138,6 +10152,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
     DLOG(@"[CC-AES] %s inLen=%zu (real=%zu) keyLen=%zu", opStr, dataInLen, realDataInLen, keyLen);
 
+#if !SILENT_DIST_MODE
     // v37.34: Dump FULL plaintext (not only first 80B) for ENC calls whose size is in
     // FFF493 range (280-1200 bytes). This lets us see exactly which JSON fields are
     // present in our stub JSON (604B) vs the 1010B full JSON built by the canonical
@@ -10160,6 +10175,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             dumpCount++;
         }
     }
+#endif
 
     // v37.44: Save FFF493#2 native plaintext for send-hook field replacement.
     // Detection: ENC op + plaintext contains "NEW_USER_ENTER_SERVER_REQ" + len>500.
@@ -10336,7 +10352,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.108-DIST %d layers active (NATIVE_ACCID+CANONICAL_ch/dm/gp+NATIVE_UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+NO_ACCID_REPLACE+NO_UUID_REPLACE+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+NO_EE121_STATUS_PATCH+NO_BODY_OVERWRITE+FORGE_DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.109-DIST SILENT_MODE=%d %d layers active (NATIVE_ACCID+NATIVE_UUID+CANONICAL_ch/dm/gp+ALL hooks intact, diagnostics compiled-out for stealth)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
