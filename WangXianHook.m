@@ -1,6 +1,19 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v37.101-UUID-MATCH: Replace REAL device UUID in FFF493#2 MACADDRESS field
+ *
+ * v37.101 ROOT CAUSE FIX (服务器在收到FFF493#2后立即关闭连接):
+ *   FFF493#2 JSON的"MACADDRESS"字段包含REAL设备UUID (如"180C4F27-..."),
+ *   但EE121-CANON使用CANONICAL UUID "66B0EE01-..."。服务器交叉验证
+ *   EE121和FFF493#2的UUID → 不匹配 → 立即关闭连接!
+ *   CH-L4 hook只patch了channel/dm/gp, 没有patch UUID。
+ *   IDFV hook只patch [UIDevice identifierForVendor], MACADDRESS来自不同源。
+ *
+ *   FIX: 在FFF493-REPL处理中, 扫描newStr查找"MACADDRESS": "UUID",
+ *   替换为CANONICAL UUID。设置didReplaceUUID=YES → jsonModified=YES
+ *   → 触发md5重算 + 重新加密, 确保UUID一致性。
+ *
  * WangXianHook v37.100-NOREENCRYPT: SKIP re-encryption when JSON unchanged
  *
  * v37.100 ROOT CAUSE FIX (服务器在收到FFF493#2后关闭连接):
@@ -814,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.100-NOREENCRYPT loaded ===");
+        _log(@"=== WangXianHook v37.101-UUID-MATCH loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4976,6 +4989,33 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                                                freeWhenDone:NO];
                 if (nativeStr) {
                     NSMutableString *newStr = [NSMutableString stringWithString:nativeStr];
+                    // v37.101 FIX: Replace REAL device UUID in "MACADDRESS" field with CANONICAL UUID!
+                    // ROOT CAUSE: FFF493#2 JSON has "MACADDRESS": "180C4F27-..." (REAL device UUID),
+                    // but EE121-CANON uses CANONICAL UUID "66B0EE01-...". Server cross-validates
+                    // UUID between EE121 and FFF493#2 → mismatch → immediate connection CLOSE!
+                    // CH-L4 hook patches channel/dm/gp in CCCrypt plaintext but NOT UUID.
+                    // IDFV hook patches [UIDevice identifierForVendor] but MACADDRESS comes from
+                    // a different source. FIX: scan newStr for "MACADDRESS": "UUID" and replace.
+                    BOOL didReplaceUUID = NO;
+                    {
+                        NSString *macKey = @"\"MACADDRESS\": \"";
+                        NSRange macRange = [newStr rangeOfString:macKey];
+                        if (macRange.location != NSNotFound &&
+                            macRange.location + macRange.length + 36 <= newStr.length) {
+                            NSUInteger uuidStart = macRange.location + macRange.length;
+                            NSString *realUUID = [newStr substringWithRange:NSMakeRange(uuidStart, 36)];
+                            static const char kCanonUUID_v101[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
+                            NSString *canonUUID = [NSString stringWithUTF8String:kCanonUUID_v101];
+                            if (![realUUID isEqualToString:canonUUID]) {
+                                [newStr replaceCharactersInRange:NSMakeRange(uuidStart, 36) withString:canonUUID];
+                                didReplaceUUID = YES;
+                                DLOG(@"[FFF493-UUID] v37.101: #%d REPLACED MACADDRESS UUID: %@ → %@",
+                                     fffWhich, realUUID, canonUUID);
+                            } else {
+                                DLOG(@"[FFF493-UUID] v37.101: #%d MACADDRESS already CANONICAL UUID", fffWhich);
+                            }
+                        }
+                    }
                     NSString *realSessionId = nil; NSString *realTicket = nil;
                     if (g_sessionValid && g_sessionId[0] != 0 && g_ticket[0] != 0) {
                         realSessionId = [NSString stringWithUTF8String:g_sessionId];
@@ -5002,7 +5042,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // v37.99 FIX: Track whether JSON was ACTUALLY modified.
                     // v37.100 FIX: volatile — prevent -O2 from determining jsonModified is always YES
                     // and eliminating the jsonModified==NO path (SKIP insert, else branch, etc.)
-                    volatile BOOL jsonModified = (didReplaceSession || didReplaceTicket);
+                    // v37.101: Include didReplaceUUID — MACADDRESS UUID replacement always triggers
+                    // re-encryption + md5 recomputation to fix EE121/FFF493#2 UUID mismatch.
+                    volatile BOOL jsonModified = (didReplaceSession || didReplaceTicket || didReplaceUUID);
                     // v37.100 FIX: asm compiler barrier — prevent -O2 from tracking jsonModified value
                     // across this point and eliminating the else branch of if(jsonModified).
                     asm volatile("" ::: "memory");
@@ -10352,7 +10394,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.100 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_NOREENCRYPT_if_unchanged+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
+    DLOG(@"[CH-INIT] v37.101 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_UUID_REPLACE+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
