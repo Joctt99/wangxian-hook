@@ -800,7 +800,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.98-HASH2-REVERT-ORIG+MD5RECALC+ACCID-SAFE loaded ===");
+        _log(@"=== WangXianHook v37.99-FFF493-NODUP+MD5GUARD loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4979,30 +4979,38 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     BOOL didReplaceTicket = ([newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
                                             withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
                                                options:0 range:NSMakeRange(0, newStr.length)] > 0);
+                    // v37.99 FIX: Track whether JSON was ACTUALLY modified.
+                    // Only recompute md5 if we changed something. If original JSON already has
+                    // correct sessionId/ticket, DON'T touch it — original md5 is valid.
+                    BOOL jsonModified = (didReplaceSession || didReplaceTicket);
                     // v37.88 FIX: #1 (IOS_CLIENT_MSG_REQ) has NO sessionId/ticket fields in JSON!
-                    // The plaintext is: {"msgs": [...], "time": ..., "seqNum": ..., "randStr": ..., "__msg_clazz": "IOS_CLIENT_MSG_REQ", "msgtype": ...}
-                    // So replaceOccurrencesOfString above finds nothing. We must INSERT the fields.
+                    // v37.99 FIX: ONLY insert if the field is truly ABSENT from JSON!
+                    // FFF493#2 (NEW_USER_ENTER_SERVER_REQ) already HAS non-empty sessionId/ticket
+                    // from the login flow. Previous code inserted DUPLICATE fields → JSON corruption
+                    // → server validation failure → connection CLOSE!
                     if (!didReplaceSession || !didReplaceTicket) {
-                        // Insert sessionId and ticket into #1 JSON
-                        // Strategy: find the last "}" and insert before it
-                        NSUInteger lastBrace = [newStr rangeOfString:@"}" options:NSBackwardsSearch].location;
-                        if (lastBrace != NSNotFound) {
-                            NSString *insertStr = [NSString stringWithFormat:@"\"sessionId\": \"%@\", \"ticket\": \"%@\"", realSessionId, realTicket];
-                            [newStr insertString:insertStr atIndex:lastBrace];
-                            DLOG(@"[FFF493-REPL] v37.88: #%d INSERTED sessionId+ticket into JSON (was missing) at pos=%lu",
-                                 fffWhich, (unsigned long)lastBrace);
+                        BOOL hasSessionId = ([newStr rangeOfString:@"\"sessionId\""].location != NSNotFound);
+                        BOOL hasTicket = ([newStr rangeOfString:@"\"ticket\""].location != NSNotFound);
+                        if (!hasSessionId || !hasTicket) {
+                            NSUInteger lastBrace = [newStr rangeOfString:@"}" options:NSBackwardsSearch].location;
+                            if (lastBrace != NSNotFound) {
+                                NSString *insertStr = [NSString stringWithFormat:@"\"sessionId\": \"%@\", \"ticket\": \"%@\"", realSessionId, realTicket];
+                                [newStr insertString:insertStr atIndex:lastBrace];
+                                jsonModified = YES;
+                                DLOG(@"[FFF493-REPL] v37.99: #%d INSERTED sessionId+ticket into JSON (was absent) at pos=%lu",
+                                     fffWhich, (unsigned long)lastBrace);
+                            }
+                        } else {
+                            DLOG(@"[FFF493-REPL] v37.99: #%d SKIP insert — sessionId+ticket already present (non-empty) in JSON",
+                                 fffWhich);
                         }
                     }
                     // v37.97 FIX: After modifying sessionId/ticket, RE-COMPUTE "md5" field!
-                    // ROOT CAUSE: Original JSON has "md5": "2a7a66e93b6f6ee0ca7d3e00a2fae992" computed from original content.
-                    // After inserting sessionId/ticket, content changed but md5 stayed stale.
-                    // Server validates md5(JSON_without_md5_field) == JSON.md5. Mismatch → CLOSE connection!
-                    //
-                    // v37.97-2 FIX: DO NOT use NSRegularExpression. -O2 optimizer treats
-                    //   nil-return + if(md5Match) as dead code, dropping the ENTIRE md5
-                    //   recomputation (no [FFF493-MD5] markers appear in compiled dylib!).
-                    // Instead use plain rangeOfString substring extraction — simple, predictable.
-                    {
+                    // v37.99 FIX: ONLY recompute if JSON was ACTUALLY modified (jsonModified flag).
+                    // If JSON unchanged, original md5 is correct — DON'T touch it!
+                    // (Our MD5(JSON_without_md5) formula differs from client's MD5(concat_values) formula,
+                    //  so recomputing on unmodified JSON would CORRUPT a valid md5.)
+                    if (jsonModified) {
                         NSString *kMd5Key = @"\"md5\": \"";
                         NSRange md5KeyRange = [newStr rangeOfString:kMd5Key];
                         if (md5KeyRange.location != NSNotFound &&
