@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.94-HASH2-CONSISTENCY loaded ===");
+        _log(@"=== WangXianHook v37.95-CANON-ACCID loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4633,11 +4633,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                              realAccId, realUser, realUserLen, realPass, realPassLen);
 
                         // Rebuild newBuf from scratch (after header 12B).
-                        // v37.79: Use REAL accId + CANONICAL ch/dm/gp/UUID.
+                        // v37.95: Use CANONICAL accId + CANONICAL ch/dm/gp/UUID + FORCED hash2=ddcb91f42c.
                         size_t rebuildOut = 12;
-                        // accountId (REAL, 20 bytes)
+                        // v37.95 FIX: Use CANONICAL accId (65657881045335015151) instead of REAL accId.
+                        // ROOT CAUSE: hash2=ddcb91f42c is MD5(CANONICAL body). If body has REAL accId,
+                        // server computes MD5(REAL_accId+...) ≠ ddcb91f42c → close connection.
+                        // Token from EE120 is session-specific (issued before EE121), NOT account-specific.
+                        // CANONICAL account (65657881045335015151) has character data, REAL account doesn't.
+                        static const char kCanonAccId_v95[] = "65657881045335015151"; // 20 bytes
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x14;
-                        memcpy(newBuf+rebuildOut+2, realAccId, 20); rebuildOut += 22;
+                        memcpy(newBuf+rebuildOut+2, kCanonAccId_v95, 20); rebuildOut += 22;
                         // user (REAL, variable length)
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)(realUserLen&0xFF);
                         memcpy(newBuf+rebuildOut+2, realUser, realUserLen); rebuildOut += 2+realUserLen;
@@ -4683,7 +4688,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // Server validates: hash3 == first16hex(MD5(binaryHash + token))
                         //                   hash1 == last16hex(MD5(binaryHash + token))
                         {
-                            // v37.94 FIX: Force hash2 = binary hash (ddcb91f42c...) to MATCH
+                            // v37.95 FIX: Force hash2 = binary hash (ddcb91f42c...) to MATCH
                             // hash1/hash3 computation. ROOT CAUSE of status=4:
                             //   hash1/hash3 = MD5(ddcb91f42c + token)  [using binary hash]
                             //   hash2 = 640a8eab...                     [using orig body MD5]
@@ -4732,12 +4737,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 memcpy(hash3Val, md5Hex, 16);
                                 memcpy(hash1Val, md5Hex+16, 16);
                                 hashComputed = 1;
-                                DLOG(@"[EE121-HASH-RECALC] v37.94: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
+                                DLOG(@"[EE121-HASH-RECALC] v37.95: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
                                      md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v94, g_hashToken);
                             } else {
                                 if (h1) memcpy(hash1Val, p+h1+2, 16);
                                 if (h3) memcpy(hash3Val, p+h3+2, 16);
-                                DLOG(@"[EE121-HASH-RECALC] v37.94: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
+                                DLOG(@"[EE121-HASH-RECALC] v37.95: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
                                      g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
                                      16, h3?p+h3+2:(const unsigned char*)"????????????????");
                             }
@@ -4747,18 +4752,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            // v37.94 FIX: Write hash2 = BINARY HASH (ddcb91f42c), NOT origHash2 (640a8eab).
+                            // v37.95 FIX: Write hash2 = BINARY HASH (ddcb91f42c), NOT origHash2 (640a8eab).
                             // This makes hash2 CONSISTENT with hash1/hash3 = MD5(ddcb91f42c + token).
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
                             memcpy(newBuf+rebuildOut+2, kBinaryHashHex_v94, 32);
                             rebuildOut += 34;
-                            DLOG(@"[EE121-HASH2] v37.94: hash2=%s (FORCED binary hash, was orig=%s)", kBinaryHashHex_v94, origHash2Hex);
+                            DLOG(@"[EE121-HASH2] v37.95: hash2=%s (FORCED binary hash, was orig=%s)", kBinaryHashHex_v94, origHash2Hex);
                             // Write hash1 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.94: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.94: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH1] v37.95: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH3] v37.95: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -4768,7 +4773,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.94: Rebuilt EE121 REAL accId + CANONICAL ch/dm/gp/UUID. hash2=FORCED(ddcb91f42c) hash1/hash3=MD5(binaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.95: Rebuilt EE121 CANONICAL accId + CANONICAL ch/dm/gp/UUID. hash2=FORCED(ddcb91f42c) hash1/hash3=MD5(binaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -10089,7 +10094,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.94 %d layers active (NATIVE_EE121+hash2=FORCED_ddcb91f42c+hash1/hash3=MD5(binaryHash+token)+HASH_CONSISTENCY+UUID_REPLACE_IN_ALL_HASHES+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT)", layersOK);
+    DLOG(@"[CH-INIT] v37.95 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+FORCED_hash2=ddcb91f42c+hash1/hash3=MD5(binaryHash+token)+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
