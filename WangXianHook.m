@@ -4256,24 +4256,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[1] = (pos >> 16) & 0xFF;
                     newBuf[2] = (pos >> 8) & 0xFF;
                     newBuf[3] = pos & 0xFF;
-                    DLOG(@"[TLV-SCAN] v37.97: EE100 PATCHED ch=1 acc=%d origLen=%zu newLen=%zu cmd=0x%08X",
-                         ee100AccReplaced?1:0, len, pos, tlvCmd);
+                    DLOG(@"[TLV-SCAN] v37.108: EE100 PATCHED ch=1 acc=0 origLen=%zu newLen=%zu cmd=0x%08X",
+                         len, pos, tlvCmd);
                     ssize_t rret = orig_send(fd, newBuf, pos, flags);
                     free(newBuf);
-                    if (ee100Buf) free(ee100Buf);
                     if (rret >= 0) return (ssize_t)len;
                     return rret;
                 }
-            } else if (ee100Buf) {
-                // accId replaced but no channel change — just send modified buf
-                DLOG(@"[TLV-SCAN] v37.97: EE100 PATCHED ch=0 acc=1 origLen=%zu (no channel) cmd=0x%08X",
-                     len, tlvCmd);
-                ssize_t rret = orig_send(fd, ee100Buf, ee100OutLen, flags);
-                free(ee100Buf);
-                if (rret >= 0) return (ssize_t)len;
-                return rret;
             } else {
-                DLOG(@"[TLV-SCAN] v37.97: EE100 no DY_MIESHI found, accId already canon — skip patch");
+                DLOG(@"[TLV-SCAN] v37.108: EE100 no DY_MIESHI found, using NATIVE accId — skip patch");
             }
         }
 
