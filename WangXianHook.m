@@ -4206,8 +4206,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             if (len >= 38) {
                 char origAccId[21] = {0};
                 memcpy(origAccId, p + 18, 20); origAccId[20] = 0;
-                // Check if it's a 20-digit real accId (not canonical)
-                if (memcmp(p + 18, kCanonEE100_v97, 20) != 0) {
+                // v37.97 FIX: Use strcmp on stack buffer (origAccId).
+                // DO NOT use memcmp(p+18, static_array, N) — -O2 optimizer
+                // incorrectly considers that "always equal" and deletes REPLACED
+                // branch as dead code, leaving only already-CANONICAL branch.
+                if (strcmp(origAccId, kCanonEE100_v97) != 0) {
                     ee100Buf = (unsigned char *)malloc(len + 64);
                     if (ee100Buf) {
                         memcpy(ee100Buf, p, len);
@@ -4287,12 +4290,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 static const char kCanonEE113_v97[] = "65657881045335015151";
                 if (len >= 34) { // 12 header + 2 (0014) + 20 accId = 34
                     uint16_t accFlen = ((uint16_t)p[12] << 8) | p[13];
-                    if (accFlen == 20 && memcmp(p + 14, kCanonEE113_v97, 20) != 0) {
+                    // v37.97 FIX: Read orig into stack buffer FIRST, then compare.
+                    // AVOID memcmp(p+14, static_array, 20) — -O2 optimizer
+                    // mis-deduces "always equal" and drops REPLACED branch.
+                    char orig113[21] = {0};
+                    if (accFlen == 20) memcpy(orig113, p + 14, 20);
+                    orig113[20] = 0;
+                    if (accFlen == 20 && strcmp(orig113, kCanonEE113_v97) != 0) {
                         unsigned char *newBuf113 = (unsigned char *)malloc(len + 8);
                         if (newBuf113) {
                             memcpy(newBuf113, p, len);
-                            char orig113[21] = {0};
-                            memcpy(orig113, p + 14, 20); orig113[20] = 0;
                             memcpy(newBuf113 + 14, kCanonEE113_v97, 20);
                             // pktLen unchanged (20B→20B)
                             DLOG(@"[TLV-SCAN] v37.97: EE113 REPLACED accId orig=%s → canon=%s (len=%zu cmd=0x%08X)",
@@ -4303,10 +4310,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             return rret;
                         }
                     } else {
-                        DLOG(@"[TLV-SCAN] v37.97: EE113 accId already CANONICAL (len=%zu cmd=0x%08X)", len, tlvCmd);
+                        if (accFlen == 20) {
+                            DLOG(@"[TLV-SCAN] v37.97: EE113 accId already CANONICAL (len=%zu cmd=0x%08X)", len, tlvCmd);
+                        } else {
+                            DLOG(@"[TLV-SCAN] v37.97: EE113 too short for accId (len=%zu cmd=0x%08X)", len, tlvCmd);
+                        }
                     }
-                } else {
-                    DLOG(@"[TLV-SCAN] v37.97: EE113 too short for accId (len=%zu cmd=0x%08X)", len, tlvCmd);
                 }
             } else {
                 // Reconstruct packet with TLV field replacements
@@ -4991,83 +5000,80 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // ROOT CAUSE: Original JSON has "md5": "2a7a66e93b6f6ee0ca7d3e00a2fae992" computed from original content.
                     // After inserting sessionId/ticket, content changed but md5 stayed stale.
                     // Server validates md5(JSON_without_md5_field) == JSON.md5. Mismatch → CLOSE connection!
-                    // Step 1: Extract OLD md5 value from JSON (format: "md5": "hex32")
-                    NSRegularExpression *md5Regex = [NSRegularExpression regularExpressionWithPattern:@"\"md5\"\\s*:\\s*\"([0-9a-fA-F]{32})\"" options:0 error:nil];
-                    NSTextCheckingResult *md5Match = [md5Regex firstMatchInString:newStr options:0 range:NSMakeRange(0, newStr.length)];
-                    if (md5Match && md5Match.numberOfRanges >= 2) {
-                        NSString *oldMd5 = [newStr substringWithRange:[md5Match rangeAtIndex:1]];
-                        // Step 2: Remove the "md5": "xxx", field (including leading/trailing comma/space) to get the pre-md5 JSON
-                        NSMutableString *jsonWithoutMd5 = [newStr mutableCopy];
-                        NSRange fullMd5Range = [md5Match rangeAtIndex:0];
-                        // Try to also remove a trailing comma and space after the md5 field
-                        if (fullMd5Range.location + fullMd5Range.length + 2 <= jsonWithoutMd5.length) {
-                            unichar c1 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location + fullMd5Range.length];
-                            unichar c2 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location + fullMd5Range.length + 1];
-                            if (c1 == ',' && c2 == ' ') {
-                                fullMd5Range.length += 2;
+                    //
+                    // v37.97-2 FIX: DO NOT use NSRegularExpression. -O2 optimizer treats
+                    //   nil-return + if(md5Match) as dead code, dropping the ENTIRE md5
+                    //   recomputation (no [FFF493-MD5] markers appear in compiled dylib!).
+                    // Instead use plain rangeOfString substring extraction — simple, predictable.
+                    {
+                        NSString *kMd5Key = @"\"md5\": \"";
+                        NSRange md5KeyRange = [newStr rangeOfString:kMd5Key];
+                        if (md5KeyRange.location != NSNotFound &&
+                            md5KeyRange.location + md5KeyRange.length + 32 + 1 <= newStr.length) {
+                            // Step 1: Extract OLD md5 (32 hex chars after the key)
+                            NSUInteger valueStart = md5KeyRange.location + md5KeyRange.length;
+                            NSString *oldMd5 = [newStr substringWithRange:NSMakeRange(valueStart, 32)];
+                            // Verify 32nd char is closing-quote " (so md5 field is valid)
+                            unichar closing = [newStr characterAtIndex:(valueStart + 32)];
+                            if (closing == '"') {
+                                // Step 2: Find FULL field range (key through closing quote
+                                NSRange fullField = NSMakeRange(md5KeyRange.location,
+                                                                 (valueStart + 32 + 1) - md5KeyRange.location);
+                                // Also try to include trailing ", " (comma-space)
+                                if (fullField.location + fullField.length + 2 <= newStr.length) {
+                                    unichar tc1 = [newStr characterAtIndex:(fullField.location + fullField.length)];
+                                    unichar tc2 = [newStr characterAtIndex:(fullField.location + fullField.length + 1)];
+                                    if (tc1 == ',' && tc2 == ' ') fullField.length += 2;
+                                }
+                                // Or include leading ", " (comma-space before the key
+                                if (fullField.location >= 2) {
+                                    unichar lc1 = [newStr characterAtIndex:(fullField.location - 1)];
+                                    unichar lc2 = [newStr characterAtIndex:(fullField.location - 2)];
+                                    if (lc1 == ' ' && lc2 == ',') {
+                                        fullField.location -= 2;
+                                        fullField.length += 2;
+                                    }
+                                }
+                                // Build jsonWithoutMd5 by deleting fullField from copy
+                                NSMutableString *jsonWithoutMd5 = [newStr mutableCopy];
+                                [jsonWithoutMd5 deleteCharactersInRange:fullField];
+                                // Step 3: Compute MD5 of jsonWithoutMd5 via raw CC_MD5 (dlsym, no hook)
+                                const char *jsonStr = [jsonWithoutMd5 UTF8String];
+                                size_t jsonLen = strlen(jsonStr);
+                                unsigned char md5Raw[16];
+                                memset(md5Raw, 0, sizeof(md5Raw));
+                                typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                                static RawCCMD5 s_rawMD5_v97 = NULL;
+                                if (!s_rawMD5_v97) s_rawMD5_v97 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                                if (s_rawMD5_v97) s_rawMD5_v97(jsonStr, (unsigned long)jsonLen, md5Raw);
+                                static const char kHex_v97[] = "0123456789abcdef";
+                                char newMd5Hex[33];
+                                for (int hi = 0; hi < 16; hi++) {
+                                    newMd5Hex[hi*2]   = kHex_v97[(md5Raw[hi] >> 4) & 0xF];
+                                    newMd5Hex[hi*2+1] = kHex_v97[md5Raw[hi] & 0xF];
+                                }
+                                newMd5Hex[32] = 0;
+                                NSString *newMd5 = [NSString stringWithUTF8String:newMd5Hex];
+                                // Step 4: Insert new md5 into final JSON (delete old field, insert new at same spot)
+                                NSMutableString *finalJson = [newStr mutableCopy];
+                                // Delete same fullField from finalJson too (same content as above)
+                                [finalJson deleteCharactersInRange:fullField];
+                                // Find insertion point: before "time" or after first "{"
+                                NSString *kTimeKey = @"\"time\":";
+                                NSRange timeRange = [finalJson rangeOfString:kTimeKey];
+                                NSUInteger insertAt = 0;
+                                if (timeRange.location != NSNotFound && timeRange.location <= finalJson.length) {
+                                    insertAt = timeRange.location;
+                                } else {
+                                    NSRange firstBrace = [finalJson rangeOfString:@"{"];
+                                    if (firstBrace.location != NSNotFound) insertAt = firstBrace.location + 1;
+                                }
+                                NSString *insertMd5 = [NSString stringWithFormat:@"\"md5\": \"%@\", ", newMd5];
+                                [finalJson insertString:insertMd5 atIndex:insertAt];
+                                DLOG(@"[FFF493-MD5] v37.97: #%d RECOMPUTED md5: old=%@ → new=%@ (jsonWithoutMd5Len=%zu)",
+                                     fffWhich, oldMd5, newMd5, jsonLen);
+                                newStr = finalJson;
                             }
-                        }
-                        // Or try to also remove a leading comma+space
-                        if (fullMd5Range.location >= 2) {
-                            unichar cb1 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location - 1];
-                            unichar cb2 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location - 2];
-                            if (cb1 == ' ' && cb2 == ',') {
-                                fullMd5Range.location -= 2;
-                                fullMd5Range.length += 2;
-                            }
-                        }
-                        [jsonWithoutMd5 deleteCharactersInRange:fullMd5Range];
-                        // Step 3: Compute MD5 of jsonWithoutMd5 using system CC_MD5 (via dlsym to avoid our hook)
-                        const char *jsonStr = [jsonWithoutMd5 UTF8String];
-                        size_t jsonLen = strlen(jsonStr);
-                        unsigned char md5Raw[16];
-                        memset(md5Raw, 0, sizeof(md5Raw));
-                        typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
-                        static RawCCMD5 s_rawMD5_v97 = NULL;
-                        if (!s_rawMD5_v97) s_rawMD5_v97 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
-                        if (s_rawMD5_v97) s_rawMD5_v97(jsonStr, (unsigned long)jsonLen, md5Raw);
-                        static const char kHex_v97[] = "0123456789abcdef";
-                        char newMd5Hex[33];
-                        for (int hi = 0; hi < 16; hi++) {
-                            newMd5Hex[hi*2]   = kHex_v97[(md5Raw[hi] >> 4) & 0xF];
-                            newMd5Hex[hi*2+1] = kHex_v97[md5Raw[hi] & 0xF];
-                        }
-                        newMd5Hex[32] = 0;
-                        NSString *newMd5 = [NSString stringWithUTF8String:newMd5Hex];
-                        // Step 4: Insert new md5 field back into JSON
-                        // Find a good insertion point: before "time" field (common pattern), or after last field before }
-                        NSRange timeRange = [newStr rangeOfString:@"\"time\"\\s*:" options:NSRegularExpressionSearch];
-                        NSMutableString *finalJson = [newStr mutableCopy];
-                        // First delete old md5 (same fullMd5Range as above but on finalJson = newStr)
-                        // Recalculate fullMd5Range on finalJson (it's same content as before modifications)
-                        NSTextCheckingResult *md5Match2 = [md5Regex firstMatchInString:finalJson options:0 range:NSMakeRange(0, finalJson.length)];
-                        if (md5Match2 && md5Match2.numberOfRanges >= 1) {
-                            NSRange delRange = [md5Match2 rangeAtIndex:0];
-                            if (delRange.location + delRange.length + 2 <= finalJson.length) {
-                                unichar c1 = [finalJson characterAtIndex:delRange.location + delRange.length];
-                                unichar c2 = [finalJson characterAtIndex:delRange.location + delRange.length + 1];
-                                if (c1 == ',' && c2 == ' ') { delRange.length += 2; }
-                            }
-                            if (delRange.location >= 2) {
-                                unichar cb1 = [finalJson characterAtIndex:delRange.location - 1];
-                                unichar cb2 = [finalJson characterAtIndex:delRange.location - 2];
-                                if (cb1 == ' ' && cb2 == ',') { delRange.location -= 2; delRange.length += 2; }
-                            }
-                            [finalJson deleteCharactersInRange:delRange];
-                            // Now insert new md5: at the deletion point or before "time"
-                            NSString *insertMd5 = [NSString stringWithFormat:@"\"md5\": \"%@\", ", newMd5];
-                            NSUInteger insertAt = 0;
-                            if (timeRange.location != NSNotFound && timeRange.location < finalJson.length) {
-                                insertAt = timeRange.location;
-                            } else {
-                                // Insert after first "{" (after "{")
-                                NSRange firstBrace = [finalJson rangeOfString:@"{"];
-                                if (firstBrace.location != NSNotFound) insertAt = firstBrace.location + 1;
-                            }
-                            [finalJson insertString:insertMd5 atIndex:insertAt];
-                            DLOG(@"[FFF493-MD5] v37.97: #%d RECOMPUTED md5: old=%@ → new=%@ (jsonWithoutMd5Len=%zu)",
-                                 fffWhich, oldMd5, newMd5, jsonLen);
-                            newStr = finalJson;
                         }
                     }
                     const char *newPlain = [newStr UTF8String];
@@ -5488,12 +5494,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             if (len >= 34) {
                 const unsigned char *fp2 = (const unsigned char *)buf;
                 uint16_t accLen = ((uint16_t)fp2[12] << 8) | fp2[13];
-                if (accLen == 20 && memcmp(fp2 + 14, kCanonF013_v97, 20) != 0) {
+                // v37.97 FIX: Read orig F013 accId into stack first, then strcmp.
+                // DO NOT use memcmp(fp2+14, static_array, 20) — -O2 optimizer
+                // treats memcmp(mem_ptr, static_str, N) as predictable, drops REPLACE branch.
+                char origF013[21] = {0};
+                if (accLen == 20) memcpy(origF013, fp2 + 14, 20);
+                origF013[20] = 0;
+                if (accLen == 20 && strcmp(origF013, kCanonF013_v97) != 0) {
                     unsigned char *f013New = (unsigned char *)malloc(len + 8);
                     if (f013New) {
                         memcpy(f013New, fp2, len);
-                        char origF013[21] = {0};
-                        memcpy(origF013, fp2 + 14, 20); origF013[20] = 0;
                         memcpy(f013New + 14, kCanonF013_v97, 20);
                         DLOG(@"[F013-ACCID] v37.97: F013 REPLACED accId orig=%s → canon=%s (len=%zu)",
                              origF013, kCanonF013_v97, len);
