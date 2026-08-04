@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.92-HASH-ORDER loaded ===");
+        _log(@"=== WangXianHook v37.93-UUID-FIX loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4753,8 +4753,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.92: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.92: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH1] v37.93: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH3] v37.93: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -8307,9 +8307,14 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
                 if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
                 if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
-                // Generic UUID format detection ONLY in EE121 ctx=1 to avoid false positives.
+                // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
+                // ROOT CAUSE: 162B and 168B hash inputs have different field order
+                // (no "SQAGEIOS"+"WIFI7.6.3979" markers) → eeCtx=0 → UUID NOT replaced.
+                // These hashes used NATIVE UUID (180C4F27...) instead of CANONICAL
+                // (66B0EE01...) → server validation failed → status=4 (版本过低).
+                // FIX: Also detect UUID when any EE121-specific string (ch/dm/gp) is found.
                 // Format: 8hex - 4hex - 4hex - 4hex - 12hex = 36 bytes total
-                if (hasEE121Ctx == 1 && !hasUUID && i + 36 <= len) {
+                if ((hasEE121Ctx == 1 || hasCh || hasDm || hasGp) && !hasUUID && i + 36 <= len) {
                     const uint8_t *u = in + i;
                     if (IS_HEX(u[0])&&IS_HEX(u[1])&&IS_HEX(u[2])&&IS_HEX(u[3])&&IS_HEX(u[4])&&IS_HEX(u[5])&&IS_HEX(u[6])&&IS_HEX(u[7])
                         && u[8]=='-'
@@ -10080,7 +10085,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.92 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+HASH_ORDER_FIX(hash3→hash2→hash1)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.93 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+HASH_ORDER_FIX(hash3→hash2→hash1)+UUID_REPLACE_IN_ALL_HASHES+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
