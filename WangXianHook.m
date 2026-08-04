@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.91-NATIVE-EE121 loaded ===");
+        _log(@"=== WangXianHook v37.92-HASH-ORDER loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4669,20 +4669,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         for (size_t sp = 12; sp + 2 + 16 <= len; ) {
                             uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
                             if (sp + 2 + sl > len) break;
-                            if (sl == 16 && h1 == 0) { h1 = sp; sp += 2+sl; continue; }
-                            if (sl == 32 && h2 == 0) { h2 = sp; sp += 2+sl; continue; }
+                            // v37.92 FIX: Native packet order is hash3 → hash2 → hash1.
+                            // First 16B TLV is hash3, second 16B TLV is hash1.
                             if (sl == 16 && h3 == 0) { h3 = sp; sp += 2+sl; continue; }
+                            if (sl == 32 && h2 == 0) { h2 = sp; sp += 2+sl; continue; }
+                            if (sl == 16 && h1 == 0) { h1 = sp; sp += 2+sl; continue; }
                             sp += 2+sl;
                         }
-                        // hash1 block: 00 10 + 16hex chars (18B) — RECOMPUTED in v37.80
-                        // v37.80: hash1 is NOT from original packet. It's the LAST 8 bytes
-                        // of MD5(hash2_forced_hex + captured_token).
-                        // hash2 block: 00 20 + 32hex chars = ddcb91f42c5a612b492a2296a971a5af (FORCED)
-                        // hash3 block: 00 10 + 16hex chars = FIRST 8 bytes of MD5(...)
-                        // Field order: hash1 → hash2 → hash3
-                        // Server validates: hash3 == first8B(MD5(hash2 + token))
-                        //                   hash1 == last8B(MD5(hash2 + token))
-                        // If hash2 is forced but hash1/hash3 aren't recomputed → mismatch → close.
+                        // hash3 block: 00 10 + 16hex chars (FIRST 16B TLV in native packet)
+                        // hash2 block: 00 20 + 32hex chars (fields MD5, 32B TLV)
+                        // hash1 block: 00 10 + 16hex chars (SECOND 16B TLV in native packet)
+                        // v37.92: Field order in native packet: hash3 → hash2 → hash1
+                        // Server validates: hash3 == first16hex(MD5(binaryHash + token))
+                        //                   hash1 == last16hex(MD5(binaryHash + token))
                         {
                             // v37.83: Use ORIGINAL hash2 (body MD5) from packet, NOT forced binary hash.
                             // Server expects hash2 == MD5(body_fields+salt), NOT binary hash.
@@ -4738,20 +4737,24 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                      g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
                                      16, h3?p+h3+2:(const unsigned char*)"????????????????");
                             }
-                            // Write hash1 field
-                            newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
-                            memcpy(newBuf+rebuildOut+2, hash1Val, 16);
-                            rebuildOut += 18;
-                            // Write hash2 field (ORIGINAL body MD5, NOT forced binary hash)
-                            newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
-                            rebuildOut += 34;
+                            // v37.92 FIX: Write hash3 FIRST, then hash2, then hash1.
+                            // Native packet order (confirmed from L444 tail80B):
+                            //   hash3 → hash2 → hash1 (hash1 is LAST, closest to packet end)
+                            // Previous code wrote hash1→hash2→hash3 (WRONG ORDER) → status=4.
                             // Write hash3 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.83: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.83: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            // Write hash2 field (ORIGINAL fields MD5, NOT binary hash)
+                            newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
+                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
+                            rebuildOut += 34;
+                            // Write hash1 field
+                            newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
+                            memcpy(newBuf+rebuildOut+2, hash1Val, 16);
+                            rebuildOut += 18;
+                            DLOG(@"[EE121-HASH1] v37.92: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH3] v37.92: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -10077,7 +10080,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.91 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.92 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+HASH_ORDER_FIX(hash3→hash2→hash1)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
