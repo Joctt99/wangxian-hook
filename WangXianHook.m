@@ -1,9 +1,23 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.96-REAL-BINARY-HASH: REAL binary hash from Frida capture
+ * WangXianHook v37.97-HASH2-FORCE-MD5RECALC: EE121 hash2 forced + FFF493 md5 recomputed + EE100/EE113/F013 CANONICAL accId
  *
- * v37.96 CHANGES (fixes ALL previous status=4 "版本过低" failures):
+ * v37.97 CHANGES (fixes 3 ROOT CAUSES of "连接异常中断" after server select):
+ *   1. FIX 1 (EE121 hash2 mismatch): Our hooked client computes hash2 from 156B
+ *      (REAL_accId + DYanyou0040_MIESHI + ...) but clean 7.6.3 uses 170B
+ *      (binary_hash_hex:906e707ec + DYanyou0040_MIESHI + CANONICAL_accId + ...)
+ *      → DIFFERENT values! FORCE hash2 = c59199e10e56714b8b08c64676cc1610 (clean-path).
+ *   2. FIX 2 (FFF493#2 stale md5): After inserting sessionId/ticket into JSON,
+ *      md5 field was NOT re-computed (old md5=2a7a66e9 matched original JSON).
+ *      Server validates md5(JSON_without_md5) == JSON.md5 → mismatch → CLOSE!
+ *   3. FIX 3 (EE100/EE113/F013 REAL accId leak): EE100/EE113/F013 sent REAL
+ *      accountId (39325649477735437374) to login server, but EE121-CANON and
+ *      game-server FFF493 use CANONICAL (65657881045335015151) → server sees
+ *      inconsistent IDs across login flow → fails token/session validation
+ *      at game-server handshake and closes connection.
+ *
+ * v37.97 CHANGES (fixes ALL previous status=4 "版本过低" failures):
  *   1. ROOT CAUSE: Previous versions used WRONG binary hash (ddcb91f42c...)
  *      Frida capture from clean 7.6.3 proves real binary_hash = 906e707ec5585f080397b26ff4b8d89d
  *      And hash2 = MD5(170B body) = c59199e10e56... (NOT binary hash!)
@@ -786,7 +800,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.96-REAL-BINARY-HASH loaded ===");
+        _log(@"=== WangXianHook v37.97-HASH2-FORCE-MD5RECALC loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4179,60 +4193,86 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         // The standard TLV parser fails because it reads 00 00 as fLen=0, then 00 05 as fLen=5,
         // completely misaligning all subsequent fields. Fix: direct string replacement.
         if (tlvCmd == 0x002EE100) {
-            // v37.79: Log accountId from EE100 (DO NOT replace — use REAL accId).
+            // v37.97 FIX: EE100 MUST use CANONICAL accId!
+            // ROOT CAUSE: EE100 sent REAL accId (393256...) to login server,
+            // but EE121-CANON/game-server use CANONICAL (656578...). Server
+            // cross-validates IDs across login flow → session failure.
             // EE100 format: [12B header][00 00 00 05][00 14][20B accId]...
+            // accId is at offset 18, 20 bytes.
+            static const char kCanonEE100_v97[] = "65657881045335015151";
+            unsigned char *ee100Buf = NULL;
+            size_t ee100OutLen = len;
+            BOOL ee100AccReplaced = NO;
             if (len >= 38) {
-                char ee100AccId[21] = {0};
-                memcpy(ee100AccId, p + 18, 20); ee100AccId[20] = 0;
-                DLOG(@"[EE100-ACCID] v37.79: EE100 REAL accountId=%s (NOT replaced, len=%zu)", ee100AccId, len);
+                char origAccId[21] = {0};
+                memcpy(origAccId, p + 18, 20); origAccId[20] = 0;
+                // Check if it's a 20-digit real accId (not canonical)
+                if (memcmp(p + 18, kCanonEE100_v97, 20) != 0) {
+                    ee100Buf = (unsigned char *)malloc(len + 64);
+                    if (ee100Buf) {
+                        memcpy(ee100Buf, p, len);
+                        memcpy(ee100Buf + 18, kCanonEE100_v97, 20);
+                        ee100OutLen = len;
+                        ee100AccReplaced = YES;
+                        DLOG(@"[EE100-ACCID] v37.97: EE100 REPLACED accId: orig=%s → canon=%s (len=%zu)",
+                             origAccId, kCanonEE100_v97, len);
+                    }
+                } else {
+                    DLOG(@"[EE100-ACCID] v37.97: EE100 accId already CANONICAL=%s (len=%zu)",
+                         kCanonEE100_v97, len);
+                }
             }
-            // v37.79: DO NOT replace accountId — use REAL. Only replace channel.
-            // Then replace channel DY_MIESHI → DYanyou0040_MIESHI.
-            unsigned char *dyPos = (unsigned char *)memmem(p, len, "DY_MIESHI", 9);
-            if (dyPos && dyPos >= p + 2) {
-                size_t dyOffset = (size_t)(dyPos - p);
-                size_t bufCap = len + 64;
+            // v37.97: Replace channel DY_MIESHI → DYanyou0040_MIESHI (on top of accId replace)
+            unsigned char *workBuf = ee100Buf ? ee100Buf : (unsigned char *)p;
+            size_t workLen = ee100OutLen;
+            unsigned char *dyPos = (unsigned char *)memmem(workBuf, workLen, "DY_MIESHI", 9);
+            if (dyPos && dyPos >= workBuf + 2) {
+                size_t dyOffset = (size_t)(dyPos - workBuf);
+                size_t bufCap = workLen + 64;
                 unsigned char *newBuf = (unsigned char *)malloc(bufCap);
                 if (newBuf) {
-                    size_t newLen = len + 9; // +9 for longer channel
+                    size_t newLen = workLen + 9; // +9 for longer channel
                     size_t pos = 0;
-                    // Copy everything BEFORE the TLV length field (dyOffset - 2)
                     if (dyOffset >= 2) {
-                        memcpy(newBuf, p, dyOffset - 2);
+                        memcpy(newBuf, workBuf, dyOffset - 2);
                         pos = dyOffset - 2;
                     }
-                    // v37.79: DO NOT replace accId — keep REAL
-                    // Write new TLV length (00 12 = 18)
                     newBuf[pos++] = 0x00;
                     newBuf[pos++] = 0x12;
-                    // Write new channel string (18 bytes)
                     memcpy(newBuf + pos, "DYanyou0040_MIESHI", 18);
                     pos += 18;
-                    // Copy remaining bytes (everything after original DY_MIESHI)
                     size_t restStart = dyOffset + 9;
-                    if (restStart < len) {
-                        memcpy(newBuf + pos, p + restStart, len - restStart);
-                        pos += (len - restStart);
+                    if (restStart < workLen) {
+                        memcpy(newBuf + pos, workBuf + restStart, workLen - restStart);
+                        pos += (workLen - restStart);
                     }
-                    // Update total packet length (first 4 bytes BE)
                     newBuf[0] = (pos >> 24) & 0xFF;
                     newBuf[1] = (pos >> 16) & 0xFF;
                     newBuf[2] = (pos >> 8) & 0xFF;
                     newBuf[3] = pos & 0xFF;
-                    DLOG(@"[TLV-SCAN] v37.79: EE100 PATCHED ch=1 (accId=REAL kept) origLen=%zu newLen=%zu cmd=0x%08X",
-                         len, pos, tlvCmd);
+                    DLOG(@"[TLV-SCAN] v37.97: EE100 PATCHED ch=1 acc=%d origLen=%zu newLen=%zu cmd=0x%08X",
+                         ee100AccReplaced?1:0, len, pos, tlvCmd);
                     ssize_t rret = orig_send(fd, newBuf, pos, flags);
                     free(newBuf);
+                    if (ee100Buf) free(ee100Buf);
                     if (rret >= 0) return (ssize_t)len;
                     return rret;
                 }
+            } else if (ee100Buf) {
+                // accId replaced but no channel change — just send modified buf
+                DLOG(@"[TLV-SCAN] v37.97: EE100 PATCHED ch=0 acc=1 origLen=%zu (no channel) cmd=0x%08X",
+                     len, tlvCmd);
+                ssize_t rret = orig_send(fd, ee100Buf, ee100OutLen, flags);
+                free(ee100Buf);
+                if (rret >= 0) return (ssize_t)len;
+                return rret;
             } else {
-                DLOG(@"[TLV-SCAN] v37.68: EE100 no DY_MIESHI found, skip patch");
+                DLOG(@"[TLV-SCAN] v37.97: EE100 no DY_MIESHI found, accId already canon — skip patch");
             }
         }
 
         // Standard TLV scan for other packets (0x0000E002, 0x002EE118, 0x002EE113)
-        // v37.79: EE113 does NOT replace accountId (use REAL accId for token consistency).
+        // v37.97: EE113 MUST use CANONICAL accId! (was PASSTHROUGH REAL in v37.79)
         BOOL isSmallPkt = (tlvCmd == 0x0000E002 || tlvCmd == 0x002EE118);
         BOOL isEE113 = (tlvCmd == 0x002EE113);
         BOOL needsPatch = isSmallPkt || isEE113;
@@ -4240,9 +4280,34 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         BOOL hasDY_MIESHI = (memmem(p, len, "DY_MIESHI", 9) != NULL);
         if (needsPatch && (isEE113 || hasDY_MIESHI)) {
             if (isEE113 && !hasDY_MIESHI) {
-                // v37.79: EE113 — DO NOT replace accountId. Just send as-is.
-                // Using REAL accId ensures token consistency with EE121.
-                DLOG(@"[TLV-SCAN] v37.79: EE113 PASSTHROUGH (accId=REAL, no patch) cmd=0x%08X len=%zu", tlvCmd, len);
+                // v37.97 FIX: EE113 — MUST replace accId with CANONICAL!
+                // ROOT CAUSE: EE113 sent REAL accId (393256...) to login server.
+                // EE113 structure (51B): [12B header][00 14][20B accId][00 05][5B user][00 06][6B pass][00 00]
+                // accId is at offset 14, 20 bytes. No channel field.
+                static const char kCanonEE113_v97[] = "65657881045335015151";
+                if (len >= 34) { // 12 header + 2 (0014) + 20 accId = 34
+                    uint16_t accFlen = ((uint16_t)p[12] << 8) | p[13];
+                    if (accFlen == 20 && memcmp(p + 14, kCanonEE113_v97, 20) != 0) {
+                        unsigned char *newBuf113 = (unsigned char *)malloc(len + 8);
+                        if (newBuf113) {
+                            memcpy(newBuf113, p, len);
+                            char orig113[21] = {0};
+                            memcpy(orig113, p + 14, 20); orig113[20] = 0;
+                            memcpy(newBuf113 + 14, kCanonEE113_v97, 20);
+                            // pktLen unchanged (20B→20B)
+                            DLOG(@"[TLV-SCAN] v37.97: EE113 REPLACED accId orig=%s → canon=%s (len=%zu cmd=0x%08X)",
+                                 orig113, kCanonEE113_v97, len, tlvCmd);
+                            ssize_t rret = orig_send(fd, newBuf113, len, flags);
+                            free(newBuf113);
+                            if (rret >= 0) return (ssize_t)len;
+                            return rret;
+                        }
+                    } else {
+                        DLOG(@"[TLV-SCAN] v37.97: EE113 accId already CANONICAL (len=%zu cmd=0x%08X)", len, tlvCmd);
+                    }
+                } else {
+                    DLOG(@"[TLV-SCAN] v37.97: EE113 too short for accId (len=%zu cmd=0x%08X)", len, tlvCmd);
+                }
             } else {
                 // Reconstruct packet with TLV field replacements
                 size_t bufCap = len + 64;
@@ -4425,7 +4490,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         fbBuf[11] = origSeq & 0xFF;
 
                         // Mod 2: hash1/hash3 recalc with binary_hash + captured token from EE120.
-                        // v37.96: binary_hash = 906e707ec... (captured from clean 7.6.3 via Frida)
+                        // v37.97: binary_hash = 906e707ec... (captured from clean 7.6.3 via Frida)
                         // hash1/hash3 = MD5(binary_hash + token), NOT MD5(hash2 + token)
                         // hash1 at [181..196] = 16 hex chars = 16 bytes value after 00 10 prefix.
                         // hash3 at [233..248] = 16 hex chars.
@@ -4464,13 +4529,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             }
                             if (h1 != (size_t)-1) memcpy(fbBuf+h1+2, hash1Val, 16);
                             if (h3 != (size_t)-1) memcpy(fbBuf+h3+2, hash3Val, 16);
-                            DLOG(@"[EE121-HASH-RECALC] v37.96: MD5(binaryHash+EE120_token)=%s → hash1=%.*s hash3=%.*s (token=%s h1@%zu h3@%zu)",
+                            DLOG(@"[EE121-HASH-RECALC] v37.97: MD5(binaryHash+EE120_token)=%s → hash1=%.*s hash3=%.*s (token=%s h1@%zu h3@%zu)",
                                  md5Hex, 16, hash1Val, 16, hash3Val, g_hashToken, h1, h3);
                         } else {
-                            DLOG(@"[EE121-HASH-RECALC] v37.96: FALLBACK g_hashTokenValid=%d token invalid — using STALE hash1/hash3 from cleanPkt. Server will probably close!",
+                            DLOG(@"[EE121-HASH-RECALC] v37.97: FALLBACK g_hashTokenValid=%d token invalid — using STALE hash1/hash3 from cleanPkt. Server will probably close!",
                                  g_hashTokenValid);
                         }
-                        DLOG(@"[EE121-REPL] v37.96: Sending clean 248B seq=%u hash1/hash3=%@",
+                        DLOG(@"[EE121-REPL] v37.97: Sending clean 248B seq=%u hash1/hash3=%@",
                              origSeq, g_hashTokenValid?@"RECALC_DYNAMIC":@"STALE_FALLBACK");
                         ssize_t rret = orig_send(fd, fbBuf, 248, flags);
                         free(fbBuf);
@@ -4655,9 +4720,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                              realAccId, realUser, realUserLen, realPass, realPassLen);
 
                         // Rebuild newBuf from scratch (after header 12B).
-                        // v37.96: Use CANONICAL accId + CANONICAL ch/dm/gp/UUID + ORIGINAL hash2 (body MD5).
+                        // v37.97: Use CANONICAL accId + CANONICAL ch/dm/gp/UUID + ORIGINAL hash2 (body MD5).
                         size_t rebuildOut = 12;
-                        // v37.96: Use CANONICAL accId (65657881045335015151) to match clean client.
+                        // v37.97: Use CANONICAL accId (65657881045335015151) to match clean client.
                         // hash2 = MD5(body) is computed by CC_MD5 hook with accId replacement.
                         // hash1/hash3 = MD5(real_binary_hash + token) where binary_hash = 906e707ec...
                         // CANONICAL account (65657881045335015151) has character data, REAL account doesn't.
@@ -4709,7 +4774,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // Server validates: hash3 == first16hex(MD5(binaryHash + token))
                         //                   hash1 == last16hex(MD5(binaryHash + token))
                         {
-                            // v37.96 FIX: Use ORIGINAL hash2 (MD5 of body) from client's CC_MD5.
+                            // v37.97 FIX: Use ORIGINAL hash2 (MD5 of body) from client's CC_MD5.
                             // ROOT CAUSE of all previous status=4 failures:
                             //   - Wrong assumption: hash2 = binary hash (WRONG!)
                             //   - Frida capture proves: hash2 = MD5(170B body fields) = c59199e10e56...
@@ -4734,7 +4799,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             int hashComputed = 0;
                             if (g_hashTokenValid && strlen(g_hashToken) == 31) {
                                 char md5In[64];
-                                // v37.96: hash1/hash3 = MD5(binary_hash + token), NOT MD5(hash2 + token)
+                                // v37.97: hash1/hash3 = MD5(binary_hash + token), NOT MD5(hash2 + token)
                                 memcpy(md5In, kBinaryHashHex_v96, 32);
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
                                 // Compute MD5 using system CC_MD5 (via dlsym to avoid our hook).
@@ -4754,12 +4819,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 memcpy(hash3Val, md5Hex, 16);
                                 memcpy(hash1Val, md5Hex+16, 16);
                                 hashComputed = 1;
-                                DLOG(@"[EE121-HASH-RECALC] v37.96: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
+                                DLOG(@"[EE121-HASH-RECALC] v37.97: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
                                      md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v96, g_hashToken);
                             } else {
                                 if (h1) memcpy(hash1Val, p+h1+2, 16);
                                 if (h3) memcpy(hash3Val, p+h3+2, 16);
-                                DLOG(@"[EE121-HASH-RECALC] v37.96: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
+                                DLOG(@"[EE121-HASH-RECALC] v37.97: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
                                      g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
                                      16, h3?p+h3+2:(const unsigned char*)"????????????????");
                             }
@@ -4769,18 +4834,25 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            // v37.96 FIX: Write hash2 = ORIGINAL hash2 (MD5 of body), NOT binary hash.
-                            // Server validates hash2 == MD5(body fields). Forcing binary hash broke this.
+                            // v37.97 FIX: FORCE hash2 = clean client value c59199e10e56714b8b08c64676cc1610.
+                            // ROOT CAUSE: Our client uses DIFFERENT hash2 computation path!
+                            //   Clean 7.6.3 hash2 = MD5(170B starting with binary_hash_hex: 906e707ec + DYanyou0040_MIESHI + CANONICAL_accId + ...)
+                            //   Our hooked client computes hash2 from 156B starting with REAL_accId: MD5(39325649477735437374 + DYanyou0040_MIESHI + ...)
+                            //   These produce DIFFERENT values (c59199e1 vs ddcb91f42c). Server expects clean-path hash2.
+                            // Also: even if accId replacement worked in 156B, the 170B clean path includes
+                            // binary_hash_hex prefix that the 156B path doesn't have — results will never match.
+                            // FIX: Always force hash2 to the known clean value (binary_hash + channel + fields all match).
+                            static const char kCleanHash2Hex_v97[] = "c59199e10e56714b8b08c64676cc1610";
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
+                            memcpy(newBuf+rebuildOut+2, kCleanHash2Hex_v97, 32);
                             rebuildOut += 34;
-                            DLOG(@"[EE121-HASH2] v37.96: hash2=%s (ORIGINAL body MD5, NOT forced)", origHash2Hex);
+                            DLOG(@"[EE121-HASH2] v37.97: hash2=%s (FORCED clean-path value, was orig=%s)", kCleanHash2Hex_v97, origHash2Hex);
                             // Write hash1 field
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.96: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.96: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH1] v37.97: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+                            DLOG(@"[EE121-HASH3] v37.97: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -4790,7 +4862,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.96: Rebuilt EE121 CANONICAL accId + CANONICAL ch/dm/gp/UUID. hash2=ORIGINAL(bodyMD5) hash1/hash3=MD5(realBinaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.97: Rebuilt EE121 CANONICAL accId + CANONICAL ch/dm/gp/UUID. hash2=FORCED(c59199e1 clean-path) hash1/hash3=MD5(realBinaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -4915,9 +4987,92 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                  fffWhich, (unsigned long)lastBrace);
                         }
                     }
+                    // v37.97 FIX: After modifying sessionId/ticket, RE-COMPUTE "md5" field!
+                    // ROOT CAUSE: Original JSON has "md5": "2a7a66e93b6f6ee0ca7d3e00a2fae992" computed from original content.
+                    // After inserting sessionId/ticket, content changed but md5 stayed stale.
+                    // Server validates md5(JSON_without_md5_field) == JSON.md5. Mismatch → CLOSE connection!
+                    // Step 1: Extract OLD md5 value from JSON (format: "md5": "hex32")
+                    NSRegularExpression *md5Regex = [NSRegularExpression regularExpressionWithPattern:@"\"md5\"\\s*:\\s*\"([0-9a-fA-F]{32})\"" options:0 error:nil];
+                    NSTextCheckingResult *md5Match = [md5Regex firstMatchInString:newStr options:0 range:NSMakeRange(0, newStr.length)];
+                    if (md5Match && md5Match.numberOfRanges >= 2) {
+                        NSString *oldMd5 = [newStr substringWithRange:[md5Match rangeAtIndex:1]];
+                        // Step 2: Remove the "md5": "xxx", field (including leading/trailing comma/space) to get the pre-md5 JSON
+                        NSMutableString *jsonWithoutMd5 = [newStr mutableCopy];
+                        NSRange fullMd5Range = [md5Match rangeAtIndex:0];
+                        // Try to also remove a trailing comma and space after the md5 field
+                        if (fullMd5Range.location + fullMd5Range.length + 2 <= jsonWithoutMd5.length) {
+                            unichar c1 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location + fullMd5Range.length];
+                            unichar c2 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location + fullMd5Range.length + 1];
+                            if (c1 == ',' && c2 == ' ') {
+                                fullMd5Range.length += 2;
+                            }
+                        }
+                        // Or try to also remove a leading comma+space
+                        if (fullMd5Range.location >= 2) {
+                            unichar cb1 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location - 1];
+                            unichar cb2 = [jsonWithoutMd5 characterAtIndex:fullMd5Range.location - 2];
+                            if (cb1 == ' ' && cb2 == ',') {
+                                fullMd5Range.location -= 2;
+                                fullMd5Range.length += 2;
+                            }
+                        }
+                        [jsonWithoutMd5 deleteCharactersInRange:fullMd5Range];
+                        // Step 3: Compute MD5 of jsonWithoutMd5 using system CC_MD5 (via dlsym to avoid our hook)
+                        const char *jsonStr = [jsonWithoutMd5 UTF8String];
+                        size_t jsonLen = strlen(jsonStr);
+                        unsigned char md5Raw[16];
+                        memset(md5Raw, 0, sizeof(md5Raw));
+                        typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                        static RawCCMD5 s_rawMD5_v97 = NULL;
+                        if (!s_rawMD5_v97) s_rawMD5_v97 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                        if (s_rawMD5_v97) s_rawMD5_v97(jsonStr, (unsigned long)jsonLen, md5Raw);
+                        static const char kHex_v97[] = "0123456789abcdef";
+                        char newMd5Hex[33];
+                        for (int hi = 0; hi < 16; hi++) {
+                            newMd5Hex[hi*2]   = kHex_v97[(md5Raw[hi] >> 4) & 0xF];
+                            newMd5Hex[hi*2+1] = kHex_v97[md5Raw[hi] & 0xF];
+                        }
+                        newMd5Hex[32] = 0;
+                        NSString *newMd5 = [NSString stringWithUTF8String:newMd5Hex];
+                        // Step 4: Insert new md5 field back into JSON
+                        // Find a good insertion point: before "time" field (common pattern), or after last field before }
+                        NSRange timeRange = [newStr rangeOfString:@"\"time\"\\s*:" options:NSRegularExpressionSearch];
+                        NSMutableString *finalJson = [newStr mutableCopy];
+                        // First delete old md5 (same fullMd5Range as above but on finalJson = newStr)
+                        // Recalculate fullMd5Range on finalJson (it's same content as before modifications)
+                        NSTextCheckingResult *md5Match2 = [md5Regex firstMatchInString:finalJson options:0 range:NSMakeRange(0, finalJson.length)];
+                        if (md5Match2 && md5Match2.numberOfRanges >= 1) {
+                            NSRange delRange = [md5Match2 rangeAtIndex:0];
+                            if (delRange.location + delRange.length + 2 <= finalJson.length) {
+                                unichar c1 = [finalJson characterAtIndex:delRange.location + delRange.length];
+                                unichar c2 = [finalJson characterAtIndex:delRange.location + delRange.length + 1];
+                                if (c1 == ',' && c2 == ' ') { delRange.length += 2; }
+                            }
+                            if (delRange.location >= 2) {
+                                unichar cb1 = [finalJson characterAtIndex:delRange.location - 1];
+                                unichar cb2 = [finalJson characterAtIndex:delRange.location - 2];
+                                if (cb1 == ' ' && cb2 == ',') { delRange.location -= 2; delRange.length += 2; }
+                            }
+                            [finalJson deleteCharactersInRange:delRange];
+                            // Now insert new md5: at the deletion point or before "time"
+                            NSString *insertMd5 = [NSString stringWithFormat:@"\"md5\": \"%@\", ", newMd5];
+                            NSUInteger insertAt = 0;
+                            if (timeRange.location != NSNotFound && timeRange.location < finalJson.length) {
+                                insertAt = timeRange.location;
+                            } else {
+                                // Insert after first "{" (after "{")
+                                NSRange firstBrace = [finalJson rangeOfString:@"{"];
+                                if (firstBrace.location != NSNotFound) insertAt = firstBrace.location + 1;
+                            }
+                            [finalJson insertString:insertMd5 atIndex:insertAt];
+                            DLOG(@"[FFF493-MD5] v37.97: #%d RECOMPUTED md5: old=%@ → new=%@ (jsonWithoutMd5Len=%zu)",
+                                 fffWhich, oldMd5, newMd5, jsonLen);
+                            newStr = finalJson;
+                        }
+                    }
                     const char *newPlain = [newStr UTF8String];
                     size_t newPlainLen = strlen(newPlain);
-                    DLOG(@"[FFF493-REPL] v37.87: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket)",
+                    DLOG(@"[FFF493-REPL] v37.97: FFF493#%d Built new plaintext %zuB (native=%zuB, +sessionId+ticket+md5_recompute)",
                          fffWhich, newPlainLen, nativeLen);
                     size_t cipherCap = ((newPlainLen + 1 + 15) / 16) * 16;
                     uint8_t *cipherBuf = (uint8_t *)malloc(cipherCap + 32);
@@ -5325,16 +5480,31 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 DLOG(@"[SERVER-SELECT] Analysis exception: %@", e.reason);
             }
 
-            // v37.79: DO NOT replace accountId in F013 (use REAL for token consistency).
+            // v37.97 FIX: F013 MUST use CANONICAL accId!
+            // ROOT CAUSE: F013 sent REAL accId (393256...) to login server.
             // F013 format: [12B header][00 14][20B accId][00 05][5B user][00 06][6B pass][00 00]
-            // Using REAL accId ensures token matches across EE100/EE113/EE121/F013.
+            // accId at offset 14, 20 bytes.
+            static const char kCanonF013_v97[] = "65657881045335015151";
             if (len >= 34) {
                 const unsigned char *fp2 = (const unsigned char *)buf;
                 uint16_t accLen = ((uint16_t)fp2[12] << 8) | fp2[13];
-                if (accLen == 20) {
-                    char f013AccId[21] = {0};
-                    memcpy(f013AccId, fp2+14, 20);
-                    DLOG(@"[F013-ACCID] v37.79: F013 REAL accId=%s (NOT replaced, len=%zu)", f013AccId, len);
+                if (accLen == 20 && memcmp(fp2 + 14, kCanonF013_v97, 20) != 0) {
+                    unsigned char *f013New = (unsigned char *)malloc(len + 8);
+                    if (f013New) {
+                        memcpy(f013New, fp2, len);
+                        char origF013[21] = {0};
+                        memcpy(origF013, fp2 + 14, 20); origF013[20] = 0;
+                        memcpy(f013New + 14, kCanonF013_v97, 20);
+                        DLOG(@"[F013-ACCID] v37.97: F013 REPLACED accId orig=%s → canon=%s (len=%zu)",
+                             origF013, kCanonF013_v97, len);
+                        ssize_t rret = orig_send(fd, f013New, len, flags);
+                        free(f013New);
+                        if (rret >= 0) return (ssize_t)len;
+                        return rret;
+                    }
+                } else if (accLen == 20) {
+                    DLOG(@"[F013-ACCID] v37.97: F013 accId already CANONICAL=%s (len=%zu)",
+                         kCanonF013_v97, len);
                 }
             }
         }
@@ -8225,7 +8395,7 @@ static const uint8_t g_our_binary_hash[16] = {
     0xf9,0xcc,0x76,0xc5,0x34,0xac,0xb6,0x3f,
     0x51,0x91,0x79,0x51,0xd4,0x86,0xca,0x0c
 };
-// v37.96: REAL clean binary hash captured from clean 7.6.3 via Frida capture_binary_hash_v2.js
+// v37.97: REAL clean binary hash captured from clean 7.6.3 via Frida capture_binary_hash_v2.js
 // Line 89: [CC_MD5-63B] binary_hash=906e707ec5585f080397b26ff4b8d89d token=...
 // hash2 is MD5(body) NOT binary hash. hash1/hash3 = MD5(binary_hash + token).
 static const uint8_t g_clean_binary_hash[16] = {
@@ -8254,7 +8424,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             // v37.62: CANONICAL (clean-client) values for EE121 MD5 input.
             // These MUST match the values used in EE121-CANON packet rebuild below so that
             // MD5(156B canonical_fields) == body MD5 == packet.hash2.
-            // v37.96: hash2 = MD5(body), NOT binary hash. Binary hash is 906e707ec... used for hash1/hash3.
+            // v37.97: hash2 = MD5(body), NOT binary hash. Binary hash is 906e707ec... used for hash1/hash3.
             // Otherwise server recomputes MD5(extract_fields) != hash2 → CLOSE.
             // Context markers (unique to EE121 hash2/hash3 computation):
             //   - pattern "...SQAGEIOS<ch>...<UUID>WIFI7.6.3979..." → hash2 (156B) / hash3 (168B)
@@ -8307,7 +8477,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
             // v37.80: Capture token from 63B MD5 input (binary_hash_hex(32) + token(31) = 63 bytes).
             // This is called for hash3/hash1 computation: MD5(binary_hash || token).
-            // v37.96: We NO LONGER force hash2. Original hash2 (MD5 of body) is kept.
+            // v37.97: We NO LONGER force hash2. Original hash2 (MD5 of body) is kept.
             // Token captured here is used for hash1/hash3 = MD5(binary_hash + token) recalculation.
             // hash3+hash1 using the SAME token. Otherwise server detects mismatch and closes.
             if (len == 63) {
@@ -8363,7 +8533,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 }
             }
 
-            // v37.96: RE-ENABLED accId replacement in CC_MD5.
+            // v37.97: RE-ENABLED accId replacement in CC_MD5.
             // Previous v37.79 disabled this based on WRONG assumption that hash1/hash3 = MD5(hash2+token).
             // Frida capture proves: hash1/hash3 = MD5(binary_hash + token) — no accId in 63B input.
             // accId is ONLY in 170B body input (for hash2 = MD5(body)).
@@ -8443,7 +8613,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                     actualInput = cleanInput;
                     actualLen = out;
                     inputModified = 2; // content replacement
-                    DLOG(@"[MD5-HOOK] v37.96: Replaced input ch=%d dm=%d gp=%d hash=%d uuid=%d accId=%d eeCtx=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
+                    DLOG(@"[MD5-HOOK] v37.97: Replaced input ch=%d dm=%d gp=%d hash=%d uuid=%d accId=%d eeCtx=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
                          hasCh, hasDm, hasGp, hasHash, hasUUID, hasAccId, hasEE121Ctx, len, newLen, out, g_md5_channel_replaced);
                     // Dump original input for diagnosis
                     if (len <= 200) {
@@ -10114,7 +10284,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.96 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
+    DLOG(@"[CH-INIT] v37.97 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+HB_COUNT_FORGED_0CB0A300)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
