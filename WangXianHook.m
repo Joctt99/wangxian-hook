@@ -765,7 +765,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.90-CMDFIX loaded ===");
+        _log(@"=== WangXianHook v37.91-NATIVE-EE121 loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4363,20 +4363,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // can verify and ACCEPT native EE121 → real sessionId/ticket → game entry.
                 // If not, fall back to clean 248B (hash1/3 unverifiable → status=4 ACCEPT
                 // but no real sessionId → stuck at '正在进入').
-                if (1) {
-                    // v37.84: ALWAYS use clean 248B EE121 packet + dynamic hash1/hash3 recalc.
-                    // ROOT CAUSE: Two server checks conflict:
-                    //   Check A: hash2 field MUST == ddcb91f42c (expected binary hash, app integrity)
-                    //   Check B: hash3||hash1 MUST == MD5(hash2 + current_session_token) (anti-replay)
-                    // v37.76-v37.82 forced hash2=ddcb91f42c but RECALC hash1/hash3 with REAL body fields
-                    //   → packet bytes changed (channel/dm/gp TLV rewrites) → BREAKS some low-level packet
-                    //     checksum/integrity field we don't know about → server IMMEDIATELY closes.
-                    // v37.83 used REAL body + hash2=MD5(body) + MD5(body+token) recalc
-                    //   → Check A fails → status=4 版本过低 patched to 0 but body still "登录失败"
-                    //     → NO REAL sessionId/ticket → SESSION-CAPTURE count=0 → FFF493 sessionId=""
-                    //     → server ignores FFF493 → stuck at 正在进入.
-                    // SOLUTION: Use HARD-CODED clean 248B (preserves all byte structure, check A passes)
-                    //           + ONLY modify seq + hash1/hash3 with CURRENT session token
+                if (0) {
+                    // v37.91: DISABLED hard-coded 248B EE121-REPL.
+                    // REASON: Real captured native hash2=640a8eab... (fields MD5) but
+                    // cleanPkt has hash2=ddcb91f42c... (binary hash) → server rejects.
+                    // Native packet's hash1/hash3 are ALREADY correct (client computed
+                    // them using binary_hash ddcb91f42c + token via CC_MD5 hook).
+                    // SOLUTION: Send native packet with field replacement (EE007-ALIGN +
+                    // EE121-CANON) but KEEP native hash1/hash2/hash3.
                     // Username/password/accId in clean packet match real user (kk994/994624/65657881045335015151).
                     DLOG(@"[EE121-REPL] v37.87: CLEAN 248B pkt + seq + hash1/hash3 RECALC(token_from_EE120)");
                     uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
@@ -4707,7 +4701,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             int hashComputed = 0;
                             if (g_hashTokenValid && strlen(g_hashToken) == 31) {
                                 char md5In[64];
-                                memcpy(md5In, origHash2Hex, 32);
+                                // v37.91: Use BINARY_HASH (ddcb91f42c...) for hash1/hash3 calc,
+                                // NOT origHash2 (640a8eab... fields MD5). Client natively computes
+                                // hash1/hash3 = MD5(binary_hash + token), confirmed by log match:
+                                // MD5(ddcb91f42c...+token) == native hash1/hash3.
+                                static const char kBinaryHashHex_v91[] = "ddcb91f42c5a612b492a2296a971a5af";
+                                memcpy(md5In, kBinaryHashHex_v91, 32);
                                 memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
                                 // Compute MD5 using system CC_MD5 (via CommonCrypto already imported).
                                 // Avoid using our CC_MD5 hook (which changes outputs) — use dlsym directly.
@@ -4729,8 +4728,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 memcpy(hash3Val, md5Hex, 16);
                                 memcpy(hash1Val, md5Hex+16, 16);
                                 hashComputed = 1;
-                                DLOG(@"[EE121-HASH-RECALC] v37.83: MD5(origHash2+token) = %s hash3=%.*s hash1=%.*s (origHash2=%s token=%s)",
-                                     md5Hex, 16, hash3Val, 16, hash1Val, origHash2Hex, g_hashToken);
+                                DLOG(@"[EE121-HASH-RECALC] v37.91: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
+                                     md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v91, g_hashToken);
                             } else {
                                 // Fallback: copy from original packet
                                 if (h1) memcpy(hash1Val, p+h1+2, 16);
@@ -4762,7 +4761,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         NSMutableString *rt = [NSMutableString stringWithCapacity:200];
                         for (size_t i = (rebuildOut > 80 ? rebuildOut-80 : 0); i < rebuildOut; i++)
                             [rt appendFormat:@"%02X ", newBuf[i]];
-                        DLOG(@"[EE121-CANON] v37.83: Rebuilt EE121 REAL accId + CANONICAL ch/dm/gp/UUID. hash2=ORIG(bodyMD5) hash1/hash3=RECALCULATED(origHash2+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
+                        DLOG(@"[EE121-CANON] v37.91: Rebuilt EE121 REAL accId + CANONICAL ch/dm/gp/UUID. hash2=ORIG(fieldsMD5) hash1/hash3=MD5(binaryHash+token). pktLen=%u h1Found=%u h2Found=%u h3Found=%u tail80: %@",
                              newPL, (h1!=0), (h2!=0), (h3!=0), rt);
                         out = rebuildOut;
                     }
@@ -10078,7 +10077,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.88 %d layers active (CLEAN_248B_PKT+hash2=binary_hash+hash1/hash3=RECALC(token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
+    DLOG(@"[CH-INIT] v37.91 %d layers active (NATIVE_EE121+hash2=fieldsMD5+hash1/hash3=MD5(binaryHash+token)+EE006-EXPAND+FFF493#1+#2_BOTH_REPLACED+GLOBAL_sessionValid_FORCED+FULL_EE121_BODY_OVERWRITE+HB_COUNT_FORGED_0CB0A300_STICKY_INJECT+no_more_登录失败_body_text)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
