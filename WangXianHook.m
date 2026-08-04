@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.101-UUID-MATCH loaded ===");
+        _log(@"=== WangXianHook v37.102-MD5-COMMA-FIX loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5095,14 +5095,23 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 // Step 2: Find FULL field range (key through closing quote
                                 NSRange fullField = NSMakeRange(md5KeyRange.location,
                                                                  (valueStart + 32 + 1) - md5KeyRange.location);
+                                // v37.102 FIX: Only remove ONE ", " (trailing OR leading, NOT both!)
+                                // Previous code removed BOTH → JSON missing comma → invalid → server reject!
+                                // Example: {"a":"1", "md5":"x", "b":"2"}
+                                //   Remove BOTH ", " → {"a":"1""b":"2"} ← MISSING COMMA!
+                                //   Remove trailing only → {"a":"1", "b":"2"} ← VALID!
                                 // Also try to include trailing ", " (comma-space)
+                                BOOL foundTrailingComma = NO;
                                 if (fullField.location + fullField.length + 2 <= newStr.length) {
                                     unichar tc1 = [newStr characterAtIndex:(fullField.location + fullField.length)];
                                     unichar tc2 = [newStr characterAtIndex:(fullField.location + fullField.length + 1)];
-                                    if (tc1 == ',' && tc2 == ' ') fullField.length += 2;
+                                    if (tc1 == ',' && tc2 == ' ') {
+                                        fullField.length += 2;
+                                        foundTrailingComma = YES;
+                                    }
                                 }
-                                // Or include leading ", " (comma-space before the key
-                                if (fullField.location >= 2) {
+                                // Only include leading ", " if trailing was NOT found (avoid removing both!)
+                                if (!foundTrailingComma && fullField.location >= 2) {
                                     unichar lc1 = [newStr characterAtIndex:(fullField.location - 1)];
                                     unichar lc2 = [newStr characterAtIndex:(fullField.location - 2)];
                                     if (lc1 == ' ' && lc2 == ',') {
