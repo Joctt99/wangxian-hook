@@ -827,7 +827,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.105-NO-FFF493-REPLACEMENT-ATALL loaded ===");
+        _log(@"=== WangXianHook v37.106-CHL4-UUID-REPLACE loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10180,6 +10180,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         // Server cross-checks UUID across login+game server packets
                         memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 51);
                         out += 51; p += 51; continue;
+                    } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
+                        // v37.106: Replace bare REAL device UUID with CANONICAL UUID
+                        // FFF493#2 JSON has "MACADDRESS": "180C4F27-..." (different format than #1)
+                        // This catches the UUID at the bare position (after the quote)
+                        memcpy(out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
+                        out += 36; p += 36; continue;
                     } else if (rem >= 20) {
                         // v37.77: Replace 20-digit accountId with CANONICAL (length-neutral 20→20)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
@@ -10417,7 +10423,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.105 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL+EE006-EXPAND+NO_FFF493_REPLACEMENT+ORIGINAL_PACKETS_ASIS+FORGE_DISABLED)", layersOK);
+    DLOG(@"[CH-INIT] v37.106 %d layers active (CANONICAL_ACCID+CANONICAL_ch/dm/gp/UUID+ORIGINAL_hash2=bodyMD5+hash1/hash3=MD5(realBinaryHash_906e707ec+token)+ACCID_REPLACE_IN_MD5+UUID_REPLACE_ALL_IN_CCCRYPT+EE006-EXPAND+NO_FFF493_SENDHOOK_REPLACEMENT+CHL4_BARE_UUID_REPLACE+FORGE_DISABLED)", layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
