@@ -633,14 +633,19 @@ extern "C" kern_return_t mach_vm_remap(
 #import <CommonCrypto/CommonHMAC.h>
 #import <Security/Security.h>
 
-// v37.109-DIST: SILENT MODE for public distribution.
-// When SILENT_DIST_MODE=1, all DLOG() calls are compiled out (zero runtime cost, no file I/O).
-// Only critical startup/crash messages via direct _log() calls survive.
-// Set to 0 during development to re-enable full diagnostics for future app version updates.
+// v37.110-DIST: SILENT MODE for public distribution.
+// When SILENT_DIST_MODE=1, DLOG produces no output BUT STILL EVALUATES arguments.
+// CRITICAL FIX v37.110: Previous v37.109 used `do {} while(0)` which DROPPED
+// argument evaluation entirely. Many DLOG calls have side effects in their args:
+//   DLOG(@"setup: %d", (g_initFlag=1, doSetup()));  // g_initFlag and doSetup SKIPPED!
+// This caused network interrupt (critical init code never ran).
+// FIX: Use `(void)((fmt), ##__VA_ARGS__)` — comma operator evaluates ALL args,
+// then discards the result. Zero output while preserving ALL side effects.
+// Set to 0 during development to re-enable full diagnostics.
 #define SILENT_DIST_MODE 1
 
 #if SILENT_DIST_MODE
-#define DLOG(fmt, ...) do { /* SILENT: compiled out */ } while(0)
+#define DLOG(fmt, ...) do { (void)((fmt), ##__VA_ARGS__); } while(0)
 #else
 #define DLOG(fmt, ...) _log([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 #endif
@@ -841,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.109-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.110-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10352,7 +10357,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.109-DIST SILENT_MODE=%d %d layers active (NATIVE_ACCID+NATIVE_UUID+CANONICAL_ch/dm/gp+ALL hooks intact, diagnostics compiled-out for stealth)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.110-DIST SILENT_MODE=%d %d layers active (v37.110 FIX: DLOG args now EVALUATED via comma-op (void)((fmt),##__VA_ARGS__); side effects preserved. ALL core hooks intact.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
