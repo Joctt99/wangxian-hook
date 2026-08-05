@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.129-DIAG loaded (minimal signature hooks) ===");
+        _log(@"=== WangXianHook v37.130-DIAG loaded (smart response patching) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1595,46 +1595,72 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         return nil; // Not a signature URL, don't patch
     }
     
-    DLOG(@"[SIGN-BYPASS] v37.125: Intercepted signature URL: %@", url);
-    DLOG(@"[SIGN-BYPASS] v37.125: Original body: %@", body);
+    DLOG(@"[SIGN-BYPASS] v37.130: Intercepted signature URL: %@", url);
+    DLOG(@"[SIGN-BYPASS] v37.130: Original body: %@", body);
     
-    NSString *patchedResponse = nil;
+    // v37.130: SMART PATCHING — don't replace entire body, only modify specific fields.
+    // Previous versions replaced the entire response, losing critical fields like
+    // "sign", "timeStamp", "randStr" that the game needs for subsequent verification.
     
-    // --- Determine endpoint type and return matching format ---
+    NSString *patchedResponse = body ?: @"";
     
-    // 1. judgeAppInfoApi (ln_sign_cert.9iy.com) - expects id, COUNT, MAXLIMIT, etc.
-    // Original: {"code":0,"message":"未到上限，继续注册","data":{"id":11927,"CREATETIME":"...","COUNT":0,"MAXLIMIT":5000,...}}
-    if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CENDDATE\":null,\"EMAIL\":null,\"EFLAG\":0,\"DAYS\":null,\"CERTID\":1,\"CERTNAME\":null,\"LIMITGAP\":null,\"TIP\":0,\"REMARK\":null,\"NET\":null}}";
-        DLOG(@"[SIGN-BYPASS] v37.125: Format: judgeAppInfoApi (full 9iy format)");
+    // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
+    // Original: {"code":0,"data":{"timeStamp":"...","randStr":"...","sign":"...","verity":1,"tip":0,"end":0,"open":1}}
+    // If verity:1 already → just patch end/open to 0/1, keep everything else
+    // If verity:0 → force verity:1
+    if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
+        DLOG(@"[SIGN-BYPASS] v37.130: Format: judgeAppInfoSignApi (smart patch)");
+        // Only patch verity and tip fields, keep sign/timeStamp/randStr
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        // If body doesn't contain verity at all, it's a non-JSON or error response — replace
+        if (![patchedResponse containsString:@"verity"]) {
+            patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
+        }
     }
-    // 2. postAppInfoApi (9iy) - expects simple {code:1, message:"OK"}
-    // Original: {"code":1, "message":"OK"}
-    else if ([url containsString:@"postAppInfoApi"]) {
-        patchedResponse = @"{\"code\":1,\"message\":\"OK\"}";
-        DLOG(@"[SIGN-BYPASS] v37.125: Format: postAppInfoApi (simple {code:1,message:OK})");
+    // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
+    // Original: {"code":0,"data":{"id":11927,...,"ENDTIME":"2026-07-22 11:47:08",...}}
+    // Need to extend ENDTIME, set END=0, OPEN=1, but keep all other fields
+    else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.130: Format: judgeAppInfoApi (smart ENDTIME patch)");
+        // Only patch ENDTIME, END, OPEN — keep id, COUNT, MAXLIMIT, CERTID, etc.
+        // Replace any ENDTIME value with 2027-12-31
+        NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
+        if (start.location != NSNotFound) {
+            NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
+            if (endQuote.location != NSNotFound) {
+                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:
+                    [patchedResponse substringWithRange:NSMakeRange(start.location + start.length, endQuote.location - start.location - start.length)]
+                    withString:@"2027-12-31 23:59:59"];
+            }
+        }
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
-    // 3. getAppInfoApi (9iy) - expects simple {code:1, message:"OK"}
-    // Original: {"code":1, "message":"OK"}
-    else if ([url containsString:@"getAppInfoApi"]) {
-        patchedResponse = @"{\"code\":1,\"message\":\"OK\"}";
-        DLOG(@"[SIGN-BYPASS] v37.125: Format: getAppInfoApi (simple {code:1,message:OK})");
+    // --- postAppInfoApi / getAppInfoApi ---
+    // Original: {"code":1, "message":"OK"} — already correct, return as-is
+    else if ([url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.130: Format: postAppInfoApi/getAppInfoApi (passthrough)");
+        // Return original body as-is — it's already {code:1, message:"OK"}
     }
-    // 4. judgeAppInfoSignApi (cert.qunhongtech.com) - expects code:0 + verity
-    // Original format: {code:0, data:{result:true, verity:1, tip:0}}
-    else if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
-        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
-        DLOG(@"[SIGN-BYPASS] v37.125: Format: judgeAppInfoSignApi (verity=1 format)");
-    }
-    // 5. Fallback: generic cert/sign endpoint
+    // --- Fallback: generic cert endpoint ---
     else {
-        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"id\":11927,\"COUNT\":0,\"MAXLIMIT\":5000,\"APPID\":\"com.sqage.wangxianapp\",\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
-        DLOG(@"[SIGN-BYPASS] v37.125: Format: GENERIC fallback (all fields merged)");
+        DLOG(@"[SIGN-BYPASS] v37.130: Format: GENERIC fallback (smart patch)");
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
-    DLOG(@"[SIGN-BYPASS] v37.125: Replaced body: %@", patchedResponse);
-    DLOG(@"[SIGN-BYPASS] v37.125: Response len=%lu", (unsigned long)patchedData.length);
+    DLOG(@"[SIGN-BYPASS] v37.130: Patched body: %@", patchedResponse);
+    DLOG(@"[SIGN-BYPASS] v37.130: Response len=%lu", (unsigned long)patchedData.length);
     
     return patchedData;
 }
