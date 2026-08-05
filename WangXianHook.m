@@ -886,7 +886,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.136-DIAG loaded (V3 LCNetworking Params capital fix) ===");
+        _log(@"=== WangXianHook v37.137-DIAG loaded (V3 class method + full data response fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1124,124 +1124,119 @@ static void installLCNetworkingHooks(void) {
         return;
     }
 
-    // Hook getWithURL:parameters:success:failure:
-    SEL getSel = NSSelectorFromString(@"getWithURL:parameters:success:failure:");
-    Method m = class_getInstanceMethod(lcnetCls, getSel);
-    if (m) {
-        // Store original and install hook
-        // We use a block-based approach for safety
-        IMP origImpl = method_getImplementation(m);
+    // v37.137: V3's lnSignature.dylib LCNetworking methods are CLASS methods (+), not instance (-)!
+    // Stack: __50+[LCNetworking getWithURL:Params:success:failure:]_block_invoke_2
+    // Must use class_getClassMethod, NOT class_getInstanceMethod.
 
-        // Create a hooked implementation using imp_implementationWithBlock
-        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
-                                                      void(^success)(id), void(^failure)(NSError*)) {
-            if (url && isSignatureVerificationURL(url)) {
-                DLOG(@"[LCNET-BYPASS] Intercepted signature URL: %@", url);
-                if (success) {
-                    NSDictionary *fakeResp = @{
-                        @"code": @0,
-                        @"message": @"success",
-                        @"data": @{
-                            @"result": @YES,
-                            @"verity": @1,
-                            @"tip": @0,
-                            @"ENDTIME": @"2027-12-31 23:59:59",
-                            @"END": @0,
-                            @"OPEN": @1,
-                            @"id": @11927,
-                            @"COUNT": @0,
-                            @"MAXLIMIT": @5000
-                        }
-                    };
-                    success(fakeResp);
-                }
-                return;
+    // Helper block: build full fake response for getAppInfoApi (V3's GetApp expects data.ENDTIME etc.)
+    NSDictionary * (^fullGetAppResp)(void) = ^{
+        return @{
+            @"code": @0,
+            @"message": @"OK",
+            @"data": @{
+                @"id": @11927,
+                @"CREATETIME": @"2025-04-16 11:47:08",
+                @"COUNT": @0,
+                @"MAXLIMIT": @5000,
+                @"NAME": @"",
+                @"APPID": @"com.sqage.wangxianapp",
+                @"OPEN": @1,
+                @"END": @0,
+                @"ENDTIME": @"2027-12-31 23:59:59",
+                @"CENDDATE": [NSNull null],
+                @"EMAIL": [NSNull null],
+                @"EFLAG": @0,
+                @"DAYS": [NSNull null],
+                @"CERTID": @1,
+                @"CERTNAME": [NSNull null],
+                @"LIMITGAP": [NSNull null],
+                @"TIP": @0,
+                @"REMARK": [NSNull null],
+                @"NET": [NSNull null]
             }
-            // Call original for non-signature URLs
-            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
-                self, getSel, url, params, success, failure);
-        });
-        method_setImplementation(m, newImpl);
-        DLOG(@"[LCNET-BYPASS] getWithURL: HOOKED");
-    }
+        };
+    };
 
-    // Hook PostWithURL:parameters:success:failure:
-    SEL postSel = NSSelectorFromString(@"PostWithURL:parameters:success:failure:");
-    m = class_getInstanceMethod(lcnetCls, postSel);
-    if (m) {
-        IMP origImpl = method_getImplementation(m);
-
-        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
-                                                      void(^success)(id), void(^failure)(NSError*)) {
-            if (url && isSignatureVerificationURL(url)) {
-                DLOG(@"[LCNET-BYPASS] Intercepted signature POST URL: %@", url);
-                if (success) {
-                    NSDictionary *fakeResp = @{@"code": @0, @"message": @"OK"};
-                    success(fakeResp);
-                }
-                return;
+    // Helper: build full fake response for judgeAppInfoApi
+    NSDictionary * (^fullJudgeResp)(void) = ^{
+        return @{
+            @"code": @0,
+            @"message": @"success",
+            @"data": @{
+                @"result": @YES,
+                @"verity": @1,
+                @"tip": @0,
+                @"ENDTIME": @"2027-12-31 23:59:59",
+                @"END": @0,
+                @"OPEN": @1,
+                @"id": @11927,
+                @"COUNT": @0,
+                @"MAXLIMIT": @5000
             }
-            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
-                self, postSel, url, params, success, failure);
-        });
-        method_setImplementation(m, newImpl);
-        DLOG(@"[LCNET-BYPASS] PostWithURL: HOOKED");
-    }
+        };
+    };
 
-    // v37.136: V3's lnSignature.dylib uses CAPITAL "Params" in selector, NOT lowercase "parameters"!
-    // Stack trace: __50+[LCNetworking getWithURL:Params:success:failure:]_block_invoke_2 + 128
-    // Previous hooks used lowercase "parameters" -> never matched -> request leaked through
-    // NSURLSession layer where we patched body -> SignatureCheck.nettimes accessed NULL field -> SIGSEGV.
+    // --- V3-style selectors (capital "Params") — CLASS methods ---
+    // These are the ones V3's lnSignature.dylib actually uses.
+
     SEL getSelV3 = NSSelectorFromString(@"getWithURL:Params:success:failure:");
-    Method mV3 = class_getInstanceMethod(lcnetCls, getSelV3);
+    Method mV3 = class_getClassMethod(lcnetCls, getSelV3);
     if (mV3) {
         IMP origImplV3 = method_getImplementation(mV3);
         IMP newImplV3 = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                        void(^success)(id), void(^failure)(NSError*)) {
             if (url && isSignatureVerificationURL(url)) {
-                DLOG(@"[LCNET-BYPASS] v37.136: Intercepted V3-style signature GET URL: %@", url);
-                if ([url containsString:@"getAppInfoApi"] || [url containsString:@"postAppInfoApi"]) {
-                    // V3 expects: {"code":0,"message":"OK"} (no "data" wrapper)
-                    NSDictionary *fakeResp = @{@"code": @0, @"message": @"OK"};
-                    DLOG(@"[LCNET-BYPASS] v37.136: Returning simple {code:0, message:OK} for %@",
-                         [url lastPathComponent]);
-                    if (success) success(fakeResp);
+                DLOG(@"[LCNET-BYPASS] v37.137: Intercepted V3 GET: %@", url);
+                NSDictionary *fakeResp;
+                if ([url containsString:@"getAppInfoApi"]) {
+                    // V3's GetApp accesses data.ENDTIME — MUST include full data structure!
+                    fakeResp = fullGetAppResp();
+                    DLOG(@"[LCNET-BYPASS] v37.137: getAppInfoApi → full response with data.ENDTIME");
+                } else if ([url containsString:@"postAppInfoApi"]) {
+                    fakeResp = @{@"code": @0, @"message": @"OK"};
+                    DLOG(@"[LCNET-BYPASS] v37.137: postAppInfoApi → simple {code:0}");
                 } else {
-                    // Other endpoints: full cert-style response with data wrapper
-                    NSDictionary *fakeResp = @{
-                        @"code": @0,
-                        @"message": @"success",
-                        @"data": @{
-                            @"result": @YES,
-                            @"verity": @1,
-                            @"tip": @0,
-                            @"ENDTIME": @"2027-12-31 23:59:59",
-                            @"END": @0,
-                            @"OPEN": @1,
-                            @"id": @11927,
-                            @"COUNT": @0,
-                            @"MAXLIMIT": @5000
-                        }
-                    };
-                    if (success) success(fakeResp);
+                    fakeResp = fullJudgeResp();
+                    DLOG(@"[LCNET-BYPASS] v37.137: other cert URL → full judge response");
                 }
+                if (success) success(fakeResp);
                 return;
             }
             ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImplV3)(
                 self, getSelV3, url, params, success, failure);
         });
         method_setImplementation(mV3, newImplV3);
-        DLOG(@"[LCNET-BYPASS] v37.136: getWithURL:Params:success:failure: HOOKED (V3 capital Params)");
+        DLOG(@"[LCNET-BYPASS] v37.137: +getWithURL:Params: HOOKED (class method, capital Params)");
+    } else {
+        DLOG(@"[LCNET-BYPASS] v37.137: +getWithURL:Params: NOT FOUND — trying instance method");
+        Method mInst = class_getInstanceMethod(lcnetCls, getSelV3);
+        if (mInst) {
+            IMP origImpl = method_getImplementation(mInst);
+            IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                          void(^success)(id), void(^failure)(NSError*)) {
+                if (url && isSignatureVerificationURL(url)) {
+                    DLOG(@"[LCNET-BYPASS] v37.137: Intercepted inst GET: %@", url);
+                    NSDictionary *fakeResp = [url containsString:@"getAppInfoApi"]
+                        ? fullGetAppResp() : fullJudgeResp();
+                    if (success) success(fakeResp);
+                    return;
+                }
+                ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                    self, getSelV3, url, params, success, failure);
+            });
+            method_setImplementation(mInst, newImpl);
+            DLOG(@"[LCNET-BYPASS] v37.137: -getWithURL:Params: HOOKED (instance method fallback)");
+        }
     }
 
     SEL postSelV3 = NSSelectorFromString(@"PostWithURL:Params:success:failure:");
-    Method mPostV3 = class_getInstanceMethod(lcnetCls, postSelV3);
+    Method mPostV3 = class_getClassMethod(lcnetCls, postSelV3);
     if (mPostV3) {
         IMP origImplPostV3 = method_getImplementation(mPostV3);
         IMP newImplPostV3 = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                           void(^success)(id), void(^failure)(NSError*)) {
             if (url && isSignatureVerificationURL(url)) {
-                DLOG(@"[LCNET-BYPASS] v37.136: Intercepted V3-style signature POST URL: %@", url);
+                DLOG(@"[LCNET-BYPASS] v37.137: Intercepted V3 POST: %@", url);
                 NSDictionary *fakeResp = @{@"code": @0, @"message": @"OK"};
                 if (success) success(fakeResp);
                 return;
@@ -1250,59 +1245,72 @@ static void installLCNetworkingHooks(void) {
                 self, postSelV3, url, params, success, failure);
         });
         method_setImplementation(mPostV3, newImplPostV3);
-        DLOG(@"[LCNET-BYPASS] v37.136: PostWithURL:Params:success:failure: HOOKED (V3 capital Params)");
-    }
-
-    // v37.136: DEFENSE-IN-DEPTH: Hook SignatureCheck.nettimes directly to prevent SIGSEGV.
-    // Crash frame #2: -[SignatureCheck nettimes] + 0 (SIGSEGV)
-    // Even if LCNetworking somehow leaks through, this forces nettimes to return a safe NSString
-    // instead of dereferencing NULL/missing fields.
-    Class sigCheckCls = NSClassFromString(@"SignatureCheck");
-    if (sigCheckCls) {
-        SEL nettimesSel = NSSelectorFromString(@"nettimes");
-        Method nettimesM = class_getInstanceMethod(sigCheckCls, nettimesSel);
-        if (nettimesM) {
-            IMP origNet = method_getImplementation(nettimesM);
-            IMP safeNet = imp_implementationWithBlock(^NSString *(id self) {
-                @try {
-                    NSString *result = ((NSString *(*)(id, SEL))origNet)(self, nettimesSel);
-                    if (result && [result isKindOfClass:[NSString class]] && result.length > 0) {
-                        DLOG(@"[SIGCHECK-SAFE] v37.136: nettimes orig=%@", result);
-                        return result;
-                    }
-                } @catch (NSException *e) {
-                    DLOG(@"[SIGCHECK-SAFE] v37.136: nettimes orig threw: %@", e);
+        DLOG(@"[LCNET-BYPASS] v37.137: +PostWithURL:Params: HOOKED (class method)");
+    } else {
+        Method mPostInst = class_getInstanceMethod(lcnetCls, postSelV3);
+        if (mPostInst) {
+            IMP origImpl = method_getImplementation(mPostInst);
+            IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                          void(^success)(id), void(^failure)(NSError*)) {
+                if (url && isSignatureVerificationURL(url)) {
+                    DLOG(@"[LCNET-BYPASS] v37.137: Intercepted inst POST: %@", url);
+                    if (success) success(@{@"code": @0, @"message": @"OK"});
+                    return;
                 }
-                NSString *safe = @"2099-12-31 23:59:59";
-                DLOG(@"[SIGCHECK-SAFE] v37.136: nettimes returning SAFE=%@", safe);
-                return safe;
+                ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                    self, postSelV3, url, params, success, failure);
             });
-            method_setImplementation(nettimesM, safeNet);
-            DLOG(@"[SIGCHECK-SAFE] v37.136: SignatureCheck.nettimes HOOKED (safe return)");
-        }
-
-        // Also hook +[SignatureCheck GetApp] to return safe values (class method from stack #3)
-        SEL getAppSel = NSSelectorFromString(@"GetApp");
-        Method getAppM = class_getClassMethod(sigCheckCls, getAppSel);
-        if (getAppM) {
-            IMP origGetApp = method_getImplementation(getAppM);
-            IMP safeGetApp = imp_implementationWithBlock(^id(id self) {
-                @try {
-                    id result = ((id(*)(id, SEL))origGetApp)(self, getAppSel);
-                    if (result) {
-                        DLOG(@"[SIGCHECK-SAFE] v37.136: GetApp orig class=%@", NSStringFromClass([result class]));
-                        return result;
-                    }
-                } @catch (NSException *e) {
-                    DLOG(@"[SIGCHECK-SAFE] v37.136: GetApp orig threw: %@", e);
-                }
-                DLOG(@"[SIGCHECK-SAFE] v37.136: GetApp orig=nil, returning empty dict");
-                return @{};
-            });
-            method_setImplementation(getAppM, safeGetApp);
-            DLOG(@"[SIGCHECK-SAFE] v37.136: SignatureCheck.GetApp HOOKED (safe return)");
+            method_setImplementation(mPostInst, newImpl);
+            DLOG(@"[LCNET-BYPASS] v37.137: -PostWithURL:Params: HOOKED (instance fallback)");
         }
     }
+
+    // --- Also hook lowercase "parameters" variants (game's own LCNetworking may use these) ---
+    SEL getSel = NSSelectorFromString(@"getWithURL:parameters:success:failure:");
+    Method mGet = class_getClassMethod(lcnetCls, getSel);
+    if (!mGet) mGet = class_getInstanceMethod(lcnetCls, getSel);
+    if (mGet) {
+        IMP origImpl = method_getImplementation(mGet);
+        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                      void(^success)(id), void(^failure)(NSError*)) {
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] v37.137: Intercepted GET (lowercase): %@", url);
+                NSDictionary *fakeResp = [url containsString:@"getAppInfoApi"]
+                    ? fullGetAppResp() : fullJudgeResp();
+                if (success) success(fakeResp);
+                return;
+            }
+            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                self, getSel, url, params, success, failure);
+        });
+        method_setImplementation(mGet, newImpl);
+        DLOG(@"[LCNET-BYPASS] v37.137: getWithURL:parameters: HOOKED");
+    }
+
+    SEL postSel = NSSelectorFromString(@"PostWithURL:parameters:success:failure:");
+    Method mPost = class_getClassMethod(lcnetCls, postSel);
+    if (!mPost) mPost = class_getInstanceMethod(lcnetCls, postSel);
+    if (mPost) {
+        IMP origImpl = method_getImplementation(mPost);
+        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                      void(^success)(id), void(^failure)(NSError*)) {
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] v37.137: Intercepted POST (lowercase): %@", url);
+                if (success) success(@{@"code": @0, @"message": @"OK"});
+                return;
+            }
+            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                self, postSel, url, params, success, failure);
+        });
+        method_setImplementation(mPost, newImpl);
+        DLOG(@"[LCNET-BYPASS] v37.137: PostWithURL:parameters: HOOKED");
+    }
+
+    // v37.137: REMOVED SignatureCheck.nettimes and GetApp hooks.
+    // v37.136's hooks on these methods may have caused immediate crash due to
+    // return type mismatch (nettimes might not return NSString*).
+    // Instead, we fix the root cause: LCNetworking hooks now use class_getClassMethod
+    // and return FULL response with data field for getAppInfoApi.
 }
 
 // ============================================================
@@ -1795,12 +1803,17 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     // --- postAppInfoApi / getAppInfoApi ---
-    // v37.135: V3's lnSignature.dylib returns {"code":1,"message":"OK"} — code:1 = FAILURE for game!
-    // Must force code:0 (success) or game stays on startup page with "no network".
-    else if ([url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.135: Format: postAppInfoApi/getAppInfoApi (force code:0)");
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\": 1" withString:@"\"code\": 0"];
+    // v37.137: V3's lnSignature.dylib returns {"code":1,"message":"OK"} (26B, NO data field).
+    // If we just change code:1→code:0, V3's GetApp tries to access data.ENDTIME → nil → SIGSEGV!
+    // FIX: Replace ENTIRE response with full structure including data field.
+    else if ([url containsString:@"postAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.137: Format: postAppInfoApi (replace with full code:0)");
+        patchedResponse = @"{\"code\":0, \"message\":\"OK\"}";
+    }
+    else if ([url containsString:@"getAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.137: Format: getAppInfoApi (replace with FULL data structure)");
+        // V3's GetApp accesses data.ENDTIME — MUST include complete data object!
+        patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CENDDATE\":null,\"EMAIL\":null,\"EFLAG\":0,\"DAYS\":null,\"CERTID\":1,\"CERTNAME\":null,\"LIMITGAP\":null,\"TIP\":0,\"REMARK\":null,\"NET\":null}}";
     }
     // --- Fallback: generic cert endpoint ---
     else {
