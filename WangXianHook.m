@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.128-DIAG loaded (three-layer signature bypass) ===");
+        _log(@"=== WangXianHook v37.129-DIAG loaded (minimal signature hooks) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1032,10 +1032,11 @@ static void installSecurityFrameworkHooks(void) {
 }
 
 // --- Layer 2: SignatureKit Method Hooks (Safe, no original IMP calls) ---
-// Re-enable SignatureKit hooks for distribution signing bypass.
-// These hooks NEVER call original IMPs, avoiding SIGBUS.
-// They return success values to keep the game's state machine progressing.
-
+// v37.129: MINIMAL SignatureKit hooks — only suppress UI and block exit.
+// DO NOT hook judgeNet/judgeBase/JudgeApp/verifySig/handleResult —
+// stubbing them to do nothing BREAKS the game's state machine.
+// The game's verification flow must run naturally so it progresses
+// to HTTP requests, which our HTTP hooks intercept.
 static void installSignatureKitBypassHooks(void) {
     Class sigKitCls = NSClassFromString(@"SignatureKit");
     if (!sigKitCls) {
@@ -1043,33 +1044,11 @@ static void installSignatureKitBypassHooks(void) {
         return;
     }
 
-    // Hook +[SignatureKit judgeAppInfoWithBaseUrl:]
-    // Instead of stubbing to do nothing, we DON'T hook this method.
-    // Let it send the HTTP request — our HTTP hooks will intercept the response.
-    // This preserves the game's async flow and state machine.
-
-    // Hook +[SignatureKit handleAppInfoResult:]
-    // This is called when the HTTP response comes back.
-    // We let it process our fake success response normally.
-    // DO NOT stub this — calling original is safe here because
-    // the response data is our controlled fake success JSON.
-
-    // Hook +[SignatureKit judgeBase] — return YES
-    Method m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"judgeBase"));
-    if (m) {
-        method_setImplementation(m, (IMP)hook_judgeBase);
-        DLOG(@"[SIGKIT-BYPASS] judgeBase HOOKED (return YES)");
-    }
-
-    // Hook +[SignatureKit judgeNet] — return YES
-    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"judgeNet"));
-    if (m) {
-        method_setImplementation(m, (IMP)hook_judgeNet);
-        DLOG(@"[SIGKIT-BYPASS] judgeNet HOOKED (return YES)");
-    }
+    // ONLY hook showAlert: and exitApplication — these are safe to stub.
+    // They don't affect the verification flow, just prevent error UI and app exit.
 
     // Hook +[SignatureKit showAlert:] — suppress alerts
-    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showAlert:"));
+    Method m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showAlert:"));
     if (m) {
         method_setImplementation(m, (IMP)hook_showAlert);
         DLOG(@"[SIGKIT-BYPASS] showAlert: HOOKED (suppress)");
@@ -1082,34 +1061,19 @@ static void installSignatureKitBypassHooks(void) {
         DLOG(@"[SIGKIT-BYPASS] exitApplication HOOKED (block)");
     }
 
-    // Hook +[SignatureKit verifySignatureFromParameters:] — return success
-    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"verifySignatureFromParameters:"));
+    // Hook +[SignatureKit showTipViewEND:] if it exists — suppress version expired popup
+    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showTipViewEND:"));
     if (m) {
-        method_setImplementation(m, (IMP)hook_verifySig);
-        DLOG(@"[SIGKIT-BYPASS] verifySignatureFromParameters: HOOKED (return success)");
+        method_setImplementation(m, (IMP)hook_showTip);
+        DLOG(@"[SIGKIT-BYPASS] showTipViewEND: HOOKED (suppress)");
     }
 
-    // Also hook SignatureCheck if it exists (from lnSignature.dylib stub)
-    Class sigCheckCls = NSClassFromString(@"SignatureCheck");
-    if (sigCheckCls) {
-        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"JudgeApp"));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_judgeApp);
-            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.JudgeApp HOOKED (stub)");
-        }
-        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"showTipViewEND:"));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_showTip);
-            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.showTipViewEND: HOOKED (suppress)");
-        }
-        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"exitApplication"));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_scExit);
-            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.exitApplication HOOKED (block)");
-        }
-    }
+    // v37.129: DO NOT hook judgeBase, judgeNet, verifySig, handleResult, JudgeApp
+    // These methods are part of the game's verification state machine.
+    // Stubbing them to do nothing prevents the game from progressing.
+    // Let them run naturally — HTTP hooks will intercept the verification responses.
 
-    DLOG(@"[SIGKIT-BYPASS] All SignatureKit/SignatureCheck hooks installed");
+    DLOG(@"[SIGKIT-BYPASS] Minimal hooks installed (showAlert/exitApp/showTip only)");
 }
 
 // --- Layer 3: LCNetworking Hooks ---
@@ -10879,7 +10843,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.128-DIAG SILENT_MODE=%d %d layers active (v37.128: Three-layer signature bypass — SecStaticCodeCheckValidity + SignatureKit methods + LCNetworking. Fixes distribution-signed app crash. v37.126: GENERIC DY_MIESHI replacement. v37.124: HTTP hooks installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.129-DIAG SILENT_MODE=%d %d layers active (v37.129: Minimal SignatureKit hooks — only showAlert/exitApp/showTip, do NOT stub judgeNet/judgeBase/JudgeApp which breaks game state machine. v37.128: SecStaticCodeCheckValidity + LCNetworking. v37.126: GENERIC DY_MIESHI. v37.124: HTTP hooks. v37.120: FIX code:0→code:1. v37.118: MSI DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
