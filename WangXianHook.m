@@ -972,6 +972,8 @@ static void hook_scExit(id self, SEL _cmd) {
 
 // Forward declaration: isSignatureVerificationURL is defined below (in HTTP hooks section)
 static BOOL isSignatureVerificationURL(NSString *url);
+// Forward declaration: rebindSymbol is defined below (in fishhook helpers section)
+static int rebindSymbol(const char *symbolName, void *replacement, void **original);
 
 // Use void* instead of Security framework types to avoid import issues
 typedef OSStatus (*SecStaticCodeCheckValidityFunc)(void *, uint32_t, void *);
