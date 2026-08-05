@@ -1,6 +1,16 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v37.134: CRITICAL FIX — hash1/hash3 = CC_MD5(token), NOT MD5(binaryHash+token)
+ *
+ * v37.134 ROOT CAUSE FIX (EE121 sent but server never responds, login stuck):
+ *   v37.133 log proved: CC_MD5(token=31B) = 7905f181f6d975600548b1dc84ed9b70
+ *   Original packet hash3=7905f181f6d97560 (first 16) hash1=0548b1dc84ed9b70 (last 16)
+ *   → hash1/hash3 = CC_MD5(token), computed NATIVELY by game (mod=0, not hooked)
+ *   But v37.97 code OVERWRROTE them with MD5(binaryHash+token)=3c23a0bb... → WRONG!
+ *   Server validated hash1/hash3 ≠ CC_MD5(token) → silently dropped EE121 → login stuck.
+ *   FIX: Always preserve original hash1/hash3 from packet. Do NOT recompute.
+ *
  * WangXianHook v37.133: 2 ROOT CAUSE FIXES (登录网络中断)
  *
  * v37.133 ROOT CAUSE FIX 1 (EE121 server close connection after login):
@@ -876,7 +886,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.133-DIAG loaded (EE121 UUID fix + HTTP status getter hook) ===");
+        _log(@"=== WangXianHook v37.134-DIAG loaded (hash1/hash3=CC_MD5(token) fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5486,37 +5496,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             unsigned char hash1Val[16];
                             unsigned char hash3Val[16];
                             int hashComputed = 0;
-                            if (g_hashTokenValid && strlen(g_hashToken) == 31) {
-                                char md5In[64];
-                                // v37.97: hash1/hash3 = MD5(binary_hash + token), NOT MD5(hash2 + token)
-                                memcpy(md5In, kBinaryHashHex_v96, 32);
-                                memcpy(md5In+32, g_hashToken, 31); md5In[63] = 0;
-                                // Compute MD5 using system CC_MD5 (via dlsym to avoid our hook).
-                                unsigned char md5Out[16];
-                                memset(md5Out, 0, sizeof(md5Out));
-                                typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
-                                static RawCCMD5 s_rawMD5 = NULL;
-                                if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
-                                if (s_rawMD5) s_rawMD5(md5In, 63, md5Out);
-                                static const char kHex[] = "0123456789abcdef";
-                                char md5Hex[33];
-                                for (int hi = 0; hi < 16; hi++) {
-                                    md5Hex[hi*2]   = kHex[(md5Out[hi] >> 4) & 0xF];
-                                    md5Hex[hi*2+1] = kHex[md5Out[hi] & 0xF];
-                                }
-                                md5Hex[32] = 0;
-                                memcpy(hash3Val, md5Hex, 16);
-                                memcpy(hash1Val, md5Hex+16, 16);
-                                hashComputed = 1;
-                                DLOG(@"[EE121-HASH-RECALC] v37.97: MD5(binaryHash+token) = %s hash3=%.*s hash1=%.*s (binaryHash=%s token=%s)",
-                                     md5Hex, 16, hash3Val, 16, hash1Val, kBinaryHashHex_v96, g_hashToken);
-                            } else {
-                                if (h1) memcpy(hash1Val, p+h1+2, 16);
-                                if (h3) memcpy(hash3Val, p+h3+2, 16);
-                                DLOG(@"[EE121-HASH-RECALC] v37.97: FALLBACK token NOT captured (g_hashTokenValid=%d). Using orig hash1=%.*s hash3=%.*s",
-                                     g_hashTokenValid, 16, h1?p+h1+2:(const unsigned char*)"????????????????",
-                                     16, h3?p+h3+2:(const unsigned char*)"????????????????");
-                            }
+                            // v37.134 CRITICAL FIX: hash1/hash3 = CC_MD5(token), NOT MD5(binaryHash+token)!
+                            // Evidence from v37.133 log:
+                            //   CC_MD5(token=31B) = 7905f181f6d975600548b1dc84ed9b70
+                            //   Original packet hash3 = 7905f181f6d97560 (first 16 chars) ✅
+                            //   Original packet hash1 = 0548b1dc84ed9b70 (last 16 chars) ✅
+                            //   v37.97 assumed MD5(binaryHash+token) = 3c23a0bb... → WRONG! Server rejects.
+                            // FIX: Always preserve original hash1/hash3 from the packet.
+                            // CC_MD5(token) is computed by the game NATIVELY (mod=0, not hooked),
+                            // so original values are already correct.
+                            if (h3) memcpy(hash3Val, p+h3+2, 16); else memset(hash3Val, 0, 16);
+                            if (h1) memcpy(hash1Val, p+h1+2, 16); else memset(hash1Val, 0, 16);
+                            hashComputed = 0;
+                            DLOG(@"[EE121-HASH] v37.134: Preserving ORIGINAL hash1/hash3 from packet (CC_MD5(token) based, NOT MD5(binaryHash+token))");
                             // v37.92 FIX: Write hash3 FIRST, then hash2, then hash1.
                             // Native packet order: hash3 → hash2 → hash1
                             // Write hash3 field
