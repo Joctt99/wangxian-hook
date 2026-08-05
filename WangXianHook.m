@@ -705,6 +705,9 @@ static BOOL g_logEnabled = YES; // Development mode: full diagnostics.
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
+// Forward declare _log (defined later at line ~887) so detectInjectionEnv can use DLOG
+static void _log(NSString *msg);
+
 // v37.141: ENVIRONMENT DETECTION
 // Two injection paths with different signature ecosystems:
 //   PATH A — 全能签/锤子助手注入:
