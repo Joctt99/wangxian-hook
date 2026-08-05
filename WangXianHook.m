@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.124-DIAG loaded (HTTP hooks fix) ===");
+        _log(@"=== WangXianHook v37.125-DIAG loaded (format-specific responses) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1382,12 +1382,9 @@ static BOOL isSignatureVerificationURL(NSString *url) {
 }
 
 // v37.122: Patch signature verification response to always return success.
-// This replaces ALL responses from signature verification endpoints with
-// a successful JSON structure, regardless of the original response content.
-// This works on ALL devices because:
-// 1. No device-specific behavior
-// 2. Complete control over response content
-// 3. Game receives consistent success responses
+// v37.125: Use FORMAT-SPECIFIC responses matching what each endpoint actually returns.
+// CRITICAL FINDING: Different endpoints expect DIFFERENT JSON structures.
+// If we return a mismatched structure, the game silently fails verification.
 static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     if (!url) return nil;
     
@@ -1396,19 +1393,46 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         return nil; // Not a signature URL, don't patch
     }
     
-    DLOG(@"[SIGN-BYPASS] v37.122: Intercepted signature verification URL: %@", url);
+    DLOG(@"[SIGN-BYPASS] v37.125: Intercepted signature URL: %@", url);
+    DLOG(@"[SIGN-BYPASS] v37.125: Original body: %@", body);
     
-    // v37.122: Create a universally successful response structure
-    // This covers ALL possible response formats the game expects:
-    // 1. judgeAppInfoApi format: {code:0, data:{verity:1, ...}}
-    // 2. judgeAppInfoSignApi format: {code:0, data:{result:true, verity:1}}
-    // 3. Generic format with ENDTIME for certificate validation
+    NSString *patchedResponse = nil;
     
-    // Always return this successful structure
-    NSString *patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+    // --- Determine endpoint type and return matching format ---
+    
+    // 1. judgeAppInfoApi (ln_sign_cert.9iy.com) - expects id, COUNT, MAXLIMIT, etc.
+    // Original: {"code":0,"message":"未到上限，继续注册","data":{"id":11927,"CREATETIME":"...","COUNT":0,"MAXLIMIT":5000,...}}
+    if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
+        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CENDDATE\":null,\"EMAIL\":null,\"EFLAG\":0,\"DAYS\":null,\"CERTID\":1,\"CERTNAME\":null,\"LIMITGAP\":null,\"TIP\":0,\"REMARK\":null,\"NET\":null}}";
+        DLOG(@"[SIGN-BYPASS] v37.125: Format: judgeAppInfoApi (full 9iy format)");
+    }
+    // 2. postAppInfoApi (9iy) - expects simple {code:1, message:"OK"}
+    // Original: {"code":1, "message":"OK"}
+    else if ([url containsString:@"postAppInfoApi"]) {
+        patchedResponse = @"{\"code\":1,\"message\":\"OK\"}";
+        DLOG(@"[SIGN-BYPASS] v37.125: Format: postAppInfoApi (simple {code:1,message:OK})");
+    }
+    // 3. getAppInfoApi (9iy) - expects simple {code:1, message:"OK"}
+    // Original: {"code":1, "message":"OK"}
+    else if ([url containsString:@"getAppInfoApi"]) {
+        patchedResponse = @"{\"code\":1,\"message\":\"OK\"}";
+        DLOG(@"[SIGN-BYPASS] v37.125: Format: getAppInfoApi (simple {code:1,message:OK})");
+    }
+    // 4. judgeAppInfoSignApi (cert.qunhongtech.com) - expects code:0 + verity
+    // Original format: {code:0, data:{result:true, verity:1, tip:0}}
+    else if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
+        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+        DLOG(@"[SIGN-BYPASS] v37.125: Format: judgeAppInfoSignApi (verity=1 format)");
+    }
+    // 5. Fallback: generic cert/sign endpoint
+    else {
+        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"id\":11927,\"COUNT\":0,\"MAXLIMIT\":5000,\"APPID\":\"com.sqage.wangxianapp\",\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+        DLOG(@"[SIGN-BYPASS] v37.125: Format: GENERIC fallback (all fields merged)");
+    }
     
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
-    DLOG(@"[SIGN-BYPASS] v37.122: Replaced with universal success response, len=%lu", (unsigned long)patchedData.length);
+    DLOG(@"[SIGN-BYPASS] v37.125: Replaced body: %@", patchedResponse);
+    DLOG(@"[SIGN-BYPASS] v37.125: Response len=%lu", (unsigned long)patchedData.length);
     
     return patchedData;
 }
@@ -10577,7 +10601,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.124-DIAG SILENT_MODE=%d %d layers active (v37.124: CRITICAL FIX — HTTP hooks were NEVER INSTALLED! Now installs NSURLSession dataTaskWithRequest:completionHandler:, dataTaskWithRequest: (delegate), NSURLConnection sendAsync/sendSync. This was the root cause of ALL signature verification failures. v37.122: HTTP response interception. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.125-DIAG SILENT_MODE=%d %d layers active (v37.125: FORMAT-SPECIFIC signature responses — each endpoint gets its matching JSON format (judgeAppInfoApi=id/COUNT/MAXLIMIT format, post/getAppInfoApi=code:1 OK, judgeAppInfoSignApi=verity format). v37.124: HTTP hooks actually installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
