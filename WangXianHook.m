@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.123-DIAG loaded (fresh-install diagnostic) ===");
+        _log(@"=== WangXianHook v37.124-DIAG loaded (HTTP hooks fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10577,7 +10577,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.123-DIAG SILENT_MODE=%d %d layers active (v37.123: DIAGNOSTIC MODE for fresh-install network failure. v37.122: CROSS-DEVICE — SignatureKit REMOVED at method level, HTTP response interception for signature bypass. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.124-DIAG SILENT_MODE=%d %d layers active (v37.124: CRITICAL FIX — HTTP hooks were NEVER INSTALLED! Now installs NSURLSession dataTaskWithRequest:completionHandler:, dataTaskWithRequest: (delegate), NSURLConnection sendAsync/sendSync. This was the root cause of ALL signature verification failures. v37.122: HTTP response interception. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10778,6 +10778,55 @@ static void installAllHooks(void) {
     // 3. HTTP response interception is device-independent
     _log(@"[INIT] v37.122: SignatureKit/SignatureCheck REMOVED at method level");
     _log(@"[INIT] v37.122: Using HTTP response interception for signature bypass");
+
+    // === v37.124: INSTALL HTTP HOOKS (CRITICAL FIX - was never called before!) ===
+    // Without these hooks, ALL HTTP response interception is non-functional.
+    // This was the root cause of signature verification failure on fresh install.
+    {
+        // 1. NSURLSession -dataTaskWithRequest:completionHandler: (completion handler mode)
+        Class sessionCls = [NSURLSession class];
+        if (sessionCls) {
+            Method m = class_getInstanceMethod(sessionCls, @selector(dataTaskWithRequest:completionHandler:));
+            if (m) {
+                orig_dtwrc = (DTReqCompIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_dtwrc);
+                _log(@"[HTTP-INSTALL] NSURLSession dataTaskWithRequest:completionHandler: HOOKED");
+            } else {
+                _log(@"[HTTP-INSTALL] WARNING: dataTaskWithRequest:completionHandler: not found!");
+            }
+
+            // 2. NSURLSession -dataTaskWithRequest: (delegate mode)
+            m = class_getInstanceMethod(sessionCls, @selector(dataTaskWithRequest:));
+            if (m) {
+                orig_dtr = (DTReqIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_dtr);
+                _log(@"[HTTP-INSTALL] NSURLSession dataTaskWithRequest: (delegate) HOOKED");
+            }
+        }
+
+        // 3. NSURLConnection +sendAsynchronousRequest:queue:completionHandler:
+        Class connCls = NSClassFromString(@"NSURLConnection");
+        if (connCls) {
+            Method m = class_getClassMethod(connCls, @selector(sendAsynchronousRequest:queue:completionHandler:));
+            if (m) {
+                orig_asyncReq = (AsyncReqIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_async);
+                _log(@"[HTTP-INSTALL] NSURLConnection sendAsync: HOOKED");
+            }
+
+            // 4. NSURLConnection +sendSynchronousRequest:returningResponse:error:
+            m = class_getClassMethod(connCls, @selector(sendSynchronousRequest:returningResponse:error:));
+            if (m) {
+                orig_syncReq = (SyncReqIMP)method_getImplementation(m);
+                method_setImplementation(m, (IMP)hook_sync);
+                _log(@"[HTTP-INSTALL] NSURLConnection sendSync: HOOKED");
+            }
+        }
+
+        // 5. Install delegate-mode data receiving hooks
+        installNSURLSessionHooks();
+        _log(@"[HTTP-INSTALL] All HTTP hooks installed (v37.124)");
+    }
 
     _log(@"[INIT] v37.14: Socket hooks + NETIMPL hooks (crypto hooks disabled to prevent crash)");
 
