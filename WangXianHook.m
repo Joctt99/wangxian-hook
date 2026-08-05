@@ -973,31 +973,30 @@ static void hook_scExit(id self, SEL _cmd) {
 // Forward declaration: isSignatureVerificationURL is defined below (in HTTP hooks section)
 static BOOL isSignatureVerificationURL(NSString *url);
 
-#import <Security/Security.h>
-
-typedef OSStatus (*SecStaticCodeCheckValidityFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef);
+// Use void* instead of Security framework types to avoid import issues
+typedef OSStatus (*SecStaticCodeCheckValidityFunc)(void *, uint32_t, void *);
 static SecStaticCodeCheckValidityFunc orig_SecStaticCodeCheckValidity = NULL;
 
-static OSStatus hook_SecStaticCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, void *req) {
     DLOG(@"[SEC-BYPASS] SecStaticCodeCheckValidity: returning errSecSuccess (bypass local sig check)");
-    return errSecSuccess; // 0 = success
+    return 0; // errSecSuccess
 }
 
-typedef OSStatus (*SecCodeCheckValidityFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef);
+typedef OSStatus (*SecCodeCheckValidityFunc)(void *, uint32_t, void *);
 static SecCodeCheckValidityFunc orig_SecCodeCheckValidity = NULL;
 
-static OSStatus hook_SecCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, void *req) {
     DLOG(@"[SEC-BYPASS] SecCodeCheckValidity: returning errSecSuccess");
-    return errSecSuccess;
+    return 0;
 }
 
-typedef OSStatus (*SecCodeCheckValidityWithErrorsFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef, CFErrorRef *);
+typedef OSStatus (*SecCodeCheckValidityWithErrorsFunc)(void *, uint32_t, void *, void **);
 static SecCodeCheckValidityWithErrorsFunc orig_SecCodeCheckValidityWithErrors = NULL;
 
-static OSStatus hook_SecCodeCheckValidityWithErrors(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req, CFErrorRef *errors) {
+static OSStatus hook_SecCodeCheckValidityWithErrors(void *code, uint32_t flags, void *req, void **errors) {
     DLOG(@"[SEC-BYPASS] SecCodeCheckValidityWithErrors: returning errSecSuccess");
     if (errors) *errors = NULL;
-    return errSecSuccess;
+    return 0;
 }
 
 static void installSecurityFrameworkHooks(void) {
