@@ -933,6 +933,7 @@ static id hook_verifySig(id self, SEL _cmd, id params) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         NSString *timestamp = [NSString stringWithFormat:@"%f", [[NSDate date] timeIntervalSince1970]];
+        // ARC-safe: just assign to static var, ARC will retain it automatically
         s_dummySig = @{
             @"sig": @"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             @"timestamp": timestamp,
@@ -940,7 +941,6 @@ static id hook_verifySig(id self, SEL _cmd, id params) {
             @"code": @0,
             @"message": @"success"
         };
-        [s_dummySig retain];
     });
     DLOG(@"[SK] verifySignatureFromParameters: returning DUMMY signature (no orig call)");
     return s_dummySig;
