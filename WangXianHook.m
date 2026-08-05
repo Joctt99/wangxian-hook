@@ -1,4 +1,4 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.101-UUID-MATCH: Replace REAL device UUID in FFF493#2 MACADDRESS field
@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.119-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.120-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1401,7 +1401,8 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
         newBody = [regex stringByReplacingMatchesInString:newBody options:0 range:NSMakeRange(0, newBody.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
         newBody = [newBody stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         newBody = [newBody stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+        // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
+        // Changing it to code:1 breaks startup verification, causing "无法联网".
         NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
         DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
         if (orig_urlSessionDataTaskDidReceiveData) {
@@ -9323,21 +9324,14 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         // Ensure END=0 (not ended) and OPEN=1 (open)
                         body = [body stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
                         body = [body stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-                        // Ensure code=1 (success) instead of code=0
-                        body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
+                        // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
+                        // Changing it to code:1 breaks startup verification, causing "无法联网".
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
-                        DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1, code=1");
+                        DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1 (code preserved as-is)");
                     }
                     
-                    // Patch any sign/cert API response to success
-                    if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
-                        DLOG(@"[NET-PATCH] Detected cert/sign API response, ensuring success");
-                        if ([body containsString:@"\"code\":0"]) {
-                            body = [body stringByReplacingOccurrencesOfString:@"\"code\":0" withString:@"\"code\":1"];
-                            data = [body dataUsingEncoding:NSUTF8StringEncoding];
-                            DLOG(@"[NET-PATCH] Patched cert API code:0 -> 1");
-                        }
-                    }
+                    // v37.120: REMOVED cert/sign API code:0→code:1 replacement
+                    // Game uses code:0 for success. This replacement was breaking startup verification.
                 }
             }
             
@@ -10485,7 +10479,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.119-DIST SILENT_MODE=%d %d layers active (v37.119: hardcoded accId fallback removed, dynamic 20-digit scan instead. v37.118: MSI hooks DISABLED — root cause of SIGABRT on return. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.120-DIST SILENT_MODE=%d %d layers active (v37.120: FIX HTTP code:0→code:1 replacement in 3 locations — game uses code:0 for success, wrong replacement broke startup verification causing '无法联网'. v37.119: hardcoded accId fallback removed. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
