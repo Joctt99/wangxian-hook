@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.125-DIAG loaded (format-specific responses) ===");
+        _log(@"=== WangXianHook v37.126-DIAG loaded (generic DY_MIESHI fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4429,6 +4429,46 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t tlvCmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                           ((uint32_t)p[6] << 8) | (uint32_t)p[7];
+
+        // v37.126: GENERIC DY_MIESHI replacement for ALL packets on port 5678.
+        // Previously only EE100/EE113/EE118/E002/EE121 were patched. But 0x0002A017
+        // and possibly other commands also contain DY_MIESHI and need replacement.
+        // Fix: For ANY packet on port 5678 that contains DY_MIESHI, do a direct
+        // byte replacement to DYanyou0040_MIESHI before further command-specific processing.
+        if (tlvCmd != 0x002EE100 && tlvCmd != 0x002EE113 && tlvCmd != 0x0000E002 &&
+            tlvCmd != 0x002EE118 && tlvCmd != 0x002EE121 && tlvCmd != 0x002EE120) {
+            unsigned char *dyPos = (unsigned char *)memmem(p, len, "DY_MIESHI", 9);
+            if (dyPos && dyPos >= p + 2) {
+                size_t dyOffset = (size_t)(dyPos - p);
+                size_t bufCap = len + 64;
+                unsigned char *newBuf = (unsigned char *)malloc(bufCap);
+                if (newBuf) {
+                    size_t pos = 0;
+                    if (dyOffset >= 2) {
+                        memcpy(newBuf, p, dyOffset - 2);
+                        pos = dyOffset - 2;
+                    }
+                    newBuf[pos++] = 0x00;
+                    newBuf[pos++] = 0x12;  // 18 bytes
+                    memcpy(newBuf + pos, "DYanyou0040_MIESHI", 18);
+                    pos += 18;
+                    size_t restStart = dyOffset + 9;
+                    if (restStart < len) {
+                        memcpy(newBuf + pos, p + restStart, len - restStart);
+                        pos += (len - restStart);
+                    }
+                    newBuf[0] = (pos >> 24) & 0xFF;
+                    newBuf[1] = (pos >> 16) & 0xFF;
+                    newBuf[2] = (pos >> 8) & 0xFF;
+                    newBuf[3] = pos & 0xFF;
+                    DLOG(@"[CH-GENERIC] v37.126: Replaced DY_MIESHI in cmd=0x%08X origLen=%zu newLen=%zu", tlvCmd, len, pos);
+                    ssize_t rret = orig_send(fd, newBuf, pos, flags);
+                    free(newBuf);
+                    if (rret >= 0) return (ssize_t)len;
+                    return rret;
+                }
+            }
+        }
 
         // v37.68: SPECIAL CASE for EE100 — direct byte replacement bypassing TLV parser.
         // EE100 has non-standard 4-byte prefixes (00 00 00 XX) before field groups:
@@ -10601,7 +10641,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.125-DIAG SILENT_MODE=%d %d layers active (v37.125: FORMAT-SPECIFIC signature responses — each endpoint gets its matching JSON format (judgeAppInfoApi=id/COUNT/MAXLIMIT format, post/getAppInfoApi=code:1 OK, judgeAppInfoSignApi=verity format). v37.124: HTTP hooks actually installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.126-DIAG SILENT_MODE=%d %d layers active (v37.126: GENERIC DY_MIESHI replacement — ALL packets on port 5678 now get channel replaced, not just specific commands. Fixes 0x0002A017 packet sending short DY_MIESHI causing server disconnect. v37.125: format-specific responses. v37.124: HTTP hooks installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
