@@ -886,7 +886,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.137-DIAG loaded (V3 class method + full data response fix) ===");
+        _log(@"=== WangXianHook v37.138-DIAG loaded (hash2=MD5(newBody) recompute fix) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5585,83 +5585,72 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // 979 3B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
                         // --- hash1/hash2/hash3 block ---
-                        // Scan original packet for hash1(16B)/hash2(32B)/hash3(16B) TLV fields.
+                        // v37.138 CRITICAL FIX: hash1/hash3 AND hash2 have DIFFERENT computation rules!
+                        // Step 0: Scan original packet for hash1(16B)/hash2(32B)/hash3(16B) TLV positions.
                         uint32_t h1 = 0, h2 = 0, h3 = 0;
                         for (size_t sp = 12; sp + 2 + 16 <= len; ) {
                             uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
                             if (sp + 2 + sl > len) break;
-                            // v37.92 FIX: Native packet order is hash3 → hash2 → hash1.
-                            // First 16B TLV is hash3, second 16B TLV is hash1.
                             if (sl == 16 && h3 == 0) { h3 = sp; sp += 2+sl; continue; }
                             if (sl == 32 && h2 == 0) { h2 = sp; sp += 2+sl; continue; }
                             if (sl == 16 && h1 == 0) { h1 = sp; sp += 2+sl; continue; }
                             sp += 2+sl;
                         }
-                        // hash3 block: 00 10 + 16hex chars (FIRST 16B TLV in native packet)
-                        // hash2 block: 00 20 + 32hex chars (fields MD5, 32B TLV)
-                        // hash1 block: 00 10 + 16hex chars (SECOND 16B TLV in native packet)
-                        // v37.92: Field order in native packet: hash3 → hash2 → hash1
-                        // Server validates: hash3 == first16hex(MD5(binaryHash + token))
-                        //                   hash1 == last16hex(MD5(binaryHash + token))
+                        //   hash1 = last 16 hex of CC_MD5(token)   → COPY from original packet
+                        //   hash3 = first 16 hex of CC_MD5(token)  → COPY from original packet
+                        //   hash2 = MD5(body fields WITHOUT hash1/hash2/hash3 TLVs themselves)
+                        //                                              → RECOMPUTE with NEW body fields!
+                        //
+                        // Why body changed? We replaced:
+                        //   channel:  DY_MIESHI(9B) → anyou0040_MIESHI(18B)
+                        //   devModel: pnng_res(7B) → Apple Inc. Apple A10 GPU(27B) etc.
+                        // Original hash2 was MD5 of OLD body. Must re-MD5 with NEW body.
                         {
-                            // v37.97 FIX: Use ORIGINAL hash2 (MD5 of body) from client's CC_MD5.
-                            // ROOT CAUSE of all previous status=4 failures:
-                            //   - Wrong assumption: hash2 = binary hash (WRONG!)
-                            //   - Frida capture proves: hash2 = MD5(170B body fields) = c59199e10e56...
-                            //   - hash1/hash3 = MD5(binary_hash + token) where binary_hash = 906e707ec...
-                            //   - These are DIFFERENT values! hash2 ≠ binary_hash
-                            //   - Server validates: hash2 == MD5(body fields from packet)
-                            //   - Forcing hash2 = binary hash broke MD5(body) ≠ forced hash2 → REJECT
-                            // FIX: Keep original hash2 (computed by hooked CC_MD5 with canonical fields).
-                            //      hash1/hash3 = MD5(906e707ec... + token) using real binary hash.
-                            static const char kBinaryHashHex_v96[] = "906e707ec5585f080397b26ff4b8d89d";
-                            char origHash2Hex[33] = {0};
-                            if (h2 && h2 + 2 + 32 <= len) {
-                                memcpy(origHash2Hex, p + h2 + 2, 32);
-                                origHash2Hex[32] = 0;
-                            } else {
-                                memcpy(origHash2Hex, kBinaryHashHex_v96, 32);
-                                origHash2Hex[32] = 0;
-                            }
-                            // Build MD5 input: binaryHash_hex(32) + token(31) = 63 bytes
+                            // === Step 1: Preserve ORIGINAL hash1/hash3 (CC_MD5(token) based) ===
                             unsigned char hash1Val[16];
                             unsigned char hash3Val[16];
-                            int hashComputed = 0;
-                            // v37.134 CRITICAL FIX: hash1/hash3 = CC_MD5(token), NOT MD5(binaryHash+token)!
-                            // Evidence from v37.133 log:
-                            //   CC_MD5(token=31B) = 7905f181f6d975600548b1dc84ed9b70
-                            //   Original packet hash3 = 7905f181f6d97560 (first 16 chars) ✅
-                            //   Original packet hash1 = 0548b1dc84ed9b70 (last 16 chars) ✅
-                            //   v37.97 assumed MD5(binaryHash+token) = 3c23a0bb... → WRONG! Server rejects.
-                            // FIX: Always preserve original hash1/hash3 from the packet.
-                            // CC_MD5(token) is computed by the game NATIVELY (mod=0, not hooked),
-                            // so original values are already correct.
                             if (h3) memcpy(hash3Val, p+h3+2, 16); else memset(hash3Val, 0, 16);
                             if (h1) memcpy(hash1Val, p+h1+2, 16); else memset(hash1Val, 0, 16);
-                            hashComputed = 0;
-                            DLOG(@"[EE121-HASH] v37.134: Preserving ORIGINAL hash1/hash3 from packet (CC_MD5(token) based, NOT MD5(binaryHash+token))");
-                            // v37.92 FIX: Write hash3 FIRST, then hash2, then hash1.
-                            // Native packet order: hash3 → hash2 → hash1
-                            // Write hash3 field
+                            DLOG(@"[EE121-HASH] v37.138: Preserving ORIGINAL hash1/hash3 (=CC_MD5(token))");
+
+                            // === Step 2: Recompute hash2 as MD5 of NEW body (header 12B up to, but NOT including, the hash3 TLV we are about to write) ===
+                            // Body for hash2 MD5: newBuf[12 .. rebuildOut-1] (all TLVs: accId, user, pass, SQAGE, IOS, channel, devModel, GPU, UUID?, WIFI, 7.6.3, 979)
+                            // rebuildOut currently points right before where hash3 will be written → exactly the boundary.
+                            size_t hash2BodyStart = 12;
+                            size_t hash2BodyLen   = rebuildOut - hash2BodyStart;
+                            unsigned char md5Out[16];
+                            memset(md5Out, 0, sizeof(md5Out));
+                            typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                            static RawCCMD5 s_rawMD5 = NULL;
+                            if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                            if (s_rawMD5) {
+                                s_rawMD5(newBuf + hash2BodyStart, (unsigned long)hash2BodyLen, md5Out);
+                            }
+                            static const char kHex[] = "0123456789abcdef";
+                            char newHash2Hex[33];
+                            for (int hi = 0; hi < 16; hi++) {
+                                newHash2Hex[hi*2]   = kHex[(md5Out[hi] >> 4) & 0xF];
+                                newHash2Hex[hi*2+1] = kHex[md5Out[hi] & 0xF];
+                            }
+                            newHash2Hex[32] = 0;
+                            DLOG(@"[EE121-HASH2] v37.138: RECOMPUTED hash2=MD5(newBody%zub)=%s (oldHash2WasWrongForNewBody)",
+                                 (unsigned long)hash2BodyLen, newHash2Hex);
+
+                            // === Step 3: Write hash3 → hash2 → hash1 in native order ===
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash3Val, 16);
                             rebuildOut += 18;
-                            // v37.98 FIX: REVERT hash2 to ORIGINAL value (ddcb91f42c...).
-                            // ROOT CAUSE: v37.97 forced hash2=c59199e10e (clean 170B path) but our
-                            // client sends 156B body (REAL accId path). Server validates hash2 against
-                            // the ACTUAL body we send, NOT the clean client body. v37.96 used origHash2Hex
-                            // and login SUCCEEDED. v37.97 forced c59199e1 → server REJECTED → connection CLOSE.
-                            // FIX: Use origHash2Hex (MD5 of our actual 156B body with CANONICAL accId).
+
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x20;
-                            memcpy(newBuf+rebuildOut+2, origHash2Hex, 32);
+                            memcpy(newBuf+rebuildOut+2, newHash2Hex, 32);
                             rebuildOut += 34;
-                            DLOG(@"[EE121-HASH2] v37.98: hash2=%s (ORIGINAL body MD5, v37.97 forced c59199e1 REVERTED)", origHash2Hex);
-                            // Write hash1 field
+
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
-                            DLOG(@"[EE121-HASH1] v37.97: hash1=%.*s %@", 16, hash1Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
-                            DLOG(@"[EE121-HASH3] v37.97: hash3=%.*s %@", 16, hash3Val, hashComputed?@"(RECALCULATED)":@"(FALLBACK)");
+
+                            DLOG(@"[EE121-HASH1] v37.138: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
+                            DLOG(@"[EE121-HASH3] v37.138: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
