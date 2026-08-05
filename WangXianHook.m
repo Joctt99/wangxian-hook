@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.130-DIAG loaded (smart response patching) ===");
+        _log(@"=== WangXianHook v37.131-DIAG loaded (HTTP status code patching) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1671,6 +1671,24 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
 static void (*orig_urlSessionDataTaskDidReceiveData)(id, SEL, NSURLSession*, NSURLSessionDataTask*, NSData*) = NULL;
 
+// v37.131: Hook for didReceiveResponse to patch HTTP status code 500→200
+static IMP orig_urlSessionDidReceiveResponse = NULL;
+static void hook_urlSessionDidReceiveResponse(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSURLResponse *response, void (^completionHandler)(NSURLSessionResponseDisposition disposition)) {
+    NSString *url = dataTask.currentRequest.URL.absoluteString;
+    if (url && isSignatureVerificationURL(url)) {
+        NSHTTPURLResponse *httpResp = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        if (httpResp && httpResp.statusCode != 200) {
+            DLOG(@"[SIGN-BYPASS] v37.131: delegate mode: Patching HTTP status %ld→200 for %@", (long)httpResp.statusCode, url);
+            NSMutableDictionary *patchedHeaders = [httpResp.allHeaderFields mutableCopy] ?: [NSMutableDictionary dictionary];
+            [patchedHeaders setObject:@"application/json" forKey:@"Content-Type"];
+            response = [[NSHTTPURLResponse alloc] initWithURL:httpResp.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:patchedHeaders];
+        }
+    }
+    if (orig_urlSessionDidReceiveResponse) {
+        ((void(*)(id, SEL, NSURLSession*, NSURLSessionDataTask*, NSURLResponse*, void(^)(NSURLSessionResponseDisposition)))orig_urlSessionDidReceiveResponse)(self, _cmd, session, dataTask, response, completionHandler);
+    }
+}
+
 static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
     NSString *url = dataTask.currentRequest.URL.absoluteString;
     DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu url=%@", (unsigned long)[data length], url);
@@ -1769,6 +1787,33 @@ static void installNSURLSessionHooks(void) {
         free(classes);
         if (hookedCount > 0) {
             DLOG(@"[INIT] URLSession:dataTask:didReceiveData: hooked on %d classes", hookedCount);
+        }
+    }
+
+    // v37.131: Hook URLSession:dataTask:didReceiveResponse:completionHandler:
+    // to patch HTTP status code 500→200 for signature verification URLs
+    classes = (Class *)malloc(sizeof(Class) * 0x10000);
+    if (classes) {
+        int numClasses = objc_getClassList(classes, 0x10000);
+        int respHookedCount = 0;
+        for (int i = 0; i < numClasses; i++) {
+            Class cls = classes[i];
+            SEL respSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
+            Method m = class_getInstanceMethod(cls, respSel);
+            if (m) {
+                IMP currentImp = method_getImplementation(m);
+                if (currentImp != (IMP)hook_urlSessionDidReceiveResponse) {
+                    orig_urlSessionDidReceiveResponse = currentImp;
+                    method_setImplementation(m, (IMP)hook_urlSessionDidReceiveResponse);
+                    DLOG(@"[HTTP-HOOK] Hooked URLSession:dataTask:didReceiveResponse: on class: %@", NSStringFromClass(cls));
+                    respHookedCount++;
+                    if (respHookedCount >= 5) break;
+                }
+            }
+        }
+        free(classes);
+        if (respHookedCount > 0) {
+            DLOG(@"[INIT] URLSession:dataTask:didReceiveResponse: hooked on %d classes", respHookedCount);
         }
     }
 }
@@ -9640,6 +9685,14 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         if (patchedData) {
                             data = patchedData;
                             body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                            // v37.131: Also patch HTTP status code 500→200
+                            // Server returns 500 (TooManyResultsException) but game checks status code
+                            if (httpResp && httpResp.statusCode != 200) {
+                                DLOG(@"[SIGN-BYPASS] v37.131: Patching HTTP status %ld→200", (long)httpResp.statusCode);
+                                NSMutableDictionary *patchedHeaders = [httpResp.allHeaderFields mutableCopy] ?: [NSMutableDictionary dictionary];
+                                [patchedHeaders setObject:@"application/json" forKey:@"Content-Type"];
+                                resp = [[NSHTTPURLResponse alloc] initWithURL:httpResp.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:patchedHeaders];
+                            }
                             // Log that we patched it, then continue to normal processing
                         }
                     }
