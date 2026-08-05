@@ -886,7 +886,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-DIAG loaded (hash1/hash3=CC_MD5(token) fix) ===");
+        _log(@"=== WangXianHook v37.135-DIAG loaded (code:1→0 fix for V3 distribution) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1176,7 +1176,7 @@ static void installLCNetworkingHooks(void) {
             if (url && isSignatureVerificationURL(url)) {
                 DLOG(@"[LCNET-BYPASS] Intercepted signature POST URL: %@", url);
                 if (success) {
-                    NSDictionary *fakeResp = @{@"code": @1, @"message": @"OK"};
+                    NSDictionary *fakeResp = @{@"code": @0, @"message": @"OK"};
                     success(fakeResp);
                 }
                 return;
@@ -1679,10 +1679,12 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     // --- postAppInfoApi / getAppInfoApi ---
-    // Original: {"code":1, "message":"OK"} — already correct, return as-is
+    // v37.135: V3's lnSignature.dylib returns {"code":1,"message":"OK"} — code:1 = FAILURE for game!
+    // Must force code:0 (success) or game stays on startup page with "no network".
     else if ([url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.130: Format: postAppInfoApi/getAppInfoApi (passthrough)");
-        // Return original body as-is — it's already {code:1, message:"OK"}
+        DLOG(@"[SIGN-BYPASS] v37.135: Format: postAppInfoApi/getAppInfoApi (force code:0)");
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\": 1" withString:@"\"code\": 0"];
     }
     // --- Fallback: generic cert endpoint ---
     else {
