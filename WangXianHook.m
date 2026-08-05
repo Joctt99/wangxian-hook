@@ -642,7 +642,7 @@ extern "C" kern_return_t mach_vm_remap(
 // FIX: Use `(void)((fmt), ##__VA_ARGS__)` — comma operator evaluates ALL args,
 // then discards the result. Zero output while preserving ALL side effects.
 // Set to 0 during development to re-enable full diagnostics.
-#define SILENT_DIST_MODE 0  // v37.121: DIAGNOSTIC MODE - ENABLE LOGS for second device testing
+#define SILENT_DIST_MODE 1  // v37.122: Cross-device compatible version - HTTP response interception
 
 #if SILENT_DIST_MODE
 #define DLOG(fmt, ...) do { (void)((fmt), ##__VA_ARGS__); } while(0)
@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.120-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.122-DIST-SILENT loaded (cross-device compatible) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1334,6 +1334,76 @@ static void installJSONSerializationHook(void) {
 }
 
 // ============================================================
+#pragma mark - Signature Verification HTTP Bypass (v37.122)
+// ============================================================
+
+// v37.122: Unified function to check if a URL is a signature verification endpoint.
+// This covers ALL possible API paths used by the game's signature system.
+// Base URL: https://cert.qunhongtech.com/
+// Endpoints: judgeAppInfoApi, judgeAppInfoSignApi, postAppInfoApi, getAppInfoApi
+static BOOL isSignatureVerificationURL(NSString *url) {
+    if (!url || url.length == 0) return NO;
+    
+    // Check for base domain
+    if ([url containsString:@"cert.qunhongtech.com"]) {
+        return YES;
+    }
+    
+    // Check for specific API endpoints (in case domain differs)
+    NSArray *endpoints = @[
+        @"judgeAppInfoApi",
+        @"judgeAppInfoSignApi", 
+        @"postAppInfoApi",
+        @"getAppInfoApi",
+        @"verifySign",
+        @"checkSign",
+        @"certApi",
+        @"signApi",
+        @"verifyApi"
+    ];
+    
+    for (NSString *ep in endpoints) {
+        if ([url containsString:ep]) {
+            return YES;
+        }
+    }
+    
+    return NO;
+}
+
+// v37.122: Patch signature verification response to always return success.
+// This replaces ALL responses from signature verification endpoints with
+// a successful JSON structure, regardless of the original response content.
+// This works on ALL devices because:
+// 1. No device-specific behavior
+// 2. Complete control over response content
+// 3. Game receives consistent success responses
+static NSData *patchSignatureResponse(NSString *url, NSString *body) {
+    if (!url) return nil;
+    
+    // Only patch signature verification URLs
+    if (!isSignatureVerificationURL(url)) {
+        return nil; // Not a signature URL, don't patch
+    }
+    
+    DLOG(@"[SIGN-BYPASS] v37.122: Intercepted signature verification URL: %@", url);
+    
+    // v37.122: Create a universally successful response structure
+    // This covers ALL possible response formats the game expects:
+    // 1. judgeAppInfoApi format: {code:0, data:{verity:1, ...}}
+    // 2. judgeAppInfoSignApi format: {code:0, data:{result:true, verity:1}}
+    // 3. Generic format with ENDTIME for certificate validation
+    
+    // Always return this successful structure
+    NSString *patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+    
+    NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
+    DLOG(@"[SIGN-BYPASS] v37.122: Replaced with universal success response, len=%lu", (unsigned long)patchedData.length);
+    
+    return patchedData;
+}
+
+// ============================================================
 #pragma mark - NSURLSessionDataDelegate hooks
 // ============================================================
 
@@ -1343,6 +1413,19 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
     NSString *url = dataTask.currentRequest.URL.absoluteString;
     DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu url=%@", (unsigned long)[data length], url);
     
+    // v37.122: Use unified signature bypass for ALL signature verification URLs
+    if (url && isSignatureVerificationURL(url)) {
+        NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSData *patchedData = patchSignatureResponse(url, dataStr);
+        if (patchedData) {
+            if (orig_urlSessionDataTaskDidReceiveData) {
+                orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, patchedData);
+                return;
+            }
+        }
+    }
+    
+    // v37.122: Fallback - patch other responses (server list, version errors)
     NSString *dataStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (dataStr) {
         if ([dataStr containsString:@"版本"] || [dataStr containsString:@"server"] || 
@@ -1355,9 +1438,9 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
         }
     }
     
-    // Patch delegate-mode responses for sign/cert APIs
+    // v37.122: Also patch delegate-mode responses for sign/cert APIs (legacy fallback)
     if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || [dataStr containsString:@"ENDTIME"])) {
-        DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response");
+        DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response (legacy)");
         NSString *newBody = dataStr;
         // Extend ENDTIME to future
         NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
@@ -1365,7 +1448,6 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
         newBody = [newBody stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         newBody = [newBody stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
         // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
-        // Changing it to code:1 breaks startup verification, causing "无法联网".
         NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
         DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
         if (orig_urlSessionDataTaskDidReceiveData) {
@@ -9250,6 +9332,16 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                 if (body) {
                     DLOG(@"[NET] Body: %@", body);
                     
+                    // v37.122: FIRST check - use unified signature bypass for ALL signature verification URLs
+                    if (url && isSignatureVerificationURL(url)) {
+                        NSData *patchedData = patchSignatureResponse(url, body);
+                        if (patchedData) {
+                            data = patchedData;
+                            body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                            // Log that we patched it, then continue to normal processing
+                        }
+                    }
+                    
                     // Check if this is a server list response
                     BOOL isServerList = ([body containsString:@"server"] || [body containsString:@"servers"] || 
                                         [body containsString:@"serverCount"] || [body containsString:@"serverid"]);
@@ -9278,17 +9370,15 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
                     }
                     
-                    // Patch judgeAppInfoApi response: extend ENDTIME to future date
+                    // v37.122: LEGACY FALLBACK - Patch judgeAppInfoApi response (if not caught above)
                     if ([url containsString:@"judgeAppInfoApi"] || [body containsString:@"ENDTIME"]) {
-                        DLOG(@"[NET-PATCH] Detected judgeAppInfoApi response, extending ENDTIME");
+                        DLOG(@"[NET-PATCH] Detected judgeAppInfoApi response, extending ENDTIME (legacy)");
                         // Replace any ENDTIME value with a future date (2027-12-31)
                         NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
                         body = [regex stringByReplacingMatchesInString:body options:0 range:NSMakeRange(0, body.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
                         // Ensure END=0 (not ended) and OPEN=1 (open)
                         body = [body stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
                         body = [body stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-                        // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
-                        // Changing it to code:1 breaks startup verification, causing "无法联网".
                         data = [body dataUsingEncoding:NSUTF8StringEncoding];
                         DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1 (code preserved as-is)");
                     }
@@ -10442,7 +10532,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.120-DIST SILENT_MODE=%d %d layers active (v37.120: FIX HTTP code:0→code:1 replacement in 3 locations — game uses code:0 for success, wrong replacement broke startup verification causing '无法联网'. v37.119: hardcoded accId fallback removed. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.122-DIST SILENT_MODE=%d %d layers active (v37.122: CROSS-DEVICE COMPATIBLE — SignatureKit REMOVED at method level, using HTTP response interception for signature bypass. v37.120: FIX HTTP code:0→code:1 replacement. v37.119: hardcoded accId fallback removed. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10634,133 +10724,15 @@ static void installAllHooks(void) {
     }
 #pragma clang diagnostic pop
 
-    // === v37.121: SignatureKit hooks SAFELY RE-INSTALLED (DIAGNOSTIC MODE) ===
-    // Why: v37.116 removed ALL SignatureKit hooks, letting game run native verification.
-    // This works on the main test device but may FAIL on OTHER devices (different iOS
-    // version, different security policy, or different app state).
-    //
-    // SAFETY MEASURES to prevent SIGBUS:
-    // 1. DO NOT save original IMP pointers — they may become invalid in async callbacks
-    // 2. DO NOT call original implementations
-    // 3. Return ONLY pre-computed SUCCESS values
-    // 4. For void methods, do nothing (suppress)
-    //
-    // This is the SAFEST possible approach — no pointer dependencies at all.
-    Class skCls = NSClassFromString(@"SignatureKit");
-    if (skCls) {
-        Class metaCls = object_getClass(skCls);
-
-        // 1. showAlert: - SUPPRESS (don't show any alert)
-        Method m = class_getClassMethod(skCls, @selector(showAlert:));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_showAlert);
-            _log(@"[SK-SAFE] showAlert: SUPPRESSED");
-        }
-
-        // 2. exitApplication - BLOCK (don't let app exit)
-        m = class_getClassMethod(skCls, @selector(exitApplication));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_exitApp);
-            _log(@"[SK-SAFE] exitApplication: BLOCKED");
-        }
-
-        // 3. handleAppInfoResult: - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
-        if (m) {
-            // Create a dummy success result object
-            static NSDictionary *s_dummyResult = nil;
-            if (!s_dummyResult) {
-                s_dummyResult = @{
-                    @"code": @0,
-                    @"message": @"success",
-                    @"data": @{
-                        @"result": @YES,
-                        @"verity": @1
-                    }
-                };
-            }
-            method_setImplementation(m, (IMP)hook_handleResult);
-            _log(@"[SK-SAFE] handleAppInfoResult: STUBBED (returns success)");
-        }
-
-        // 4. judgeAppInfoWithBaseUrl: - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_judgeBase);
-            _log(@"[SK-SAFE] judgeAppInfoWithBaseUrl: STUBBED (returns success)");
-        }
-
-        // 5. judgeNet - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(judgeNet));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_judgeNet);
-            _log(@"[SK-SAFE] judgeNet: STUBBED (returns success)");
-        }
-
-        // 6. verifySignatureFromParameters: - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
-        if (m) {
-            // Return a dummy success result
-            static NSDictionary *s_dummySigResult = nil;
-            if (!s_dummySigResult) {
-                s_dummySigResult = @{
-                    @"verity": @1,
-                    @"tip": @0
-                };
-            }
-            method_setImplementation(m, (IMP)hook_verifySig);
-            _log(@"[SK-SAFE] verifySignatureFromParameters: STUBBED (returns success)");
-        }
-
-        // 7. generateRequestParams - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(generateRequestParams));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_genParams);
-            _log(@"[SK-SAFE] generateRequestParams: STUBBED");
-        }
-
-        // 8. createSignatureParams: - STUB (don't call original)
-        m = class_getClassMethod(skCls, @selector(createSignatureParams:));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_createSigParams);
-            _log(@"[SK-SAFE] createSignatureParams: STUBBED");
-        }
-
-        _log(@"[SK-SAFE] All SignatureKit hooks installed SAFELY (no orig IMP calls)");
-    } else {
-        _log(@"[SK-SAFE] SignatureKit class not found (may not be needed)");
-    }
-
-    // === v37.121: SignatureCheck hooks RE-INSTALLED for diagnosis ===
-    Class scCls = NSClassFromString(@"SignatureCheck");
-    if (scCls) {
-        // JudgeApp - BLOCK (don't call original, return success)
-        Method m = class_getClassMethod(scCls, @selector(JudgeApp));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_judgeApp);
-            _log(@"[SC-SAFE] JudgeApp: BLOCKED");
-        }
-
-        // showTipViewEND: - SUPPRESS (don't show any alert)
-        m = class_getClassMethod(scCls, @selector(showTipViewEND:));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_showTip);
-            _log(@"[SC-SAFE] showTipViewEND: SUPPRESSED");
-        }
-
-        // exitApplication - BLOCK (don't let app exit)
-        m = class_getClassMethod(scCls, @selector(exitApplication));
-        if (m) {
-            method_setImplementation(m, (IMP)hook_scExit);
-            _log(@"[SC-SAFE] exitApplication: BLOCKED");
-        }
-
-        _log(@"[SC-SAFE] All SignatureCheck hooks installed SAFELY");
-    } else {
-        _log(@"[SC-SAFE] SignatureCheck class not found");
-    }
-
-    _log(@"[INIT] v37.121-DIAG: SignatureKit+SignatureCheck SAFELY re-installed for cross-device compatibility");
+    // === v37.122: SignatureKit hooks REMOVED at method level ===
+    // Cross-device compatibility: Method-level hooks cause SIGBUS/SIGABRT on some devices.
+    // Solution: Intercept HTTP responses instead (see hook_dtwrc and hook_urlSessionDataTaskDidReceiveData).
+    // This approach works on ALL devices because:
+    // 1. No method-level hooks = no SIGBUS from stale function pointers
+    // 2. No method-level hooks = no SIGABRT from broken state machine
+    // 3. HTTP response interception is device-independent
+    _log(@"[INIT] v37.122: SignatureKit/SignatureCheck REMOVED at method level");
+    _log(@"[INIT] v37.122: Using HTTP response interception for signature bypass");
 
     _log(@"[INIT] v37.14: Socket hooks + NETIMPL hooks (crypto hooks disabled to prevent crash)");
 
