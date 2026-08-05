@@ -642,7 +642,7 @@ extern "C" kern_return_t mach_vm_remap(
 // FIX: Use `(void)((fmt), ##__VA_ARGS__)` — comma operator evaluates ALL args,
 // then discards the result. Zero output while preserving ALL side effects.
 // Set to 0 during development to re-enable full diagnostics.
-#define SILENT_DIST_MODE 1  // v37.122: Cross-device compatible version - HTTP response interception
+#define SILENT_DIST_MODE 0  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
 
 #if SILENT_DIST_MODE
 #define DLOG(fmt, ...) do { (void)((fmt), ##__VA_ARGS__); } while(0)
@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.122-DIST-SILENT loaded (cross-device compatible) ===");
+        _log(@"=== WangXianHook v37.123-DIAG loaded (fresh-install diagnostic) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10532,7 +10532,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.122-DIST SILENT_MODE=%d %d layers active (v37.122: CROSS-DEVICE COMPATIBLE — SignatureKit REMOVED at method level, using HTTP response interception for signature bypass. v37.120: FIX HTTP code:0→code:1 replacement. v37.119: hardcoded accId fallback removed. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.123-DIAG SILENT_MODE=%d %d layers active (v37.123: DIAGNOSTIC MODE for fresh-install network failure. v37.122: CROSS-DEVICE — SignatureKit REMOVED at method level, HTTP response interception for signature bypass. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
