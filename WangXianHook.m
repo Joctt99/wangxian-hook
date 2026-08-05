@@ -705,6 +705,39 @@ static BOOL g_logEnabled = YES; // Development mode: full diagnostics.
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
+// v37.141: ENVIRONMENT DETECTION
+// Two injection paths with different signature ecosystems:
+//   PATH A — 全能签/锤子助手注入:
+//     • App directly hits cert.qunhongtech.com; real sign/verify responses needed.
+//     • lnSignature.dylib NOT present.
+//     • Our hooks should only: HTTP 500→200 + ENDTIME patch. Don't return fake data.
+//   PATH B — V3 自签站 分发下载 (resign with UDID):
+//     • V3 injects lnSignature.dylib + libSupport.dylib into Frameworks/.
+//     • LCNetworking class hits ln_sign_cert.9iy.com (V3's cert endpoint).
+//     • Our hooks must: install LCNetworking hooks + return FULL fake response with data.ENDTIME etc.
+// Detection rule: [[NSBundle mainBundle] pathForResource:@"lnSignature" ofType:@"dylib"] exists → V3 env.
+static BOOL g_isV3ResignEnv = NO;   // YES=Frameworks/lnSignature.dylib found
+static BOOL g_isV3Detected = NO;    // detection ran once
+
+static void detectInjectionEnv(void) {
+    if (g_isV3Detected) return;
+    g_isV3Detected = YES;
+    NSString *lnPath = [[NSBundle mainBundle] pathForResource:@"lnSignature" ofType:@"dylib"];
+    if (!lnPath) {
+        // Also try Frameworks subfolder
+        NSString *fw = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Frameworks"];
+        if (fw) lnPath = [fw stringByAppendingPathComponent:@"lnSignature.dylib"];
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (lnPath && [fm fileExistsAtPath:lnPath]) {
+        g_isV3ResignEnv = YES;
+        DLOG(@"[ENV] v37.141: ✅ V3自签分发环境检测到 lnSignature.dylib — 启用 LCNetworking hooks + 完整假响应");
+    } else {
+        g_isV3ResignEnv = NO;
+        DLOG(@"[ENV] v37.141: ✅ 全能签/锤子助手本地注入环境 — 仅启用 HTTP 500→200 + 关键字段微调，不拦截body");
+    }
+}
+
 // v37.51: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
 static int g_md5_replace_count = 0;
 // v37.60: Flag set when CC_MD5 input had channel name "DY_MIESHI" replaced with
@@ -886,7 +919,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.140-DIAG loaded (hash2 rollback: original copy, NOT recomputed) ===");
+        _log(@"=== WangXianHook v37.141 loaded (env-aware: 全能签=HTTP fix only, V3=full sign bypass) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1118,9 +1151,17 @@ static void installSignatureKitBypassHooks(void) {
 // Hook it to intercept signature verification requests at the application level.
 
 static void installLCNetworkingHooks(void) {
+    // v37.141: ONLY install LCNetworking hooks in V3自签分发环境 (lnSignature.dylib present).
+    // In 全能签 environment, game has its own LCNetworking (or direct NSURLSession) that hits
+    // cert.qunhongtech.com for REAL signature data. Installing LCNetworking hooks there would
+    // return fake responses → server thinks EE121 signature is invalid → ignores it → only heartbeats.
+    if (!g_isV3ResignEnv) {
+        DLOG(@"[LCNET-BYPASS] v37.141: 全能签环境 — SKIP LCNetworking hooks (only HTTP 500→200 + code:1→0 patches apply)");
+        return;
+    }
     Class lcnetCls = NSClassFromString(@"LCNetworking");
     if (!lcnetCls) {
-        DLOG(@"[LCNET-BYPASS] LCNetworking class not found, skipping");
+        DLOG(@"[LCNET-BYPASS] V3 env but LCNetworking class not found — this shouldn't happen");
         return;
     }
 
@@ -1748,6 +1789,10 @@ static BOOL isSignatureVerificationURL(NSString *url) {
 // v37.125: Use FORMAT-SPECIFIC responses matching what each endpoint actually returns.
 // CRITICAL FINDING: Different endpoints expect DIFFERENT JSON structures.
 // If we return a mismatched structure, the game silently fails verification.
+// v37.141: ENVIRONMENT-AWARE PATCHING:
+//   全能签环境(g_isV3ResignEnv=NO): 只做字段微调 (verity/ENDTIME/END/OPEN), 不替换 postAppInfoApi/getAppInfoApi
+//     → 游戏需要 cert.qunhongtech.com 返回的真实 sign/timeStamp/randStr 等字段用于 EE121 签名校验
+//   V3分发环境(g_isV3ResignEnv=YES): 完整替换 (因为 lnSignature.dylib 返回空数据
 static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     if (!url) return nil;
     
@@ -1756,40 +1801,33 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         return nil; // Not a signature URL, don't patch
     }
     
-    DLOG(@"[SIGN-BYPASS] v37.130: Intercepted signature URL: %@", url);
-    DLOG(@"[SIGN-BYPASS] v37.130: Original body: %@", body);
-    
-    // v37.130: SMART PATCHING — don't replace entire body, only modify specific fields.
-    // Previous versions replaced the entire response, losing critical fields like
-    // "sign", "timeStamp", "randStr" that the game needs for subsequent verification.
+    DLOG(@"[SIGN-BYPASS] v37.141: Intercepted signature URL: %@ (V3env=%d)", url, (int)g_isV3ResignEnv);
+    DLOG(@"[SIGN-BYPASS] v37.141: Original body: %@", body);
     
     NSString *patchedResponse = body ?: @"";
+    BOOL didPatch = NO;
     
-    // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
-    // Original: {"code":0,"data":{"timeStamp":"...","randStr":"...","sign":"...","verity":1,"tip":0,"end":0,"open":1}}
-    // If verity:1 already → just patch end/open to 0/1, keep everything else
-    // If verity:0 → force verity:1
+    // --- judgeAppInfoSignApi / verifySign / checkSign (BOTH environments) ---
+    // cert.qunhongtech.com 返回真实 sign/timeStamp/randStr，必须保留！
+    // 只做 verity/tip/end/open 字段微调
     if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
-        DLOG(@"[SIGN-BYPASS] v37.130: Format: judgeAppInfoSignApi (smart patch)");
-        // Only patch verity and tip fields, keep sign/timeStamp/randStr
+        DLOG(@"[SIGN-BYPASS] v37.141: Format: judgeAppInfoSignApi (smart field patch, keep sign/timeStamp/randStr)");
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        didPatch = YES;
         // If body doesn't contain verity at all, it's a non-JSON or error response — replace
         if (![patchedResponse containsString:@"verity"]) {
             patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
         }
     }
-    // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
-    // Original: {"code":0,"data":{"id":11927,...,"ENDTIME":"2026-07-22 11:47:08",...}}
-    // Need to extend ENDTIME, set END=0, OPEN=1, but keep all other fields
+    // --- judgeAppInfoApi (BOTH environments) ---
+    // 只做 ENDTIME 扩展 + END/OPEN 字段 patch，保留其他字段
     else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.130: Format: judgeAppInfoApi (smart ENDTIME patch)");
-        // Only patch ENDTIME, END, OPEN — keep id, COUNT, MAXLIMIT, CERTID, etc.
-        // Replace any ENDTIME value with 2027-12-31
+        DLOG(@"[SIGN-BYPASS] v37.141: Format: judgeAppInfoApi (smart ENDTIME patch, keep other fields)");
         NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
         if (start.location != NSNotFound) {
             NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
@@ -1801,34 +1839,78 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         }
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        didPatch = YES;
     }
     // --- postAppInfoApi / getAppInfoApi ---
-    // v37.137: V3's lnSignature.dylib returns {"code":1,"message":"OK"} (26B, NO data field).
-    // If we just change code:1→code:0, V3's GetApp tries to access data.ENDTIME → nil → SIGSEGV!
-    // FIX: Replace ENTIRE response with full structure including data field.
+    // v37.141: DIFFERENT BEHAVIOR BY ENVIRONMENT:
+    //   全能签 ENV: DON'T TOUCH body! 游戏会向 cert.qunhongtech.com 返回真实 data (含 sign/鉴权字段
+    //             篡改会导致服务器认为 EE121 签名无效 → 只返回心跳包 → 卡在登录中
+    //   V3 ENV: 完整替换响应 (因为 lnSignature.dylib 返回 code:1 或空 data.ENDTIME → 崩溃)
     else if ([url containsString:@"postAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.137: Format: postAppInfoApi (replace with full code:0)");
-        patchedResponse = @"{\"code\":0, \"message\":\"OK\"}";
+        if (g_isV3ResignEnv) {
+            DLOG(@"[SIGN-BYPASS] v37.141: V3 env → postAppInfoApi FULL replace {code:0}");
+            patchedResponse = @"{\"code\":0, \"message\":\"OK\"}";
+            didPatch = YES;
+        } else {
+            DLOG(@"[SIGN-BYPASS] v37.141: 全能签 env → postAppInfoApi SKIP body tamper (keep real sign data)");
+            // 只做 code:1→0 微调，如果 code 字段是 1 (表示失败) → 但保留所有其他字段
+            if ([patchedResponse containsString:@"\"code\":1"]) {
+                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+                didPatch = YES;
+            }
+            // 其他保持原始数据不动
+        }
     }
     else if ([url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.137: Format: getAppInfoApi (replace with FULL data structure)");
-        // V3's GetApp accesses data.ENDTIME — MUST include complete data object!
-        patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CENDDATE\":null,\"EMAIL\":null,\"EFLAG\":0,\"DAYS\":null,\"CERTID\":1,\"CERTNAME\":null,\"LIMITGAP\":null,\"TIP\":0,\"REMARK\":null,\"NET\":null}}";
+        if (g_isV3ResignEnv) {
+            DLOG(@"[SIGN-BYPASS] v37.141: V3 env → getAppInfoApi FULL replace with data.ENDTIME etc.");
+            patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CENDDATE\":null,\"EMAIL\":null,\"EFLAG\":0,\"DAYS\":null,\"CERTID\":1,\"CERTNAME\":null,\"LIMITGAP\":null,\"TIP\":0,\"REMARK\":null,\"NET\":null}}";
+            didPatch = YES;
+        } else {
+            DLOG(@"[SIGN-BYPASS] v37.141: 全能签 env → getAppInfoApi SKIP body tamper (keep real sign data)");
+            // 全能签环境: 只做 ENDTIME 扩展 + END/OPEN + code:1→0 微调，如果需要
+            if ([patchedResponse containsString:@"\"code\":1"]) {
+                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+                didPatch = YES;
+            }
+            // ENDTIME 扩展
+            NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
+            if (start.location != NSNotFound) {
+                NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
+                if (endQuote.location != NSNotFound) {
+                    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:
+                        [patchedResponse substringWithRange:NSMakeRange(start.location + start.length, endQuote.location - start.location - start.length)]
+                        withString:@"2027-12-31 23:59:59"];
+                    didPatch = YES;
+                }
+            }
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        }
     }
     // --- Fallback: generic cert endpoint ---
     else {
-        DLOG(@"[SIGN-BYPASS] v37.130: Format: GENERIC fallback (smart patch)");
+        DLOG(@"[SIGN-BYPASS] v37.141: Format: GENERIC fallback (smart field patch)");
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        didPatch = YES;
+    }
+    
+    if (!didPatch && g_isV3ResignEnv) {
+        // V3 环境但没匹配到具体格式 → 至少做 code:1→0 和 ENDTIME 通用修补
+        if ([patchedResponse containsString:@"\"code\":1"]) {
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+            didPatch = YES;
+        }
     }
     
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
-    DLOG(@"[SIGN-BYPASS] v37.130: Patched body: %@", patchedResponse);
-    DLOG(@"[SIGN-BYPASS] v37.130: Response len=%lu", (unsigned long)patchedData.length);
+    DLOG(@"[SIGN-BYPASS] v37.141: Patched=%d body: %@", (int)didPatch, patchedResponse);
+    DLOG(@"[SIGN-BYPASS] v37.141: Response len=%lu", (unsigned long)patchedData.length);
     
     return patchedData;
 }
@@ -5202,6 +5284,37 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
                     DLOG(@"[EE121-ORIG] v37.62: origLen=%zu tail80B: %@", len, tailHex);
                 }
+                // v37.140 DIAG: Dump FULL original EE121 TLV structure for comparison with rebuilt
+                {
+                    NSMutableString *tlvDump = [NSMutableString stringWithCapacity:300];
+                    size_t to = 12;
+                    int tlvIdx = 0;
+                    while (to + 2 < len) {
+                        uint16_t tl = ((uint16_t)p[to]<<8) | p[to+1];
+                        if (to + 2 + tl > len) {
+                            [tlvDump appendFormat:@"[TLV#%d@%zu] len=%u OUT_OF_RANGE_ABORT (remain=%zu)", tlvIdx, to, (unsigned)tl, len-to];
+                            break;
+                        }
+                        NSString *valStr;
+                        if (tl <= 40) {
+                            valStr = [[NSString alloc] initWithBytes:p+to+2 length:tl encoding:NSUTF8StringEncoding];
+                            if (!valStr) {
+                                NSMutableString *hx = [NSMutableString stringWithCapacity:tl*3];
+                                for (size_t k = 0; k < tl; k++) [hx appendFormat:@"%02X ", p[to+2+k]];
+                                valStr = hx;
+                            }
+                        } else {
+                            NSMutableString *hx = [NSMutableString stringWithCapacity:48];
+                            for (size_t k = 0; k < 16; k++) [hx appendFormat:@"%02X ", p[to+2+k]];
+                            valStr = [NSString stringWithFormat:@"%@...(len=%u)", hx, (unsigned)tl];
+                        }
+                        [tlvDump appendFormat:@"[TLV#%d@%zu] %uB: %@  ", tlvIdx, to, (unsigned)tl, valStr];
+                        tlvIdx++;
+                        to += 2 + tl;
+                    }
+                    DLOG(@"[EE121-ORIG-DIAG] v37.140: ORIG TLV structure (%d TLVs, pktLen=%zu, end@%zu / diff=%zd):\n    %@",
+                         tlvIdx, len, to, (ssize_t)len - (ssize_t)to, tlvDump);
+                }
 
                 // v37.62: Conditional EE121 sending based on CC_MD5 channel replacement.
                 // If CC_MD5 hook replaced "DY_MIESHI"→"DYanyou0040_MIESHI" in hash1/hash3
@@ -5626,6 +5739,47 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                             DLOG(@"[EE121-HASH1] v37.140: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
                             DLOG(@"[EE121-HASH3] v37.140: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
+                        }
+                        // v37.140 DIAG: Dump FULL rebuilt EE121-CANON hex (first 200 bytes) so we can compare TLV structure vs EE121-ORIG 213B
+                        // Currently only EE007-ALIGN's first 100B is dumped, but EE121-CANON OVERWRITES newBuf afterwards!
+                        {
+                            NSMutableString *diagHex = [NSMutableString stringWithCapacity:600];
+                            size_t diagLen = rebuildOut < 200 ? rebuildOut : 200;
+                            for (size_t i = 0; i < diagLen; i++) {
+                                [diagHex appendFormat:@"%02X ", newBuf[i]];
+                                if ((i+1) % 32 == 0 && i+1 < diagLen) [diagHex appendString:@"\n    "];
+                            }
+                            DLOG(@"[EE121-CANON-DIAG] v37.140: FULL first%zub of CANON pkt (pktLen=%u):\n    %@",
+                                 diagLen, (unsigned)rebuildOut, diagHex);
+                            // Also print all TLVs for structural comparison
+                            NSMutableString *tlvDump = [NSMutableString stringWithCapacity:300];
+                            size_t to = 12;
+                            int tlvIdx = 0;
+                            while (to + 2 < rebuildOut) {
+                                uint16_t tl = ((uint16_t)newBuf[to]<<8) | newBuf[to+1];
+                                if (to + 2 + tl > rebuildOut) {
+                                    [tlvDump appendFormat:@"[TLV#%d@%zu] len=%u OUT_OF_RANGE_ABORT", tlvIdx, to, (unsigned)tl];
+                                    break;
+                                }
+                                NSString *valStr;
+                                if (tl <= 40) {
+                                    valStr = [[NSString alloc] initWithBytes:newBuf+to+2 length:tl encoding:NSUTF8StringEncoding];
+                                    if (!valStr) {
+                                        NSMutableString *hx = [NSMutableString stringWithCapacity:tl*3];
+                                        for (size_t k = 0; k < tl; k++) [hx appendFormat:@"%02X ", newBuf[to+2+k]];
+                                        valStr = hx;
+                                    }
+                                } else {
+                                    NSMutableString *hx = [NSMutableString stringWithCapacity:48];
+                                    for (size_t k = 0; k < 16; k++) [hx appendFormat:@"%02X ", newBuf[to+2+k]];
+                                    valStr = [NSString stringWithFormat:@"%@...(len=%u)", hx, (unsigned)tl];
+                                }
+                                [tlvDump appendFormat:@"[TLV#%d@%zu] %uB: %@  ", tlvIdx, to, (unsigned)tl, valStr];
+                                tlvIdx++;
+                                to += 2 + tl;
+                            }
+                            DLOG(@"[EE121-CANON-DIAG] v37.140: TLV structure (%d TLVs, end@%zu / pktLen=%u):\n    %@",
+                                 tlvIdx, to, (unsigned)rebuildOut, tlvDump);
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
@@ -11265,6 +11419,9 @@ static void installAllHooks(void) {
         DLOG(@"[GLOBALS-INIT] v37.88: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
     }
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
+
+    // v37.141: Environment detection FIRST — decide if 全能签 (no V3 hooks) or V3自签分发 (full hooks)
+    detectInjectionEnv();
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
     // hook installation. This is the ROOT fix — L0-L3 fishhook hooks are dead
