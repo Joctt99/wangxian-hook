@@ -5586,28 +5586,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
                         // --- hash1/hash2/hash3 block ---
                         // v37.140 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
-                        // Evidence chain:
-                        //   v37.134 EE121-CANON:  hash1/hash2/hash3 ALL copied from original packet
-                        //                       → 全能签 登录 SUCCESS ✅
-                        //   v37.137 (on top of v37.134 EE121 code + LCNetworking fixes):
-                        //                       → 全能签 登录 SUCCESS ✅
-                        //   v37.138/139:  hash2 = MD5(rebuilt_body_range_guess)
-                        //                 (6 ranges probed, NONE matched original hash2)
-                        //                       → 全能签 卡登录 ❌
-                        // CONCLUSION: hash2 computation is NOT MD5(any contiguous byte range).
-                        // It might be MD5(non-contiguous TLV values only, stripping TLV headers),
-                        // or MD5(some sorted-canonicalized field set), or HMAC — we don't know.
-                        // BUT: we KNOW preserving the ORIGINAL hash2 value works.
-                        // Server appears to only validate hash1/hash3 (CC_MD5(token) pair).
-                        // hash2 is likely a client-side integrity check that the server ignores,
-                        // or hash2 validation was disabled server-side for backward compatibility.
+                        // Declare h1/h2/h3 OUTSIDE brace scope so tail DLOG can access them.
+                        uint32_t h1 = 0, h2 = 0, h3 = 0;
                         {
                             // Step 1: Extract hash1/hash2/hash3 raw bytes from original packet.
                             unsigned char hash1Val[16];
                             unsigned char hash3Val[16];
                             char origHash2Hex[33];
                             // Scan original packet TLV offsets
-                            uint32_t h1 = 0, h2 = 0, h3 = 0;
                             for (size_t sp = 12; sp + 2 + 16 <= len; ) {
                                 uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
                                 if (sp + 2 + sl > len) break;
