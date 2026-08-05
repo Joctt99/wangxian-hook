@@ -1286,7 +1286,7 @@ static void installLCNetworkingHooks(void) {
         Method getAppM = class_getClassMethod(sigCheckCls, getAppSel);
         if (getAppM) {
             IMP origGetApp = method_getImplementation(getAppM);
-            IMP safeGetApp = imp_implementationWithBlock(^(id self) {
+            IMP safeGetApp = imp_implementationWithBlock(^id(id self) {
                 @try {
                     id result = ((id(*)(id, SEL))origGetApp)(self, getAppSel);
                     if (result) {
