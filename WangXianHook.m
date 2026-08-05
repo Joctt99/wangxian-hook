@@ -801,7 +801,10 @@ static void signalHandler(int sig) {
 }
 
 static void setupSignalHandlers(void) {
-    signal(SIGABRT, signalHandler);
+    // v37.117: SIGABRT DISABLED — intercepting SIGABRT masks the real C++ exception
+    // cause (std::terminate). Let it propagate naturally so the system crash log
+    // shows the actual C++ exception type and what caused the widgetSelected crash.
+    // signal(SIGABRT, signalHandler);
     signal(SIGSEGV, signalHandler);
     signal(SIGILL, signalHandler);
     signal(SIGBUS, signalHandler);
@@ -846,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.116-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.117-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -3910,6 +3913,18 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
 
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    
+    // v37.117: When game server connection is closed (user returns from role page),
+    // reset ALL per-connection state IMMEDIATELY. Previously we only reset on connect(),
+    // but the game might corrupt internal state between close() and the next connect().
+    // This matches the pattern: user enters game → returns to server → close() called
+    // → we reset state → next connect() gets clean hooks.
+    if (g_gameServerFd == fd) {
+        DLOG(@"[CLOSE-RESET] Game server fd %d closed → resetting per-connection state", fd);
+        g_gameServerConnected = NO;
+        g_gameServerFd = -1;
+        resetGameStateForReconnect();
+    }
     
     // v36.97: Also block close for fake response fd
     // v36.136: Check g_fakeRespFd (not g_fakeRespInjected) so close is blocked
@@ -10655,7 +10670,12 @@ static void installAllHooks(void) {
     // The hook functions remain defined above for reference, but are NOT installed.
     _log(@"[INIT] v37.116: SignatureKit hooks REMOVED (no orig IMP calls = no SIGBUS)");
 
-    // === KEEP: SignatureCheck hooks (in capture_real.js) ===
+    // === v37.117: SignatureCheck hooks TEMPORARILY DISABLED ===
+    // These hooks (JudgeApp, showTipViewEND, exitApplication) block/suppress signature
+    // check UI. They may be interfering with the return-from-role-page flow.
+    // Disabling them to determine if they cause the SIGABRT in widgetSelected.
+    _log(@"[INIT] v37.117: SignatureCheck hooks DISABLED (diagnostic)");
+#if 0
     Class scCls = NSClassFromString(@"SignatureCheck");
     if (scCls) {
         Class metaCls = object_getClass(scCls);
@@ -10678,6 +10698,7 @@ static void installAllHooks(void) {
     } else {
         _log(@"[INIT] WARNING: SignatureCheck NOT found!");
     }
+#endif
 
     _log(@"[INIT] v37.14: Socket hooks + NETIMPL hooks (crypto hooks disabled to prevent crash)");
 
