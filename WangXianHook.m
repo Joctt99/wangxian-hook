@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.117-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.119-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2916,13 +2916,8 @@ static void __attribute__((noinline)) tryHookMieshiServerInfo(int attempt) {
             return;
         }
 
-        if (attempt < 3) {
-            double delays[] = {2.0, 5.0, 10.0};
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                tryHookMieshiServerInfo(attempt + 1);
-            });
-        }
     }
+    // v37.118: MSI retry loop DISABLED — no more MSI hooks needed
 }
 
 #pragma mark - Deep Diagnostics (trace server list display)
@@ -3768,6 +3763,8 @@ static BOOL tryNextServer(void) {
     DLOG(@"[SERVER-ROTATE] v36.101: Reset fake response state for new connection");
     
     // Update stub data
+    // v37.119: MSI hooks are DISABLED (no MSI init hook installs g_msiStubData).
+    // This block is a no-op, but kept guarded so it's safe if MSI is ever re-enabled.
     if (g_msiStubData) {
         [g_msiStubData setObject:[NSString stringWithUTF8String:g_gameServerIP] forKey:@"ip"];
         [g_msiStubData setObject:@(12003) forKey:@"port"];  // Force 12003 in stub too
@@ -4678,7 +4675,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             size_t dmOff = (size_t)-1; // deviceModel TLV
             size_t gpOff = (size_t)-1; // GPU TLV
             size_t accOff = (size_t)-1; // v37.77: accountId TLV (20-digit numeric)
-            static const char kCanonAccIdEE007[] = "65657881045335015151"; // 20 bytes
+            // v37.119: REMOVED kCanonAccIdEE007 — no longer used; accId is passed through as-is.
             while (off + 2 < len) {
                 uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
                 if (off + 2 + fLen > len) break;
@@ -4807,11 +4804,22 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             uint16_t accLen = ((uint16_t)p[12]<<8) | p[13];
                             if (accLen == 20 && 14+20 <= len) {
                                 memcpy(realAccId, p+14, 20); realAccId[20]=0;
-                            } else {
-                                memcpy(realAccId, "26908076555292905058", 20);
                             }
-                        } else {
-                            memcpy(realAccId, "26908076555292905058", 20);
+                        }
+                        // v37.119: If accId TLV parse failed, scan body for 20-digit numeric field
+                        // instead of falling back to a hardcoded accId (which would cause
+                        // other users to enter wrong roles).
+                        if (realAccId[0] == 0 && len >= 40) {
+                            for (const unsigned char *scan = p+14; scan + 20 <= p+len; scan++) {
+                                BOOL allDigits = YES;
+                                for (int k = 0; k < 20; k++) {
+                                    if (scan[k] < '0' || scan[k] > '9') { allDigits = NO; break; }
+                                }
+                                if (allDigits) {
+                                    memcpy(realAccId, scan, 20); realAccId[20] = 0;
+                                    break;
+                                }
+                            }
                         }
                         // Extract REAL user/pass from original packet (same as clean client).
                         char realUser[32]  = {0}; uint16_t realUserLen  = 5;
@@ -10477,7 +10485,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.116-DIST SILENT_MODE=%d %d layers active (v37.116: SignatureKit hooks REMOVED — no stale IMP pointers = no SIGBUS. v37.115: restore orig+@try. v37.114: STUBBED→SIGABRT. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.119-DIST SILENT_MODE=%d %d layers active (v37.119: hardcoded accId fallback removed, dynamic 20-digit scan instead. v37.118: MSI hooks DISABLED — root cause of SIGABRT on return. v37.117: state reset on close(). v37.116: SignatureKit hooks REMOVED. v37.115: restore orig+@try. v37.114: STUBBED. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10650,8 +10658,14 @@ static void installAllHooks(void) {
     // v37.13: RESTORE proactive C++ function patches
     proactivePatchCppFunctions();
 
-    // v37.13: RESTORE MSI retry
-    tryHookMieshiServerInfo(0);
+    // v37.119: MSI hooks DISABLED + hardcoded accId fallback removed.
+    // v37.118: MSI hooks DISABLED — they caused SIGABRT in widgetSelected on return from role page.
+    // ROOT CAUSE: g_msiStubData is a SINGLE global dictionary shared by ALL ServerInfoForClient objects.
+    // When custom_recv updates it with game server IP/port, ALL servers in the list show the same data.
+    // This corrupts the game's server selection state machine → C++ std::terminate on click.
+    // Fix: Do NOT install any MSI hooks. Let ServerInfoForClient use its native implementation.
+    // The port rewriting in connect() handles the actual connection to game server port 12003.
+    _log(@"[INIT] v37.119: MSI hooks DISABLED + hardcoded accId fallback REMOVED (root cause of SIGABRT + wrong-role)");
 
     // === KEEP: UIAlertView.show hook (in capture_real.js) ===
 #pragma clang diagnostic push
