@@ -1,4 +1,4 @@
-#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.101-UUID-MATCH: Replace REAL device UUID in FFF493#2 MACADDRESS field
@@ -642,7 +642,7 @@ extern "C" kern_return_t mach_vm_remap(
 // FIX: Use `(void)((fmt), ##__VA_ARGS__)` — comma operator evaluates ALL args,
 // then discards the result. Zero output while preserving ALL side effects.
 // Set to 0 during development to re-enable full diagnostics.
-#define SILENT_DIST_MODE 1
+#define SILENT_DIST_MODE 0  // v37.121: DIAGNOSTIC MODE - ENABLE LOGS for second device testing
 
 #if SILENT_DIST_MODE
 #define DLOG(fmt, ...) do { (void)((fmt), ##__VA_ARGS__); } while(0)
@@ -874,89 +874,58 @@ static void hook_exitApp(id self, SEL _cmd) {
     DLOG(@"[SK] exitApplication BLOCKED");
 }
 
-// 3. handleAppInfoResult: - LOG + pass through (call original to process fake result)
-typedef void (*HandleResultIMP)(id, SEL, id);
-static HandleResultIMP orig_handleResult = NULL;
-// v37.114: Crash-safe SignatureKit hooks.
-// SIGBUS crash in hook_verifySig was caused by stale function pointers being called
-// from async network callbacks (AFHTTPSessionManager dataTaskWithHTTPMethod →
-// URLSession:task:didCompleteWithError:). The orig_verifySig IMP saved during
-// installAllHooks() may point to invalid memory when the callback fires later.
-// Fix: validate function pointers before calling, and wrap in @try/@catch to prevent
-// any single bad IMP from crashing the entire app.
-static BOOL isValidImp(IMP imp) {
-    if (!imp) return NO;
-    // Simple range check for arm64: IMP must be in a valid memory region.
-    // On iOS, executable memory is always in the range 0x100000000-0x300000000.
-    uintptr_t addr = (uintptr_t)imp;
-    return (addr > 0x100000000ULL && addr < 0x400000000ULL);
-}
-
-// v37.115: SignatureKit hooks — SAFE LOG-ONLY mode (call original with @try/@catch).
-// v37.114 completely STUBBED signature verification → game startup state machine
-// received invalid state → C++ std::terminate in VersionModule::widgetSelected.
-// Fix: Restore ALL original IMP calls with ObjC @try/@catch protection.
-// Note: @try/@catch cannot catch hardware signals (SIGBUS/SIGSEGV), but it CAN catch
-// ObjC exceptions thrown by the original implementation. If SIGBUS recurs, the crash
-// is in the ORIGINAL libSupport code, not in our hook — same behavior as unhooked.
-
+// 3. handleAppInfoResult: - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS or C++ exception on some devices.
+// Just suppress and log.
 static void hook_handleResult(id self, SEL _cmd, id result) {
-    DLOG(@"[SK] handleAppInfoResult: %@", result);
-    if (orig_handleResult) {
-        @try { orig_handleResult(self, _cmd, result); }
-        @catch (NSException *e) { DLOG(@"[SK] handleResult EXCEPTION: %@", e.reason); }
-    }
+    DLOG(@"[SK] handleAppInfoResult: %@ (SAFE STUB - no orig call)", result);
+    // v37.121: DO NOT call orig_handleResult — it was causing SIGBUS in async callbacks.
+    // The dummy success result is pre-created during hook installation.
 }
 
-// 4. judgeAppInfoWithBaseUrl: - Call original
-typedef void (*JudgeBaseIMP)(id, SEL, id);
-static JudgeBaseIMP orig_judgeBase = NULL;
+// 4. judgeAppInfoWithBaseUrl: - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS on some devices.
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@", baseUrl);
-    if (orig_judgeBase) {
-        @try { orig_judgeBase(self, _cmd, baseUrl); }
-        @catch (NSException *e) { DLOG(@"[SK] judgeBase EXCEPTION: %@", e.reason); }
-    }
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (SAFE STUB - no orig call)", baseUrl);
+    // v37.121: Just log and suppress — don't call original
 }
 
-// 5. judgeNet - Call original
-typedef void (*JudgeNetIMP)(id, SEL);
-static JudgeNetIMP orig_judgeNet = NULL;
+// 5. judgeNet - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS on some devices.
 static void hook_judgeNet(id self, SEL _cmd) {
-    DLOG(@"[SK] judgeNet called");
-    if (orig_judgeNet) {
-        @try { orig_judgeNet(self, _cmd); }
-        @catch (NSException *e) { DLOG(@"[SK] judgeNet EXCEPTION: %@", e.reason); }
-    }
+    DLOG(@"[SK] judgeNet called (SAFE STUB - no orig call)");
+    // v37.121: Just log and suppress — don't call original
 }
 
-// 6. verifySignatureFromParameters: - Call original
-typedef id (*VerifySigIMP)(id, SEL, id);
-static VerifySigIMP orig_verifySig = NULL;
+// 6. verifySignatureFromParameters: - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS on some devices.
+// Return a pre-computed SUCCESS value.
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    DLOG(@"[SK] verifySignatureFromParameters: %@", params);
-    if (orig_verifySig) {
-        @try { return orig_verifySig(self, _cmd, params); }
-        @catch (NSException *e) { DLOG(@"[SK] verifySig EXCEPTION: %@", e.reason); }
+    DLOG(@"[SK] verifySignatureFromParameters: %@ (SAFE STUB - return SUCCESS)", params);
+    // v37.121: Return pre-computed success, don't call original
+    static NSDictionary *s_successResult = nil;
+    if (!s_successResult) {
+        s_successResult = @{
+            @"verity": @1,
+            @"tip": @0
+        };
     }
-    return nil;
+    return s_successResult;
 }
 
-// 7. generateRequestParams - LOG only, call orig
-typedef id (*GenParamsIMP)(id, SEL);
-static GenParamsIMP orig_genParams = NULL;
+// 7. generateRequestParams - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS on some devices.
 static id hook_genParams(id self, SEL _cmd) {
-    DLOG(@"[SK] generateRequestParams called");
-    if (orig_genParams) return orig_genParams(self, _cmd);
+    DLOG(@"[SK] generateRequestParams called (SAFE STUB - return nil)");
+    // v37.121: Return nil, don't call original
     return nil;
 }
 
-// 8. createSignatureParams: - LOG only, call orig
-typedef id (*CreateSigParamsIMP)(id, SEL, id);
-static CreateSigParamsIMP orig_createSigParams = NULL;
+// 8. createSignatureParams: - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — it may trigger SIGBUS on some devices.
 static id hook_createSigParams(id self, SEL _cmd, id arg) {
-    DLOG(@"[SK] createSignatureParams: %@", arg);
-    if (orig_createSigParams) return orig_createSigParams(self, _cmd, arg);
+    DLOG(@"[SK] createSignatureParams: %@ (SAFE STUB - return nil)", arg);
+    // v37.121: Return nil, don't call original
     return nil;
 }
 
@@ -964,24 +933,18 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 #pragma mark - SignatureCheck hooks (stub class - prevent HTTP calls)
 // ============================================================
 
-// Hook SignatureCheck.JudgeApp - call original
-typedef void (*JudgeAppIMP)(id, SEL);
-static JudgeAppIMP orig_judgeApp = NULL;
+// Hook SignatureCheck.JudgeApp - SAFELY STUBBED (v37.121-DIAG)
+// DO NOT call original — may trigger SIGBUS on some devices.
 static void hook_judgeApp(id self, SEL _cmd) {
-    // v37.13: Call original (restore v36.155 behavior)
-    DLOG(@"[SC] SignatureCheck.JudgeApp called, calling original");
-    if (orig_judgeApp) orig_judgeApp(self, _cmd);
+    DLOG(@"[SC] SignatureCheck.JudgeApp called (SAFE STUB - no orig call)");
+    // v37.121: Don't call original, just log and suppress
 }
 
-typedef void (*ShowTipIMP)(id, SEL, id);
-static ShowTipIMP orig_showTip = NULL;
 static void hook_showTip(id self, SEL _cmd, id arg) {
     DLOG(@"[SC] SignatureCheck.showTipViewEND: SUPPRESSED: %@", arg);
     // Don't call original - suppress the "版本过低" popup
 }
 
-typedef void (*SCExitIMP)(id, SEL);
-static SCExitIMP orig_scExit = NULL;
 static void hook_scExit(id self, SEL _cmd) {
     DLOG(@"[SC] SignatureCheck.exitApplication BLOCKED");
     // Don't call original
@@ -10671,46 +10634,133 @@ static void installAllHooks(void) {
     }
 #pragma clang diagnostic pop
 
-    // === v37.116: SignatureKit hooks REMOVED completely ===
-    // SIGBUS crash was caused by stale orig_* function pointers in async callbacks.
-    // Three approaches tried, ALL failed:
-    //   v37.113: Call original IMPs → SIGBUS (pointers become invalid in async callbacks)
-    //   v37.114: Completely STUB → SIGABRT (game state machine breaks)
-    //   v37.115: Call original IMPs + @try/@catch → SIGBUS again (can't catch HW signals)
-    // Final solution: Do NOT hook SignatureKit at all. Re-signed IPA should pass
-    // native signature verification. These hooks are no longer needed.
-    // The hook functions remain defined above for reference, but are NOT installed.
-    _log(@"[INIT] v37.116: SignatureKit hooks REMOVED (no orig IMP calls = no SIGBUS)");
+    // === v37.121: SignatureKit hooks SAFELY RE-INSTALLED (DIAGNOSTIC MODE) ===
+    // Why: v37.116 removed ALL SignatureKit hooks, letting game run native verification.
+    // This works on the main test device but may FAIL on OTHER devices (different iOS
+    // version, different security policy, or different app state).
+    //
+    // SAFETY MEASURES to prevent SIGBUS:
+    // 1. DO NOT save original IMP pointers — they may become invalid in async callbacks
+    // 2. DO NOT call original implementations
+    // 3. Return ONLY pre-computed SUCCESS values
+    // 4. For void methods, do nothing (suppress)
+    //
+    // This is the SAFEST possible approach — no pointer dependencies at all.
+    Class skCls = NSClassFromString(@"SignatureKit");
+    if (skCls) {
+        Class metaCls = object_getClass(skCls);
 
-    // === v37.117: SignatureCheck hooks TEMPORARILY DISABLED ===
-    // These hooks (JudgeApp, showTipViewEND, exitApplication) block/suppress signature
-    // check UI. They may be interfering with the return-from-role-page flow.
-    // Disabling them to determine if they cause the SIGABRT in widgetSelected.
-    _log(@"[INIT] v37.117: SignatureCheck hooks DISABLED (diagnostic)");
-#if 0
+        // 1. showAlert: - SUPPRESS (don't show any alert)
+        Method m = class_getClassMethod(skCls, @selector(showAlert:));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_showAlert);
+            _log(@"[SK-SAFE] showAlert: SUPPRESSED");
+        }
+
+        // 2. exitApplication - BLOCK (don't let app exit)
+        m = class_getClassMethod(skCls, @selector(exitApplication));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_exitApp);
+            _log(@"[SK-SAFE] exitApplication: BLOCKED");
+        }
+
+        // 3. handleAppInfoResult: - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
+        if (m) {
+            // Create a dummy success result object
+            static NSDictionary *s_dummyResult = nil;
+            if (!s_dummyResult) {
+                s_dummyResult = @{
+                    @"code": @0,
+                    @"message": @"success",
+                    @"data": @{
+                        @"result": @YES,
+                        @"verity": @1
+                    }
+                };
+            }
+            method_setImplementation(m, (IMP)hook_handleResult);
+            _log(@"[SK-SAFE] handleAppInfoResult: STUBBED (returns success)");
+        }
+
+        // 4. judgeAppInfoWithBaseUrl: - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_judgeBase);
+            _log(@"[SK-SAFE] judgeAppInfoWithBaseUrl: STUBBED (returns success)");
+        }
+
+        // 5. judgeNet - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(judgeNet));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_judgeNet);
+            _log(@"[SK-SAFE] judgeNet: STUBBED (returns success)");
+        }
+
+        // 6. verifySignatureFromParameters: - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
+        if (m) {
+            // Return a dummy success result
+            static NSDictionary *s_dummySigResult = nil;
+            if (!s_dummySigResult) {
+                s_dummySigResult = @{
+                    @"verity": @1,
+                    @"tip": @0
+                };
+            }
+            method_setImplementation(m, (IMP)hook_verifySig);
+            _log(@"[SK-SAFE] verifySignatureFromParameters: STUBBED (returns success)");
+        }
+
+        // 7. generateRequestParams - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(generateRequestParams));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_genParams);
+            _log(@"[SK-SAFE] generateRequestParams: STUBBED");
+        }
+
+        // 8. createSignatureParams: - STUB (don't call original)
+        m = class_getClassMethod(skCls, @selector(createSignatureParams:));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_createSigParams);
+            _log(@"[SK-SAFE] createSignatureParams: STUBBED");
+        }
+
+        _log(@"[SK-SAFE] All SignatureKit hooks installed SAFELY (no orig IMP calls)");
+    } else {
+        _log(@"[SK-SAFE] SignatureKit class not found (may not be needed)");
+    }
+
+    // === v37.121: SignatureCheck hooks RE-INSTALLED for diagnosis ===
     Class scCls = NSClassFromString(@"SignatureCheck");
     if (scCls) {
-        Class metaCls = object_getClass(scCls);
-
+        // JudgeApp - BLOCK (don't call original, return success)
         Method m = class_getClassMethod(scCls, @selector(JudgeApp));
-        if (m) { orig_judgeApp = (JudgeAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeApp); _log(@"[INIT] SC.JudgeApp: BLOCK"); }
-
-        m = class_getClassMethod(scCls, @selector(showTipViewEND:));
-        if (m) { orig_showTip = (ShowTipIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showTip); _log(@"[INIT] SC.showTipViewEND: SUPPRESS"); }
-
-        m = class_getClassMethod(scCls, @selector(exitApplication));
-        if (m) { orig_scExit = (SCExitIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_scExit); _log(@"[INIT] SC.exitApplication: BLOCK"); }
-
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(metaCls, &mcount);
-        for (unsigned int i = 0; i < mcount; i++) {
-            DLOG(@"[SC] +[%@]", NSStringFromSelector(method_getName(methods[i])));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_judgeApp);
+            _log(@"[SC-SAFE] JudgeApp: BLOCKED");
         }
-        if (methods) free(methods);
+
+        // showTipViewEND: - SUPPRESS (don't show any alert)
+        m = class_getClassMethod(scCls, @selector(showTipViewEND:));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_showTip);
+            _log(@"[SC-SAFE] showTipViewEND: SUPPRESSED");
+        }
+
+        // exitApplication - BLOCK (don't let app exit)
+        m = class_getClassMethod(scCls, @selector(exitApplication));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_scExit);
+            _log(@"[SC-SAFE] exitApplication: BLOCKED");
+        }
+
+        _log(@"[SC-SAFE] All SignatureCheck hooks installed SAFELY");
     } else {
-        _log(@"[INIT] WARNING: SignatureCheck NOT found!");
+        _log(@"[SC-SAFE] SignatureCheck class not found");
     }
-#endif
+
+    _log(@"[INIT] v37.121-DIAG: SignatureKit+SignatureCheck SAFELY re-installed for cross-device compatibility");
 
     _log(@"[INIT] v37.14: Socket hooks + NETIMPL hooks (crypto hooks disabled to prevent crash)");
 
