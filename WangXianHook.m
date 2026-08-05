@@ -886,7 +886,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.138-DIAG loaded (hash2=MD5(newBody) recompute fix) ===");
+        _log(@"=== WangXianHook v37.139-DIAG loaded (hash2 runtime probe + exact range match) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5606,25 +5606,150 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         //   devModel: pnng_res(7B) → Apple Inc. Apple A10 GPU(27B) etc.
                         // Original hash2 was MD5 of OLD body. Must re-MD5 with NEW body.
                         {
+                            // === Step 0: PROBE hash2 input boundary using ORIGINAL packet ===
+                            // Try different offset ranges and log which one matches ORIGINAL hash2.
+                            // This is a diagnostic probe to determine the EXACT byte range server uses.
+                            if (h2 != 0) {
+                                char origHash2Check[33] = {0};
+                                memcpy(origHash2Check, p+h2+2, 32);
+                                typedef unsigned char *(*RawCCMD5_Probe)(const void *, unsigned long, unsigned char *);
+                                static RawCCMD5_Probe s_probeMD5 = NULL;
+                                if (!s_probeMD5) s_probeMD5 = (RawCCMD5_Probe)dlsym(RTLD_DEFAULT, "CC_MD5");
+                                if (s_probeMD5) {
+                                    struct { int start; int end; const char *name; } ranges[] = {
+                                        { 12, (int)h3, "body[12..h3)" },
+                                        {  8, (int)h3, "hdr[8..h3)"  },
+                                        {  4, (int)h3, "hdr[4..h3)"  },
+                                        {  0, (int)h3, "hdr[0..h3)"  },
+                                        { 12, (int)h2, "body[12..h2)" },
+                                        {  4, (int)h2, "hdr[4..h2)"  },
+                                    };
+                                    unsigned char probeOut[16];
+                                    static const char kHexP[] = "0123456789abcdef";
+                                    char probeHex[33];
+                                    for (int ri = 0; ri < 6; ri++) {
+                                        if (ranges[ri].end <= ranges[ri].start) continue;
+                                        memset(probeOut, 0, 16);
+                                        s_probeMD5(p + ranges[ri].start, (unsigned long)(ranges[ri].end - ranges[ri].start), probeOut);
+                                        for (int hi = 0; hi < 16; hi++) {
+                                            probeHex[hi*2]   = kHexP[(probeOut[hi]>>4)&0xF];
+                                            probeHex[hi*2+1] = kHexP[probeOut[hi]&0xF];
+                                        }
+                                        probeHex[32] = 0;
+                                        int match = (memcmp(probeHex, origHash2Check, 32) == 0);
+                                        DLOG(@"[HASH2-PROBE] v37.139: %s len=%d → %@  orig=%s  %s",
+                                             ranges[ri].name,
+                                             ranges[ri].end - ranges[ri].start,
+                                             [NSString stringWithUTF8String:probeHex],
+                                             origHash2Check,
+                                             match ? @"✅ MATCH!" : @"-");
+                                    }
+                                }
+                            }
+
                             // === Step 1: Preserve ORIGINAL hash1/hash3 (CC_MD5(token) based) ===
                             unsigned char hash1Val[16];
                             unsigned char hash3Val[16];
                             if (h3) memcpy(hash3Val, p+h3+2, 16); else memset(hash3Val, 0, 16);
                             if (h1) memcpy(hash1Val, p+h1+2, 16); else memset(hash1Val, 0, 16);
-                            DLOG(@"[EE121-HASH] v37.138: Preserving ORIGINAL hash1/hash3 (=CC_MD5(token))");
+                            DLOG(@"[EE121-HASH] v37.139: Preserving ORIGINAL hash1/hash3 (=CC_MD5(token))");
 
-                            // === Step 2: Recompute hash2 as MD5 of NEW body (header 12B up to, but NOT including, the hash3 TLV we are about to write) ===
-                            // Body for hash2 MD5: newBuf[12 .. rebuildOut-1] (all TLVs: accId, user, pass, SQAGE, IOS, channel, devModel, GPU, UUID?, WIFI, 7.6.3, 979)
-                            // rebuildOut currently points right before where hash3 will be written → exactly the boundary.
-                            size_t hash2BodyStart = 12;
-                            size_t hash2BodyLen   = rebuildOut - hash2BodyStart;
+                            // === Step 2: Build hash2 candidate inputs for multiple ranges.
+                            // We will write the packet normally, then install post-send MD5 hook if needed,
+                            // but for now try hdr[4..rebuildOut] as a best guess based on probe results.
+                            size_t h2CandStart = 4;  // will be adjusted after probe
+                            size_t h2CandLen   = rebuildOut - h2CandStart;
+                            // Actually let's try multiple candidates and choose the one matching the
+                            // verification paradigm: use original pkt's h3 boundary as reference.
+                            // Original: hash2 range = [12 .. h3)   (h3 is offset of hash3 TLV in original pkt)
+                            // Rebuilt:  hash2 range = [12 .. rebuildOut)  (rebuildOut = offset just before writing hash3)
+                            // v37.138 used this range but with wrong boundary (12 not 4)
+                            // v37.139 try BOTH [12..rebuildOut) and [4..rebuildOut) since we have
+                            // the diagnostic probe to confirm after testing.
+                            // For NOW let's default to [12..rebuildOut) since that's what clean EE121 uses
+                            // in Frida traces of 7.60 (h2 = MD5 of body fields only, no header).
+                            // BUT: Actually we know from 7.60 Frida traces clean 170B path → h2 was
+                            // MD5(body fields) i.e. starting at offset 12. The channel 9B vs 18B difference
+                            // only affects the body region starting at 12. Let's default to [12..rebuildOut)
+                            // BUT add a FALLBACK: if the HASH2-PROBE above found a MATCH for range X,
+                            // use that EXACT same range for the rebuilt packet.
+                            size_t chosenStart = 12;  // default
+                            size_t chosenLen   = rebuildOut - chosenStart;
+                            // We can not dynamically read the probe log output here, so try both
+                            // ranges and log for offline selection via HASH2-PROBE results.
+                            // For build v37.139 we use PROBE-BASED approach: default [12..rebuildOut).
+                            h2CandStart = chosenStart;
+                            h2CandLen   = chosenLen;
+                            // === Step 2 DYNAMIC (after probe): Pick verified range for hash2 ===
+                            // Probe above logged which [start..end] in the ORIGINAL packet produced
+                            // a MD5 matching the original hash2. Now do EXACT same [start..end]
+                            // but on the REBUILT newBuf. The mapping is:
+                            //   Original: [12 .. h3)       → Rebuilt: [12 .. rebuildOut)
+                            //   Original: [4  .. h3)       → Rebuilt: [4  .. rebuildOut)
+                            //   Original: [12 .. h2)       → Rebuilt: [12 .. rebuildOut)
+                            //   Original: [4  .. h2)       → Rebuilt: [4  .. rebuildOut)
+                            // h3 in original marks START of hash3 TLV. rebuildOut in newBuf also
+                            // marks START of hash3 TLV. Same semantic position → same relative offset.
                             unsigned char md5Out[16];
                             memset(md5Out, 0, sizeof(md5Out));
                             typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
                             static RawCCMD5 s_rawMD5 = NULL;
                             if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                            // First do a run-time probe on ORIGINAL packet to find WHICH range is the TRUE one.
+                            // Then APPLY SAME range RELATIVE to hash3 TLV start → to rebuilt packet.
+                            // This probe is cached in static variable (once per process lifetime) so no overhead.
+                            static int s_verifiedStartDelta = -1;  // -1 = unprobed; 0 = startFrom=0, 8=startFrom=8, etc.
+                            static int s_verifiedEndToH3   = 0;   // 1 = end==h3 (hash3 TLV start), 0 = end==h2
+                            if (s_verifiedStartDelta < 0 && h2 != 0 && s_rawMD5) {
+                                // Determine range at runtime — exactly once
+                                int starts[] = {12, 8, 4, 0};
+                                int endIsH3[] = {1, 1, 1, 1, 0, 0};  // first 4 use h3 as end, next 2 use h2
+                                int sarr[] = {12, 8, 4, 0, 12, 4};  // same 6 ranges as probe above
+                                char origH2[33] = {0};
+                                memcpy(origH2, p+h2+2, 32);
+                                unsigned char pOut[16];
+                                char pHex[33];
+                                static const char kx[] = "0123456789abcdef";
+                                int hitIdx = -1;
+                                for (int ri = 0; ri < 6; ri++) {
+                                    int s = sarr[ri];
+                                    int e = endIsH3[ri] ? (int)h3 : (int)h2;
+                                    if (e <= s) continue;
+                                    memset(pOut, 0, 16);
+                                    s_rawMD5(p+s, (unsigned)(e-s), pOut);
+                                    for (int i = 0; i < 16; i++) {
+                                        pHex[i*2]   = kx[(pOut[i]>>4)&0xF];
+                                        pHex[i*2+1] = kx[pOut[i]&0xF];
+                                    }
+                                    pHex[32]=0;
+                                    if (memcmp(pHex, origH2, 32)==0) { hitIdx = ri; break; }
+                                }
+                                if (hitIdx >= 0) {
+                                    s_verifiedStartDelta = sarr[hitIdx];
+                                    s_verifiedEndToH3   = endIsH3[hitIdx];
+                                    DLOG(@"[HASH2-VERIFY] v37.139: ✅ Probe hit: range[%d] start=%d end_is_h3=%d", hitIdx, sarr[hitIdx], endIsH3[hitIdx]);
+                                } else {
+                                    // Fallback — default to [12..h3) (classic Frida 7.60)
+                                    s_verifiedStartDelta = 12;
+                                    s_verifiedEndToH3   = 1;
+                                    DLOG(@"[HASH2-VERIFY] v37.139: ⚠️  Probe NO HIT — fallback to start=12 end_is_h3=1");
+                                }
+                            }
+                            // Now apply the verified range to rebuilt packet.
+                            // Start offset is straightforward: s_verifiedStartDelta
+                            // End: if end_is_h3=1 → end = rebuildOut (hash3 TLV start in newBuf, same as h3 in orig)
+                            //      if end_is_h3=0 → end = rebuildOut+18+34 (skip hash3+hash2 TLV to get hash1 start, but h2 was hash2 start in orig. After rebuild hash2 TLV is at rebuildOut+18, so before-that = rebuildOut+18)
+                            size_t realStart = (s_verifiedStartDelta < 0) ? 12 : (size_t)s_verifiedStartDelta;
+                            size_t realEnd;
+                            if (s_verifiedEndToH3 == 1) realEnd = rebuildOut;                                    // before hash3 TLV
+                            else                        realEnd = rebuildOut + 18;                              // before hash2 TLV (hash3 already written in newBuf? No — we are BEFORE writing hash TLV now. rebuildOut = pre-hash position. hash2 TLV in newBuf would be at rebuildOut+18. So h2-equivalent pre-hash2 pos = rebuildOut + 18 (skip not-yet-written hash3)
+                            // Actually simpler: since we are pre-hash write, rebuildOut is where hash3 TLV starts (like h3). h2 in original was offset of hash2 TLV (= h3+18 in original). So rebuildOut+18 ≈ h2.
+                            if (realEnd <= realStart) { realStart = 12; realEnd = rebuildOut; }
+                            size_t realLen = realEnd - realStart;
+                            h2CandStart = realStart;
+                            h2CandLen   = realLen;
                             if (s_rawMD5) {
-                                s_rawMD5(newBuf + hash2BodyStart, (unsigned long)hash2BodyLen, md5Out);
+                                s_rawMD5(newBuf + h2CandStart, (unsigned long)h2CandLen, md5Out);
                             }
                             static const char kHex[] = "0123456789abcdef";
                             char newHash2Hex[33];
@@ -5633,8 +5758,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 newHash2Hex[hi*2+1] = kHex[md5Out[hi] & 0xF];
                             }
                             newHash2Hex[32] = 0;
-                            DLOG(@"[EE121-HASH2] v37.138: RECOMPUTED hash2=MD5(newBody%zub)=%s (oldHash2WasWrongForNewBody)",
-                                 (unsigned long)hash2BodyLen, newHash2Hex);
+                            DLOG(@"[EE121-HASH2] v37.139: RECOMPUTED hash2=MD5(newBuf[%zu..%zu)=%zub]=%s probeRange=start:%d endIsH3:%d",
+                                 h2CandStart, realEnd, (unsigned long)h2CandLen, newHash2Hex,
+                                 s_verifiedStartDelta, s_verifiedEndToH3);
 
                             // === Step 3: Write hash3 → hash2 → hash1 in native order ===
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
@@ -5649,8 +5775,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
 
-                            DLOG(@"[EE121-HASH1] v37.138: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
-                            DLOG(@"[EE121-HASH3] v37.138: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
+                            DLOG(@"[EE121-HASH1] v37.139: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
+                            DLOG(@"[EE121-HASH3] v37.139: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
                         }
                         // Final pktLen
                         uint32_t newPL = (uint32_t)rebuildOut;
