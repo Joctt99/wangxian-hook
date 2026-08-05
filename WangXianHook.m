@@ -1,6 +1,33 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v37.133: 2 ROOT CAUSE FIXES (登录网络中断)
+ *
+ * v37.133 ROOT CAUSE FIX 1 (EE121 server close connection after login):
+ *   Original EE121 packet = 213B, NO UUID TLV field. Rebuilt EE121-CANON was
+ *   UNCONDITIONALLY inserting 38B UUID (00 24 + 36B UUID) → 213+38=251 (was 248
+ *   due to other field changes). Server received malformed packet with unknown
+ *   field inserted → CLOSE connection immediately → "网络中断".
+ *   FIX: Scan original packet for UUID TLV first. Only insert UUID in rebuilt
+ *   packet if original packet ACTUALLY contained a UUID TLV. Otherwise SKIP.
+ *
+ * v37.133 ROOT CAUSE FIX 2 (HTTP status 500 not patched → signature check fail):
+ *   cert.qunhongtech.com returned HTTP 500 (TooManyResultsException). Previous
+ *   v37.131 patched status code in didReceiveResponse: delegate + completionHandler
+ *   ONLY. But AFNetworking often reads status code DIRECTLY from
+ *   dataTask.response property getter — which bypasses both. Status remained 500
+ *   → game treated signature verification as FAILED → "网络中断".
+ *   FIX: Hook NSURLSessionDataTask.response GETTER (lowest possible level).
+ *   Whenever anyone reads .response on a dataTask whose URL is signature-related,
+ *   status code 500→200 automatically. Guarantees patch regardless of access pattern.
+ *
+ * WangXianHook v37.132: Frameworks/ path compatibility for 全能签/锤子助手 injection
+ *
+ * v37.132 CHANGES (fixes dylib load failure in 全能签/锤子助手):
+ *   1. Makefile install_name changed from @executable_path/Dylibs/ to @executable_path/Frameworks/
+ *   2. LC_LOAD_DYLIB path uses same Frameworks/ directory
+ *   3. Compatible with ALL injection tools (全能签, 锤子助手, etc.)
+ *
  * WangXianHook v37.101-UUID-MATCH: Replace REAL device UUID in FFF493#2 MACADDRESS field
  *
  * v37.101 ROOT CAUSE FIX (服务器在收到FFF493#2后立即关闭连接):
@@ -849,7 +876,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.131-DIAG loaded (HTTP status code patching) ===");
+        _log(@"=== WangXianHook v37.133-DIAG loaded (EE121 UUID fix + HTTP status getter hook) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1689,9 +1716,38 @@ static void hook_urlSessionDidReceiveResponse(id self, SEL _cmd, NSURLSession *s
     }
 }
 
+// v37.133: Hook NSURLSessionDataTask.response getter to patch status code 500→200
+// at the LOWEST level — works regardless of delegate/completionHandler pattern.
+static IMP orig_dataTaskResponse = NULL;
+static NSURLResponse *hook_dataTaskResponse(id self, SEL _cmd) {
+    NSURLResponse *resp = orig_dataTaskResponse ? ((NSURLResponse*(*)(id,SEL))orig_dataTaskResponse)(self, _cmd) : nil;
+    if (!resp) return resp;
+    // Only patch for signature verification URLs
+    NSURLRequest *req = [(NSURLSessionTask *)self currentRequest];
+    NSString *url = req.URL.absoluteString;
+    if (url && isSignatureVerificationURL(url)) {
+        NSHTTPURLResponse *httpResp = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
+        if (httpResp && httpResp.statusCode != 200) {
+            DLOG(@"[SIGN-BYPASS] v37.133: response getter: Patching HTTP status %ld→200 for %@", (long)httpResp.statusCode, url);
+            NSMutableDictionary *patchedHeaders = [httpResp.allHeaderFields mutableCopy] ?: [NSMutableDictionary dictionary];
+            [patchedHeaders setObject:@"application/json" forKey:@"Content-Type"];
+            NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:httpResp.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:patchedHeaders];
+            return fakeResp;
+        }
+    }
+    return resp;
+}
+
 static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
     NSString *url = dataTask.currentRequest.URL.absoluteString;
     DLOG(@"[HTTP-DATA] urlSession:dataTask:didReceiveData: len=%zu url=%@", (unsigned long)[data length], url);
+    
+    // v37.133: Pre-emptively patch status code via dataTask.response if possible
+    // (hook_dataTaskResponse getter handles the actual patching automatically)
+    NSHTTPURLResponse *earlyResp = [(NSURLResponse *)dataTask.response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)dataTask.response : nil;
+    if (url && isSignatureVerificationURL(url) && earlyResp) {
+        DLOG(@"[HTTP-DATA] v37.133: dataTask.response status=%ld (patched via getter if needed)", (long)earlyResp.statusCode);
+    }
     
     // v37.122: Use unified signature bypass for ALL signature verification URLs
     if (url && isSignatureVerificationURL(url)) {
@@ -1814,6 +1870,58 @@ static void installNSURLSessionHooks(void) {
         free(classes);
         if (respHookedCount > 0) {
             DLOG(@"[INIT] URLSession:dataTask:didReceiveResponse: hooked on %d classes", respHookedCount);
+        }
+    }
+
+    // v37.133: Hook NSURLSessionDataTask.response getter — lowest-level HTTP status patch.
+    // AFNetworking may read status code from dataTask.response directly
+    // (bypassing both didReceiveResponse: delegate AND completionHandler callbacks).
+    // Hooking the getter ensures status 500→200 patch works no matter what pattern the client uses.
+    {
+        // Try multiple concrete class names (iOS internals vary by version)
+        const char *taskClsNames[] = {
+            "__NSCFLocalDataTask",
+            "__NSCFLNetworkDataTask",
+            "NSURLSessionDataTask",
+            "__NSCFURLSessionDataTask",
+            NULL
+        };
+        int getterHooked = 0;
+        for (int i = 0; taskClsNames[i] != NULL; i++) {
+            Class taskCls = NSClassFromString([NSString stringWithUTF8String:taskClsNames[i]]);
+            if (!taskCls) continue;
+            SEL respSel = @selector(response);
+            Method m = class_getInstanceMethod(taskCls, respSel);
+            if (m) {
+                IMP cur = method_getImplementation(m);
+                if (cur != (IMP)hook_dataTaskResponse) {
+                    orig_dataTaskResponse = cur;
+                    method_setImplementation(m, (IMP)hook_dataTaskResponse);
+                    DLOG(@"[HTTP-HOOK] v37.133: Hooked dataTask.response getter on class: %s", taskClsNames[i]);
+                    getterHooked = 1;
+                    break;
+                }
+            }
+        }
+        // Final fallback: try to hook on generic NSURLSessionTask (response property is declared there)
+        if (!getterHooked) {
+            Class taskCls = [NSURLSessionTask class];
+            SEL respSel = @selector(response);
+            Method m = class_getInstanceMethod(taskCls, respSel);
+            if (m) {
+                IMP cur = method_getImplementation(m);
+                if (cur != (IMP)hook_dataTaskResponse) {
+                    orig_dataTaskResponse = cur;
+                    method_setImplementation(m, (IMP)hook_dataTaskResponse);
+                    DLOG(@"[HTTP-HOOK] v37.133: Hooked NSURLSessionTask.response getter (fallback)");
+                    getterHooked = 1;
+                }
+            }
+        }
+        if (getterHooked) {
+            DLOG(@"[INIT] v37.133: dataTask.response getter hook installed (HTTP status 500→200 guaranteed)");
+        } else {
+            DLOG(@"[HTTP-HOOK] v37.133: WARNING: Could not hook dataTask.response getter!");
         }
     }
 }
@@ -5319,13 +5427,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             }
                             sp += 2 + sl;
                         }
+                        // v37.133 CRITICAL FIX: ONLY insert UUID TLV if original packet ACTUALLY contained UUID!
+                        // Original 213B EE121 has NO UUID field. Forcing 38B UUID here caused
+                        // packet size mismatch (213→248) → server rejected + closed connection immediately.
                         if (gotRealUUID) {
+                            DLOG(@"[EE121-CANON] v37.133: Original packet HAD UUID (36B) — inserting UUID TLV");
                             newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x24; memcpy(newBuf+rebuildOut+2,realDevUUID,36);
+                            rebuildOut+=38;
                         } else {
-                            // Fallback: use fixed UUID (should not happen normally)
-                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x24; memcpy(newBuf+rebuildOut+2,kUUID,36);
+                            DLOG(@"[EE121-CANON] v37.133: Original packet had NO UUID — SKIPPING UUID TLV (preserving structure)");
                         }
-                        rebuildOut+=38;
                         // WIFI 4B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x04; memcpy(newBuf+rebuildOut+2,"WIFI",4);   rebuildOut+=6;
                         // 7.6.3 5B
