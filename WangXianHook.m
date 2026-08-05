@@ -3911,6 +3911,10 @@ static int hook_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exce
     return result;
 }
 
+// Forward declaration: resetGameStateForReconnect is defined below (after hook_close)
+// but hook_close needs to call it when game server fd is closed.
+static void resetGameStateForReconnect(void);
+
 static int hook_close(int fd) {
     if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
     
