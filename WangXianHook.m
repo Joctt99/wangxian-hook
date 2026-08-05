@@ -846,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.114-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.115-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -889,64 +889,57 @@ static BOOL isValidImp(IMP imp) {
     return (addr > 0x100000000ULL && addr < 0x400000000ULL);
 }
 
-// v37.114-DIST: SignatureKit hooks — NO orig function calls.
-// SIGBUS crash was caused by stale orig_verifySig/imp function pointers being called
-// from async network callbacks. The @try/@catch block CANNOT catch hardware signals
-// (SIGBUS/SIGSEGV). The ONLY safe approach is to never call the original IMPs.
-// Instead, we STUB the signature verification chain: handleResult ignores the result,
-// verifySig returns a dummy "valid" signature, and judgeAppInfo/judgeNet do nothing.
-// This bypasses the entire signature check without touching potentially stale pointers.
+// v37.115: SignatureKit hooks — SAFE LOG-ONLY mode (call original with @try/@catch).
+// v37.114 completely STUBBED signature verification → game startup state machine
+// received invalid state → C++ std::terminate in VersionModule::widgetSelected.
+// Fix: Restore ALL original IMP calls with ObjC @try/@catch protection.
+// Note: @try/@catch cannot catch hardware signals (SIGBUS/SIGSEGV), but it CAN catch
+// ObjC exceptions thrown by the original implementation. If SIGBUS recurs, the crash
+// is in the ORIGINAL libSupport code, not in our hook — same behavior as unhooked.
 
 static void hook_handleResult(id self, SEL _cmd, id result) {
-    // v37.114: DO NOT call orig_handleResult — it may trigger the broken verifySig chain
-    // Just log and return. The game will proceed with whatever result we set.
-    DLOG(@"[SK] handleAppInfoResult: %@ (STUBBED, no orig call)", result);
-    // Intentionally NOT calling orig_handleResult to avoid SIGBUS
+    DLOG(@"[SK] handleAppInfoResult: %@", result);
+    if (orig_handleResult) {
+        @try { orig_handleResult(self, _cmd, result); }
+        @catch (NSException *e) { DLOG(@"[SK] handleResult EXCEPTION: %@", e.reason); }
+    }
 }
 
-// 4. judgeAppInfoWithBaseUrl: - STUBBED (no orig call)
+// 4. judgeAppInfoWithBaseUrl: - Call original
 typedef void (*JudgeBaseIMP)(id, SEL, id);
 static JudgeBaseIMP orig_judgeBase = NULL;
 static void hook_judgeBase(id self, SEL _cmd, id baseUrl) {
-    // v37.114: DO NOT call orig — stubbed to avoid SIGBUS from broken signature chain
-    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@ (STUBBED)", baseUrl);
+    DLOG(@"[SK] judgeAppInfoWithBaseUrl: %@", baseUrl);
+    if (orig_judgeBase) {
+        @try { orig_judgeBase(self, _cmd, baseUrl); }
+        @catch (NSException *e) { DLOG(@"[SK] judgeBase EXCEPTION: %@", e.reason); }
+    }
 }
 
-// 5. judgeNet - STUBBED (no orig call)
+// 5. judgeNet - Call original
 typedef void (*JudgeNetIMP)(id, SEL);
 static JudgeNetIMP orig_judgeNet = NULL;
 static void hook_judgeNet(id self, SEL _cmd) {
-    // v37.114: DO NOT call orig — stubbed
-    DLOG(@"[SK] judgeNet called (STUBBED)");
+    DLOG(@"[SK] judgeNet called");
+    if (orig_judgeNet) {
+        @try { orig_judgeNet(self, _cmd); }
+        @catch (NSException *e) { DLOG(@"[SK] judgeNet EXCEPTION: %@", e.reason); }
+    }
 }
 
-// 6. verifySignatureFromParameters: - RETURN DUMMY SIGNATURE (no orig call)
-// IMPORTANT: Return a valid-looking signature object so game server accepts it.
-// We construct a minimal NSDictionary with the expected signature format.
+// 6. verifySignatureFromParameters: - Call original
 typedef id (*VerifySigIMP)(id, SEL, id);
 static VerifySigIMP orig_verifySig = NULL;
 static id hook_verifySig(id self, SEL _cmd, id params) {
-    // v37.114: DO NOT call orig_verifySig — it causes SIGBUS in async callbacks
-    // Build a dummy signature result. Expected format based on libSupport analysis:
-    // { "sig": "<base64 signature>", "timestamp": "<current time>", "status": 0 }
-    static NSDictionary *s_dummySig = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *timestamp = [NSString stringWithFormat:@"%f", [[NSDate date] timeIntervalSince1970]];
-        // ARC-safe: just assign to static var, ARC will retain it automatically
-        s_dummySig = @{
-            @"sig": @"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            @"timestamp": timestamp,
-            @"status": @0,
-            @"code": @0,
-            @"message": @"success"
-        };
-    });
-    DLOG(@"[SK] verifySignatureFromParameters: returning DUMMY signature (no orig call)");
-    return s_dummySig;
+    DLOG(@"[SK] verifySignatureFromParameters: %@", params);
+    if (orig_verifySig) {
+        @try { return orig_verifySig(self, _cmd, params); }
+        @catch (NSException *e) { DLOG(@"[SK] verifySig EXCEPTION: %@", e.reason); }
+    }
+    return nil;
 }
 
-// 7. generateRequestParams - LOG only, call orig (safer, not in SIGBUS chain)
+// 7. generateRequestParams - LOG only, call orig
 typedef id (*GenParamsIMP)(id, SEL);
 static GenParamsIMP orig_genParams = NULL;
 static id hook_genParams(id self, SEL _cmd) {
@@ -955,7 +948,7 @@ static id hook_genParams(id self, SEL _cmd) {
     return nil;
 }
 
-// 8. createSignatureParams: - LOG only, call orig (safer, not in SIGBUS chain)
+// 8. createSignatureParams: - LOG only, call orig
 typedef id (*CreateSigParamsIMP)(id, SEL, id);
 static CreateSigParamsIMP orig_createSigParams = NULL;
 static id hook_createSigParams(id self, SEL _cmd, id arg) {
