@@ -846,7 +846,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.115-DIST-SILENT loaded ===");
+        _log(@"=== WangXianHook v37.116-DIST-SILENT loaded ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10458,7 +10458,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.114-DIST SILENT_MODE=%d %d layers active (v37.114: SignatureKit hooks STUBBED — no orig IMP calls, prevents SIGBUS crash in async callbacks. v37.113: preserve crypto-chain state. v37.112: no free(). v37.111: per-connection reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.116-DIST SILENT_MODE=%d %d layers active (v37.116: SignatureKit hooks REMOVED — no stale IMP pointers = no SIGBUS. v37.115: restore orig+@try. v37.114: STUBBED→SIGABRT. v37.113: preserve crypto-chain. v37.112: no free(). v37.111: reconnect reset. v37.110: DLOG comma-op.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10644,44 +10644,16 @@ static void installAllHooks(void) {
     }
 #pragma clang diagnostic pop
 
-    // === KEEP: SignatureKit hooks (in capture_real.js) ===
-    Class skCls = NSClassFromString(@"SignatureKit");
-    if (skCls) {
-        Class metaCls = object_getClass(skCls);
-
-        Method m = class_getClassMethod(skCls, @selector(showAlert:));
-        if (m) { orig_showAlert = (ShowAlertIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_showAlert); _log(@"[INIT] SK.showAlert: SUPPRESS"); }
-
-        m = class_getClassMethod(skCls, @selector(exitApplication));
-        if (m) { orig_exitApp = (ExitAppIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_exitApp); _log(@"[INIT] SK.exitApplication: BLOCK"); }
-
-        m = class_getClassMethod(skCls, @selector(judgeAppInfoWithBaseUrl:));
-        if (m) { orig_judgeBase = (JudgeBaseIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeBase); _log(@"[INIT] SK.judgeAppInfoWithBaseUrl: ORIG"); }
-
-        m = class_getClassMethod(skCls, @selector(handleAppInfoResult:));
-        if (m) { orig_handleResult = (HandleResultIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_handleResult); _log(@"[INIT] SK.handleAppInfoResult: LOG"); }
-
-        m = class_getClassMethod(skCls, @selector(judgeNet));
-        if (m) { orig_judgeNet = (JudgeNetIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_judgeNet); _log(@"[INIT] SK.judgeNet: BLOCK"); }
-
-        m = class_getClassMethod(skCls, @selector(verifySignatureFromParameters:));
-        if (m) { orig_verifySig = (VerifySigIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_verifySig); _log(@"[INIT] SK.verifySignatureFromParameters: ORIG"); }
-
-        m = class_getClassMethod(skCls, @selector(generateRequestParams));
-        if (m) { orig_genParams = (GenParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_genParams); _log(@"[INIT] SK.generateRequestParams: LOG"); }
-
-        m = class_getClassMethod(skCls, @selector(createSignatureParams:));
-        if (m) { orig_createSigParams = (CreateSigParamsIMP)method_getImplementation(m); method_setImplementation(m, (IMP)hook_createSigParams); _log(@"[INIT] SK.createSignatureParams: LOG"); }
-
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(metaCls, &mcount);
-        for (unsigned int i = 0; i < mcount; i++) {
-            DLOG(@"[SK] +[%@]", NSStringFromSelector(method_getName(methods[i])));
-        }
-        if (methods) free(methods);
-    } else {
-        _log(@"[INIT] WARNING: SignatureKit NOT found!");
-    }
+    // === v37.116: SignatureKit hooks REMOVED completely ===
+    // SIGBUS crash was caused by stale orig_* function pointers in async callbacks.
+    // Three approaches tried, ALL failed:
+    //   v37.113: Call original IMPs → SIGBUS (pointers become invalid in async callbacks)
+    //   v37.114: Completely STUB → SIGABRT (game state machine breaks)
+    //   v37.115: Call original IMPs + @try/@catch → SIGBUS again (can't catch HW signals)
+    // Final solution: Do NOT hook SignatureKit at all. Re-signed IPA should pass
+    // native signature verification. These hooks are no longer needed.
+    // The hook functions remain defined above for reference, but are NOT installed.
+    _log(@"[INIT] v37.116: SignatureKit hooks REMOVED (no orig IMP calls = no SIGBUS)");
 
     // === KEEP: SignatureCheck hooks (in capture_real.js) ===
     Class scCls = NSClassFromString(@"SignatureCheck");
