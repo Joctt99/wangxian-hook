@@ -27,6 +27,7 @@ CFLAGS += -O0
 CFLAGS += -fobjc-arc
 CFLAGS += -fno-exceptions
 CFLAGS += -fno-rtti
+CFLAGS += -install_name @executable_path/Dylibs/WangXianHook.dylib
 
 all: $(TARGET)
 
