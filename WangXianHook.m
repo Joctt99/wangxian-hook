@@ -849,7 +849,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.126-DIAG loaded (generic DY_MIESHI fix) ===");
+        _log(@"=== WangXianHook v37.128-DIAG loaded (three-layer signature bypass) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -948,6 +948,243 @@ static void hook_showTip(id self, SEL _cmd, id arg) {
 static void hook_scExit(id self, SEL _cmd) {
     DLOG(@"[SC] SignatureCheck.exitApplication BLOCKED");
     // Don't call original
+}
+
+// ============================================================
+#pragma mark - v37.128: Distribution Signature Bypass
+// ============================================================
+// ROOT CAUSE: On distribution-signed apps (V3/enterprise/super-sign),
+// the game's SignatureKit verification fails because:
+// 1. Local code signature validation (SecStaticCodeCheckValidity) fails
+// 2. HTTP-based verification might use a different path
+// 3. SignatureKit's internal state machine breaks
+//
+// SOLUTION: Three-layer bypass:
+// Layer 1: Hook Security framework (SecStaticCodeCheckValidity etc.)
+// Layer 2: Hook SignatureKit methods (return success, never call original)
+// Layer 3: Hook LCNetworking (intercept HTTP at app level)
+// ============================================================
+
+// --- Layer 1: Security Framework Hooks ---
+// These bypass LOCAL code signature validation.
+// On distribution-signed apps, the signature doesn't match what the game expects.
+// By hooking these functions, we make ALL signature checks pass.
+
+// Forward declaration: isSignatureVerificationURL is defined below (in HTTP hooks section)
+static BOOL isSignatureVerificationURL(NSString *url);
+
+#import <Security/Security.h>
+
+typedef OSStatus (*SecStaticCodeCheckValidityFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef);
+static SecStaticCodeCheckValidityFunc orig_SecStaticCodeCheckValidity = NULL;
+
+static OSStatus hook_SecStaticCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+    DLOG(@"[SEC-BYPASS] SecStaticCodeCheckValidity: returning errSecSuccess (bypass local sig check)");
+    return errSecSuccess; // 0 = success
+}
+
+typedef OSStatus (*SecCodeCheckValidityFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef);
+static SecCodeCheckValidityFunc orig_SecCodeCheckValidity = NULL;
+
+static OSStatus hook_SecCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+    DLOG(@"[SEC-BYPASS] SecCodeCheckValidity: returning errSecSuccess");
+    return errSecSuccess;
+}
+
+typedef OSStatus (*SecCodeCheckValidityWithErrorsFunc)(SecStaticCodeRef, SecCSFlags, SecRequirementRef, CFErrorRef *);
+static SecCodeCheckValidityWithErrorsFunc orig_SecCodeCheckValidityWithErrors = NULL;
+
+static OSStatus hook_SecCodeCheckValidityWithErrors(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req, CFErrorRef *errors) {
+    DLOG(@"[SEC-BYPASS] SecCodeCheckValidityWithErrors: returning errSecSuccess");
+    if (errors) *errors = NULL;
+    return errSecSuccess;
+}
+
+static void installSecurityFrameworkHooks(void) {
+    // Hook SecStaticCodeCheckValidity
+    void *secFW = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+    if (!secFW) secFW = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+
+    orig_SecStaticCodeCheckValidity = (SecStaticCodeCheckValidityFunc)dlsym(RTLD_DEFAULT, "SecStaticCodeCheckValidity");
+    if (orig_SecStaticCodeCheckValidity) {
+        int r = rebindSymbol("_SecStaticCodeCheckValidity",
+                             (void *)hook_SecStaticCodeCheckValidity,
+                             (void **)&orig_SecStaticCodeCheckValidity);
+        DLOG(@"[SEC-BYPASS] SecStaticCodeCheckValidity hook: rebind=%d", r);
+    }
+
+    orig_SecCodeCheckValidity = (SecCodeCheckValidityFunc)dlsym(RTLD_DEFAULT, "SecCodeCheckValidity");
+    if (orig_SecCodeCheckValidity) {
+        int r = rebindSymbol("_SecCodeCheckValidity",
+                             (void *)hook_SecCodeCheckValidity,
+                             (void **)&orig_SecCodeCheckValidity);
+        DLOG(@"[SEC-BYPASS] SecCodeCheckValidity hook: rebind=%d", r);
+    }
+
+    orig_SecCodeCheckValidityWithErrors = (SecCodeCheckValidityWithErrorsFunc)dlsym(RTLD_DEFAULT, "SecCodeCheckValidityWithErrors");
+    if (orig_SecCodeCheckValidityWithErrors) {
+        int r = rebindSymbol("_SecCodeCheckValidityWithErrors",
+                             (void *)hook_SecCodeCheckValidityWithErrors,
+                             (void **)&orig_SecCodeCheckValidityWithErrors);
+        DLOG(@"[SEC-BYPASS] SecCodeCheckValidityWithErrors hook: rebind=%d", r);
+    }
+}
+
+// --- Layer 2: SignatureKit Method Hooks (Safe, no original IMP calls) ---
+// Re-enable SignatureKit hooks for distribution signing bypass.
+// These hooks NEVER call original IMPs, avoiding SIGBUS.
+// They return success values to keep the game's state machine progressing.
+
+static void installSignatureKitBypassHooks(void) {
+    Class sigKitCls = NSClassFromString(@"SignatureKit");
+    if (!sigKitCls) {
+        DLOG(@"[SIGKIT-BYPASS] SignatureKit class not found, skipping");
+        return;
+    }
+
+    // Hook +[SignatureKit judgeAppInfoWithBaseUrl:]
+    // Instead of stubbing to do nothing, we DON'T hook this method.
+    // Let it send the HTTP request — our HTTP hooks will intercept the response.
+    // This preserves the game's async flow and state machine.
+
+    // Hook +[SignatureKit handleAppInfoResult:]
+    // This is called when the HTTP response comes back.
+    // We let it process our fake success response normally.
+    // DO NOT stub this — calling original is safe here because
+    // the response data is our controlled fake success JSON.
+
+    // Hook +[SignatureKit judgeBase] — return YES
+    Method m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"judgeBase"));
+    if (m) {
+        method_setImplementation(m, (IMP)hook_judgeBase);
+        DLOG(@"[SIGKIT-BYPASS] judgeBase HOOKED (return YES)");
+    }
+
+    // Hook +[SignatureKit judgeNet] — return YES
+    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"judgeNet"));
+    if (m) {
+        method_setImplementation(m, (IMP)hook_judgeNet);
+        DLOG(@"[SIGKIT-BYPASS] judgeNet HOOKED (return YES)");
+    }
+
+    // Hook +[SignatureKit showAlert:] — suppress alerts
+    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showAlert:"));
+    if (m) {
+        method_setImplementation(m, (IMP)hook_showAlert);
+        DLOG(@"[SIGKIT-BYPASS] showAlert: HOOKED (suppress)");
+    }
+
+    // Hook +[SignatureKit exitApplication] — block exit
+    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"exitApplication"));
+    if (m) {
+        method_setImplementation(m, (IMP)hook_exitApp);
+        DLOG(@"[SIGKIT-BYPASS] exitApplication HOOKED (block)");
+    }
+
+    // Hook +[SignatureKit verifySignatureFromParameters:] — return success
+    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"verifySignatureFromParameters:"));
+    if (m) {
+        method_setImplementation(m, (IMP)hook_verifySig);
+        DLOG(@"[SIGKIT-BYPASS] verifySignatureFromParameters: HOOKED (return success)");
+    }
+
+    // Also hook SignatureCheck if it exists (from lnSignature.dylib stub)
+    Class sigCheckCls = NSClassFromString(@"SignatureCheck");
+    if (sigCheckCls) {
+        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"JudgeApp"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_judgeApp);
+            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.JudgeApp HOOKED (stub)");
+        }
+        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"showTipViewEND:"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_showTip);
+            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.showTipViewEND: HOOKED (suppress)");
+        }
+        m = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"exitApplication"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_scExit);
+            DLOG(@"[SIGKIT-BYPASS] SignatureCheck.exitApplication HOOKED (block)");
+        }
+    }
+
+    DLOG(@"[SIGKIT-BYPASS] All SignatureKit/SignatureCheck hooks installed");
+}
+
+// --- Layer 3: LCNetworking Hooks ---
+// The game uses LCNetworking (not NSURLSession directly) for some HTTP requests.
+// Hook it to intercept signature verification requests at the application level.
+
+static void installLCNetworkingHooks(void) {
+    Class lcnetCls = NSClassFromString(@"LCNetworking");
+    if (!lcnetCls) {
+        DLOG(@"[LCNET-BYPASS] LCNetworking class not found, skipping");
+        return;
+    }
+
+    // Hook getWithURL:parameters:success:failure:
+    SEL getSel = NSSelectorFromString(@"getWithURL:parameters:success:failure:");
+    Method m = class_getInstanceMethod(lcnetCls, getSel);
+    if (m) {
+        // Store original and install hook
+        // We use a block-based approach for safety
+        IMP origImpl = method_getImplementation(m);
+
+        // Create a hooked implementation using imp_implementationWithBlock
+        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                      void(^success)(id), void(^failure)(NSError*)) {
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] Intercepted signature URL: %@", url);
+                if (success) {
+                    NSDictionary *fakeResp = @{
+                        @"code": @0,
+                        @"message": @"success",
+                        @"data": @{
+                            @"result": @YES,
+                            @"verity": @1,
+                            @"tip": @0,
+                            @"ENDTIME": @"2027-12-31 23:59:59",
+                            @"END": @0,
+                            @"OPEN": @1,
+                            @"id": @11927,
+                            @"COUNT": @0,
+                            @"MAXLIMIT": @5000
+                        }
+                    };
+                    success(fakeResp);
+                }
+                return;
+            }
+            // Call original for non-signature URLs
+            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                self, getSel, url, params, success, failure);
+        });
+        method_setImplementation(m, newImpl);
+        DLOG(@"[LCNET-BYPASS] getWithURL: HOOKED");
+    }
+
+    // Hook PostWithURL:parameters:success:failure:
+    SEL postSel = NSSelectorFromString(@"PostWithURL:parameters:success:failure:");
+    m = class_getInstanceMethod(lcnetCls, postSel);
+    if (m) {
+        IMP origImpl = method_getImplementation(m);
+
+        IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
+                                                      void(^success)(id), void(^failure)(NSError*)) {
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] Intercepted signature POST URL: %@", url);
+                if (success) {
+                    NSDictionary *fakeResp = @{@"code": @1, @"message": @"OK"};
+                    success(fakeResp);
+                }
+                return;
+            }
+            ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
+                self, postSel, url, params, success, failure);
+        });
+        method_setImplementation(m, newImpl);
+        DLOG(@"[LCNET-BYPASS] PostWithURL: HOOKED");
+    }
 }
 
 // ============================================================
@@ -10641,7 +10878,7 @@ static void installChannelInterceptLayers(void) {
     DLOG(@"[CH-L5] send buffer scan + L6 EE007 len-patch: handled in custom_send().");
     layersOK++;
 
-    DLOG(@"[CH-INIT] v37.126-DIAG SILENT_MODE=%d %d layers active (v37.126: GENERIC DY_MIESHI replacement — ALL packets on port 5678 now get channel replaced, not just specific commands. Fixes 0x0002A017 packet sending short DY_MIESHI causing server disconnect. v37.125: format-specific responses. v37.124: HTTP hooks installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
+    DLOG(@"[CH-INIT] v37.128-DIAG SILENT_MODE=%d %d layers active (v37.128: Three-layer signature bypass — SecStaticCodeCheckValidity + SignatureKit methods + LCNetworking. Fixes distribution-signed app crash. v37.126: GENERIC DY_MIESHI replacement. v37.124: HTTP hooks installed. v37.120: FIX code:0→code:1. v37.118: MSI hooks DISABLED.)", (int)SILENT_DIST_MODE, layersOK);
 }
 
 // v37.52: Directly patch C-string literal "DY_MIESHI" → "DYanyou0040_MIESHI" in binary memory.
@@ -10833,15 +11070,20 @@ static void installAllHooks(void) {
     }
 #pragma clang diagnostic pop
 
-    // === v37.122: SignatureKit hooks REMOVED at method level ===
-    // Cross-device compatibility: Method-level hooks cause SIGBUS/SIGABRT on some devices.
-    // Solution: Intercept HTTP responses instead (see hook_dtwrc and hook_urlSessionDataTaskDidReceiveData).
-    // This approach works on ALL devices because:
-    // 1. No method-level hooks = no SIGBUS from stale function pointers
-    // 2. No method-level hooks = no SIGABRT from broken state machine
-    // 3. HTTP response interception is device-independent
-    _log(@"[INIT] v37.122: SignatureKit/SignatureCheck REMOVED at method level");
-    _log(@"[INIT] v37.122: Using HTTP response interception for signature bypass");
+    // === v37.128: Three-layer signature bypass for distribution signing ===
+    // Layer 1: Security framework (local code signature validation bypass)
+    // Layer 2: SignatureKit/SignatureCheck methods (return success, never call original)
+    // Layer 3: HTTP response interception (NSURLSession + NSURLConnection + LCNetworking)
+    _log(@"[INIT] v37.128: Installing three-layer signature bypass");
+
+    // Layer 1: Security framework hooks
+    installSecurityFrameworkHooks();
+
+    // Layer 2: SignatureKit method hooks
+    installSignatureKitBypassHooks();
+
+    // Layer 3: LCNetworking hooks (application-level HTTP interception)
+    installLCNetworkingHooks();
 
     // === v37.124: INSTALL HTTP HOOKS (CRITICAL FIX - was never called before!) ===
     // Without these hooks, ALL HTTP response interception is non-functional.
