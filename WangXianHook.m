@@ -5287,7 +5287,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     for (size_t i = len - 80; i < len; i++) [tailHex appendFormat:@"%02X ", p[i]];
                     DLOG(@"[EE121-ORIG] v37.62: origLen=%zu tail80B: %@", len, tailHex);
                 }
-                // v37.140 DIAG: Dump FULL original EE121 TLV structure for comparison with rebuilt
+                // v37.141 DIAG: Dump FULL original EE121 TLV structure for comparison with rebuilt
                 {
                     NSMutableString *tlvDump = [NSMutableString stringWithCapacity:300];
                     size_t to = 12;
@@ -5315,7 +5315,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         tlvIdx++;
                         to += 2 + tl;
                     }
-                    DLOG(@"[EE121-ORIG-DIAG] v37.140: ORIG TLV structure (%d TLVs, pktLen=%zu, end@%zu / diff=%zd):\n    %@",
+                    DLOG(@"[EE121-ORIG-DIAG] v37.141: ORIG TLV structure (%d TLVs, pktLen=%zu, end@%zu / diff=%zd):\n    %@",
                          tlvIdx, len, to, (ssize_t)len - (ssize_t)to, tlvDump);
                 }
 
@@ -5701,7 +5701,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // 979 3B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
                         // --- hash1/hash2/hash3 block ---
-                        // v37.140 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
+                        // v37.141 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
                         // Declare h1/h2/h3 OUTSIDE brace scope so tail DLOG can access them.
                         uint32_t h1 = 0, h2 = 0, h3 = 0;
                         {
@@ -5722,9 +5722,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             if (h1) memcpy(hash1Val, p+h1+2, 16); else memset(hash1Val, 0, 16);
                             memset(origHash2Hex, 0, 33);
                             if (h2) memcpy(origHash2Hex, p+h2+2, 32);
-                            DLOG(@"[EE121-HASH] v37.140: hash1/hash2/hash3 ALL preserved from original packet (hash2 not recomputed)");
-                            if (h2) DLOG(@"[EE121-HASH2] v37.140: Using ORIGINAL hash2=%.32s (v37.138/139 MD5-recompute BROKE LOGIN — REVERTED)", origHash2Hex);
-                            else   DLOG(@"[EE121-HASH2] v37.140: ⚠️ Original packet had NO hash2 TLV!");
+                            DLOG(@"[EE121-HASH] v37.141: hash1/hash2/hash3 ALL preserved from original packet (hash2 not recomputed)");
+                            if (h2) DLOG(@"[EE121-HASH2] v37.141: Using ORIGINAL hash2=%.32s (v37.138/139 MD5-recompute BROKE LOGIN — REVERTED)", origHash2Hex);
+                            else   DLOG(@"[EE121-HASH2] v37.141: ⚠️ Original packet had NO hash2 TLV!");
 
                             // === Step 2: Write hash3 → hash2 → hash1 in native order ===
                             newBuf[rebuildOut] = 0x00; newBuf[rebuildOut+1] = 0x10;
@@ -5740,10 +5740,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             memcpy(newBuf+rebuildOut+2, hash1Val, 16);
                             rebuildOut += 18;
 
-                            DLOG(@"[EE121-HASH1] v37.140: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
-                            DLOG(@"[EE121-HASH3] v37.140: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
+                            DLOG(@"[EE121-HASH1] v37.141: hash1=%.*s (orig, CC_MD5(token) last16)", 16, hash1Val);
+                            DLOG(@"[EE121-HASH3] v37.141: hash3=%.*s (orig, CC_MD5(token) first16)", 16, hash3Val);
                         }
-                        // v37.140 DIAG: Dump FULL rebuilt EE121-CANON hex (first 200 bytes) so we can compare TLV structure vs EE121-ORIG 213B
+                        // v37.141 DIAG: Dump FULL rebuilt EE121-CANON hex (first 200 bytes) so we can compare TLV structure vs EE121-ORIG 213B
                         // Currently only EE007-ALIGN's first 100B is dumped, but EE121-CANON OVERWRITES newBuf afterwards!
                         {
                             NSMutableString *diagHex = [NSMutableString stringWithCapacity:600];
@@ -5752,7 +5752,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 [diagHex appendFormat:@"%02X ", newBuf[i]];
                                 if ((i+1) % 32 == 0 && i+1 < diagLen) [diagHex appendString:@"\n    "];
                             }
-                            DLOG(@"[EE121-CANON-DIAG] v37.140: FULL first%zub of CANON pkt (pktLen=%u):\n    %@",
+                            DLOG(@"[EE121-CANON-DIAG] v37.141: FULL first%zub of CANON pkt (pktLen=%u):\n    %@",
                                  diagLen, (unsigned)rebuildOut, diagHex);
                             // Also print all TLVs for structural comparison
                             NSMutableString *tlvDump = [NSMutableString stringWithCapacity:300];
@@ -5781,7 +5781,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                                 tlvIdx++;
                                 to += 2 + tl;
                             }
-                            DLOG(@"[EE121-CANON-DIAG] v37.140: TLV structure (%d TLVs, end@%zu / pktLen=%u):\n    %@",
+                            DLOG(@"[EE121-CANON-DIAG] v37.141: TLV structure (%d TLVs, end@%zu / pktLen=%u):\n    %@",
                                  tlvIdx, to, (unsigned)rebuildOut, tlvDump);
                         }
                         // Final pktLen
