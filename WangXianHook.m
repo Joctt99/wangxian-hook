@@ -1339,17 +1339,24 @@ static void installJSONSerializationHook(void) {
 
 // v37.122: Unified function to check if a URL is a signature verification endpoint.
 // This covers ALL possible API paths used by the game's signature system.
-// Base URL: https://cert.qunhongtech.com/
-// Endpoints: judgeAppInfoApi, judgeAppInfoSignApi, postAppInfoApi, getAppInfoApi
+// Known domains: cert.qunhongtech.com, ln_sign_cert.9iy.com
+// Known paths: /cert/judgeAppInfoApi, /cert/getAppInfoApi, /cert/postAppInfoApi
 static BOOL isSignatureVerificationURL(NSString *url) {
     if (!url || url.length == 0) return NO;
     
-    // Check for base domain
-    if ([url containsString:@"cert.qunhongtech.com"]) {
+    // Check for known cert domains
+    if ([url containsString:@"cert.qunhongtech.com"] ||
+        [url containsString:@"ln_sign_cert.9iy.com"] ||
+        [url containsString:@"9iy.com"]) {
         return YES;
     }
     
-    // Check for specific API endpoints (in case domain differs)
+    // Check for /cert/ path (covers ALL cert API endpoints on any domain)
+    if ([url containsString:@"/cert/"] || [url containsString:@"/cert?"]) {
+        return YES;
+    }
+    
+    // Check for specific API endpoints (in case domain/path differs)
     NSArray *endpoints = @[
         @"judgeAppInfoApi",
         @"judgeAppInfoSignApi", 
@@ -1359,7 +1366,10 @@ static BOOL isSignatureVerificationURL(NSString *url) {
         @"checkSign",
         @"certApi",
         @"signApi",
-        @"verifyApi"
+        @"verifyApi",
+        @"judgeAppInfo",
+        @"getAppInfo",
+        @"postAppInfo"
     ];
     
     for (NSString *ep in endpoints) {
@@ -9410,7 +9420,27 @@ static NSURLSessionDataTask *hook_dtr(id self, SEL _cmd, NSURLRequest *req) {
 typedef void (*AsyncReqIMP)(id, SEL, NSURLRequest *, NSOperationQueue *, void (^)(NSURLResponse *, NSData *, NSError *));
 static AsyncReqIMP orig_asyncReq = NULL;
 static void hook_async(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *q, void (^comp)(NSURLResponse *, NSData *, NSError *)) {
-    DLOG(@"[NET-C] async URL: %@", req.URL.absoluteString);
+    NSString *url = req.URL.absoluteString;
+    DLOG(@"[NET-C] async URL: %@", url);
+    
+    // v37.123: Intercept signature verification requests
+    if (url && isSignatureVerificationURL(url) && comp) {
+        void (^wrappedComp)(NSURLResponse *, NSData *, NSError *) = [^(NSURLResponse *resp, NSData *data, NSError *err) {
+            DLOG(@"[NET-C] async response: url=%@ dataLen=%lu err=%@", url, (unsigned long)data.length, err);
+            if (data && data.length > 0) {
+                NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                NSData *patchedData = patchSignatureResponse(url, body);
+                if (patchedData) {
+                    data = patchedData;
+                    DLOG(@"[NET-C] async response PATCHED with universal success");
+                }
+            }
+            comp(resp, data, err);
+        } copy];
+        if (orig_asyncReq) orig_asyncReq(self, _cmd, req, q, wrappedComp);
+        return;
+    }
+    
     if (orig_asyncReq) orig_asyncReq(self, _cmd, req, q, comp);
 }
 
@@ -9418,8 +9448,23 @@ static void hook_async(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *q
 typedef NSData *(*SyncReqIMP)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
 static SyncReqIMP orig_syncReq = NULL;
 static NSData *hook_sync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
-    DLOG(@"[NET-C] sync URL: %@", req.URL.absoluteString);
-    if (orig_syncReq) return orig_syncReq(self, _cmd, req, resp, err);
+    NSString *url = req.URL.absoluteString;
+    DLOG(@"[NET-C] sync URL: %@", url);
+    
+    if (orig_syncReq) {
+        NSData *result = orig_syncReq(self, _cmd, req, resp, err);
+        
+        // v37.123: Intercept signature verification responses
+        if (url && isSignatureVerificationURL(url) && result && result.length > 0) {
+            NSString *body = [[NSString alloc] initWithData:result encoding:NSUTF8StringEncoding];
+            NSData *patchedData = patchSignatureResponse(url, body);
+            if (patchedData) {
+                DLOG(@"[NET-C] sync response PATCHED with universal success");
+                return patchedData;
+            }
+        }
+        return result;
+    }
     return nil;
 }
 
