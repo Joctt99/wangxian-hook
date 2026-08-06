@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
+#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX9: ENABLE FFF493#2 replacement + ADD 0x802EE100 session capture
