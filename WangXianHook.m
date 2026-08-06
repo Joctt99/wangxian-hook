@@ -1,4 +1,4 @@
-﻿﻿﻿#import "ProtocolPatcher.h"
+#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX11: Runtime binary hash + FIX9 session fixes
