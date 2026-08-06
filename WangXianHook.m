@@ -1,4 +1,4 @@
-#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX9: ENABLE FFF493#2 replacement + ADD 0x802EE100 session capture
@@ -908,7 +908,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX9 loaded (ENABLE FFF493#2 sessionId/ticket replacement + ADD 0x802EE100 session capture. Official client uses 7.6.3+983 with dynamic 20-digit clientId) ===");
+        _log(@"=== WangXianHook v37.134-FIX10-SKIP loaded (SKIP EE121-CANON rebuild + DISABLE CC_MD5 channel/dm/gp replacement — send ORIGINAL EE121 packet to test if server returns status=0) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5297,7 +5297,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
                 off += 2 + fLen;
             }
-            if (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1) {
+            // v37.134-FIX10-SKIP: DISABLE EE121-CANON rebuild — send ORIGINAL EE121 packet.
+            // PURPOSE: Test if server returns status=0 with original packet (all hashes match).
+            // If status=0 → problem was in EE121-CANON field modification (hash mismatch).
+            // If status=4 → problem is elsewhere (binary hash, signature, server-side check).
+            // CC_MD5 hook channel/dm/gp replacement ALSO disabled to keep hash2 consistent with original body.
+            if (0 && (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
                 // Reconstruct packet by replacing all 3 fields found
                 // Use dynamic buffer, write from 0 sequentially
                 size_t bufCap = len + 64;
@@ -9436,9 +9441,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             int hasCh = 0, hasDm = 0, hasGp = 0, hasHash = 0, hasUUID = 0;
             uint32_t uuidPos = 0; // position of ANY 36B format UUID (when hasEE121Ctx==1)
             for (uint32_t i = 0; i + 9 <= len; i++) {
-                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
-                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
-                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
+                // v37.134-FIX10-SKIP: DISABLE channel/dm/gp replacement in CC_MD5 hook.
+                // This keeps hash2 = MD5(original body fields) matching original EE121 packet.
+                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0 && 0) hasCh = 1;
+                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0 && 0) hasDm = 1;
+                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0 && 0) hasGp = 1;
                 if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
                 // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
                 // ROOT CAUSE: 162B and 168B hash inputs have different field order
