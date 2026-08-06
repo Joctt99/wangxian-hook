@@ -893,7 +893,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.142 loaded (URL-domain-based strategy: cert.qunhongtech.com=field patch only, ln_sign_cert=full fake) ===");
+        _log(@"=== WangXianHook v37.134-FIX4 loaded (judgeAppInfoSignApi universal success response with ENDTIME/END/OPEN) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1656,7 +1656,11 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
         if (![patchedResponse containsString:@"verity"]) {
-            patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
+            // v37.134-FIX4: Server returned error (HTTP 500) — use UNIVERSAL success response
+            // with ALL fields the game needs: result, verity, tip, ENDTIME, END, OPEN
+            // Previous minimal response (missing ENDTIME/END/OPEN) caused login stuck!
+            DLOG(@"[SIGN-BYPASS] v37.134-FIX4: judgeAppInfoSignApi server error — using UNIVERSAL success response");
+            patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31\",\"END\":0,\"OPEN\":1}}";
         }
     }
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
