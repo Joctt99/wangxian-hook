@@ -748,6 +748,99 @@ static int g_md5_replace_count = 0;
 // or fall back to clean 248B (hash1/3 unverifiable).
 static int g_md5_channel_replaced = 0;
 
+// v37.134-FIX15: Memory scan to replace binary hash in memory.
+// Root cause: CC_MD5_Final/Update hooks fail (rebind=0) → streaming MD5 not intercepted
+// → binary hash not replaced → hash1/hash3 = MD5(actual_hash+token) ≠ MD5(clean_hash+token)
+// → server returns status=4 → no real sessionId → game server rejects → stuck.
+// Fix: Scan writable memory for binary hash (16-byte + 32-char hex) and replace with clean hash.
+extern "C" kern_return_t mach_vm_region_recurse(
+    vm_map_t target_task,
+    mach_vm_address_t *address,
+    mach_vm_size_t *size,
+    natural_t *nesting_depth,
+    vm_region_recurse_info_t info,
+    mach_msg_type_number_t *info_count
+);
+
+#include <mach/vm_region.h>
+
+static int g_memscan_done = 0;
+
+static void scanAndReplaceBinaryHashInMemory(void) {
+    if (g_memscan_done) return;
+    int hashReady = 0;
+    for (int i = 0; i < 16; i++) if (g_our_binary_hash[i]) { hashReady = 1; break; }
+    if (!hashReady) return;
+
+    char oldHexLower[33], newHexLower[33], oldHexUpper[33], newHexUpper[33];
+    for (int h = 0; h < 16; h++) {
+        snprintf(oldHexLower + h*2, 3, "%02x", g_our_binary_hash[h]);
+        snprintf(newHexLower + h*2, 3, "%02x", g_clean_binary_hash[h]);
+        snprintf(oldHexUpper + h*2, 3, "%02X", g_our_binary_hash[h]);
+        snprintf(newHexUpper + h*2, 3, "%02X", g_clean_binary_hash[h]);
+    }
+
+    int replaceCount = 0;
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t address = 0;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    int regionsScanned = 0;
+
+    while (regionsScanned < 500) {
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(task, &address, &size, &depth,
+                                                   (vm_region_recurse_info_t)&info, &info_count);
+        if (kr != KERN_SUCCESS) break;
+
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+
+        // Only scan writable, non-executable regions
+        if (!(info.protection & VM_PROT_WRITE) || (info.protection & VM_PROT_EXECUTE)) {
+            address += size;
+            continue;
+        }
+
+        // Skip very large regions (> 50MB) to avoid long scans
+        if (size > 50 * 1024 * 1024) {
+            address += size;
+            continue;
+        }
+
+        regionsScanned++;
+        uint8_t *start = (uint8_t *)address;
+        uint8_t *end = start + size;
+
+        // Search for 16-byte binary form
+        for (uint8_t *p = start; p + 16 <= end; p++) {
+            if (memcmp(p, g_our_binary_hash, 16) == 0) {
+                memcpy(p, g_clean_binary_hash, 16);
+                replaceCount++;
+            }
+        }
+
+        // Search for 32-char hex string forms (lowercase + uppercase)
+        for (uint8_t *p = start; p + 32 <= end; p++) {
+            if (memcmp(p, oldHexLower, 32) == 0) {
+                memcpy(p, newHexLower, 32);
+                replaceCount++;
+            } else if (memcmp(p, oldHexUpper, 32) == 0) {
+                memcpy(p, newHexUpper, 32);
+                replaceCount++;
+            }
+        }
+
+        address += size;
+    }
+
+    g_memscan_done = 1;
+    _log([NSString stringWithFormat:@"[MEM-SCAN] v37.134-FIX15: Scanned %d writable regions, replaced %d binary hash occurrences (binary+hex forms)", regionsScanned, replaceCount]);
+}
+
 // v37.64: Track whether EE006/A018 have been sent on login server (port 5678).
 // v37.63 assumed client skips EE006+A018 when IDFV returns nil, but v37.62 log proves
 // client DOES send A018 (origLen=186, A018-REPL→223B) and short EE006 (20B).
@@ -7770,6 +7863,13 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             //   Expected 'Gr1YYlXG0dcXb2yOgdjMRKGU6gl7DN7' starts at byte 14.
             // Also handle variant with optional 2-byte leading 00 1F (some servers may prefix it).
             if (cmd == 0x802EE120 && ret >= 13) {
+                // v37.134-FIX15: Re-scan memory for binary hash before game computes hash1/hash3.
+                // The first scan (in installSecurityHooks) might have run before game computed
+                // the binary hash. Now that EE120 is received, the game has the hash in memory
+                // and is about to compute hash1/hash3. This is our last chance to replace it.
+                g_memscan_done = 0; // Reset to allow re-scan
+                scanAndReplaceBinaryHashInMemory();
+
                 size_t pos = 13; // after 12B header + 1B status
                 while (pos + 1 < (size_t)ret) {
                     // Strategy: Check 1-byte length first (most common in EE120).
@@ -10191,6 +10291,12 @@ static void installSecurityHooks(void) {
             int rmu = rebindSymbol("_CC_MD5_Update", (void *)hook_CC_MD5_Update, (void **)&orig_CC_MD5_Update);
             DLOG(@"[SEC] CC_MD5_Update hook v37.134-FIX15: rebind=%d addr=%p", rmu, orig_CC_MD5_Update);
         }
+
+        // v37.134-FIX15: CRITICAL — Scan memory for binary hash and replace with clean hash.
+        // CC_MD5_Final/Update hooks fail (rebind=0) → streaming MD5 not intercepted.
+        // This memory scan ensures the game uses clean_binary_hash for ALL hash computations
+        // (including hash1/hash3 via streaming MD5 that our hooks can't intercept).
+        scanAndReplaceBinaryHashInMemory();
     }
 
 #if !DISABLE_CRYPTO_HOOKS
