@@ -9429,6 +9429,16 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             // v37.134-FIX14: hOld/hNew are now DYNAMIC — computed from g_our_binary_hash
             // at hook install time. Old hardcoded "f9cc76c5..." never matched actual binary hash.
             // The FIX12 code below handles dynamic hex string replacement using g_our_binary_hash.
+            // v37.134-FIX15: Define hOld/hNew here for code at lines 9449/9486/9563/9564.
+            char hOld[33] = {0}; // our binary hash hex string (lowercase)
+            char hNew[33] = {0}; // clean binary hash hex string (lowercase)
+            {
+                int hr = 0; for (int _h = 0; _h < 16; _h++) if (g_our_binary_hash[_h]) { hr = 1; break; }
+                if (hr) {
+                    for (int h = 0; h < 16; h++) snprintf(hOld + h*2, 3, "%02x", g_our_binary_hash[h]);
+                    for (int h = 0; h < 16; h++) snprintf(hNew + h*2, 3, "%02x", g_clean_binary_hash[h]);
+                }
+            }
             static const char kCanonAccId[] = "65657881045335015151"; // 20 bytes clean-client accId
 
             // --- Check for EE121-unique context markers ---
@@ -9443,10 +9453,12 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 }
                 if (foundSq && foundWifi) hasEE121Ctx = 1;
                 else {
-                    // hash1/hash3 63B input marker: f9cc76c5... OR 906e707ec... (32 hex) + ~31B token (no other context)
+                    // hash1/hash3 63B input marker: binary_hash_hex(32) OR clean_hash_hex(32) + ~31B token
                     int foundClean = 0;
-                    for (uint32_t i = 0; i + 32 <= len; i++) {
-                        if (memcmp(in+i, hOld, 32) == 0 || memcmp(in+i, hNew, 32) == 0) { foundClean = 1; break; }
+                    if (hOld[0] != 0) { // v37.134-FIX15: Guard against empty hash
+                        for (uint32_t i = 0; i + 32 <= len; i++) {
+                            if (memcmp(in+i, hOld, 32) == 0 || memcmp(in+i, hNew, 32) == 0) { foundClean = 1; break; }
+                        }
                     }
                     if (foundClean && len >= 40 && len <= 80) hasEE121Ctx = 2;
                 }
@@ -9483,7 +9495,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
                 if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
                 if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
-                if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
+                if (!hasHash && hOld[0] != 0 && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
                 // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
                 // ROOT CAUSE: 162B and 168B hash inputs have different field order
                 // (no "SQAGEIOS"+"WIFI7.6.3979" markers) → eeCtx=0 → UUID NOT replaced.
