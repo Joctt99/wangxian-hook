@@ -1,9 +1,16 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX18: UUID TLV insertion for empty TLV#9 + FIX17 hash1/hash3 replacement
+ * WangXianHook v37.134-FIX19: Disable FFF493-REPL — root cause of "卡住正在进入" after FIX18
  *
- * v37.134-FIX18 CHANGES (CRITICAL — root cause of "卡住正在进入" / status=4 PERSISTING after FIX17):
+ * v37.134-FIX19 CHANGES (CRITICAL — root cause of "卡住正在进入" PERSISTING after FIX18):
+ *   ROOT CAUSE: FFF493-REPL system was RE-ENCRYPTING FFF493#2 packets after FIX18 fixed EE121.
+ *   With FIX18, EE121 succeeds → server returns REAL sessionId/ticket → client includes them
+ *   in FFF493#2. But FFF493-REPL intercepted the packet, replaced MACADDRESS UUID, re-encrypted
+ *   with saved AES key → produced DIFFERENT ciphertext/HMAC → server rejected → no role data → stuck.
+ *   PROOF: Clean client (no injection) and 全能签+Frida (no WangXianHook) both enter game fine.
+ *   FIX: Disable FFF493-REPL entirely (add "0 &&" to replacement condition). Original FFF493#2
+ *   packet (with CH-L4 CCCrypt patches + CC_MD5 hash correction) goes through as-is.
  *   ROOT CAUSE: On devices where IDFV returns nil, EE121 TLV#9 (UUID) is EMPTY (0B).
  *   Frida capture of working client shows TLV#9=36B UUID → server returns SESSION_DATA (登录成功).
  *   Frida capture of FIX17 client shows TLV#9=0B (empty) → server returns status=4 (rejected).
@@ -945,7 +952,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX18 loaded (UUID TLV insertion for empty TLV#9 in EE007-ALIGN + UUID insertion in CC_MD5 hash2 input + FIX17 hash1/hash3 replacement via CC_MD5(cleanHashHex+token) + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX19 loaded (FFF493-REPL DISABLED — send original FFF493#2 as-is + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5864,7 +5871,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 //            // sessionId/ticket in it. Previous code INSERTED them → server confused → no role data!
 //            // Now skip #1 replacement entirely: let original packet (with CH-L4 patches) go through.
 //            // v37.134-FIX9: REMOVED '0 &&' — ENABLE FFF493#2 replacement with sessionId/ticket!
-            if (fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
+            // v37.134-FIX19: RE-DISABLED FFF493-REPL! Root cause of "卡住正在进入" after FIX18.
+            //   With FIX18, EE121 succeeds → server returns REAL sessionId/ticket → client
+            //   includes them in FFF493#2. FFF493-REPL was REPLACING UUID + RE-ENCRYPTING the
+            //   packet → different ciphertext/HMAC → server rejects → no role data → stuck.
+            //   Clean client (no injection) and 全能签+Frida (no WangXianHook) both work fine
+            //   → server accepts ORIGINAL packets as-is. CH-L4 CCCrypt hook already patches
+            //   channel/device/gpu in plaintext BEFORE client encryption. CC_MD5 hook already
+            //   computes correct md5. No re-encryption needed!
+            if (0 && fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                 uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
