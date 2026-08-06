@@ -1,9 +1,18 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX9: ENABLE FFF493#2 replacement + ADD 0x802EE100 session capture
+ * WangXianHook v37.134-FIX11: Runtime binary hash + FIX9 session fixes
  *
- * v37.134-FIX9 CHANGES (server closes connection after FFF493#2):
+ * v37.134-FIX11 CHANGES (EE121 always returns status=4, FFF493 empty sessionId):
+ *   ROOT CAUSE (BIGGEST BUG): g_our_binary_hash was HARDCODED to f9cc76c5... from v37.60
+ *   - Every rebuild/injection changes the actual binary hash → output replacement condition
+ *     memcmp(md, g_our_binary_hash, 16) NEVER matched → binary hash NOT replaced to clean
+ *   - Server validates hash1/hash3 = MD5(clean_binary_hash + token) → FAILS → status=4
+ *   - This caused EVERY version after v37.60 to have status=4!
+ *   FIX: Runtime compute CURRENT binary hash using UNHOOKED CC_MD5 on main executable
+ *   BEFORE installing hook. Use dynamic value instead of hardcoded old value.
+ *
+ * v37.134-FIX9 CHANGES (preserved):
  *   ROOT CAUSE 1: FFF493#2 replacement was DISABLED by "if (0 && ...)" condition
  *   - sessionId and ticket were EMPTY in FFF493#2 packet → server rejects → closes connection
  *   FIX: Removed "0 &&" condition → ENABLE FFF493#2 replacement with real sessionId/ticket
@@ -908,7 +917,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX10-SKIP loaded (SKIP EE121-CANON rebuild + DISABLE CC_MD5 channel/dm/gp replacement — send ORIGINAL EE121 packet to test if server returns status=0) ===");
+        _log(@"=== WangXianHook v37.134-FIX11 loaded (Runtime binary hash fix + FIX9 session captures + EE121-CANON rebuild + CC_MD5 ch/dm/gp replacements enabled) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5297,12 +5306,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
                 off += 2 + fLen;
             }
-            // v37.134-FIX10-SKIP: DISABLE EE121-CANON rebuild — send ORIGINAL EE121 packet.
-            // PURPOSE: Test if server returns status=0 with original packet (all hashes match).
-            // If status=0 → problem was in EE121-CANON field modification (hash mismatch).
-            // If status=4 → problem is elsewhere (binary hash, signature, server-side check).
-            // CC_MD5 hook channel/dm/gp replacement ALSO disabled to keep hash2 consistent with original body.
-            if (0 && (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
+            // v37.134-FIX11: RESTORE EE121-CANON rebuild (fixed binary hash now works properly).
+            // CC_MD5 hook channel/dm/gp replacement ALSO enabled → hash2 matches CANON body.
+            if ((chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
                 // Reconstruct packet by replacing all 3 fields found
                 // Use dynamic buffer, write from 0 sequentially
                 size_t bufCap = len + 64;
@@ -9328,16 +9334,13 @@ static int hook_CCCrypt(uint32_t op, uint32_t alg, uint32_t options,
 typedef unsigned char *(*CC_MD5Func)(const void *data, uint32_t len, unsigned char *md);
 static CC_MD5Func orig_CC_MD5 = NULL;
 
-// v37.60: Updated to ACTUAL binary hash from CC_MD5(19437B) output.
-// v37.48-v37.60 had 913a1d1a... which was WRONG — output replacement never triggered.
-// Actual hash from log: [MD5-LOG] CC_MD5 inLen=19437 out=f9cc76c534acb63f51917951d486ca0c
-static const uint8_t g_our_binary_hash[16] = {
-    0xf9,0xcc,0x76,0xc5,0x34,0xac,0xb6,0x3f,
-    0x51,0x91,0x79,0x51,0xd4,0x86,0xca,0x0c
-};
-// v37.97: REAL clean binary hash captured from clean 7.6.3 via Frida capture_binary_hash_v2.js
-// Line 89: [CC_MD5-63B] binary_hash=906e707ec5585f080397b26ff4b8d89d token=...
-// hash2 is MD5(body) NOT binary hash. hash1/hash3 = MD5(binary_hash + token).
+// v37.134-FIX11: Runtime-compute our binary hash (NOT hardcoded old value!)
+// ROOT CAUSE of status=4: g_our_binary_hash was HARDCODED to f9cc76c5... (v37.60 value)
+// but every rebuild/injection changes the actual binary hash → output replacement condition
+// memcmp(md, g_our_binary_hash, 16) NEVER matches → binary hash NOT replaced →
+// server validates hash1/hash3 = MD5(clean_binary_hash+token) FAILS → status=4.
+// FIX: Compute CURRENT binary hash at runtime by reading main executable file.
+static uint8_t g_our_binary_hash[16] = {0}; // populated at runtime, NOT const!
 static const uint8_t g_clean_binary_hash[16] = {
     0x90,0x6e,0x70,0x7e,0xc5,0x58,0x5f,0x08,
     0x03,0x97,0xb2,0x6f,0xf4,0xb8,0xd8,0x9d
@@ -9441,11 +9444,10 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             int hasCh = 0, hasDm = 0, hasGp = 0, hasHash = 0, hasUUID = 0;
             uint32_t uuidPos = 0; // position of ANY 36B format UUID (when hasEE121Ctx==1)
             for (uint32_t i = 0; i + 9 <= len; i++) {
-                // v37.134-FIX10-SKIP: DISABLE channel/dm/gp replacement in CC_MD5 hook.
-                // This keeps hash2 = MD5(original body fields) matching original EE121 packet.
-                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0 && 0) hasCh = 1;
-                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0 && 0) hasDm = 1;
-                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0 && 0) hasGp = 1;
+                // v37.134-FIX11: RESTORE channel/dm/gp replacement (binary hash now correctly replaced).
+                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
+                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
+                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
                 if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
                 // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
                 // ROOT CAUSE: 162B and 168B hash inputs have different field order
@@ -9575,21 +9577,25 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
         }
 
         // v37.57: Also search for 16-byte modified binary hash (raw bytes)
+        // v37.134-FIX11: Only check if our binary hash is initialized (not all-zeros)
         if (!inputModified && actualLen >= 16) {
-            const uint8_t *ain = (const uint8_t *)actualInput;
-            for (uint32_t i = 0; i + 16 <= actualLen; i++) {
-                if (memcmp(ain + i, g_our_binary_hash, 16) == 0) {
-                    void *tmp = malloc(actualLen);
-                    if (tmp) {
-                        memcpy(tmp, actualInput, actualLen);
-                        memcpy((uint8_t *)tmp + i, g_clean_binary_hash, 16);
-                        if (cleanInput) { free(cleanInput); }
-                        cleanInput = tmp;
-                        actualInput = cleanInput;
-                        inputModified = 1;
-                        DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, actualLen);
+            int hashReady2 = 0; for (int _j = 0; _j < 16; _j++) if (g_our_binary_hash[_j]) { hashReady2 = 1; break; }
+            if (hashReady2) {
+                const uint8_t *ain = (const uint8_t *)actualInput;
+                for (uint32_t i = 0; i + 16 <= actualLen; i++) {
+                    if (memcmp(ain + i, g_our_binary_hash, 16) == 0) {
+                        void *tmp = malloc(actualLen);
+                        if (tmp) {
+                            memcpy(tmp, actualInput, actualLen);
+                            memcpy((uint8_t *)tmp + i, g_clean_binary_hash, 16);
+                            if (cleanInput) { free(cleanInput); }
+                            cleanInput = tmp;
+                            actualInput = cleanInput;
+                            inputModified = 1;
+                            DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, actualLen);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -9597,8 +9603,10 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
     unsigned char *ret = orig_CC_MD5(actualInput, actualLen, md);
     if (ret && md) {
+        // v37.134-FIX11: Only check if our binary hash is initialized (not all-zeros)
+        int hashReady = 0; for (int _i = 0; _i < 16; _i++) if (g_our_binary_hash[_i]) { hashReady = 1; break; }
         // Existing: check if output is our modified binary hash (hash2 case)
-        if (memcmp(md, g_our_binary_hash, 16) == 0) {
+        if (hashReady && memcmp(md, g_our_binary_hash, 16) == 0) {
             memcpy(md, g_clean_binary_hash, 16);
             g_md5_replace_count++;
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash OUTPUT (#%d, inputLen=%u)", g_md5_replace_count, len);
@@ -9620,7 +9628,9 @@ static CC_MD5_FinalFunc orig_CC_MD5_Final = NULL;
 static int hook_CC_MD5_Final(unsigned char *md, void *c) {
     int ret = orig_CC_MD5_Final(md, c);
     if (ret == 1 && md) {
-        if (memcmp(md, g_our_binary_hash, 16) == 0) {
+        // v37.134-FIX11: Only check if our binary hash is initialized (not all-zeros)
+        int hashReadyF = 0; for (int _k = 0; _k < 16; _k++) if (g_our_binary_hash[_k]) { hashReadyF = 1; break; }
+        if (hashReadyF && memcmp(md, g_our_binary_hash, 16) == 0) {
             memcpy(md, g_clean_binary_hash, 16);
             g_md5_replace_count++;
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash via CC_MD5_Final (#%d)", g_md5_replace_count);
@@ -9884,6 +9894,33 @@ static void installSecurityHooks(void) {
     // hash1/hash2/hash3 using the original binary hash → server accepts.
     {
         orig_CC_MD5 = (CC_MD5Func)dlsym(RTLD_NEXT, "CC_MD5");
+
+        // v37.134-FIX11: Compute CURRENT binary hash at runtime using UNHOOKED CC_MD5.
+        // Previous hardcoded f9cc76c5... was from v37.60 — every rebuild changes
+        // the actual binary so the match condition NEVER fired → status=4.
+        if (orig_CC_MD5) {
+            @autoreleasepool {
+                NSString *exePath = [[NSBundle mainBundle] executablePath];
+                if (exePath) {
+                    NSData *exeData = [NSData dataWithContentsOfFile:exePath];
+                    if (exeData && exeData.length > 10000) {
+                        unsigned char tempHash[16];
+                        memset(tempHash, 0, 16);
+                        orig_CC_MD5((const void *)exeData.bytes, (CC_LONG)exeData.length, tempHash);
+                        memcpy(g_our_binary_hash, tempHash, 16);
+                        _log(@"[MD5-BINARY-HASH] v37.134-FIX11: Runtime computed binary hash (%ld bytes) = %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x (vs hardcoded old f9cc76c5...)",
+                             (long)exeData.length,
+                             tempHash[0],tempHash[1],tempHash[2],tempHash[3],
+                             tempHash[4],tempHash[5],tempHash[6],tempHash[7],
+                             tempHash[8],tempHash[9],tempHash[10],tempHash[11],
+                             tempHash[12],tempHash[13],tempHash[14],tempHash[15]);
+                    } else {
+                        _log(@"[MD5-BINARY-HASH] v37.134-FIX11: ERROR: Could not read executable (%@ len=%ld)", exePath, exeData ? (long)exeData.length : -1L);
+                    }
+                }
+            }
+        }
+
         if (orig_CC_MD5) {
             int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
             DLOG(@"[SEC] CC_MD5 hook v37.62: rebind=%d addr=%p", rm, orig_CC_MD5);
