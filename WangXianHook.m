@@ -1674,11 +1674,52 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
-    // --- postAppInfoApi / getAppInfoApi ---
-    // V3's lnSignature returns code:1 for these APIs, game needs code:0
-    else if ([url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi/getAppInfoApi (patch code:1→0)");
+    // --- postAppInfoApi ---
+    // V3's lnSignature returns code:1, fix to code:0
+    else if ([url containsString:@"postAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi (patch code:1→0)");
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+    }
+    // --- getAppInfoApi ---
+    // V3's lnSignature returns code:1 with NO data object (just {"code":1, "message":"OK"})
+    // V3's [SignatureCheck nettimes] accesses data.ENDTIME → SIGSEGV if data missing!
+    // Fix: return FULL data structure with ENDTIME to prevent crash
+    else if ([url containsString:@"getAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] v37.134: Format: getAppInfoApi (FULL data structure with ENDTIME)");
+        // Build complete response that V3's lnSignature expects
+        NSDictionary *fullResp = @{
+            @"code": @0,
+            @"message": @"OK",
+            @"data": @{
+                @"id": @11927,
+                @"CREATETIME": @"2025-04-16 11:47:08",
+                @"COUNT": @0,
+                @"MAXLIMIT": @5000,
+                @"NAME": @"",
+                @"APPID": @"com.sqage.wangxianapp",
+                @"OPEN": @1,
+                @"END": @0,
+                @"ENDTIME": @"2027-12-31 23:59:59",
+                @"CENDDATE": [NSNull null],
+                @"EMAIL": [NSNull null],
+                @"EFLAG": @0,
+                @"DAYS": [NSNull null],
+                @"CERTID": @1,
+                @"CERTNAME": [NSNull null],
+                @"LIMITGAP": [NSNull null],
+                @"TIP": @0,
+                @"REMARK": [NSNull null],
+                @"NET": [NSNull null]
+            }
+        };
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:fullResp options:0 error:&err];
+        if (!err && json) {
+            patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        } else {
+            // Fallback with minimal data structure
+            patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
+        }
     }
     // --- Fallback: generic cert endpoint ---
     else {
