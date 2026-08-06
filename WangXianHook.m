@@ -9908,14 +9908,14 @@ static void installSecurityHooks(void) {
                         memset(tempHash, 0, 16);
                         orig_CC_MD5((const void *)exeData.bytes, (CC_LONG)exeData.length, tempHash);
                         memcpy(g_our_binary_hash, tempHash, 16);
-                        _log(@"[MD5-BINARY-HASH] v37.134-FIX11: Runtime computed binary hash (%ld bytes) = %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x (vs hardcoded old f9cc76c5...)",
+                        _log([NSString stringWithFormat:@"[MD5-BINARY-HASH] v37.134-FIX11: Runtime computed binary hash (%ld bytes) = %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x (vs hardcoded old f9cc76c5...)",
                              (long)exeData.length,
                              tempHash[0],tempHash[1],tempHash[2],tempHash[3],
                              tempHash[4],tempHash[5],tempHash[6],tempHash[7],
                              tempHash[8],tempHash[9],tempHash[10],tempHash[11],
-                             tempHash[12],tempHash[13],tempHash[14],tempHash[15]);
+                             tempHash[12],tempHash[13],tempHash[14],tempHash[15]]);
                     } else {
-                        _log(@"[MD5-BINARY-HASH] v37.134-FIX11: ERROR: Could not read executable (%@ len=%ld)", exePath, exeData ? (long)exeData.length : -1L);
+                        _log([NSString stringWithFormat:@"[MD5-BINARY-HASH] v37.134-FIX11: ERROR: Could not read executable (%@ len=%ld)", exePath, exeData ? (long)exeData.length : -1L]);
                     }
                 }
             }
