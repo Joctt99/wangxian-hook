@@ -1,9 +1,19 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX17: Direct hash1/hash3 replacement in EE121 packet
+ * WangXianHook v37.134-FIX18: UUID TLV insertion for empty TLV#9 + FIX17 hash1/hash3 replacement
  *
- * v37.134-FIX17 CHANGES (CRITICAL — root cause of "卡住正在进入" / status=4):
+ * v37.134-FIX18 CHANGES (CRITICAL — root cause of "卡住正在进入" / status=4 PERSISTING after FIX17):
+ *   ROOT CAUSE: On devices where IDFV returns nil, EE121 TLV#9 (UUID) is EMPTY (0B).
+ *   Frida capture of working client shows TLV#9=36B UUID → server returns SESSION_DATA (登录成功).
+ *   Frida capture of FIX17 client shows TLV#9=0B (empty) → server returns status=4 (rejected).
+ *   Packet size difference: 249B (with UUID) vs 213B (without UUID) = exactly 36B = UUID length.
+ *   FIX: Insert canonical UUID "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8" in TWO places:
+ *     1. EE007-ALIGN (send hook): Detect empty TLV after GPU → insert UUID TLV (00 24 + 36B)
+ *     2. CC_MD5 hook: After GPU replacement, insert 36B UUID into hash2 input → hash2 matches body
+ *   This ensures BOTH the packet body AND hash2 include UUID → server accepts EE121.
+ *
+ * v37.134-FIX17 CHANGES (preserved — Direct hash1/hash3 replacement):
  *   ROOT CAUSE: CC_MD5_Final/Update hooks NEVER worked (rebind=0) → streaming MD5
  *   not intercepted → binary hash not replaced in hash1/hash3 computation →
  *   hash1/hash3 = MD5(actual_hash+token) ≠ MD5(clean_hash+token) → server returns
@@ -935,7 +945,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX17 loaded (Direct hash1/hash3 replacement in EE121 via CC_MD5(cleanHashHex+token) + KEEP EE007-ALIGN body reconstruction + KEEP CC_MD5 ch/dm/gp replacement + KEEP binary hash runtime compute + FIX9 session captures; REMOVED memory scan + CC_MD5_Final/Update hooks) ===");
+        _log(@"=== WangXianHook v37.134-FIX18 loaded (UUID TLV insertion for empty TLV#9 in EE007-ALIGN + UUID insertion in CC_MD5 hash2 input + FIX17 hash1/hash3 replacement via CC_MD5(cleanHashHex+token) + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5313,6 +5323,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             size_t dmOff = (size_t)-1; // deviceModel TLV
             size_t gpOff = (size_t)-1; // GPU TLV
             size_t accOff = (size_t)-1; // v37.77: accountId TLV (20-digit numeric)
+            size_t uuidOff = (size_t)-1; // v37.134-FIX18: empty UUID TLV (TLV#9, after GPU)
             // v37.119: REMOVED kCanonAccIdEE007 — no longer used; accId is passed through as-is.
             while (off + 2 < len) {
                 uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
@@ -5328,6 +5339,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (chOff == (size_t)-1 && fLen >= 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
                 else if (dmOff == (size_t)-1 && fLen >= 11 && (memmem(val, fLen, "iPhone", 6) != NULL)) dmOff = off;
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
+                // v37.134-FIX18: Detect empty TLV after GPU = empty UUID field (TLV#9).
+                // When IDFV returns nil, TLV#9 is 0B. Server rejects EE121 with status=4.
+                else if (fLen == 0 && gpOff != (size_t)-1 && uuidOff == (size_t)-1) uuidOff = off;
                 off += 2 + fLen;
             }
             // v37.134-FIX15: RE-ENABLE EE007-ALIGN body reconstruction.
@@ -5367,6 +5381,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             newBuf[out] = 0x00; newBuf[out + 1] = 0x18;
                             memcpy(newBuf + out + 2, "Apple Inc. Apple A10 GPU", 24);
                             out += 26; in += 2 + fLen; fieldsApplied |= 4;
+                        } else if (in == uuidOff && fLen == 0) {
+                            // v37.134-FIX18: Insert UUID TLV (00 24 + 36B) for empty TLV#9.
+                            // When IDFV is nil, TLV#9 is 0B. Server requires non-empty UUID.
+                            // CC_MD5 hook ALSO inserts UUID into hash2 input → hash2 matches body.
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x24;
+                            memcpy(newBuf + out + 2, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
+                            out += 38; in += 2; fieldsApplied |= 16;
+                            DLOG(@"[EE121-UUID-FIX18] Inserted UUID TLV at offset %zu (was empty TLV#9)", in - 2);
                         } else if (in == accOff && fLen == 20) {
                             // v37.79: DO NOT replace accId — copy REAL through.
                             memcpy(newBuf + out, p + in, 2 + fLen);
@@ -5391,9 +5413,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     newBuf[3] =  newPktLen        & 0xFF;
                     uint32_t oldPktLen = 0;
                     if (len >= 4) oldPktLen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-                    DLOG(@"[EE007-ALIGN] v37.38 cmd=0x%08X port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u acc=%u)",
+                    DLOG(@"[EE007-ALIGN] v37.38 cmd=0x%08X port=%d origPktLen=%u newPktLen=%u fieldsMask=%u (ch=%u dm=%u gp=%u acc=%u uuid=%u)",
                          cmd, port, oldPktLen, newPktLen, fieldsApplied,
-                         (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0, (fieldsApplied & 8) != 0);
+                         (fieldsApplied & 1) != 0, (fieldsApplied & 2) != 0, (fieldsApplied & 4) != 0, (fieldsApplied & 8) != 0, (fieldsApplied & 16) != 0);
                     // Post-alignment hex dump for verification (first 100 bytes)
                     NSMutableString *ph = [NSMutableString stringWithCapacity:300];
                     for (size_t i = 0; i < out && i < 100; i++) [ph appendFormat:@"%02X ", newBuf[i]];
@@ -9623,6 +9645,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                 if (hasCh) newLen_i += 9;   // 18 - 9
                 if (hasDm) newLen_i -= 6;   // 11 - 17
                 if (hasGp) newLen_i -= 4;   // 24 - 28
+                // v37.134-FIX18: Insert UUID (36B) when EE121 body has empty TLV#9 (no UUID found).
+                // Root cause: IDFV returns nil on some devices → TLV#9 empty → server returns status=4.
+                // Fix: CC_MD5 hook inserts canonical UUID after GPU in hash2 input → hash2 includes UUID.
+                // Send hook (EE007-ALIGN) also inserts UUID TLV into packet body → body matches hash2.
+                if (hasGp && !hasUUID) newLen_i += 36;
                 uint32_t newLen = (newLen_i > 0) ? (uint32_t)newLen_i : len;
 
                 cleanInput = malloc(newLen + 64); // safety pad
@@ -9641,6 +9668,14 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                         } else if (hasGp && pos + 28 <= len && memcmp(in + pos, gpOld, 28) == 0) {
                             memcpy((uint8_t *)cleanInput + out, gpNew, 24);
                             out += 24; pos += 28;
+                            // v37.134-FIX18: Insert canonical UUID after GPU when UUID absent.
+                            // When EE121 TLV#9 is empty (IDFV nil), hash2 input lacks UUID.
+                            // Insert 36B canonical UUID here so hash2 = MD5(body WITH UUID).
+                            // The send hook (EE007-ALIGN) also inserts UUID TLV into the packet.
+                            if (!hasUUID) {
+                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                                out += 36;
+                            }
                         } else if (hasHash && pos + 32 <= len && memcmp(in + pos, hOld, 32) == 0) {
                             memcpy((uint8_t *)cleanInput + out, hNew, 32);
                             out += 32; pos += 32;
