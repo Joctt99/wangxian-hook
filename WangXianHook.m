@@ -7718,14 +7718,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // v37.134-FIX6: Patch status=4→0 for EE121 (bypass server version check)
                 if (cmd == 0x802EE121 && status == 4) {
                     DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=4→0 (patching for version bypass)", cmd);
-                    p[12] = 0;
+                    // Cast away const to modify response in-place (we own this buffer from recv)
+                    unsigned char *mp = (unsigned char *)p;
+                    mp[12] = 0;
                     // Also clear "版本过低"/"登录失败" body text so client state machine doesn't block
                     if (ret > 13) {
                         NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
                         if (bodyStr && bodyStr.length > 0) {
                             DLOG(@"[EE121-RESP] v37.134-FIX6: Body before patch: %@", bodyStr);
                             // Replace all body bytes with spaces (preserve pktLen)
-                            memset(p+13, 0x20, (size_t)(ret-13));
+                            memset(mp+13, 0x20, (size_t)(ret-13));
                             DLOG(@"[EE121-RESP] v37.134-FIX6: Body cleared (status=0, proceeding to login)");
                         }
                     }
