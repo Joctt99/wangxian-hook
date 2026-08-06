@@ -32,8 +32,14 @@ CFLAGS += -install_name @executable_path/Frameworks/WangXianHook.dylib
 all: $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
+	@echo "=== Source verification ==="
+	@grep -c "FIX19" $(SOURCE) || echo "WARNING: FIX19 not found in source!"
+	@grep -c "0 && fffWhich" $(SOURCE) || echo "WARNING: 0 and fffWhich not found!"
+	@echo "=== Building ==="
 	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
+	@echo "=== Binary verification ==="
+	@strings $(TARGET) | grep -c "FIX19" || echo "WARNING: FIX19 not in binary!"
 	@ls -la $(TARGET)
 
 clean:
