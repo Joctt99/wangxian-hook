@@ -893,7 +893,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX5 loaded (EE121-CANON: added missing empty TLV, FIX4: judgeAppInfoSignApi universal success response) ===");
+        _log(@"=== WangXianHook v37.134-FIX6 loaded (EE121-CANON: added missing empty TLV + status=4->0 patch for version bypass) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -7706,13 +7706,36 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             //     user completes authorization on master device, then re-logs in.
             // This way the device whitelist authorization system works NORMALLY.
             // NOTE: We still LOG the response for debugging, but do NOT modify it.
+            //
+            // v37.134-FIX6: RE-ENABLE status=4→0 patch for EE121!
+            // CONTEXT: FIX5 fixed EE121-CANON TLV structure (added missing empty TLV),
+            // so server now ACCEPTS the modified packet and returns status=4 ('版本过低').
+            // This is a SERVER-SIDE VERSION CHECK, NOT a device authorization issue.
+            // The old "未授权此手机" issue was about device binding — completely different.
+            // Now we need to bypass the version check so client proceeds to login flow.
             if ((cmd == 0x802EE121 || cmd == 0x802EE118 || cmd == 0x802EE120) && ret >= 13) {
                 uint8_t status = p[12];
-                DLOG(@"[EE121-RESP] v37.107-DIST: cmd=0x%08X status=%u (NOT patched, let client handle)", cmd, status);
-                if (cmd == 0x802EE121 && ret > 13) {
-                    NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
-                    if (bodyStr && bodyStr.length > 0) {
-                        DLOG(@"[EE121-RESP] v37.107-DIST: Body: %@", bodyStr);
+                // v37.134-FIX6: Patch status=4→0 for EE121 (bypass server version check)
+                if (cmd == 0x802EE121 && status == 4) {
+                    DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=4→0 (patching for version bypass)", cmd);
+                    p[12] = 0;
+                    // Also clear "版本过低"/"登录失败" body text so client state machine doesn't block
+                    if (ret > 13) {
+                        NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
+                        if (bodyStr && bodyStr.length > 0) {
+                            DLOG(@"[EE121-RESP] v37.134-FIX6: Body before patch: %@", bodyStr);
+                            // Replace all body bytes with spaces (preserve pktLen)
+                            memset(p+13, 0x20, (size_t)(ret-13));
+                            DLOG(@"[EE121-RESP] v37.134-FIX6: Body cleared (status=0, proceeding to login)");
+                        }
+                    }
+                } else {
+                    DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=%u (NOT patched, let client handle)", cmd, status);
+                    if (cmd == 0x802EE121 && ret > 13) {
+                        NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
+                        if (bodyStr && bodyStr.length > 0) {
+                            DLOG(@"[EE121-RESP] v37.134-FIX6: Body: %@", bodyStr);
+                        }
                     }
                 }
             }
@@ -10499,25 +10522,38 @@ static void installCppCryptoHooks_v131(void) {
 #pragma mark - v37.0 Minimal Recv Hook (login server patches only)
 // ============================================================
 
-// v37.6: Patch login server response data in-place
-// ONLY patches status byte for 0x802EE118/120/121 — NO string modifications
+// v37.134-FIX6: Patch login server response data in-place
+// v37.6: ONLY patch status byte for 0x802EE118/120/121 — NO string modifications
 // v37.6 FIX: v37.1-v37.4 patched status + cleared strings, which corrupted
 //            response body → '网络连接中断'. v37.5 disabled recv hook entirely
 //            → '版本过低' returned. v37.6: ONLY patch status=4→0, leave body intact.
 //            Client sees status=0 (success) + original body → parses server list correctly.
+// v37.134-FIX6: RESTORE status=4→0 patch for EE121!
+//   FIX5 fixed EE121-CANON TLV structure (added missing empty TLV), so server now
+//   ACCEPTS the packet and returns status=4 ('版本过低'). But client stops at status=4.
+//   Fix: patch status byte 4→0 AND clear '版本过低'/'登录失败' text so client proceeds.
 static void patchLoginServerData(uint8_t *data, ssize_t len) {
     if (len < 8) return;
 
-    // v37.12: ONLY clear "版本过低" string — do NOT modify status, do NOT replace other strings
-    // v37.6 showed status patch → '网络连接中断'. v37.1-v37.4 showed string patch → '网络连接中断'.
-    // v37.12 tries: ONLY clear "版本过低" (12 bytes UTF-8 → 12 spaces), keep everything else intact.
+    // v37.134-FIX6: Check if this is an EE121/EE118/EE120 response (has status byte at offset 12)
+    // Packet format: [4B pktLen][4B cmd][4B seq][1B status][body...]
+    // cmd is at offset 4-7, status at offset 12
+    uint32_t pktLen = (data[0]<<24)|(data[1]<<16)|(data[2]<<8)|data[3];
+    uint32_t cmd = (data[4]<<24)|(data[5]<<16)|(data[6]<<8)|data[7];
+    if ((cmd == 0x802EE118 || cmd == 0x802EE120 || cmd == 0x802EE121) && len >= 13) {
+        uint8_t status = data[12];
+        if (status == 4) {
+            DLOG(@"[RECV-PATCH] v37.134-FIX6: cmd=0x%08X status=4→0 (bypassing server version check)", cmd);
+            data[12] = 0;
+        }
+    }
 
     // Clear "版本过低" (UTF-8: E7 89 88 E6 9C AC E8 BF 87 E4 BD 8E) → 12 spaces
     static const uint8_t versionLow[] = {0xE7,0x89,0x88,0xE6,0x9C,0xAC,0xE8,0xBF,0x87,0xE4,0xBD,0x8E};
     for (ssize_t i = 0; i <= len - 12; i++) {
         if (memcmp(data + i, versionLow, 12) == 0) {
             memset(data + i, 0x20, 12);
-            DLOG(@"[RECV-PATCH] v37.12: Cleared '版本过低' at offset %zd (status untouched)", i);
+            DLOG(@"[RECV-PATCH] v37.134-FIX6: Cleared '版本过低' at offset %zd", i);
         }
     }
 
@@ -10526,7 +10562,16 @@ static void patchLoginServerData(uint8_t *data, ssize_t len) {
     for (ssize_t i = 0; i <= len - 12; i++) {
         if (memcmp(data + i, curVersion, 12) == 0) {
             memset(data + i, 0x20, 12);
-            DLOG(@"[RECV-PATCH] v37.12: Cleared '当前版本' at offset %zd", i);
+            DLOG(@"[RECV-PATCH] v37.134-FIX6: Cleared '当前版本' at offset %zd", i);
+        }
+    }
+
+    // Also clear "登录失败" (UTF-8: E7 99 BB E5 BD 95 E5 A4 B1 E8 B4 A5) → 12 spaces
+    static const uint8_t loginFail[] = {0xE7,0x99,0xBB,0xE5,0xBD,0x95,0xE5,0xA4,0xB1,0xE8,0xB4,0xA5};
+    for (ssize_t i = 0; i <= len - 12; i++) {
+        if (memcmp(data + i, loginFail, 12) == 0) {
+            memset(data + i, 0x20, 12);
+            DLOG(@"[RECV-PATCH] v37.134-FIX6: Cleared '登录失败' at offset %zd", i);
         }
     }
 }
