@@ -1,4 +1,4 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX11: Runtime binary hash + FIX9 session fixes
@@ -5125,7 +5125,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
+        // v37.134-FIX13: Only process EE007, NOT EE121.
+        // EE121 must be sent UNMODIFIED — EE007-ALIGN changes ch/dm/gp but hash2 is NOT
+        // recalculated (CC_MD5 ch/dm/gp replacement disabled) → hash2 mismatch → status=4.
+        // Sending original EE121 keeps hash2 consistent with original body.
+        if ((cmd == 0x000EE007) && len >= 100) {
             // v37.56: RESTORE v37.51 behavior — send clean 248B packet (seq-only replacement).
             //
             // v37.54/v37.55 sent native EE121 → server CLOSED connection (hash1/hash3
