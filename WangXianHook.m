@@ -1675,8 +1675,10 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     // --- postAppInfoApi / getAppInfoApi ---
+    // V3's lnSignature returns code:1 for these APIs, game needs code:0
     else if ([url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi/getAppInfoApi (passthrough)");
+        DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi/getAppInfoApi (patch code:1→0)");
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
     }
     // --- Fallback: generic cert endpoint ---
     else {
@@ -1687,6 +1689,13 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+    }
+
+    // Safety net: ensure code:1 → code:0 for ALL signature responses
+    // V3's lnSignature may return code:1 which game treats as failure
+    if ([patchedResponse containsString:@"\"code\":1"]) {
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+        DLOG(@"[SIGN-BYPASS] v37.134: Safety net: code:1→code:0 applied");
     }
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
