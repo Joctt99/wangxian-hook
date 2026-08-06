@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
+#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.143: SIMPLE SIGN-BYPASS (v37.134-proven, back to basics)
