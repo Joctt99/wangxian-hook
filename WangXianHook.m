@@ -748,6 +748,13 @@ static int g_md5_replace_count = 0;
 // or fall back to clean 248B (hash1/3 unverifiable).
 static int g_md5_channel_replaced = 0;
 
+// v37.134-FIX15: Forward declarations for binary hash (defined later at line ~9477)
+static uint8_t g_our_binary_hash[16] = {0};
+static const uint8_t g_clean_binary_hash[16] = {
+    0x90, 0x6e, 0x70, 0x7e, 0xc5, 0x58, 0x5f, 0x08,
+    0x03, 0x97, 0xb2, 0x6f, 0xf4, 0xb8, 0xd8, 0x9d
+};
+
 // v37.134-FIX15: Memory scan to replace binary hash in memory.
 // Root cause: CC_MD5_Final/Update hooks fail (rebind=0) → streaming MD5 not intercepted
 // → binary hash not replaced → hash1/hash3 = MD5(actual_hash+token) ≠ MD5(clean_hash+token)
@@ -9474,11 +9481,7 @@ static CC_MD5Func orig_CC_MD5 = NULL;
 // memcmp(md, g_our_binary_hash, 16) NEVER matches → binary hash NOT replaced →
 // server validates hash1/hash3 = MD5(clean_binary_hash+token) FAILS → status=4.
 // FIX: Compute CURRENT binary hash at runtime by reading main executable file.
-static uint8_t g_our_binary_hash[16] = {0}; // populated at runtime, NOT const!
-static const uint8_t g_clean_binary_hash[16] = {
-    0x90,0x6e,0x70,0x7e,0xc5,0x58,0x5f,0x08,
-    0x03,0x97,0xb2,0x6f,0xf4,0xb8,0xd8,0x9d
-};
+// v37.134-FIX15: g_our_binary_hash and g_clean_binary_hash moved to top of file (forward declarations)
 // g_md5_replace_count declared near top of file (line 589)
 
 static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char *md) {
