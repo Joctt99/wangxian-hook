@@ -893,7 +893,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX6 loaded (EE121-CANON: added missing empty TLV + status=4->0 patch for version bypass) ===");
+        _log(@"=== WangXianHook v37.134-FIX7 loaded (EE121: bumped version 7.6.3->7.7.0 + 983->990, FFF493: bumped clientProgramVersion + clientResourceVersion, status=4->0 bypass) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5531,43 +5531,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
                         // WIFI 4B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x04; memcpy(newBuf+rebuildOut+2,"WIFI",4);   rebuildOut+=6;
-                        // 7.6.3 5B
-                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x05; memcpy(newBuf+rebuildOut+2,"7.6.3",5);  rebuildOut+=7;
-                        // Version/build number — extract from ORIGINAL packet (NOT hardcoded "979"!)
-                        // ROOT CAUSE of login stuck: CC_MD5 hash2 input contains original version (e.g. "983")
-                        // but CANONICAL body had hardcoded "979" → hash2 mismatch → server rejected EE121.
-                        // Fix: scan original packet for the version TLV (after "7.6.3" TLV) and use it.
+                        // v37.134-FIX7: Bump version to bypass server version check!
+                        // Original "7.6.3" + "983" → server returns status=4 (版本过低)
+                        // Fix: upgrade to "7.7.0" + "990" so server creates real session
+                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x05; memcpy(newBuf+rebuildOut+2,"7.7.0",5);  rebuildOut+=7;
+                        // Version/build number — BUMP from 983→990 to bypass version check
                         {
-                            char origVersion[16] = {0};
-                            int origVerLen = 0;
-                            // Scan original packet TLVs to find version field (after "7.6.3" TLV)
-                            BOOL found763 = NO;
-                            for (size_t sp = 12; sp + 2 <= len; ) {
-                                uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
-                                if (sp + 2 + sl > len) break;
-                                if (found763 && sl > 0 && sl < 16) {
-                                    // This is the TLV right after "7.6.3" — it's the version/build number
-                                    origVerLen = sl;
-                                    memcpy(origVersion, p + sp + 2, sl);
-                                    origVersion[sl] = 0;
-                                    break;
-                                }
-                                // Check if this TLV is "7.6.3"
-                                if (sl == 5 && memcmp(p + sp + 2, "7.6.3", 5) == 0) {
-                                    found763 = YES;
-                                }
-                                sp += 2 + sl;
-                            }
-                            if (origVerLen > 0) {
-                                DLOG(@"[EE121-CANON] v37.134: Using ORIGINAL version=%s (NOT hardcoded 979)", origVersion);
-                                newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)origVerLen;
-                                memcpy(newBuf+rebuildOut+2, origVersion, origVerLen);
-                                rebuildOut += 2 + origVerLen;
-                            } else {
-                                // Fallback: use "979" if extraction failed
-                                DLOG(@"[EE121-CANON] v37.134: WARNING: Failed to extract version, using fallback 979");
-                                newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
-                            }
+                            // v37.134-FIX7: Use BUMPED version "990" instead of original "983"
+                            const char *bumpedVer = "990";
+                            int bumpedLen = 3;
+                            DLOG(@"[EE121-CANON] v37.134-FIX7: Bumping version 983→990 to bypass server version check");
+                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)bumpedLen;
+                            memcpy(newBuf+rebuildOut+2, bumpedVer, bumpedLen);
+                            rebuildOut += 2 + bumpedLen;
                         }
                         // --- hash1/hash2/hash3 block ---
                         // v37.141 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
@@ -10845,6 +10821,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     void   *patchedBuf = NULL;
     int patchCount = 0;
     int chCount = 0, dmCount = 0, gpCount = 0;
+    int progVerCount = 0, resVerCount = 0; // v37.134-FIX7: version bump counts
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
     // v37.79: accId replacement DISABLED for token consistency.
     static const char kCanonAccIdAES[] = "65657881045335015151"; // 20 bytes (UNUSED v37.79)
@@ -10853,7 +10830,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         const char *scanP = (const char *)dataIn;
         const char *scanEnd = scanP + dataInLen;
         const char *pcur = scanP;
-        chCount = dmCount = gpCount = 0;
+        chCount = dmCount = gpCount = progVerCount = resVerCount = 0;
         while (pcur < scanEnd) {
             size_t rem = (size_t)(scanEnd - pcur);
             if (rem >= 9 && memcmp(pcur, "DY_MIESHI", 9) == 0) {
@@ -10878,6 +10855,26 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
                 if (bounded) gpCount++;
                 pcur += 28;
+            } else if (rem >= 19 && memcmp(pcur, "\"clientProgramVersion\": \"", 19) == 0) {
+                // v37.134-FIX7: Count clientProgramVersion "7.6.3" → "7.7.0" replacement
+                const char *verStart = pcur + 19;
+                size_t verRem = (size_t)(scanEnd - verStart);
+                if (verRem >= 5 && memcmp(verStart, "7.6.3", 5) == 0 && verStart[5] == '"') {
+                    progVerCount++;
+                    pcur += 19 + 6;
+                } else {
+                    pcur += 19;
+                }
+            } else if (rem >= 24 && memcmp(pcur, "\"clientResourceVersion\": \"", 24) == 0) {
+                // v37.134-FIX7: Count clientResourceVersion "983" → "990" replacement
+                const char *verStart = pcur + 24;
+                size_t verRem = (size_t)(scanEnd - verStart);
+                if (verRem >= 3 && memcmp(verStart, "983", 3) == 0 && verStart[3] == '"') {
+                    resVerCount++;
+                    pcur += 24 + 4;
+                } else {
+                    pcur += 24;
+                }
             } else if (rem >= 20) {
                 // v37.79: accId detection DISABLED — skip to next char
                 pcur++;
@@ -10885,7 +10882,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 pcur++;
             }
         }
-        patchCount = chCount + dmCount + gpCount + accCount;
+        patchCount = chCount + dmCount + gpCount + progVerCount + resVerCount + accCount;
         // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
         // v37.37 CRITICAL FIX: Must save from FFF493#2 (inLen 500-800B) NOT FFF493#1!
         // AES-CBC uses different IV per message. Using FFF493#1's IV to encrypt FFF493#2
@@ -10911,7 +10908,15 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         // isFFF493_2_stub is now always NO; the extended-plaintext save block below
         // is also disabled.
         if (patchCount > 0) {
-            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
+            // v37.134-FIX7: Added version bump deltas
+            // clientProgramVersion: "7.6.3"(5) → "7.7.0"(5) with JSON keys:
+            //   old: "\"clientProgramVersion\": \"7.6.3\"" = 25 chars
+            //   new: "\"clientProgramVersion\": \"7.7.0\"" = 27 chars  → +2 each
+            // clientResourceVersion: "983"(3) → "990"(3) with JSON keys:
+            //   old: "\"clientResourceVersion\": \"983\"" = 28 chars
+            //   new: "\"clientResourceVersion\": \"990\"" = 29 chars  → +1 each
+            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4)
+                          + (ssize_t)progVerCount * 2 + (ssize_t)resVerCount * 1;
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
             patchedBuf = malloc(newDataInLen + 32);
             if (patchedBuf) {
@@ -10951,6 +10956,25 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         // Replacing it with a fixed CANONICAL UUID breaks device whitelist auth.
                     } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
                         // v37.107-DIST: Do NOT replace bare UUID either — same reason as above.
+                    } else if (rem >= 19 && memcmp(p, "\"clientProgramVersion\": \"", 19) == 0) {
+                        // v37.134-FIX7: Replace clientProgramVersion "7.6.3" → "7.7.0" to bypass server version check
+                        // Server returns status=4 (版本过低) if version < minimum required
+                        const char *verStart = p + 19;
+                        size_t verRem = (size_t)(e - verStart);
+                        if (verRem >= 5 && memcmp(verStart, "7.6.3", 5) == 0 && verStart[5] == '"') {
+                            // Boundary check: surrounded by quotes
+                            memcpy(out, "\"clientProgramVersion\": \"7.7.0\"", 27);
+                            out += 27; p += 19 + 6; continue;
+                        }
+                    } else if (rem >= 24 && memcmp(p, "\"clientResourceVersion\": \"", 24) == 0) {
+                        // v37.134-FIX7: Replace clientResourceVersion "983" → "990" to bypass server version check
+                        const char *verStart = p + 24;
+                        size_t verRem = (size_t)(e - verStart);
+                        if (verRem >= 3 && memcmp(verStart, "983", 3) == 0 && verStart[3] == '"') {
+                            // Boundary check: surrounded by quotes
+                            memcpy(out, "\"clientResourceVersion\": \"990\"", 29);
+                            out += 29; p += 24 + 4; continue;
+                        }
                     } else if (rem >= 20) {
                         // v37.108-DIST: Do NOT replace 20-digit accountId in CCCrypt plaintext!
                         // ROOT CAUSE: Forcing CANONICAL accId caused ALL users to enter kk994's game
@@ -10975,8 +10999,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
                 if (logged < 4) {
-                    DLOG(@"[CH-L4] v37.77 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
-                         patchCount, chCount, dmCount, gpCount, accCount, dataInLen, realDataInLen,
+                    DLOG(@"[CH-L4] v37.134-FIX7 patchesTot=%d ch=%d dm=%d gp=%d progVer=%d resVer=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, progVerCount, resVerCount, accCount, dataInLen, realDataInLen,
                          (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
