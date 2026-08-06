@@ -5526,8 +5526,42 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x04; memcpy(newBuf+rebuildOut+2,"WIFI",4);   rebuildOut+=6;
                         // 7.6.3 5B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x05; memcpy(newBuf+rebuildOut+2,"7.6.3",5);  rebuildOut+=7;
-                        // 979 3B
-                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
+                        // Version/build number — extract from ORIGINAL packet (NOT hardcoded "979"!)
+                        // ROOT CAUSE of login stuck: CC_MD5 hash2 input contains original version (e.g. "983")
+                        // but CANONICAL body had hardcoded "979" → hash2 mismatch → server rejected EE121.
+                        // Fix: scan original packet for the version TLV (after "7.6.3" TLV) and use it.
+                        {
+                            char origVersion[16] = {0};
+                            int origVerLen = 0;
+                            // Scan original packet TLVs to find version field (after "7.6.3" TLV)
+                            BOOL found763 = NO;
+                            for (size_t sp = 12; sp + 2 <= len; ) {
+                                uint16_t sl = ((uint16_t)p[sp]<<8) | p[sp+1];
+                                if (sp + 2 + sl > len) break;
+                                if (found763 && sl > 0 && sl < 16) {
+                                    // This is the TLV right after "7.6.3" — it's the version/build number
+                                    origVerLen = sl;
+                                    memcpy(origVersion, p + sp + 2, sl);
+                                    origVersion[sl] = 0;
+                                    break;
+                                }
+                                // Check if this TLV is "7.6.3"
+                                if (sl == 5 && memcmp(p + sp + 2, "7.6.3", 5) == 0) {
+                                    found763 = YES;
+                                }
+                                sp += 2 + sl;
+                            }
+                            if (origVerLen > 0) {
+                                DLOG(@"[EE121-CANON] v37.134: Using ORIGINAL version=%s (NOT hardcoded 979)", origVersion);
+                                newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)origVerLen;
+                                memcpy(newBuf+rebuildOut+2, origVersion, origVerLen);
+                                rebuildOut += 2 + origVerLen;
+                            } else {
+                                // Fallback: use "979" if extraction failed
+                                DLOG(@"[EE121-CANON] v37.134: WARNING: Failed to extract version, using fallback 979");
+                                newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x03; memcpy(newBuf+rebuildOut+2,"979",3);    rebuildOut+=5;
+                            }
+                        }
                         // --- hash1/hash2/hash3 block ---
                         // v37.141 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
                         // Declare h1/h2/h3 OUTSIDE brace scope so tail DLOG can access them.
