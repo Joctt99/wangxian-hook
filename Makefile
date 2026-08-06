@@ -29,7 +29,7 @@ CFLAGS += -fno-exceptions
 CFLAGS += -fno-rtti
 CFLAGS += -install_name @executable_path/Frameworks/WangXianHook.dylib
 
-all: $(TARGET)
+all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
