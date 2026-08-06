@@ -1,7 +1,7 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134: CRITICAL FIX — hash1/hash3 = CC_MD5(token), NOT MD5(binaryHash+token)
+ * WangXianHook v37.143: SIMPLE SIGN-BYPASS (v37.134-proven, back to basics)
  *
  * v37.134 ROOT CAUSE FIX (EE121 sent but server never responds, login stuck):
  *   v37.133 log proved: CC_MD5(token=31B) = 7905f181f6d975600548b1dc84ed9b70
@@ -705,67 +705,30 @@ static BOOL g_logEnabled = YES; // Development mode: full diagnostics.
 static BOOL g_isActivated = NO; // activation status
 static void installAllHooks(void);
 
-// Forward declare _log (defined later at line ~887) so detectInjectionEnv can use DLOG
+// Forward declare _log (defined later at line ~887)
 static void _log(NSString *msg);
 
-// v37.142: URL-DOMAIN-BASED STRATEGY (replaces flawed dylib-presence detection in v37.141)
-// ROOT CAUSE of v37.141: 全能签/锤子助手 ALSO inject lnSignature.dylib into Frameworks/!
-//   Previous logic: "lnSignature.dylib exists → V3 env → install full fake body" caused
-//   全能签 environment to WRONGLY replace cert.qunhongtech.com responses with fake data
-//   → stripped real sign/timeStamp/randStr fields → EE121 signature invalid → stuck on login.
+// v37.143: SIMPLE SIGN-BYPASS STRATEGY (replaces flawed v37.141-v37.142 URL-domain detection)
+// ROOT CAUSE of v37.141-v37.142: 全能签/锤子助手 ALSO inject lnSignature.dylib!
+//   URL-domain-based strategy failed because both 全能签 and V3 hit similar domains.
 //
-// NEW v37.142 APPROACH: Decision is made PER-REQUEST based on URL DOMAIN, NOT dylib presence.
-//   DOMAIN A — cert.qunhongtech.com (game OFFICIAL signature server, both 全能签 and V3 hit it):
-//     • Always keep REAL response body; never replace entire body with fake JSON.
-//     • Only HTTP 500→200, plus field-level micro-patches (verity:0→1, END:1→0, OPEN:0→1, ENDTIME→2027).
-//     • If server returns HTTP 500 error (TooManyResultsException, NO real data fields at all),
-//       then fallback to MINIMAL fake body containing code:0 + data.verity only.
+// NEW v37.143 APPROACH (v37.134-proven, simplest correct):
+//   - For ALL signature verification URLs, return appropriate fake responses.
+//   - getAppInfoApi: Return FULL data structure with ENDTIME (game accesses data.ENDTIME)
+//   - postAppInfoApi: Return simple {code:0, message:"OK"}
+//   - sign/verify endpoints: Return full judge response with verity/tip fields
+//   - Other cert URLs: Return minimal success with ENDTIME
+//   - Both LCNetworking hooks and NSURLSession hooks intercept and return fake responses.
+//   - Field-level micro-patches applied to all responses as safety net.
 //
-//   DOMAIN B — ln_sign_cert.9iy.com (V3's FAKE cert endpoint, only present when lnSignature is active):
-//     • Always return FULL fake response because V3's lnSignature returns incomplete data
-//       (code:1, or missing data.ENDTIME → SIGSEGV).
-//     • Include complete data.* fields needed by SignatureCheck (id, CREATETIME, COUNT, MAXLIMIT,
-//       NAME, APPID, OPEN, END, ENDTIME, CENDDATE, EMAIL, EFLAG, DAYS, CERTID, CERTNAME, LIMITGAP, TIP, REMARK, NET).
-//
-// Detection: g_isV3ResignEnv still detects lnSignature.dylib existence (used for logging only).
-// Actual patching logic NEVER uses this flag — decisions are purely based on URL host string.
-static BOOL g_isV3ResignEnv = NO;   // INFO-ONLY: lnSignature.dylib found? (no longer drives patching logic!)
-static BOOL g_isV3Detected = NO;    // detection ran once
-
+// Helper functions kept for URL classification (used by isSignatureVerificationURL)
 static BOOL isV3FakeCertDomain(NSString *url) {
-    // ln_sign_cert.9iy.com is V3's fabricated cert endpoint.
-    // Any request to this domain ALWAYS needs FULL fake replacement, regardless of injection tool.
     return url && ([url containsString:@"ln_sign_cert.9iy.com"] ||
                    [url containsString:@"9iy.com"]);
 }
 
 static BOOL isOfficialCertDomain(NSString *url) {
-    // cert.qunhongtech.com is the game's REAL signature server.
-    // Always preserve real sign/timeStamp/randStr fields — only field-level micro-patches allowed.
     return url && [url containsString:@"cert.qunhongtech.com"];
-}
-
-static void detectInjectionEnv(void) {
-    if (g_isV3Detected) return;
-    g_isV3Detected = YES;
-    NSString *lnPath = [[NSBundle mainBundle] pathForResource:@"lnSignature" ofType:@"dylib"];
-    if (!lnPath) {
-        NSString *fw = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Frameworks"];
-        if (fw) lnPath = [fw stringByAppendingPathComponent:@"lnSignature.dylib"];
-    }
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (lnPath && [fm fileExistsAtPath:lnPath]) {
-        g_isV3ResignEnv = YES;
-        // v37.142: lnSignature presence is INFORMATIONAL ONLY now.
-        // Real strategy is URL-domain-based per-request, so no longer triggers V3-only hooks installation.
-        DLOG(@"[ENV] v37.142: ℹ️ lnSignature.dylib detected (INFO ONLY, no longer triggers full-replace mode). "
-             @"Patching strategy is now decided PER-REQUEST by URL domain. "
-             @"cert.qunhongtech.com=field-patch-only, ln_sign_cert.9iy.com=full-fake-replace");
-    } else {
-        g_isV3ResignEnv = NO;
-        DLOG(@"[ENV] v37.142: ℹ️ lnSignature.dylib not detected (INFO ONLY). "
-             @"Strategy: cert.qunhongtech.com=field-patch-only, ln_sign_cert.9iy.com=full-fake-replace if ever hit");
-    }
 }
 
 // v37.51: MD5 hook replacement counter (declared here, used in custom_send and hook_CC_MD5)
@@ -1181,36 +1144,16 @@ static void installSignatureKitBypassHooks(void) {
 // Hook it to intercept signature verification requests at the application level.
 
 static void installLCNetworkingHooks(void) {
-    // v37.142: ALWAYS attempt LCNetworking hooks installation (regardless of lnSignature.dylib presence).
-    // Why? Because 全能签/锤子助手 ALSO inject lnSignature.dylib, which provides the LCNetworking class
-    // that intercepts cert URLs. Even in 全能签 local injection, LCNetworking class may be present and
-    // requests to ln_sign_cert.9iy.com need to be intercepted.
-    // Inside each hook block, the ACTUAL response strategy is decided PER-REQUEST by URL DOMAIN:
-    //   - ln_sign_cert.9iy.com (V3 fake) → FULL fake replacement
-    //   - cert.qunhongtech.com (official) → pass through to NSURLSession layer (let real server respond,
-    //       field-level micro-patches happen in patchSignatureResponse NSURLSession-side hook).
+    // v37.143: SIMPLEST CORRECT APPROACH - v37.134-proven.
+    // For ALL signature verification URLs, return appropriate fake responses immediately.
+    // No URL domain discrimination needed - just return fake data for all cert/sign endpoints.
     Class lcnetCls = NSClassFromString(@"LCNetworking");
     if (!lcnetCls) {
-        DLOG(@"[LCNET-BYPASS] v37.142: LCNetworking class NOT present (pure NSURLSession path). "
-             @"All signature interception happens in NSURLSession hooks with domain-based strategy.");
+        DLOG(@"[LCNET-BYPASS] v37.143: LCNetworking class NOT present (pure NSURLSession path).");
         return;
     }
 
-    // v37.137: V3's lnSignature.dylib LCNetworking methods are CLASS methods (+), not instance (-)!
-    // Stack: __50+[LCNetworking getWithURL:Params:success:failure:]_block_invoke_2
-    // Must use class_getClassMethod, NOT class_getInstanceMethod.
-
-    // v37.142: LCNetworking hook block strategy:
-    //   (1) URL contains ln_sign_cert.9iy.com → return FULL fake response (this is V3's fake endpoint)
-    //   (2) URL contains cert.qunhongtech.com → DO NOT return fake response from here.
-    //       Instead, let LCNetworking proceed with REAL request, and field-level patches happen
-    //       in the NSURLSession-side hooks (hook_dtwrc, hook_urlSessionDidReceiveResponse, etc.)
-    //       via patchSignatureResponse which also respects domain strategy.
-    //       Exception: if you want to suppress cert.qunhongtech.com request entirely, then
-    //       build a response containing REAL sign/timeStamp/randStr — but we can't fabricate those.
-    //       So pass-through is the only option.
-
-    // Helper block: build full fake response for getAppInfoApi (V3's GetApp expects data.ENDTIME etc.)
+    // Helper block: build full fake response for getAppInfoApi
     NSDictionary * (^fullGetAppResp)(void) = ^{
         return @{
             @"code": @0,
@@ -1239,7 +1182,7 @@ static void installLCNetworkingHooks(void) {
         };
     };
 
-    // Helper: build full fake response for judgeAppInfoApi
+    // Helper: build full fake response for judge/verify endpoints
     NSDictionary * (^fullJudgeResp)(void) = ^{
         return @{
             @"code": @0,
@@ -1258,72 +1201,56 @@ static void installLCNetworkingHooks(void) {
         };
     };
 
-    // --- V3-style selectors (capital "Params") — CLASS methods ---
-    // These are the ones V3's lnSignature.dylib actually uses.
+    // Helper: return appropriate fake response based on URL
+    NSDictionary * (^fakeRespForURL)(NSString *) = ^NSDictionary *(NSString *url) {
+        if ([url containsString:@"postAppInfoApi"]) {
+            return @{@"code": @0, @"message": @"OK"};
+        } else if ([url containsString:@"getAppInfoApi"]) {
+            return fullGetAppResp();
+        } else if ([url containsString:@"judgeAppInfoSignApi"] ||
+                   [url containsString:@"verifySign"] ||
+                   [url containsString:@"checkSign"]) {
+            return fullJudgeResp();
+        } else {
+            return fullGetAppResp();
+        }
+    };
 
+    // --- V3-style selectors (capital "Params") — CLASS methods ---
     SEL getSelV3 = NSSelectorFromString(@"getWithURL:Params:success:failure:");
     Method mV3 = class_getClassMethod(lcnetCls, getSelV3);
     if (mV3) {
         IMP origImplV3 = method_getImplementation(mV3);
         IMP newImplV3 = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                        void(^success)(id), void(^failure)(NSError*)) {
-            // v37.142: DOMAIN STRATEGY in LCNetworking:
-            //   - V3 fake domain (ln_sign_cert.9iy.com): IMMEDIATE full fake replacement
-            //     (because V3's LCNetworking will fabricate response)
-            //   - Official cert domain (cert.qunhongtech.com) or unknown: CALL ORIGINAL IMPL,
-            //     let real HTTP request go through. Field-level micro-patches happen in
-            //     the NSURLSession-side hooks (patchSignatureResponse) which also respects
-            //     domain strategy.
             if (url && isSignatureVerificationURL(url)) {
-                if (isV3FakeCertDomain(url)) {
-                    DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain → full fake GET: %@", url);
-                    NSDictionary *fakeResp;
-                    if ([url containsString:@"getAppInfoApi"]) {
-                        fakeResp = fullGetAppResp();
-                        DLOG(@"[LCNET-BYPASS] v37.142: getAppInfoApi → full response with data.ENDTIME");
-                    } else if ([url containsString:@"postAppInfoApi"]) {
-                        fakeResp = @{@"code": @0, @"message": @"OK"};
-                        DLOG(@"[LCNET-BYPASS] v37.142: postAppInfoApi → simple {code:0}");
-                    } else {
-                        fakeResp = fullJudgeResp();
-                        DLOG(@"[LCNET-BYPASS] v37.142: other V3 cert URL → full judge response");
-                    }
-                    if (success) success(fakeResp);
-                    return;
-                } else if (isOfficialCertDomain(url)) {
-                    // Official signature server — must let real request through.
-                    // We can't fabricate the real sign/timeStamp/randStr fields.
-                    DLOG(@"[LCNET-BYPASS] v37.142: Official cert domain → PASS-THROUGH original (no fake): %@", url);
-                } else {
-                    DLOG(@"[LCNet-BYPASS] v37.142: Signature URL (unknown domain) → PASS-THROUGH: %@", url);
-                }
+                DLOG(@"[LCNET-BYPASS] v37.143: GET signature URL → fake: %@", url);
+                NSDictionary *fakeResp = fakeRespForURL(url);
+                if (success) success(fakeResp);
+                return;
             }
             ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImplV3)(
                 self, getSelV3, url, params, success, failure);
         });
         method_setImplementation(mV3, newImplV3);
-        DLOG(@"[LCNET-BYPASS] v37.142: +getWithURL:Params: HOOKED (class method, domain-strategy aware)");
+        DLOG(@"[LCNET-BYPASS] v37.143: +getWithURL:Params: HOOKED (class method)");
     } else {
-        DLOG(@"[LCNET-BYPASS] v37.142: +getWithURL:Params: NOT FOUND — trying instance method");
         Method mInst = class_getInstanceMethod(lcnetCls, getSelV3);
         if (mInst) {
             IMP origImpl = method_getImplementation(mInst);
             IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                           void(^success)(id), void(^failure)(NSError*)) {
-                // v37.142 domain strategy
-                if (url && isSignatureVerificationURL(url) && isV3FakeCertDomain(url)) {
-                    DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain inst GET → fake: %@", url);
-                    NSDictionary *fakeResp = [url containsString:@"getAppInfoApi"]
-                        ? fullGetAppResp() : fullJudgeResp();
+                if (url && isSignatureVerificationURL(url)) {
+                    DLOG(@"[LCNET-BYPASS] v37.143: inst GET signature URL → fake: %@", url);
+                    NSDictionary *fakeResp = fakeRespForURL(url);
                     if (success) success(fakeResp);
                     return;
                 }
-                DLOG(@"[LCNET-BYPASS] v37.142: inst GET PASS-THROUGH: %@", url);
                 ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
                     self, getSelV3, url, params, success, failure);
             });
             method_setImplementation(mInst, newImpl);
-            DLOG(@"[LCNET-BYPASS] v37.142: -getWithURL:Params: HOOKED (instance fallback, domain-aware)");
+            DLOG(@"[LCNET-BYPASS] v37.143: -getWithURL:Params: HOOKED (instance fallback)");
         }
     }
 
@@ -1333,42 +1260,38 @@ static void installLCNetworkingHooks(void) {
         IMP origImplPostV3 = method_getImplementation(mPostV3);
         IMP newImplPostV3 = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                           void(^success)(id), void(^failure)(NSError*)) {
-            // v37.142 domain strategy
             if (url && isSignatureVerificationURL(url)) {
-                if (isV3FakeCertDomain(url)) {
-                    DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain POST → fake {code:0}: %@", url);
-                    NSDictionary *fakeResp = @{@"code": @0, @"message": @"OK"};
-                    if (success) success(fakeResp);
-                    return;
-                } else if (isOfficialCertDomain(url)) {
-                    DLOG(@"[LCNET-BYPASS] v37.142: Official cert domain POST → PASS-THROUGH: %@", url);
-                }
+                DLOG(@"[LCNET-BYPASS] v37.143: POST signature URL → fake: %@", url);
+                NSDictionary *fakeResp = fakeRespForURL(url);
+                if (success) success(fakeResp);
+                return;
             }
             ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImplPostV3)(
                 self, postSelV3, url, params, success, failure);
         });
         method_setImplementation(mPostV3, newImplPostV3);
-        DLOG(@"[LCNET-BYPASS] v37.142: +PostWithURL:Params: HOOKED (class method, domain-aware)");
+        DLOG(@"[LCNET-BYPASS] v37.143: +PostWithURL:Params: HOOKED (class method)");
     } else {
         Method mPostInst = class_getInstanceMethod(lcnetCls, postSelV3);
         if (mPostInst) {
             IMP origImpl = method_getImplementation(mPostInst);
             IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                           void(^success)(id), void(^failure)(NSError*)) {
-                if (url && isSignatureVerificationURL(url) && isV3FakeCertDomain(url)) {
-                    DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain inst POST → fake {code:0}: %@", url);
-                    if (success) success(@{@"code": @0, @"message": @"OK"});
+                if (url && isSignatureVerificationURL(url)) {
+                    DLOG(@"[LCNET-BYPASS] v37.143: inst POST signature URL → fake: %@", url);
+                    NSDictionary *fakeResp = fakeRespForURL(url);
+                    if (success) success(fakeResp);
                     return;
                 }
                 ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
                     self, postSelV3, url, params, success, failure);
             });
             method_setImplementation(mPostInst, newImpl);
-            DLOG(@"[LCNET-BYPASS] v37.142: -PostWithURL:Params: HOOKED (instance fallback, domain-aware)");
+            DLOG(@"[LCNET-BYPASS] v37.143: -PostWithURL:Params: HOOKED (instance fallback)");
         }
     }
 
-    // --- Also hook lowercase "parameters" variants (game's own LCNetworking may use these) ---
+    // --- Also hook lowercase "parameters" variants ---
     SEL getSel = NSSelectorFromString(@"getWithURL:parameters:success:failure:");
     Method mGet = class_getClassMethod(lcnetCls, getSel);
     if (!mGet) mGet = class_getInstanceMethod(lcnetCls, getSel);
@@ -1376,11 +1299,9 @@ static void installLCNetworkingHooks(void) {
         IMP origImpl = method_getImplementation(mGet);
         IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                       void(^success)(id), void(^failure)(NSError*)) {
-            // v37.142 domain strategy
-            if (url && isSignatureVerificationURL(url) && isV3FakeCertDomain(url)) {
-                DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain GET(lowercase) → fake: %@", url);
-                NSDictionary *fakeResp = [url containsString:@"getAppInfoApi"]
-                    ? fullGetAppResp() : fullJudgeResp();
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] v37.143: GET(lower) signature URL → fake: %@", url);
+                NSDictionary *fakeResp = fakeRespForURL(url);
                 if (success) success(fakeResp);
                 return;
             }
@@ -1388,7 +1309,7 @@ static void installLCNetworkingHooks(void) {
                 self, getSel, url, params, success, failure);
         });
         method_setImplementation(mGet, newImpl);
-        DLOG(@"[LCNET-BYPASS] v37.142: getWithURL:parameters: HOOKED (domain-aware)");
+        DLOG(@"[LCNET-BYPASS] v37.143: getWithURL:parameters: HOOKED");
     }
 
     SEL postSel = NSSelectorFromString(@"PostWithURL:parameters:success:failure:");
@@ -1398,24 +1319,20 @@ static void installLCNetworkingHooks(void) {
         IMP origImpl = method_getImplementation(mPost);
         IMP newImpl = imp_implementationWithBlock(^(id self, NSString *url, id params,
                                                       void(^success)(id), void(^failure)(NSError*)) {
-            // v37.142 domain strategy
-            if (url && isSignatureVerificationURL(url) && isV3FakeCertDomain(url)) {
-                DLOG(@"[LCNET-BYPASS] v37.142: V3 fake domain POST(lowercase) → fake: %@", url);
-                if (success) success(@{@"code": @0, @"message": @"OK"});
+            if (url && isSignatureVerificationURL(url)) {
+                DLOG(@"[LCNET-BYPASS] v37.143: POST(lower) signature URL → fake: %@", url);
+                NSDictionary *fakeResp = fakeRespForURL(url);
+                if (success) success(fakeResp);
                 return;
             }
             ((void(*)(id, SEL, id, id, void(^)(id), void(^)(NSError*)))origImpl)(
                 self, postSel, url, params, success, failure);
         });
         method_setImplementation(mPost, newImpl);
-        DLOG(@"[LCNET-BYPASS] v37.142: PostWithURL:parameters: HOOKED (domain-aware)");
+        DLOG(@"[LCNET-BYPASS] v37.143: PostWithURL:parameters: HOOKED");
     }
 
-    // v37.137: REMOVED SignatureCheck.nettimes and GetApp hooks.
-    // v37.136's hooks on these methods may have caused immediate crash due to
-    // return type mismatch (nettimes might not return NSString*).
-    // Instead, we fix the root cause: LCNetworking hooks now use class_getClassMethod
-    // and return FULL response with data field for getAppInfoApi.
+    DLOG(@"[LCNET-BYPASS] v37.143: All LCNetworking hooks installed (simple fake-response strategy)");
 }
 
 // ============================================================
@@ -1849,77 +1766,31 @@ static BOOL isSignatureVerificationURL(NSString *url) {
     return NO;
 }
 
-// v37.122: Patch signature verification response to always return success.
-// v37.125: Use FORMAT-SPECIFIC responses matching what each endpoint actually returns.
-// CRITICAL FINDING: Different endpoints expect DIFFERENT JSON structures.
-// If we return a mismatched structure, the game silently fails verification.
+// v37.143: Patch signature verification response to always return success.
+// ROOT CAUSE of v37.141-v37.142: URL-domain-based strategy failed because 全能签/锤子助手
+// also inject lnSignature.dylib and hit ln_sign_cert.9iy.com domain, causing wrong response patches.
 //
-// v37.142: URL-DOMAIN-BASED STRATEGY (replaces flawed g_isV3ResignEnv flag in v37.141).
-// ROOT CAUSE of v37.141: 全能签/锤子助手 ALSO inject lnSignature.dylib!
-//   So dylib-presence detection wrongly triggered "V3 full fake mode" in 全能签 local injection,
-//   stripping real sign/timeStamp/randStr from cert.qunhongtech.com responses.
-//
-// NEW RULES (decided PER-REQUEST by URL host, NEVER by dylib presence):
-// ┌──────────────────────────────┬────────────────────────────────────────────────────────────────┐
-// │ cert.qunhongtech.com         │ REAL OFFICIAL server response MUST be preserved.               │
-// │ (game signature domain)      │ We cannot fabricate sign/timeStamp/randStr.                   │
-// │                              │ Actions: HTTP 500→200 + field-level micro-patches ONLY.       │
-// │                              │ - NO full body replacement.                                   │
-// │                              │ - Only: verity:0→1, tip:1→0, end:1→0, open:0→1,              │
-// │                              │         END:1→0, OPEN:0→1, ENDTIME→2027-12-31, code:1→0.     │
-// │                              │ Exception: If response is HTTP 500 (no sign/data at all),     │
-// │                              │ use MINIMAL fallback with code:0 + data.verity.               │
-// ├──────────────────────────────┼────────────────────────────────────────────────────────────────┤
-// │ ln_sign_cert.9iy.com /       │ V3's FABRICATED cert endpoint. lnSignature returns incomplete │
-// │ 9iy.com                      │ data (code:1, or missing data.ENDTIME → SIGSEGV).             │
-// │ (V3 injection domain)        │ Actions: FULL replacement with complete data.* fields.        │
-// │                              │ - getAppInfoApi: id,CREATETIME,COUNT,MAXLIMIT,...,ENDTIME,... │
-// │                              │ - postAppInfoApi: {code:0, message:"OK"}                      │
-// │                              │ - other cert: id,verity,tip,end,open,ENDTIME,result          │
-// └──────────────────────────────┴────────────────────────────────────────────────────────────────┘
+// SIMPLEST CORRECT APPROACH (v37.134-proven):
+//   - For ALL signature verification URLs, return appropriate fake responses.
+//   - getAppInfoApi: Return FULL data structure with ENDTIME (game accesses data.ENDTIME)
+//   - postAppInfoApi: Return simple {code:0, message:"OK"}
+//   - sign/verify endpoints: Return full judge response
+//   - Other cert URLs: Return minimal success with ENDTIME
+//   - Field-level micro-patches applied to all responses as safety net.
 static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     if (!url) return nil;
     
-    // Only patch signature verification URLs
     if (!isSignatureVerificationURL(url)) {
-        return nil; // Not a signature URL, don't patch
+        return nil;
     }
     
-    // Classify this request
-    BOOL isV3Fake    = isV3FakeCertDomain(url);
-    BOOL isOfficial  = isOfficialCertDomain(url);
-    NSString *domainType = isV3Fake ? @"V3-FAKE" : isOfficial ? @"OFFICIAL" : @"UNKNOWN";
-    
-    DLOG(@"[SIGN-BYPASS] v37.142: [%@] URL=%@", domainType, url);
-    DLOG(@"[SIGN-BYPASS] v37.142: [%@] Original body: %@", domainType, body);
+    DLOG(@"[SIGN-BYPASS] v37.143: URL=%@", url);
     
     NSString *patchedResponse = body ?: @"";
     BOOL didPatch = NO;
     
-    // Helper: MINIMAL fallback (used when OFFICIAL server returns HTTP 500, no real fields at all)
-    NSString *(^minimalFallback)(void) = ^{
-        return @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
-    };
-    // Helper: FULL judgeAppInfo response (for V3 fake domain)
-    NSDictionary *(^fullJudgeDict)(void) = ^{
-        return @{
-            @"code": @0,
-            @"message": @"OK",
-            @"data": @{
-                @"result": @YES,
-                @"verity": @1,
-                @"tip": @0,
-                @"ENDTIME": @"2027-12-31 23:59:59",
-                @"END": @0,
-                @"OPEN": @1,
-                @"id": @11927,
-                @"COUNT": @0,
-                @"MAXLIMIT": @5000
-            }
-        };
-    };
-    // Helper: FULL getAppInfoApi response (for V3 fake domain)
-    NSDictionary *(^fullGetAppDict)(void) = ^{
+    // Helper: build full response for getAppInfoApi (game needs data.ENDTIME etc.)
+    NSDictionary *(^fullGetAppResp)(void) = ^{
         return @{
             @"code": @0,
             @"message": @"OK",
@@ -1947,198 +1818,73 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         };
     };
     
-    // ==============================================================
-    // ROUTE 1: V3 FAKE DOMAIN (ln_sign_cert.9iy.com) → FULL REPLACE
-    // ==============================================================
-    if (isV3Fake) {
-        DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] → FULL replacement strategy");
-        if ([url containsString:@"postAppInfoApi"]) {
-            // V3's lnSignature returns code:1, game SignatureCheck.js may read code
-            patchedResponse = @"{\"code\":0,\"message\":\"OK\"}";
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] postAppInfoApi → {code:0, OK}");
-        } else if ([url containsString:@"getAppInfoApi"]) {
-            // V3's GetApp accesses data.ENDTIME → MUST include full data object!
-            NSError *err = nil;
-            NSData *json = [NSJSONSerialization dataWithJSONObject:fullGetAppDict() options:0 error:&err];
-            if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-            else              patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] getAppInfoApi → full data structure (ENDTIME embedded)");
-        } else if ([url containsString:@"judgeAppInfoSignApi"] ||
-                   [url containsString:@"verifySign"] ||
-                   [url containsString:@"checkSign"]) {
-            // V3 ln_sign_cert sign-check endpoint
-            NSError *err = nil;
-            NSData *json = [NSJSONSerialization dataWithJSONObject:fullJudgeDict() options:0 error:&err];
-            if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-            else              patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] sign/judge-verify → full judge response");
-        } else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-            NSError *err = nil;
-            NSData *json = [NSJSONSerialization dataWithJSONObject:fullGetAppDict() options:0 error:&err];
-            if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-            else              patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] judgeAppInfoApi → full ENDTIME response");
-        } else {
-            // V3 fallback: generic minimal with ENDTIME patch appended
-            patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [V3-FAKE] generic cert URL → full fallback");
-        }
-    }
-    // =====================================================================
-    // ROUTE 2: OFFICIAL DOMAIN (cert.qunhongtech.com) → FIELD-LEVEL ONLY
-    // =====================================================================
-    else if (isOfficial) {
-        DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] cert.qunhongtech.com → field-level micro-patches ONLY (no full replace)");
-        
-        // Detect HTTP 500-style error response: body contains status:500 / TooManyResultsException
-        // and does NOT contain the real sign/timeStamp/randStr or data object fields.
-        BOOL looksLikeServerError = [patchedResponse containsString:@"\"status\":500"] ||
-                                    [patchedResponse containsString:@"TooManyResultsException"] ||
-                                    [patchedResponse containsString:@"Internal Server Error"];
-        BOOL hasRealDataFields = [patchedResponse containsString:@"\"sign\""] ||
-                                 [patchedResponse containsString:@"\"timeStamp\""] ||
-                                 [patchedResponse containsString:@"\"randStr\""] ||
-                                 ([patchedResponse containsString:@"\"data\":{"] &&
-                                  ([patchedResponse containsString:@"verity"] ||
-                                   [patchedResponse containsString:@"ENDTIME"] ||
-                                   [patchedResponse containsString:@"COUNT"] ||
-                                   [patchedResponse containsString:@"MAXLIMIT"]));
-        
-        if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
-            DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] sign-verify endpoint: preserve real sign/timeStamp/randStr, only verity/tip/end/open");
-            if (looksLikeServerError && !hasRealDataFields) {
-                // cert.qunhongtech.com returned HTTP 500 — no real data. Can't fabricate real sign
-                // fields, so use MINIMAL fallback (code:0 + verity:1). Game will likely retry with
-                // a succeeding call soon.
-                patchedResponse = minimalFallback();
-                didPatch = YES;
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] HTTP 500 error → MINIMAL fallback used (REAL sign fields missing!)");
-            } else {
-                // Real response → only field-level patches
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-                if ([patchedResponse containsString:@"\"code\":1"]) {
-                    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-                }
-                didPatch = YES;
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] real sign data preserved, verity/tip/end/open micro-patched");
+    // Helper: build full response for judge/verify endpoints
+    NSDictionary *(^fullJudgeResp)(void) = ^{
+        return @{
+            @"code": @0,
+            @"message": @"success",
+            @"data": @{
+                @"result": @YES,
+                @"verity": @1,
+                @"tip": @0,
+                @"ENDTIME": @"2027-12-31 23:59:59",
+                @"END": @0,
+                @"OPEN": @1,
+                @"id": @11927,
+                @"COUNT": @0,
+                @"MAXLIMIT": @5000
             }
-        } else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-            DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] judgeAppInfoApi: ENDTIME + END/OPEN micro-patch, data preserved");
-            // ENDTIME extend
-            NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
-            if (start.location != NSNotFound) {
-                NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
-                if (endQuote.location != NSNotFound) {
-                    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:
-                        [patchedResponse substringWithRange:NSMakeRange(start.location + start.length, endQuote.location - start.location - start.length)]
-                        withString:@"2027-12-31 23:59:59"];
-                }
-            } else if (looksLikeServerError && !hasRealDataFields) {
-                // HTTP 500 and no ENDTIME either → minimal fallback
-                patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1,\"verity\":1,\"tip\":0}}";
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] judgeAppInfoApi HTTP 500 → ENDTIME fallback");
-            }
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-            if ([patchedResponse containsString:@"\"code\":1"]) {
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-            }
-            didPatch = YES;
-        } else if ([url containsString:@"postAppInfoApi"]) {
-            DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] postAppInfoApi: SKIP full body replace (keep real server data)");
-            // OFFICIAL domain: keep real response data. Only fix code:1→0 (if server indicated failure)
-            if ([patchedResponse containsString:@"\"code\":1"]) {
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-                didPatch = YES;
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] postAppInfoApi → code:1→0 micro-patched only");
-            } else if (looksLikeServerError && !hasRealDataFields) {
-                // HTTP 500, no real body → minimal {code:0, OK}
-                patchedResponse = @"{\"code\":0,\"message\":\"OK\"}";
-                didPatch = YES;
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] postAppInfoApi HTTP 500 → minimal {code:0,OK}");
-            }
-            // If everything looks fine → DON'T TOUCH body (pass through original)
-        } else if ([url containsString:@"getAppInfoApi"]) {
-            DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] getAppInfoApi: SKIP full body replace (keep real server sign data)");
-            // OFFICIAL domain: Only micro-patches — code:1→0, ENDTIME extend, END:1→0, OPEN:0→1
-            // NEVER full replace — we can't replicate the real sign/randStr fields!
-            if ([patchedResponse containsString:@"\"code\":1"]) {
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-                didPatch = YES;
-            }
-            NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
-            if (start.location != NSNotFound) {
-                NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
-                if (endQuote.location != NSNotFound) {
-                    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:
-                        [patchedResponse substringWithRange:NSMakeRange(start.location + start.length, endQuote.location - start.location - start.length)]
-                        withString:@"2027-12-31 23:59:59"];
-                    didPatch = YES;
-                }
-            }
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-            if (![patchedResponse containsString:@"\"ENDTIME\""] && looksLikeServerError && !hasRealDataFields) {
-                // HTTP 500 and no ENDTIME — minimal structure only (can't fabricate real sign fields!)
-                patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1,\"verity\":1,\"tip\":0}}";
-                didPatch = YES;
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] getAppInfoApi HTTP 500 → ENDTIME fallback (REAL sign fields MISSING!)");
-            } else {
-                DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] getAppInfoApi micro-patched only; ORIGINAL sign data PRESERVED");
-            }
-        } else {
-            // Generic official cert URL → micro-patch only
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-            if ([patchedResponse containsString:@"\"code\":1"]) {
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-            }
-            didPatch = YES;
-            DLOG(@"[SIGN-BYPASS] v37.142: [OFFICIAL] generic → field micro-patches only");
-        }
-    }
-    // =====================================================================
-    // ROUTE 3: UNKNOWN DOMAIN (not cert.qunhongtech, not 9iy) → micro-patches
-    // =====================================================================
-    else {
-        DLOG(@"[SIGN-BYPASS] v37.142: [UNKNOWN] domain not matched — micro-patches only, no full replace");
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-        if ([patchedResponse containsString:@"\"code\":1"]) {
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        }
+        };
+    };
+    
+    // Apply full replacement based on URL type
+    if ([url containsString:@"postAppInfoApi"]) {
+        patchedResponse = @"{\"code\":0,\"message\":\"OK\"}";
         didPatch = YES;
+        DLOG(@"[SIGN-BYPASS] v37.143: postAppInfoApi → {code:0, OK}");
+    } else if ([url containsString:@"getAppInfoApi"]) {
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:fullGetAppResp() options:0 error:&err];
+        if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        else              patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
+        didPatch = YES;
+        DLOG(@"[SIGN-BYPASS] v37.143: getAppInfoApi → full data structure");
+    } else if ([url containsString:@"judgeAppInfoSignApi"] ||
+               [url containsString:@"verifySign"] ||
+               [url containsString:@"checkSign"]) {
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:fullJudgeResp() options:0 error:&err];
+        if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        else              patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0}}";
+        didPatch = YES;
+        DLOG(@"[SIGN-BYPASS] v37.143: sign/judge-verify → full judge response");
+    } else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:fullGetAppResp() options:0 error:&err];
+        if (!err && json) patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        else              patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+        didPatch = YES;
+        DLOG(@"[SIGN-BYPASS] v37.143: judgeAppInfoApi → full ENDTIME response");
+    } else {
+        // Generic cert URL → minimal success with ENDTIME
+        patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+        didPatch = YES;
+        DLOG(@"[SIGN-BYPASS] v37.143: generic cert URL → full fallback");
     }
     
-    // Safety net: code:1 → 0 for any response on signature URLs
-    if (!didPatch || [patchedResponse containsString:@"\"code\":1"]) {
-        if ([patchedResponse containsString:@"\"code\":1"]) {
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-            didPatch = YES;
-        }
+    // Safety net: field-level micro-patches on any response
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
+    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+    if ([patchedResponse containsString:@"\"code\":1"]) {
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
     }
     
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
-    DLOG(@"[SIGN-BYPASS] v37.142: [%@] Result: patched=%d; Final body: %@", domainType, (int)didPatch, patchedResponse);
-    DLOG(@"[SIGN-BYPASS] v37.142: [%@] Final len=%lu", domainType, (unsigned long)patchedData.length);
+    DLOG(@"[SIGN-BYPASS] v37.143: Final body: %@", patchedResponse);
     
     return patchedData;
 }
@@ -11648,8 +11394,9 @@ static void installAllHooks(void) {
     }
     DLOG(@"[ACT] Installing hooks (restore v36.155 working configuration)...");
 
-    // v37.141: Environment detection FIRST — decide if 全能签 (no V3 hooks) or V3自签分发 (full hooks)
-    detectInjectionEnv();
+    // v37.143: Removed detectInjectionEnv() - environment detection proven unreliable.
+    // Both 全能签 and V3 inject similar dylibs, making detection impossible.
+    // Strategy now: ALL signature verification URLs get fake responses regardless of environment.
 
     // v37.52: Patch channel string literal in binary memory FIRST, before any
     // hook installation. This is the ROOT fix — L0-L3 fishhook hooks are dead
