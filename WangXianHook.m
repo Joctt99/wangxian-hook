@@ -1,14 +1,19 @@
-#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX11: Runtime binary hash + FIX9 session fixes
+ * WangXianHook v37.134-FIX15: Fix hash2/body mismatch + CC_MD5_Update fallback
  *
- * v37.134-FIX11 CHANGES (EE121 always returns status=4, FFF493 empty sessionId):
- *   ROOT CAUSE (BIGGEST BUG): g_our_binary_hash was HARDCODED to f9cc76c5... from v37.60
- *   - Every rebuild/injection changes the actual binary hash → output replacement condition
- *     memcmp(md, g_our_binary_hash, 16) NEVER matched → binary hash NOT replaced to clean
- *   - Server validates hash1/hash3 = MD5(clean_binary_hash + token) → FAILS → status=4
- *   - This caused EVERY version after v37.60 to have status=4!
+ * v37.134-FIX15 CHANGES (CRITICAL — root cause of "卡住正在进入"):
+ *   ROOT CAUSE: CC_MD5 hook (FIX14) replaced ch/dm/gp in hash2 input → hash2 = MD5(canonical_fields)
+ *   BUT EE007-ALIGN body reconstruction was DISABLED (FIX13) → body kept ORIGINAL ch/dm/gp
+ *   → hash2 != MD5(body) → server rejects EE121 → no real sessionId → stuck at game server
+ *   FIX: RE-ENABLE EE007-ALIGN body reconstruction (replace ch/dm/gp in packet body)
+ *        EE121-CANON full rebuild stays DISABLED (breaks packet structure)
+ *        Now: body = canonical ch/dm/gp, hash2 = MD5(canonical ch/dm/gp) → MATCH!
+ *   ALSO: Add CC_MD5_Update hook as streaming MD5 fallback (in case CC_MD5_Final rebind fails)
+ *
+ * v37.134-FIX11 CHANGES (preserved — Runtime binary hash):
+ *   g_our_binary_hash was HARDCODED → every rebuild changed actual hash → NEVER matched
  *   FIX: Runtime compute CURRENT binary hash using UNHOOKED CC_MD5 on main executable
  *   BEFORE installing hook. Use dynamic value instead of hardcoded old value.
  *
@@ -917,7 +922,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX13 loaded (DISABLE EE121-CANON + DISABLE ch/dm/gp replacement + KEEP binary hash runtime compute + hex string replacement + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX15 loaded (RE-ENABLE EE007-ALIGN body reconstruction + KEEP CC_MD5 ch/dm/gp replacement + KEEP binary hash runtime compute + hex string replacement + FIX9 session captures + CC_MD5_Update fallback) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5125,11 +5130,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
         const unsigned char *p = (const unsigned char *)buf;
         uint32_t cmd = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                        ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
-        // v37.134-FIX13: Only process EE007, NOT EE121.
-        // EE121 must be sent UNMODIFIED — EE007-ALIGN changes ch/dm/gp but hash2 is NOT
-        // recalculated (CC_MD5 ch/dm/gp replacement disabled) → hash2 mismatch → status=4.
-        // Sending original EE121 keeps hash2 consistent with original body.
-        if ((cmd == 0x000EE007) && len >= 100) {
+        // v37.134-FIX15: RE-ENABLE EE007-ALIGN for EE121 — change ch/dm/gp to CANONICAL.
+        // FIX13b proved: sending ORIGINAL ch/dm/gp (DY_MIESHI, iPhone 16 Pro Max, A18 Pro)
+        // → server returns status=4 (invalid channel/device).
+        // FIX14: CC_MD5 hook changes hash2 input to canonical ch/dm/gp → hash2 = MD5(canonical).
+        // FIX15: EE007-ALIGN ALSO changes packet body to canonical ch/dm/gp → hash2 MATCHES body!
+        // EE121-CANON full rebuild stays DISABLED (FIX11 proved it breaks packet structure).
+        if ((cmd == 0x000EE007 || cmd == 0x002EE121) && len >= 100) {
             // v37.56: RESTORE v37.51 behavior — send clean 248B packet (seq-only replacement).
             //
             // v37.54/v37.55 sent native EE121 → server CLOSED connection (hash1/hash3
@@ -5310,12 +5317,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
                 off += 2 + fLen;
             }
-            // v37.134-FIX13: DISABLE EE121-CANON rebuild — send ORIGINAL EE121 packet.
-            // FIX11 proved: EE121-CANON rebuild causes server to CLOSE connection immediately.
-            // FIX10-SKIP proved: Original EE121 → server returns status=4 (patched to 0) → reaches server select.
-            // Keep CC_MD5 ch/dm/gp replacement DISABLED (hash2 must match original body).
-            // Keep binary hash runtime computation + hex string replacement ENABLED.
-            if (0 && (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
+            // v37.134-FIX15: RE-ENABLE EE007-ALIGN body reconstruction.
+            // CRITICAL FIX: CC_MD5 hook (FIX14) replaces ch/dm/gp in hash2 input → hash2 = MD5(canonical_fields).
+            // But if body keeps ORIGINAL ch/dm/gp → hash2 != MD5(body) → server rejects!
+            // FIX: Enable EE007-ALIGN to replace ch/dm/gp in body too → hash2 matches body.
+            // EE121-CANON (full rebuild) stays DISABLED (FIX11 proved it breaks packet structure).
+            if (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1) {
                 // Reconstruct packet by replacing all 3 fields found
                 // Use dynamic buffer, write from 0 sequentially
                 size_t bufCap = len + 64;
@@ -5410,7 +5417,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                     // v37.75: copy hash2 from original packet — client already computed
                     //   MD5(canonical_fields+salt) via CC_MD5 hook (replaces ch/dm/gp/uuid in input).
                     //   Evidence: MD5-LOG out=6e46921d... == EE121-ORIG hash2.
-                    if (cmd == 0x002EE121) {
+                    // v37.134-FIX15: EE121-CANON full rebuild DISABLED.
+                    // FIX11 proved: full rebuild breaks packet structure → server closes connection.
+                    // FIX15: Only use EE007-ALIGN (field replacement above) which preserves structure.
+                    // CC_MD5 hook changes hash2 input to canonical ch/dm/gp → hash2 matches EE007-ALIGN body.
+                    if (0 && cmd == 0x002EE121) {
                         static const char kChannel[]  = "DYanyou0040_MIESHI";  // 18 bytes, 00 12
                         static const char kDModel[]   = "iPhone7Plus";         // 11 bytes, 00 0B
                         static const char kGPU[]      = "Apple Inc. Apple A10 GPU"; // 24 bytes, 00 18
@@ -7832,8 +7843,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (bodyStr && bodyStr.length > 0) {
                 DLOG(@"[SESSION-CAPTURE] BODY: %@", bodyStr);
                 
-                // Extract sessionId from JSON: "sessionId": "..."
+                // Extract sessionId from JSON: "sessionId": "..." or "sessionId":"..."
+                // v37.134-FIX15: Try both with-space and without-space patterns
                 NSRange sidRange = [bodyStr rangeOfString:@"\"sessionId\": \""];
+                if (sidRange.location == NSNotFound) {
+                    sidRange = [bodyStr rangeOfString:@"\"sessionId\":\""];
+                }
                 if (sidRange.location != NSNotFound) {
                     NSUInteger start = sidRange.location + sidRange.length;
                     NSRange endRange = [bodyStr rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr.length - start)];
@@ -7847,8 +7862,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 
-                // Extract ticket from JSON: "ticket": "..."
+                // Extract ticket from JSON: "ticket": "..." or "ticket":"..."
+                // v37.134-FIX15: Try both with-space and without-space patterns
                 NSRange tikRange = [bodyStr rangeOfString:@"\"ticket\": \""];
+                if (tikRange.location == NSNotFound) {
+                    tikRange = [bodyStr rangeOfString:@"\"ticket\":\""];
+                }
                 if (tikRange.location != NSNotFound) {
                     NSUInteger start = tikRange.location + tikRange.length;
                     NSRange endRange = [bodyStr rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr.length - start)];
@@ -7935,8 +7954,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             if (bodyStr100 && bodyStr100.length > 0) {
                 DLOG(@"[SESSION-CAPTURE-100] BODY: %@", bodyStr100);
                 
-                // Extract sessionId from JSON: "sessionId": "..."
+                // Extract sessionId from JSON: "sessionId": "..." or "sessionId":"..."
+                // v37.134-FIX15: Try both with-space and without-space patterns for robustness
                 NSRange sidRange100 = [bodyStr100 rangeOfString:@"\"sessionId\": \""];
+                if (sidRange100.location == NSNotFound) {
+                    sidRange100 = [bodyStr100 rangeOfString:@"\"sessionId\":\""];
+                }
                 if (sidRange100.location != NSNotFound) {
                     NSUInteger start = sidRange100.location + sidRange100.length;
                     NSRange endRange = [bodyStr100 rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr100.length - start)];
@@ -7950,8 +7973,12 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                     }
                 }
                 
-                // Extract ticket from JSON: "ticket": "..."
+                // Extract ticket from JSON: "ticket": "..." or "ticket":"..."
+                // v37.134-FIX15: Try both with-space and without-space patterns
                 NSRange tikRange100 = [bodyStr100 rangeOfString:@"\"ticket\": \""];
+                if (tikRange100.location == NSNotFound) {
+                    tikRange100 = [bodyStr100 rangeOfString:@"\"ticket\":\""];
+                }
                 if (tikRange100.location != NSNotFound) {
                     NSUInteger start = tikRange100.location + tikRange100.length;
                     NSRange endRange = [bodyStr100 rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr100.length - start)];
@@ -9399,9 +9426,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             static const char dmNew[]   = "iPhone7Plus";             // 11 bytes (-6)
             static const char gpOld[]   = "Apple Inc. Apple A18 Pro GPU"; // 28 bytes
             static const char gpNew[]   = "Apple Inc. Apple A10 GPU";     // 24 bytes (-4)
-            // v37.60: Updated to ACTUAL binary hash hex (was wrong 913a1d1a... before)
-            static const char hOld[]    = "f9cc76c534acb63f51917951d486ca0c"; // 32 bytes
-            static const char hNew[]    = "906e707ec5585f080397b26ff4b8d89d"; // 32 bytes
+            // v37.134-FIX14: hOld/hNew are now DYNAMIC — computed from g_our_binary_hash
+            // at hook install time. Old hardcoded "f9cc76c5..." never matched actual binary hash.
+            // The FIX12 code below handles dynamic hex string replacement using g_our_binary_hash.
             static const char kCanonAccId[] = "65657881045335015151"; // 20 bytes clean-client accId
 
             // --- Check for EE121-unique context markers ---
@@ -9451,12 +9478,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             int hasCh = 0, hasDm = 0, hasGp = 0, hasHash = 0, hasUUID = 0;
             uint32_t uuidPos = 0; // position of ANY 36B format UUID (when hasEE121Ctx==1)
             for (uint32_t i = 0; i + 9 <= len; i++) {
-                // v37.134-FIX13: DISABLE channel/dm/gp replacement in CC_MD5 hook.
-                // EE121-CANON rebuild is disabled → hash2 must match ORIGINAL body.
-                // Only binary hash hex string replacement remains active (FIX12).
-                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0 && 0) hasCh = 1;
-                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0 && 0) hasDm = 1;
-                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0 && 0) hasGp = 1;
+                // v37.134-FIX14: RE-ENABLE channel/dm/gp replacement in CC_MD5 hook.
+                // EE007-ALIGN changes packet body ch/dm/gp → hash2 must match modified body.
+                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
+                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
+                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
                 if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
                 // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
                 // ROOT CAUSE: 162B and 168B hash inputs have different field order
@@ -9724,6 +9750,133 @@ static int hook_CC_MD5_Final(unsigned char *md, void *c) {
             DLOG(@"[MD5-HOOK] v37.51: Replaced binary hash via CC_MD5_Final (#%d)", g_md5_replace_count);
         }
     }
+    return ret;
+}
+
+// v37.134-FIX15: Hook CC_MD5_Update for streaming MD5 fallback.
+// If game uses CC_MD5_Init+Update+Final instead of one-shot CC_MD5,
+// and CC_MD5_Final rebind fails (rebind=0), we intercept data at Update level.
+// Same replacement logic as CC_MD5 hook: binary hash + ch/dm/gp.
+typedef int (*CC_MD5_UpdateFunc)(void *c, const void *data, CC_LONG len);
+static CC_MD5_UpdateFunc orig_CC_MD5_Update = NULL;
+
+static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
+    if (!orig_CC_MD5_Update || !data || len == 0) {
+        return orig_CC_MD5_Update ? orig_CC_MD5_Update(c, data, len) : 0;
+    }
+
+    const uint8_t *in = (const uint8_t *)data;
+    void *cleanInput = NULL;
+    const void *actualInput = data;
+    CC_LONG actualLen = len;
+    int inputModified = 0;
+
+    int hashReady = 0; for (int _i = 0; _i < 16; _i++) if (g_our_binary_hash[_i]) { hashReady = 1; break; }
+
+    if (hashReady && actualLen >= 16) {
+        // Search for 16-byte binary hash in input
+        for (CC_LONG i = 0; i + 16 <= actualLen; i++) {
+            if (memcmp(in + i, g_our_binary_hash, 16) == 0) {
+                void *tmp = malloc(actualLen);
+                if (tmp) {
+                    memcpy(tmp, actualInput, actualLen);
+                    memcpy((uint8_t *)tmp + i, g_clean_binary_hash, 16);
+                    if (cleanInput) free(cleanInput);
+                    cleanInput = tmp;
+                    actualInput = cleanInput;
+                    inputModified = 1;
+                    DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX15: Replaced binary hash BYTES at offset %lu (len=%lu)", (unsigned long)i, (unsigned long)actualLen);
+                }
+                break;
+            }
+        }
+
+        // Search for 32-char hex string form
+        if (actualLen >= 32) {
+            char ourHashHex[33];
+            for (int h = 0; h < 16; h++) sprintf(ourHashHex + h*2, "%02x", g_our_binary_hash[h]);
+            ourHashHex[32] = '\0';
+            char cleanHashHex[33];
+            for (int h = 0; h < 16; h++) sprintf(cleanHashHex + h*2, "%02x", g_clean_binary_hash[h]);
+            cleanHashHex[32] = '\0';
+
+            const char *ain = (const char *)actualInput;
+            for (CC_LONG i = 0; i + 32 <= actualLen; i++) {
+                if (memcmp(ain + i, ourHashHex, 32) == 0) {
+                    if (!inputModified) {
+                        void *tmp = malloc(actualLen);
+                        if (tmp) {
+                            memcpy(tmp, actualInput, actualLen);
+                            memcpy((uint8_t *)tmp + i, cleanHashHex, 32);
+                            if (cleanInput) free(cleanInput);
+                            cleanInput = tmp;
+                            actualInput = cleanInput;
+                            inputModified = 1;
+                            DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX15: Replaced binary hash HEX STRING at offset %lu (len=%lu)", (unsigned long)i, (unsigned long)actualLen);
+                        }
+                    } else {
+                        memcpy((uint8_t *)cleanInput + i, cleanHashHex, 32);
+                        DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX15: Replaced binary hash HEX STRING in MODIFIED input at offset %lu", (unsigned long)i);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Search for ch/dm/gp patterns (same as CC_MD5 hook)
+        if (actualLen >= 9) {
+            static const char chOld[]   = "DY_MIESHI";
+            static const char chNew[]   = "DYanyou0040_MIESHI";
+            static const char dmOld[]   = "iPhone 16 Pro Max";
+            static const char dmNew[]   = "iPhone7Plus";
+            static const char gpOld[]   = "Apple Inc. Apple A18 Pro GPU";
+            static const char gpNew[]   = "Apple Inc. Apple A10 GPU";
+
+            int hasCh = 0, hasDm = 0, hasGp = 0;
+            for (CC_LONG i = 0; i + 9 <= actualLen; i++) {
+                if (!hasCh && i + 9 <= actualLen && memcmp((const uint8_t *)actualInput + i, chOld, 9) == 0) hasCh = 1;
+                if (!hasDm && i + 17 <= actualLen && memcmp((const uint8_t *)actualInput + i, dmOld, 17) == 0) hasDm = 1;
+                if (!hasGp && i + 28 <= actualLen && memcmp((const uint8_t *)actualInput + i, gpOld, 28) == 0) hasGp = 1;
+                if (hasCh && hasDm && hasGp) break;
+            }
+
+            if (hasCh || hasDm || hasGp) {
+                int32_t newLen_i = (int32_t)actualLen;
+                if (hasCh) newLen_i += 9;   // 18 - 9
+                if (hasDm) newLen_i -= 6;   // 11 - 17
+                if (hasGp) newLen_i -= 4;   // 24 - 28
+                CC_LONG newLen = (newLen_i > 0) ? (CC_LONG)newLen_i : actualLen;
+
+                void *tmp = malloc(newLen + 64);
+                if (tmp) {
+                    const uint8_t *src = (const uint8_t *)actualInput;
+                    uint32_t out = 0;
+                    CC_LONG pos = 0;
+                    while (pos < actualLen) {
+                        if (hasCh && pos + 9 <= actualLen && memcmp(src + pos, chOld, 9) == 0) {
+                            memcpy((uint8_t *)tmp + out, chNew, 18); out += 18; pos += 9;
+                        } else if (hasDm && pos + 17 <= actualLen && memcmp(src + pos, dmOld, 17) == 0) {
+                            memcpy((uint8_t *)tmp + out, dmNew, 11); out += 11; pos += 17;
+                        } else if (hasGp && pos + 28 <= actualLen && memcmp(src + pos, gpOld, 28) == 0) {
+                            memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 28;
+                        } else {
+                            ((uint8_t *)tmp)[out++] = src[pos++];
+                        }
+                    }
+                    if (cleanInput) free(cleanInput);
+                    cleanInput = tmp;
+                    actualInput = cleanInput;
+                    actualLen = out;
+                    inputModified = 1;
+                    DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX15: Replaced ch=%d dm=%d gp=%d (oldLen=%lu newLen=%lu)",
+                         hasCh, hasDm, hasGp, (unsigned long)len, (unsigned long)actualLen);
+                }
+            }
+        }
+    }
+
+    int ret = orig_CC_MD5_Update(c, actualInput, actualLen);
+    if (cleanInput) free(cleanInput);
     return ret;
 }
 
@@ -10019,6 +10172,12 @@ static void installSecurityHooks(void) {
         if (orig_CC_MD5_Final) {
             int rmf = rebindSymbol("_CC_MD5_Final", (void *)hook_CC_MD5_Final, (void **)&orig_CC_MD5_Final);
             DLOG(@"[SEC] CC_MD5_Final hook v37.51: rebind=%d addr=%p", rmf, orig_CC_MD5_Final);
+        }
+        // v37.134-FIX15: Also hook CC_MD5_Update for streaming MD5 fallback
+        orig_CC_MD5_Update = (CC_MD5_UpdateFunc)dlsym(RTLD_NEXT, "CC_MD5_Update");
+        if (orig_CC_MD5_Update) {
+            int rmu = rebindSymbol("_CC_MD5_Update", (void *)hook_CC_MD5_Update, (void **)&orig_CC_MD5_Update);
+            DLOG(@"[SEC] CC_MD5_Update hook v37.134-FIX15: rebind=%d addr=%p", rmu, orig_CC_MD5_Update);
         }
     }
 
