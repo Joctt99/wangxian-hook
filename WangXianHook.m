@@ -1,16 +1,22 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX15: Fix hash2/body mismatch + CC_MD5_Update fallback
+ * WangXianHook v37.134-FIX17: Direct hash1/hash3 replacement in EE121 packet
  *
- * v37.134-FIX15 CHANGES (CRITICAL — root cause of "卡住正在进入"):
- *   ROOT CAUSE: CC_MD5 hook (FIX14) replaced ch/dm/gp in hash2 input → hash2 = MD5(canonical_fields)
- *   BUT EE007-ALIGN body reconstruction was DISABLED (FIX13) → body kept ORIGINAL ch/dm/gp
- *   → hash2 != MD5(body) → server rejects EE121 → no real sessionId → stuck at game server
- *   FIX: RE-ENABLE EE007-ALIGN body reconstruction (replace ch/dm/gp in packet body)
- *        EE121-CANON full rebuild stays DISABLED (breaks packet structure)
- *        Now: body = canonical ch/dm/gp, hash2 = MD5(canonical ch/dm/gp) → MATCH!
- *   ALSO: Add CC_MD5_Update hook as streaming MD5 fallback (in case CC_MD5_Final rebind fails)
+ * v37.134-FIX17 CHANGES (CRITICAL — root cause of "卡住正在进入" / status=4):
+ *   ROOT CAUSE: CC_MD5_Final/Update hooks NEVER worked (rebind=0) → streaming MD5
+ *   not intercepted → binary hash not replaced in hash1/hash3 computation →
+ *   hash1/hash3 = MD5(actual_hash+token) ≠ MD5(clean_hash+token) → server returns
+ *   status=4 → no real sessionId → game server rejects → stuck.
+ *   Memory scan (FIX15) tried to fix this but CORRUPTED game state → EE121 never sent.
+ *   FIX: Based on Frida clean-client capture, directly replace hash1/hash3 in the EE121
+ *   packet AFTER the game builds it. Algorithm (verified against capture):
+ *     hash_full = CC_MD5(clean_binary_hash_hex(32B) + token(31B)) → 32 hex chars
+ *     hash3 = hash_full[0:16]  → TLV#13 (second-to-last 16B TLV)
+ *     hash1 = hash_full[16:32] → TLV#15 (last 16B TLV)
+ *   Token comes from EE120 response (g_hashToken, 31 bytes at offset 14).
+ *   REMOVED: memory scan (scanAndReplaceBinaryHashInMemory), CC_MD5_Final/Update hook install.
+ *   KEPT: EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement (hash2 matches body).
  *
  * v37.134-FIX11 CHANGES (preserved — Runtime binary hash):
  *   g_our_binary_hash was HARDCODED → every rebuild changed actual hash → NEVER matched
@@ -755,99 +761,6 @@ static const uint8_t g_clean_binary_hash[16] = {
     0x03, 0x97, 0xb2, 0x6f, 0xf4, 0xb8, 0xd8, 0x9d
 };
 
-// v37.134-FIX15: Memory scan to replace binary hash in memory.
-// Root cause: CC_MD5_Final/Update hooks fail (rebind=0) → streaming MD5 not intercepted
-// → binary hash not replaced → hash1/hash3 = MD5(actual_hash+token) ≠ MD5(clean_hash+token)
-// → server returns status=4 → no real sessionId → game server rejects → stuck.
-// Fix: Scan writable memory for binary hash (16-byte + 32-char hex) and replace with clean hash.
-extern "C" kern_return_t mach_vm_region_recurse(
-    vm_map_t target_task,
-    mach_vm_address_t *address,
-    mach_vm_size_t *size,
-    natural_t *nesting_depth,
-    vm_region_recurse_info_t info,
-    mach_msg_type_number_t *info_count
-);
-
-#include <mach/vm_region.h>
-
-static int g_memscan_done = 0;
-
-static void scanAndReplaceBinaryHashInMemory(void) {
-    if (g_memscan_done) return;
-    int hashReady = 0;
-    for (int i = 0; i < 16; i++) if (g_our_binary_hash[i]) { hashReady = 1; break; }
-    if (!hashReady) return;
-
-    char oldHexLower[33], newHexLower[33], oldHexUpper[33], newHexUpper[33];
-    for (int h = 0; h < 16; h++) {
-        snprintf(oldHexLower + h*2, 3, "%02x", g_our_binary_hash[h]);
-        snprintf(newHexLower + h*2, 3, "%02x", g_clean_binary_hash[h]);
-        snprintf(oldHexUpper + h*2, 3, "%02X", g_our_binary_hash[h]);
-        snprintf(newHexUpper + h*2, 3, "%02X", g_clean_binary_hash[h]);
-    }
-
-    int replaceCount = 0;
-    mach_port_t task = mach_task_self();
-    mach_vm_address_t address = 0;
-    mach_vm_size_t size = 0;
-    natural_t depth = 0;
-    int regionsScanned = 0;
-
-    while (regionsScanned < 500) {
-        vm_region_submap_info_data_64_t info;
-        mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(task, &address, &size, &depth,
-                                                   (vm_region_recurse_info_t)&info, &info_count);
-        if (kr != KERN_SUCCESS) break;
-
-        if (info.is_submap) {
-            depth++;
-            continue;
-        }
-
-        // Only scan writable, non-executable regions
-        if (!(info.protection & VM_PROT_WRITE) || (info.protection & VM_PROT_EXECUTE)) {
-            address += size;
-            continue;
-        }
-
-        // Skip very large regions (> 50MB) to avoid long scans
-        if (size > 50 * 1024 * 1024) {
-            address += size;
-            continue;
-        }
-
-        regionsScanned++;
-        uint8_t *start = (uint8_t *)address;
-        uint8_t *end = start + size;
-
-        // Search for 16-byte binary form
-        for (uint8_t *p = start; p + 16 <= end; p++) {
-            if (memcmp(p, g_our_binary_hash, 16) == 0) {
-                memcpy(p, g_clean_binary_hash, 16);
-                replaceCount++;
-            }
-        }
-
-        // Search for 32-char hex string forms (lowercase + uppercase)
-        for (uint8_t *p = start; p + 32 <= end; p++) {
-            if (memcmp(p, oldHexLower, 32) == 0) {
-                memcpy(p, newHexLower, 32);
-                replaceCount++;
-            } else if (memcmp(p, oldHexUpper, 32) == 0) {
-                memcpy(p, newHexUpper, 32);
-                replaceCount++;
-            }
-        }
-
-        address += size;
-    }
-
-    g_memscan_done = 1;
-    _log([NSString stringWithFormat:@"[MEM-SCAN] v37.134-FIX15: Scanned %d writable regions, replaced %d binary hash occurrences (binary+hex forms)", regionsScanned, replaceCount]);
-}
-
 // v37.64: Track whether EE006/A018 have been sent on login server (port 5678).
 // v37.63 assumed client skips EE006+A018 when IDFV returns nil, but v37.62 log proves
 // client DOES send A018 (origLen=186, A018-REPL→223B) and short EE006 (20B).
@@ -1022,7 +935,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX15 loaded (RE-ENABLE EE007-ALIGN body reconstruction + KEEP CC_MD5 ch/dm/gp replacement + KEEP binary hash runtime compute + hex string replacement + FIX9 session captures + CC_MD5_Update fallback) ===");
+        _log(@"=== WangXianHook v37.134-FIX17 loaded (Direct hash1/hash3 replacement in EE121 via CC_MD5(cleanHashHex+token) + KEEP EE007-ALIGN body reconstruction + KEEP CC_MD5 ch/dm/gp replacement + KEEP binary hash runtime compute + FIX9 session captures; REMOVED memory scan + CC_MD5_Final/Update hooks) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5785,6 +5698,62 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         out = rebuildOut;
                     }
 
+                    // v37.134-FIX17: Direct hash1/hash3 replacement based on Frida clean client capture.
+                    // Algorithm: hash_full = CC_MD5(clean_binary_hash_hex + token) → 32 chars hex
+                    //   hash3 = hash_full[0:16]  (first 16 chars) → TLV#13 (second-to-last 16B TLV)
+                    //   hash1 = hash_full[16:32] (last 16 chars)  → TLV#15 (last 16B TLV)
+                    // Token is from EE120 response (g_hashToken, 31 bytes).
+                    // This replaces the broken CC_MD5_Final/Update hooks (rebind=0) and memory scan.
+                    if (cmd == 0x002EE121 && g_hashTokenValid && strlen(g_hashToken) == 31) {
+                        static const char kCleanHashHex[] = "906e707ec5585f080397b26ff4b8d89d";
+                        char md5In[64];
+                        memcpy(md5In, kCleanHashHex, 32);
+                        memcpy(md5In + 32, g_hashToken, 31);
+                        md5In[63] = 0;
+                        unsigned char md5Out[16];
+                        memset(md5Out, 0, sizeof(md5Out));
+                        typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                        static RawCCMD5 s_rawMD5 = NULL;
+                        if (!s_rawMD5) s_rawMD5 = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                        if (s_rawMD5) {
+                            s_rawMD5(md5In, 63, md5Out);
+                            char md5Hex[33];
+                            static const char kHexChars[] = "0123456789abcdef";
+                            for (int hi = 0; hi < 16; hi++) {
+                                md5Hex[hi*2]   = kHexChars[(md5Out[hi] >> 4) & 0xF];
+                                md5Hex[hi*2+1] = kHexChars[md5Out[hi] & 0xF];
+                            }
+                            md5Hex[32] = 0;
+                            // hash3 = first 16 chars, hash1 = last 16 chars
+                            char hash3Val[16], hash1Val[16];
+                            memcpy(hash3Val, md5Hex, 16);
+                            memcpy(hash1Val, md5Hex + 16, 16);
+
+                            // Parse TLV structure to find last two 16-byte TLVs
+                            // From Frida capture: ...TLV#13(16B=hash3) TLV#14(32B=hash2) TLV#15(16B=hash1)
+                            size_t last16Off = (size_t)-1, secondLast16Off = (size_t)-1;
+                            size_t scan2 = 12; // skip 12B header
+                            while (scan2 + 2 <= out) {
+                                uint16_t tlvLen = ((uint16_t)newBuf[scan2] << 8) | newBuf[scan2+1];
+                                if (scan2 + 2 + tlvLen > out) break;
+                                if (tlvLen == 16) {
+                                    secondLast16Off = last16Off;
+                                    last16Off = scan2;
+                                }
+                                scan2 += 2 + tlvLen;
+                            }
+                            // secondLast16Off = hash3 position, last16Off = hash1 position
+                            if (secondLast16Off != (size_t)-1) {
+                                memcpy(newBuf + secondLast16Off + 2, hash3Val, 16);
+                            }
+                            if (last16Off != (size_t)-1) {
+                                memcpy(newBuf + last16Off + 2, hash1Val, 16);
+                            }
+                            DLOG(@"[EE121-HASH-FIX17] CC_MD5(cleanHash+token)=%s → hash3=%.*s hash1=%.*s (h3Off=%zu h1Off=%zu token=%s)",
+                                 md5Hex, 16, hash3Val, 16, hash1Val, secondLast16Off, last16Off, g_hashToken);
+                        }
+                    }
+
                     ssize_t rret = orig_send(fd, newBuf, out, flags);
                     free(newBuf);
                     if (rret >= 0) return (ssize_t)len;
@@ -7870,12 +7839,9 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             //   Expected 'Gr1YYlXG0dcXb2yOgdjMRKGU6gl7DN7' starts at byte 14.
             // Also handle variant with optional 2-byte leading 00 1F (some servers may prefix it).
             if (cmd == 0x802EE120 && ret >= 13) {
-                // v37.134-FIX15: Re-scan memory for binary hash before game computes hash1/hash3.
-                // The first scan (in installSecurityHooks) might have run before game computed
-                // the binary hash. Now that EE120 is received, the game has the hash in memory
-                // and is about to compute hash1/hash3. This is our last chance to replace it.
-                g_memscan_done = 0; // Reset to allow re-scan
-                scanAndReplaceBinaryHashInMemory();
+                // v37.134-FIX16: Removed memory scan — it was corrupting game state
+                // and preventing EE121 from being sent. Instead, hash1/hash3 are
+                // replaced directly in the EE121 packet via EE007-ALIGN section.
 
                 size_t pos = 13; // after 12B header + 1B status
                 while (pos + 1 < (size_t)ret) {
@@ -10283,23 +10249,10 @@ static void installSecurityHooks(void) {
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
-        orig_CC_MD5_Final = (CC_MD5_FinalFunc)dlsym(RTLD_NEXT, "CC_MD5_Final");
-        if (orig_CC_MD5_Final) {
-            int rmf = rebindSymbol("_CC_MD5_Final", (void *)hook_CC_MD5_Final, (void **)&orig_CC_MD5_Final);
-            DLOG(@"[SEC] CC_MD5_Final hook v37.51: rebind=%d addr=%p", rmf, orig_CC_MD5_Final);
-        }
-        // v37.134-FIX15: Also hook CC_MD5_Update for streaming MD5 fallback
-        orig_CC_MD5_Update = (CC_MD5_UpdateFunc)dlsym(RTLD_NEXT, "CC_MD5_Update");
-        if (orig_CC_MD5_Update) {
-            int rmu = rebindSymbol("_CC_MD5_Update", (void *)hook_CC_MD5_Update, (void **)&orig_CC_MD5_Update);
-            DLOG(@"[SEC] CC_MD5_Update hook v37.134-FIX15: rebind=%d addr=%p", rmu, orig_CC_MD5_Update);
-        }
-
-        // v37.134-FIX15: CRITICAL — Scan memory for binary hash and replace with clean hash.
-        // CC_MD5_Final/Update hooks fail (rebind=0) → streaming MD5 not intercepted.
-        // This memory scan ensures the game uses clean_binary_hash for ALL hash computations
-        // (including hash1/hash3 via streaming MD5 that our hooks can't intercept).
-        scanAndReplaceBinaryHashInMemory();
+        // v37.134-FIX17: Removed CC_MD5_Final/Update hooks (rebind=0, never worked).
+        // Removed memory scan (corrupted game state, prevented EE121 from being sent).
+        // Instead, hash1/hash3 are directly replaced in the EE121 packet via
+        // CC_MD5(clean_binary_hash_hex + token) computation. See [EE121-HASH-FIX17].
     }
 
 #if !DISABLE_CRYPTO_HOOKS
