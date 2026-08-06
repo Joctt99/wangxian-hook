@@ -893,7 +893,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX4 loaded (judgeAppInfoSignApi universal success response with ENDTIME/END/OPEN) ===");
+        _log(@"=== WangXianHook v37.134-FIX5 loaded (EE121-CANON: added missing empty TLV, FIX4: judgeAppInfoSignApi universal success response) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5487,6 +5487,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x0B; memcpy(newBuf+rebuildOut+2,kDModel,11); rebuildOut+=13;
                         // GPU 24B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x18; memcpy(newBuf+rebuildOut+2,kGPU,24);     rebuildOut+=26;
+                        // v37.134-FIX5: Add empty TLV (00 00) between GPU and UUID/WIFI to match original 16-TLV structure
+                        // Original packet has 00 00 between GPU and WIFI (TLV#9), but rebuild was missing it (only 15 TLVs)
+                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x00;                                              rebuildOut+=2;
                         // UUID 36B — v37.107-DIST: Use REAL device UUID from original packet!
                         // Each user uses their OWN device UUID for device whitelist authorization.
                         // Extract real UUID from original packet (TLV: 00 24 [36B UUID]).
