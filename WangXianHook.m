@@ -917,7 +917,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX11 loaded (Runtime binary hash fix + FIX9 session captures + EE121-CANON rebuild + CC_MD5 ch/dm/gp replacements enabled) ===");
+        _log(@"=== WangXianHook v37.134-FIX13 loaded (DISABLE EE121-CANON + DISABLE ch/dm/gp replacement + KEEP binary hash runtime compute + hex string replacement + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5306,9 +5306,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
                 off += 2 + fLen;
             }
-            // v37.134-FIX11: RESTORE EE121-CANON rebuild (fixed binary hash now works properly).
-            // CC_MD5 hook channel/dm/gp replacement ALSO enabled → hash2 matches CANON body.
-            if ((chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
+            // v37.134-FIX13: DISABLE EE121-CANON rebuild — send ORIGINAL EE121 packet.
+            // FIX11 proved: EE121-CANON rebuild causes server to CLOSE connection immediately.
+            // FIX10-SKIP proved: Original EE121 → server returns status=4 (patched to 0) → reaches server select.
+            // Keep CC_MD5 ch/dm/gp replacement DISABLED (hash2 must match original body).
+            // Keep binary hash runtime computation + hex string replacement ENABLED.
+            if (0 && (chOff != (size_t)-1 || dmOff != (size_t)-1 || gpOff != (size_t)-1 || accOff != (size_t)-1)) {
                 // Reconstruct packet by replacing all 3 fields found
                 // Use dynamic buffer, write from 0 sequentially
                 size_t bufCap = len + 64;
@@ -9444,10 +9447,12 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             int hasCh = 0, hasDm = 0, hasGp = 0, hasHash = 0, hasUUID = 0;
             uint32_t uuidPos = 0; // position of ANY 36B format UUID (when hasEE121Ctx==1)
             for (uint32_t i = 0; i + 9 <= len; i++) {
-                // v37.134-FIX11: RESTORE channel/dm/gp replacement (binary hash now correctly replaced).
-                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
-                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
-                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
+                // v37.134-FIX13: DISABLE channel/dm/gp replacement in CC_MD5 hook.
+                // EE121-CANON rebuild is disabled → hash2 must match ORIGINAL body.
+                // Only binary hash hex string replacement remains active (FIX12).
+                if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0 && 0) hasCh = 1;
+                if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0 && 0) hasDm = 1;
+                if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0 && 0) hasGp = 1;
                 if (!hasHash && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
                 // v37.93 FIX: UUID detection when ch/dm/gp found (not just eeCtx==1).
                 // ROOT CAUSE: 162B and 168B hash inputs have different field order
@@ -9595,6 +9600,85 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             DLOG(@"[MD5-HOOK] v37.57: Replaced modified hash BYTES in input at offset %u (inputLen=%u)", i, actualLen);
                         }
                         break;
+                    }
+                }
+            }
+        }
+
+        // v37.134-FIX12: Search for hex STRING form of binary hash (32 chars like "2099ec7b...")
+        // From Frida log: CC_MD5 input = hex_string(binary_hash) + token = 63 bytes
+        // Previous code only searched 16-byte binary form → NEVER matched hex string form!
+        // Also: hOld hardcoded "f9cc76c5..." never matches current binary hash → use dynamic g_our_binary_hash
+        // FIX12b: Allow even after channel/dm/gp replacement (inputModified=2) — search in modified buffer
+        if (actualLen >= 32) {
+            int hashReady3 = 0; for (int _j2 = 0; _j2 < 16; _j2++) if (g_our_binary_hash[_j2]) { hashReady3 = 1; break; }
+            if (hashReady3) {
+                // Convert our binary hash to hex string (lowercase)
+                char ourHashHex[33];
+                for (int h = 0; h < 16; h++) sprintf(ourHashHex + h*2, "%02x", g_our_binary_hash[h]);
+                ourHashHex[32] = '\0';
+                // Convert clean binary hash to hex string (lowercase)
+                char cleanHashHex[33];
+                for (int h = 0; h < 16; h++) sprintf(cleanHashHex + h*2, "%02x", g_clean_binary_hash[h]);
+                cleanHashHex[32] = '\0';
+
+                // Search for ourHashHex in input (use actualInput which may already be modified by ch/dm/gp)
+                const char *ain = (const char *)actualInput;
+                int found = 0;
+                for (uint32_t i = 0; i + 32 <= actualLen; i++) {
+                    if (memcmp(ain + i, ourHashHex, 32) == 0) {
+                        // Need a buffer to write to
+                        if (!inputModified) {
+                            // First modification — allocate new buffer
+                            void *tmp = malloc(actualLen);
+                            if (tmp) {
+                                memcpy(tmp, actualInput, actualLen);
+                                memcpy((uint8_t *)tmp + i, cleanHashHex, 32);
+                                if (cleanInput) { free(cleanInput); }
+                                cleanInput = tmp;
+                                actualInput = cleanInput;
+                                inputModified = 1;
+                                found = 1;
+                                _log([NSString stringWithFormat:@"[MD5-HOOK] v37.134-FIX12: Replaced binary hash HEX STRING in input at offset %u (inputLen=%u): %@ → %@", i, actualLen,
+                                     [NSString stringWithUTF8String:ourHashHex], [NSString stringWithUTF8String:cleanHashHex]]);
+                            }
+                        } else {
+                            // Already modified (ch/dm/gp) — write into existing cleanInput buffer
+                            memcpy((uint8_t *)cleanInput + i, cleanHashHex, 32);
+                            found = 1;
+                            _log([NSString stringWithFormat:@"[MD5-HOOK] v37.134-FIX12: Replaced binary hash HEX STRING in MODIFIED input at offset %u (inputLen=%u): %@ → %@", i, actualLen,
+                                 [NSString stringWithUTF8String:ourHashHex], [NSString stringWithUTF8String:cleanHashHex]]);
+                        }
+                        break;
+                    }
+                }
+                // Also try uppercase hex string (some implementations use uppercase)
+                if (!found) {
+                    char ourHashHexUpper[33];
+                    for (int h = 0; h < 16; h++) sprintf(ourHashHexUpper + h*2, "%02X", g_our_binary_hash[h]);
+                    ourHashHexUpper[32] = '\0';
+                    char cleanHashHexUpper[33];
+                    for (int h = 0; h < 16; h++) sprintf(cleanHashHexUpper + h*2, "%02X", g_clean_binary_hash[h]);
+                    cleanHashHexUpper[32] = '\0';
+                    for (uint32_t i = 0; i + 32 <= actualLen; i++) {
+                        if (memcmp(ain + i, ourHashHexUpper, 32) == 0) {
+                            if (!inputModified) {
+                                void *tmp = malloc(actualLen);
+                                if (tmp) {
+                                    memcpy(tmp, actualInput, actualLen);
+                                    memcpy((uint8_t *)tmp + i, cleanHashHexUpper, 32);
+                                    if (cleanInput) { free(cleanInput); }
+                                    cleanInput = tmp;
+                                    actualInput = cleanInput;
+                                    inputModified = 1;
+                                    _log([NSString stringWithFormat:@"[MD5-HOOK] v37.134-FIX12: Replaced binary hash HEX STRING (UPPER) in input at offset %u (inputLen=%u)", i, actualLen]);
+                                }
+                            } else {
+                                memcpy((uint8_t *)cleanInput + i, cleanHashHexUpper, 32);
+                                _log([NSString stringWithFormat:@"[MD5-HOOK] v37.134-FIX12: Replaced binary hash HEX STRING (UPPER) in MODIFIED input at offset %u (inputLen=%u)", i, actualLen]);
+                            }
+                            break;
+                        }
                     }
                 }
             }
