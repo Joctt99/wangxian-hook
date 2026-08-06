@@ -1,6 +1,21 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
+ * WangXianHook v37.134-FIX9: ENABLE FFF493#2 replacement + ADD 0x802EE100 session capture
+ *
+ * v37.134-FIX9 CHANGES (server closes connection after FFF493#2):
+ *   ROOT CAUSE 1: FFF493#2 replacement was DISABLED by "if (0 && ...)" condition
+ *   - sessionId and ticket were EMPTY in FFF493#2 packet → server rejects → closes connection
+ *   FIX: Removed "0 &&" condition → ENABLE FFF493#2 replacement with real sessionId/ticket
+ *
+ *   ROOT CAUSE 2: sessionId/ticket capture ONLY listened for 0x8234AB89 response
+ *   - Login server now uses 0x802EE100 for session response → sessionId/ticket never captured
+ *   FIX: Added 0x802EE100 response handler (both normal and sticky packet paths)
+ *
+ *   USER FINDING: Official client version format = 7.6.3_[20-digit clientId]_983
+ *   - clientId changes per download (e.g., 96605991881298821213 vs 79451974082889382827)
+ *   - This is NORMAL clientId field, already correctly preserved by current hook
+ *
  * WangXianHook v37.134: CRITICAL FIX — hash1/hash3 = CC_MD5(token), NOT MD5(binaryHash+token)
  *
  * v37.134 ROOT CAUSE FIX (EE121 sent but server never responds, login stuck):
@@ -893,7 +908,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX7 loaded (EE121: bumped version 7.6.3->7.7.0 + 983->990, FFF493: bumped clientProgramVersion + clientResourceVersion, status=4->0 bypass) ===");
+        _log(@"=== WangXianHook v37.134-FIX9 loaded (ENABLE FFF493#2 sessionId/ticket replacement + ADD 0x802EE100 session capture. Official client uses 7.6.3+983 with dynamic 20-digit clientId) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -5531,19 +5546,18 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
                         // WIFI 4B
                         newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x04; memcpy(newBuf+rebuildOut+2,"WIFI",4);   rebuildOut+=6;
-                        // v37.134-FIX7: Bump version to bypass server version check!
-                        // Original "7.6.3" + "983" → server returns status=4 (版本过低)
-                        // Fix: upgrade to "7.7.0" + "990" so server creates real session
-                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x05; memcpy(newBuf+rebuildOut+2,"7.7.0",5);  rebuildOut+=7;
-                        // Version/build number — BUMP from 983→990 to bypass version check
+                        // v37.134-FIX8: REVERT version bump — official client STILL uses 7.6.3 + 983!
+                        // The status=4 was NOT about version being too low — it's about validation failure.
+                        // Using wrong version (7.7.0/990) makes server reject the packet entirely.
+                        newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=0x05; memcpy(newBuf+rebuildOut+2,"7.6.3",5);  rebuildOut+=7;
+                        // Version/build number — keep original 983
                         {
-                            // v37.134-FIX7: Use BUMPED version "990" instead of original "983"
-                            const char *bumpedVer = "990";
-                            int bumpedLen = 3;
-                            DLOG(@"[EE121-CANON] v37.134-FIX7: Bumping version 983→990 to bypass server version check");
-                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)bumpedLen;
-                            memcpy(newBuf+rebuildOut+2, bumpedVer, bumpedLen);
-                            rebuildOut += 2 + bumpedLen;
+                            const char *origVer = "983";
+                            int origLen = 3;
+                            DLOG(@"[EE121-CANON] v37.134-FIX8: Keeping ORIGINAL version 7.6.3 + 983 (matching official client)");
+                            newBuf[rebuildOut]=0x00; newBuf[rebuildOut+1]=(uint8_t)origLen;
+                            memcpy(newBuf+rebuildOut+2, origVer, origLen);
+                            rebuildOut += 2 + origLen;
                         }
                         // --- hash1/hash2/hash3 block ---
                         // v37.141 CRITICAL ROLLBACK: hash2 MUST BE COPIED FROM ORIGINAL PACKET, NOT RECOMPUTED!
@@ -5729,7 +5743,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 //            // FFF493#1 (IOS_CLIENT_MSG_REQ) is device-info — clean client does NOT include
 //            // sessionId/ticket in it. Previous code INSERTED them → server confused → no role data!
 //            // Now skip #1 replacement entirely: let original packet (with CH-L4 patches) go through.
-            if (0 && fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
+//            // v37.134-FIX9: REMOVED '0 &&' — ENABLE FFF493#2 replacement with sessionId/ticket!
+            if (fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
                 uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
                 uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
@@ -7886,6 +7901,108 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
             
             DLOG(@"[SESSION-CAPTURE] v37.69: Final state — sessionValid=%d sessionId=%s ticketLen=%d", 
                  g_sessionValid, g_sessionId[0] ? g_sessionId : "(empty)", g_ticketLen);
+        } else if (cmd == 0x802EE100 && port == 5678) {
+            // v37.134-FIX9: ALSO parse 0x802EE100 — login server's ALTERNATIVE sessionId/ticket response.
+            // Recent server versions use 0x802EE100 instead of 0x8234AB89 for session response.
+            DLOG(@"[SESSION-CAPTURE] v37.134-FIX9: 0x802EE100 received pktLen=%u ret=%zd", pktLenBE, ret);
+            
+            // Dump first 200 bytes for format analysis
+            size_t dumpLen100 = (ret > 200) ? 200 : (size_t)ret;
+            NSMutableString *hex100 = [NSMutableString stringWithCapacity:dumpLen100 * 3];
+            for (size_t i = 0; i < dumpLen100; i++) [hex100 appendFormat:@"%02X ", p[i]];
+            DLOG(@"[SESSION-CAPTURE-100] HEX: %@", hex100);
+            
+            // Try JSON decode first
+            NSString *bodyStr100 = [[NSString alloc] initWithBytes:p+12 length:(ret > 12) ? (NSUInteger)(ret-12) : 0 encoding:NSUTF8StringEncoding];
+            if (bodyStr100 && bodyStr100.length > 0) {
+                DLOG(@"[SESSION-CAPTURE-100] BODY: %@", bodyStr100);
+                
+                // Extract sessionId from JSON: "sessionId": "..."
+                NSRange sidRange100 = [bodyStr100 rangeOfString:@"\"sessionId\": \""];
+                if (sidRange100.location != NSNotFound) {
+                    NSUInteger start = sidRange100.location + sidRange100.length;
+                    NSRange endRange = [bodyStr100 rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr100.length - start)];
+                    if (endRange.location != NSNotFound) {
+                        NSUInteger sidLen = endRange.location - start;
+                        if (sidLen > 0 && sidLen < sizeof(g_sessionId)) {
+                            memcpy(g_sessionId, [bodyStr100 UTF8String] + start, sidLen);
+                            g_sessionId[sidLen] = 0;
+                            DLOG(@"[SESSION-CAPTURE-100] sessionId extracted: %s (len=%lu)", g_sessionId, (unsigned long)sidLen);
+                        }
+                    }
+                }
+                
+                // Extract ticket from JSON: "ticket": "..."
+                NSRange tikRange100 = [bodyStr100 rangeOfString:@"\"ticket\": \""];
+                if (tikRange100.location != NSNotFound) {
+                    NSUInteger start = tikRange100.location + tikRange100.length;
+                    NSRange endRange = [bodyStr100 rangeOfString:@"\"" options:0 range:NSMakeRange(start, bodyStr100.length - start)];
+                    if (endRange.location != NSNotFound) {
+                        NSUInteger tikLen = endRange.location - start;
+                        if (tikLen > 0 && tikLen < sizeof(g_ticket)) {
+                            memcpy(g_ticket, [bodyStr100 UTF8String] + start, tikLen);
+                            g_ticket[tikLen] = 0;
+                            g_ticketLen = (int)tikLen;
+                            g_sessionValid = 1;
+                            DLOG(@"[SESSION-CAPTURE-100] ticket extracted: len=%d (first 40 chars: %s...)", g_ticketLen, g_ticket);
+                        }
+                    }
+                }
+            }
+            
+            // Also try TLV format: scan body for sessionId/ticket patterns
+            if (!g_sessionValid && ret >= 44) {
+                size_t off = 12;
+                while (off + 2 <= (size_t)ret) {
+                    uint16_t fLen = ((uint16_t)p[off] << 8) | p[off + 1];
+                    if (off + 2 + fLen > (size_t)ret) break;
+                    const unsigned char *val = p + off + 2;
+                    
+                    // sessionId: exactly 32 bytes, printable ASCII
+                    if (fLen == 32 && g_sessionId[0] == 0) {
+                        int isPrintable = 1;
+                        for (int i = 0; i < 32; i++) {
+                            if (val[i] < 0x20 || val[i] > 0x7e) { isPrintable = 0; break; }
+                        }
+                        if (isPrintable) {
+                            memcpy(g_sessionId, val, 32);
+                            g_sessionId[32] = 0;
+                            DLOG(@"[SESSION-CAPTURE-100] TLV sessionId (32B): %s", g_sessionId);
+                        }
+                    }
+                    
+                    // ticket: long Base64 string, typical length 300-400 bytes
+                    if (fLen > 200 && fLen < 500 && g_ticket[0] == 0) {
+                        int isBase64 = 1;
+                        int printableCount = 0;
+                        for (uint16_t i = 0; i < fLen; i++) {
+                            unsigned char c = val[i];
+                            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || 
+                                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' ||
+                                c == '|' || c == '-' || c == '_') {
+                                printableCount++;
+                            } else if (c < 0x20 || c > 0x7e) {
+                                isBase64 = 0;
+                                break;
+                            }
+                        }
+                        if (isBase64 && printableCount > (int)(fLen * 0.8)) {
+                            if (fLen < sizeof(g_ticket)) {
+                                memcpy(g_ticket, val, fLen);
+                                g_ticket[fLen] = 0;
+                                g_ticketLen = (int)fLen;
+                                g_sessionValid = 1;
+                                DLOG(@"[SESSION-CAPTURE-100] TLV ticket (%uB) extracted, valid=%d", fLen, g_sessionValid);
+                            }
+                        }
+                    }
+                    
+                    off += 2 + fLen;
+                }
+            }
+            
+            DLOG(@"[SESSION-CAPTURE-100] v37.134-FIX9: Final state — sessionValid=%d sessionId=%s ticketLen=%d", 
+                 g_sessionValid, g_sessionId[0] ? g_sessionId : "(empty)", g_ticketLen);
         }
         
         // v36.114: TCP STICKY PACKET DETECTION for login server (port 5678)
@@ -7917,8 +8034,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 }
                 
                 // v37.69: Also handle 0x8234AB89 in sticky sub-packets
-                if (subCmd == 0x8234AB89 && remaining >= 44) {
-                    DLOG(@"[SESSION-CAPTURE] v37.69: Found 0x8234AB89 in sticky sub-packet");
+                if ((subCmd == 0x8234AB89 || subCmd == 0x802EE100) && remaining >= 44) {
+                    DLOG(@"[SESSION-CAPTURE] v37.134-FIX9: Found 0x%08X in sticky sub-packet", subCmd);
                     // Attempt to extract sessionId/ticket from sticky sub-packet body
                     const unsigned char *sp = p + offset;
                     size_t sRet = (size_t)remaining;
@@ -10821,7 +10938,6 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     void   *patchedBuf = NULL;
     int patchCount = 0;
     int chCount = 0, dmCount = 0, gpCount = 0;
-    int progVerCount = 0, resVerCount = 0; // v37.134-FIX7: version bump counts
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
     // v37.79: accId replacement DISABLED for token consistency.
     static const char kCanonAccIdAES[] = "65657881045335015151"; // 20 bytes (UNUSED v37.79)
@@ -10830,7 +10946,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         const char *scanP = (const char *)dataIn;
         const char *scanEnd = scanP + dataInLen;
         const char *pcur = scanP;
-        chCount = dmCount = gpCount = progVerCount = resVerCount = 0;
+        chCount = dmCount = gpCount = 0;
         while (pcur < scanEnd) {
             size_t rem = (size_t)(scanEnd - pcur);
             if (rem >= 9 && memcmp(pcur, "DY_MIESHI", 9) == 0) {
@@ -10855,26 +10971,6 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
                 if (bounded) gpCount++;
                 pcur += 28;
-            } else if (rem >= 19 && memcmp(pcur, "\"clientProgramVersion\": \"", 19) == 0) {
-                // v37.134-FIX7: Count clientProgramVersion "7.6.3" → "7.7.0" replacement
-                const char *verStart = pcur + 19;
-                size_t verRem = (size_t)(scanEnd - verStart);
-                if (verRem >= 5 && memcmp(verStart, "7.6.3", 5) == 0 && verStart[5] == '"') {
-                    progVerCount++;
-                    pcur += 19 + 6;
-                } else {
-                    pcur += 19;
-                }
-            } else if (rem >= 24 && memcmp(pcur, "\"clientResourceVersion\": \"", 24) == 0) {
-                // v37.134-FIX7: Count clientResourceVersion "983" → "990" replacement
-                const char *verStart = pcur + 24;
-                size_t verRem = (size_t)(scanEnd - verStart);
-                if (verRem >= 3 && memcmp(verStart, "983", 3) == 0 && verStart[3] == '"') {
-                    resVerCount++;
-                    pcur += 24 + 4;
-                } else {
-                    pcur += 24;
-                }
             } else if (rem >= 20) {
                 // v37.79: accId detection DISABLED — skip to next char
                 pcur++;
@@ -10882,7 +10978,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 pcur++;
             }
         }
-        patchCount = chCount + dmCount + gpCount + progVerCount + resVerCount + accCount;
+        patchCount = chCount + dmCount + gpCount + accCount;
         // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
         // v37.37 CRITICAL FIX: Must save from FFF493#2 (inLen 500-800B) NOT FFF493#1!
         // AES-CBC uses different IV per message. Using FFF493#1's IV to encrypt FFF493#2
@@ -10908,15 +11004,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         // isFFF493_2_stub is now always NO; the extended-plaintext save block below
         // is also disabled.
         if (patchCount > 0) {
-            // v37.134-FIX7: Added version bump deltas
-            // clientProgramVersion: "7.6.3"(5) → "7.7.0"(5) with JSON keys:
-            //   old: "\"clientProgramVersion\": \"7.6.3\"" = 25 chars
-            //   new: "\"clientProgramVersion\": \"7.7.0\"" = 27 chars  → +2 each
-            // clientResourceVersion: "983"(3) → "990"(3) with JSON keys:
-            //   old: "\"clientResourceVersion\": \"983\"" = 28 chars
-            //   new: "\"clientResourceVersion\": \"990\"" = 29 chars  → +1 each
-            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4)
-                          + (ssize_t)progVerCount * 2 + (ssize_t)resVerCount * 1;
+            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
             patchedBuf = malloc(newDataInLen + 32);
             if (patchedBuf) {
@@ -10956,25 +11044,6 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         // Replacing it with a fixed CANONICAL UUID breaks device whitelist auth.
                     } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
                         // v37.107-DIST: Do NOT replace bare UUID either — same reason as above.
-                    } else if (rem >= 19 && memcmp(p, "\"clientProgramVersion\": \"", 19) == 0) {
-                        // v37.134-FIX7: Replace clientProgramVersion "7.6.3" → "7.7.0" to bypass server version check
-                        // Server returns status=4 (版本过低) if version < minimum required
-                        const char *verStart = p + 19;
-                        size_t verRem = (size_t)(e - verStart);
-                        if (verRem >= 5 && memcmp(verStart, "7.6.3", 5) == 0 && verStart[5] == '"') {
-                            // Boundary check: surrounded by quotes
-                            memcpy(out, "\"clientProgramVersion\": \"7.7.0\"", 27);
-                            out += 27; p += 19 + 6; continue;
-                        }
-                    } else if (rem >= 24 && memcmp(p, "\"clientResourceVersion\": \"", 24) == 0) {
-                        // v37.134-FIX7: Replace clientResourceVersion "983" → "990" to bypass server version check
-                        const char *verStart = p + 24;
-                        size_t verRem = (size_t)(e - verStart);
-                        if (verRem >= 3 && memcmp(verStart, "983", 3) == 0 && verStart[3] == '"') {
-                            // Boundary check: surrounded by quotes
-                            memcpy(out, "\"clientResourceVersion\": \"990\"", 29);
-                            out += 29; p += 24 + 4; continue;
-                        }
                     } else if (rem >= 20) {
                         // v37.108-DIST: Do NOT replace 20-digit accountId in CCCrypt plaintext!
                         // ROOT CAUSE: Forcing CANONICAL accId caused ALL users to enter kk994's game
@@ -10999,8 +11068,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
                 static int logged = 0;
                 if (logged < 4) {
-                    DLOG(@"[CH-L4] v37.134-FIX7 patchesTot=%d ch=%d dm=%d gp=%d progVer=%d resVer=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
-                         patchCount, chCount, dmCount, gpCount, progVerCount, resVerCount, accCount, dataInLen, realDataInLen,
+                    DLOG(@"[CH-L4] v37.134-FIX8 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
+                         patchCount, chCount, dmCount, gpCount, accCount, dataInLen, realDataInLen,
                          (long long)realDataInLen - (long long)dataInLen);
                     logged++;
                 }
