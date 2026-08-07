@@ -1,30 +1,31 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX26: V3环境DYLD隐藏修复 — 隐藏systemhook.dylib和zsign.dylib
+ * WangXianHook v37.134-FIX27: V3环境dyld_dlsym_hook致命bug修复
  *
- * v37.134-FIX26 CHANGES (V3环境DYLD隐藏修复 — 解决"卡在启动页面无联网"根因):
- *   ROOT CAUSE: wxhook 13.log确认所有Hook都通过rebindSymbol fallback安装成功:
- *     - SCNetworkReachabilityGetFlags hook生效(flags=0x3→0x02) ✅
- *     - CC_MD5 hook生效(mod=2,输入被替换) ✅
- *     - HTTP签名验证正常通过 ✅
- *     - zsign +alert:/+request/+getRootVC 替换成功 ✅
- *   但日志中**没有任何[SOCK] connect START记录** → 游戏根本不发起socket连接。
- *   原因: DYLD隐藏列表只隐藏了4个dylib(lnSignature/libSupport/WangXianHook/libsubstrate)，
- *   但**没有隐藏systemhook.dylib和zsign.dylib**。游戏通过_dyld_image_count()/
- *   _dyld_get_image_name()遍历检测到这两个V3特有dylib → 判定环境异常 → 不联网。
- *   证据: 全能签环境无systemhook/zsign → 正常运行；V3环境有这两个dylib → 卡启动页无联网。
- *   FIX: 将"systemhook"和"zsign"添加到g_hiddenDylibs[]列表中。
- *   DYLD隐藏只是让_dyld_image_count/get_image_name不返回被隐藏的dylib信息，
- *   不影响实际的dylib加载和符号解析，安全无副作用。
- *   保留: FIX25 MSHookFunction优先+fallback + FIX21 zsign绕过 + FIX20 V3检测
- *         + FIX18 UUID + FIX17 hash + FFF493-REPL DISABLED
+ * v37.134-FIX27 CHANGES (V3环境dyld_dlsym_hook致命bug修复 — 解决"卡在启动页面无联网"根因):
+ *   ROOT CAUSE: wxhook 14.log确认FIX26的DYLD隐藏(systemhook+zsign)已生效(Total hidden: 6/444),
+ *   所有Hook通过rebindSymbol fallback安装成功(SCNetwork/CC_MD5/CCCrypt/socket),
+ *   HTTP签名验证通过,zsign +request被拦截,但日志中**没有任何[SOCK] connect START**。
+ *   对比全能签正常版: "All hooks installed" → **立即connect 5678** → send/recv。
+ *   V3版: "All hooks installed" → SCNetwork → MD5 → UI → HTTP → zsign → **无connect**。
+ *
+ *   定位: v3_penetrateSystemhookRebinds()中MSHookFunction替换了dyld_dlsym_hook，
+ *   但orig=0x0(MSHookFunction在本环境100%失败0/7，无法创建trampoline)。
+ *   且代码有变量bug: MSHook存到局部变量orig_dyld_dlsym_hook，但hook函数读全局
+ *   g_orig_dyld_dlsym_hook(始终NULL)→所有经过dyld_dlsym_hook的dlsym调用返回NULL
+ *   →游戏无法解析connect等网络符号→不发起socket连接→"卡在启动页面无联网"。
+ *
+ *   证据: rebind总数=0(日志第30行确认)→根本不需要穿透dyld_dlsym_hook。
+ *   FIX: 完全禁用dyld_dlsym_hook的MSHook(#if 0注释掉)。
+ *   保留: FIX26 DYLD隐藏(systemhook+zsign) + FIX25 MSHook优先+fallback
+ *         + FIX21 zsign绕过 + FIX20 V3检测 + FIX18 UUID + FIX17 hash
+ *         + FFF493-REPL DISABLED
  *
  *   验证点(打包安装后看wxhook.log):
- *     ✅ [DYLD-HIDE] Index 0: 'systemhook.dylib' will be hidden  ← 新增
- *     ✅ [DYLD-HIDE] Index 10: 'zsign.dylib' will be hidden      ← 新增
- *     ✅ [DYLD-HIDE] Total hidden: 6 / 444 (之前是4)
- *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=游戏发起了连接
+ *     ✅ [V3-PEN] dyld_dlsym_hook MSHook 已禁用(FIX27...)
+ *     ✅ 不再出现 [V3-PEN] ✅ dyld_dlsym_hook MSHook安装完成 orig=0x0
+ *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=修复成功
  *     ✅ 无"卡在启动页面无联网"→进入登录页
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
@@ -1008,7 +1009,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX26 loaded (V3环境DYLD隐藏修复: 隐藏systemhook+zsign + MSHookFunction优先+fallback + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX27 loaded (V3环境dyld_dlsym_hook致命bug修复: 禁用破坏dlsym的MSHook + DYLD隐藏systemhook+zsign + MSHook优先+fallback + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10620,26 +10621,27 @@ static void v3_penetrateSystemhookRebinds(void) {
     }
 
     // 5. 额外防护: 安装 dyld_dlsym_hook 拦截
-    // 当 systemhook 的 dyld_dlsym_hook 拦截我们的 dlsym 时，它返回被污染的地址
-    // 我们可以 Hook dyld_dlsym_hook 自身，当它返回 SCNetworkReachabilityGetFlags 时
-    // 返回我们已知的真实地址
+    // v37.134-FIX27: 完全禁用 dyld_dlsym_hook 的MSHook!
+    // 原因: MSHookFunction在本环境100%失败(0/7)，但dyld_dlsym_hook被替换后
+    // orig=0x0(无trampoline) → 所有dlsym调用返回NULL → 游戏无法解析connect等
+    // 网络符号 → 不发起socket连接 → "卡在启动页面无联网"。
+    // 且rebind总数=0(日志确认)，根本不需要穿透dyld_dlsym_hook。
+    // 以下代码完全注释掉:
+    #if 0
     {
         typedef void* (*dyld_dlsym_hook_t)(const char *name);
         dyld_dlsym_hook_t orig_dyld_dlsym_hook = NULL;
 
-        // 用 fishhook 或 MSHookFunction 拦截 dyld_dlsym_hook
         void *dlsymHookFn = dlsym(RTLD_DEFAULT, "dyld_dlsym_hook");
         if (!dlsymHookFn) dlsymHookFn = dlsym(RTLD_DEFAULT, "_dyld_dlsym_hook");
 
         if (dlsymHookFn && g_msHookFunction) {
-            // MSHookFunction 内联 patch
             DLOG(@"[V3-PEN] 发现 dyld_dlsym_hook=%p → MSHook 拦截", dlsymHookFn);
             g_msHookFunction(dlsymHookFn,
                              (void *)hook_v3_dyld_dlsym_hook,
                              (void **)&orig_dyld_dlsym_hook);
             DLOG(@"[V3-PEN] ✅ dyld_dlsym_hook MSHook安装完成 orig=%p", orig_dyld_dlsym_hook);
         } else if (dlsymHookFn) {
-            // fishhook 兜底
             int r = rebindSymbol("_dyld_dlsym_hook",
                                  (void *)hook_v3_dyld_dlsym_hook,
                                  (void **)&orig_dyld_dlsym_hook);
@@ -10650,6 +10652,8 @@ static void v3_penetrateSystemhookRebinds(void) {
             }
         }
     }
+    #endif
+    DLOG(@"[V3-PEN] dyld_dlsym_hook MSHook 已禁用(FIX27: rebind=0无需穿透, 避免orig=0x0破坏dlsym)");
 
     DLOG(@"[V3-PEN] === systemhook rebind 穿透完成 ===");
 }
