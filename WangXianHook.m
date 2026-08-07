@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
+﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX20: V3自签分发环境修复 — zsign绕过 + SCNetwork多层rebind强化
@@ -767,6 +767,15 @@ static BOOL g_logEnabled = NO;  // v37.109-SILENT: Zero file I/O, no NSLog — c
 static BOOL g_logEnabled = YES; // Development mode: full diagnostics.
 #endif
 static BOOL g_isActivated = NO; // activation status
+
+// v37.134-FIX20: V3环境检测标记 + MSHookFunction指针 (前向声明，在10251行附近初始化)
+static BOOL g_isV3Environment = NO;
+static IMP g_origZsignAlertImp = NULL;
+static IMP g_origZsignRequestImp = NULL;
+static IMP g_origZsignGetRootVCImp = NULL;
+typedef void (*MSHookFunction_t)(void *function, void *replace, void **result);
+static MSHookFunction_t g_msHookFunction = NULL;
+
 static void installAllHooks(void);
 
 // Forward declare _log (defined later at line ~887)
@@ -10243,15 +10252,8 @@ Method     class_getInstanceMethod(Class cls, SEL name);
 IMP        method_getImplementation(Method m);
 IMP        method_setImplementation(Method m, IMP imp);
 
-// --- MSHookFunction 原型 (libsubstrate.dylib 动态加载，失败就退化用fishhook+二次覆盖) ---
-typedef void (*MSHookFunction_t)(void *function, void *replace, void **result);
-static MSHookFunction_t g_msHookFunction = NULL;
-
-// --- 全局 V3 环境标记 (在 entry constructor 最开始检测) ---
-static BOOL g_isV3Environment = NO;
-static IMP g_origZsignAlertImp = NULL;
-static IMP g_origZsignRequestImp = NULL;
-static IMP g_origZsignGetRootVCImp = NULL;
+// v37.134-FIX20: g_isV3Environment/g_msHookFunction/g_origZsign* 已在文件顶部(770行附近)前向声明，
+// 这里不再重复定义。所有 V3 相关全局变量的初始化都在 entry → installAllHooks() → detectV3Environment() 中完成。
 
 // +[zsign alert:] 替换为空实现：永不弹窗
 static void v3hook_zsign_alert(id self, SEL _cmd, id param) {
