@@ -1,7 +1,21 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX20: V3自签分发环境修复 — zsign绕过 + SCNetwork多层rebind强化
+ * WangXianHook v37.134-FIX21: V3自签分发环境修复 — systemhook rebind穿透 + zsign绕过
+ *
+ * v37.134-FIX21 CHANGES (V3自签分发环境systemhook rebind穿透 — 解决"无网络连接"根因):
+ *   ROOT CAUSE: systemhook.dylib (DYLD 0号, 先于WangXianHook加载) 的 fishhook 将
+ *   SCNetworkReachabilityGetFlags/connect/send/recv 等关键网络符号 rebind 到自己的 stub
+ *   (返回"不可达"/-1)，而 WangXianHook 的 dlsym() 也被 systemhook 的 dyld_dlsym_hook 拦截，
+ *   拿到的已是被污染的地址 → MSHookFunction/fishhook 全部基于错误地址 → 修复失效。
+ *   FIX: (v3_penetrateSystemhookRebinds)
+ *   (1) detectV3Environment 阶段立即执行: 通过 固定偏移法(0x10028/0x10030) + dlsym + 暴力扫描
+ *       三重保险定位 systemhook 的 gRebindCount 和 gRebinds
+ *   (2) 遍历 rebind 表，将 SCNetworkReachabilityGetFlags/connect/send/recv 的 new_func 指针
+ *       强制改回真实 SystemConfiguration/libSystem 实现
+ *   (3) Hook dyld_dlsym_hook 自身: 当关键符号查询被拦截时，返回已知真实地址作为兜底
+ *   (4) 保留 FIX20 所有修复: zsign IMP替换 + SCNetwork MSHook强化 + connect兜底重试
+ *   所有 V3 修复仅在检测到 zsign 类时激活，全能签正常环境 100% 不受影响。
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
  *   ROOT CAUSE: V3自签系统额外注入zsign.dylib做签名验证。
@@ -10278,6 +10292,247 @@ static id v3hook_zsign_getRootVC(id self, SEL _cmd) {
     return nil;
 }
 
+// FIX21: 穿透 systemhook.dylib 的 rebind 表
+// V3自签系统注入 systemhook.dylib (DYLD 0号)，其 fishhook 在 WangXianHook 之前
+// 执行 rebind，将 SCNetworkReachabilityGetFlags 等系统函数替换为自己的stub
+// (通常返回"不可达"或"空实现")，导致我们的 Hook 收到的已是被污染的地址。
+//
+// 解决方案: 直接读取 systemhook 的 gRebinds 表，将关键网络符号的 new_func
+// 指针改回真实 SystemConfiguration 实现，确保后续 Hook 基于真实地址生效。
+//
+// 注: 此操作在 detectV3Environment 返回 YES 后、installSCNetworkReachabilityHook
+// 之前执行，保证 Hook 拿到的是已修复的地址。
+static void v3_penetrateSystemhookRebinds(void) {
+    DLOG(@"[V3-PEN] === 开始穿透 systemhook rebind 表 ===");
+
+    // 1. 获取 systemhook.dylib 的基址 (通过 _dyld_image_count 遍历)
+    uint32_t imgCnt = _dyld_image_count();
+    void *sysHookBase = NULL;
+    for (uint32_t i = 0; i < imgCnt; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "systemhook.dylib")) {
+            sysHookBase = _dyld_get_image_header(i);
+            DLOG(@"[V3-PEN] 找到 systemhook.dylib 基址=%p (index=%u)", sysHookBase, i);
+            break;
+        }
+    }
+    if (!sysHookBase) {
+        DLOG(@"[V3-PEN] systemhook.dylib 未加载 → 跳过穿透");
+        return;
+    }
+
+    // 2. 用 RTLD_NEXT (绕过 dyld_dlsym_hook 拦截) 获取真实符号地址
+    void *realSCNetwork = NULL;
+    void *realConnect = NULL;
+    void *realSend = NULL;
+    void *realRecv = NULL;
+
+    // dlopen SystemConfiguration 框架 (用 RTLD_NOLOAD 不增加引用计数)
+    void *scLib = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOLOAD);
+    if (scLib) {
+        realSCNetwork = dlsym(scLib, "SCNetworkReachabilityGetFlags");
+        DLOG(@"[V3-PEN] 真实SCNetworkReachabilityGetFlags=%p", realSCNetwork);
+    }
+
+    void *sysLib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
+    if (sysLib) {
+        realConnect = dlsym(sysLib, "connect");
+        realSend = dlsym(sysLib, "send");
+        realRecv = dlsym(sysLib, "recv");
+        DLOG(@"[V3-PEN] 真实connect=%p send=%p recv=%p", realConnect, realSend, realRecv);
+    }
+
+    // 3. 穿透 systemhook 的 rebind 表
+    // systemhook 导出: gRebindCount (uint32_t), gRebinds (rebind_entry_t[])
+    // rebind_entry_t 结构 (arm64):  name_ptr(8) | old_func(8) | new_func(8) = 24字节
+    //
+    // systemhook 内存布局 (Frida扫描结果):
+    //   base: 0x1018d0000  size: 49152
+    //   gRebindCount @ 0x1018e0028 (相对base偏移 0x10028)
+    //   gRebinds     @ 0x1018e0030 (相对base偏移 0x10030)
+    // 这两个是 .const/__DATA 段的全局变量，基址固定不变
+    typedef struct {
+        const char *name;      // offset 0
+        void *old_func;        // offset 8
+        void *new_func;        // offset 16
+    } rebind_entry_t;
+
+    uint32_t *rebindCountPtr = NULL;
+    rebind_entry_t *rebindsBasePtr = NULL;
+
+    // 方法1: 直接用已知偏移计算 (最可靠，因为符号是固定的全局变量)
+    // 偏移 0x10028 和 0x10030 是相对基址的虚拟内存偏移，ASLR后依然成立
+    {
+        uintptr_t base = (uintptr_t)sysHookBase;
+        uintptr_t gRebindCount_offset = 0x10028ULL;
+        uintptr_t gRebinds_offset = 0x10030ULL;
+
+        rebindCountPtr = (uint32_t *)(base + gRebindCount_offset);
+        rebindsBasePtr = (rebind_entry_t *)(base + gRebinds_offset);
+
+        // 验证: gRebindCount 值应该在 1~500 之间
+        uint32_t countVal = *rebindCountPtr;
+        if (countVal > 0 && countVal < 500) {
+            DLOG(@"[V3-PEN] ✅ 固定偏移法命中: gRebindCount=%p(=%u) gRebinds=%p",
+                 rebindCountPtr, countVal, rebindsBasePtr);
+        } else {
+            DLOG(@"[V3-PEN] 固定偏移法失败(count=%u 不合理) → 用dlsym兜底", countVal);
+            rebindCountPtr = NULL;
+            rebindsBasePtr = NULL;
+        }
+    }
+
+    // 方法2: 如果固定偏移法失败，用 dlsym (即使被 dyld_dlsym_hook 拦截，
+    //        内部 __dyld_lookup_and_bind 仍可能正确返回)
+    if (!rebindCountPtr) {
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle) {
+            void *cnt = dlsym(handle, "gRebindCount");
+            void *reb = dlsym(handle, "gRebinds");
+            if (cnt && reb) {
+                rebindCountPtr = (uint32_t *)cnt;
+                rebindsBasePtr = (rebind_entry_t *)reb;
+                DLOG(@"[V3-PEN] ✅ dlsym法命中: gRebindCount=%p gRebinds=%p", rebindCountPtr, rebindsBasePtr);
+            }
+        }
+    }
+
+    // 方法3: 如果还失败，暴力扫描 systemhook 的 __DATA 段
+    if (!rebindCountPtr) {
+        // 扫描 systemhook base 到 base+0x10000 之间的 uint32 值
+        // 找一个值在 1~500 之间，且紧随其后的 gRebinds 指针指向 base+0x10000 之后合理位置
+        uintptr_t base = (uintptr_t)sysHookBase;
+        uint32_t *scanStart = (uint32_t *)(base + 0x4000);
+        uint32_t *scanEnd = (uint32_t *)(base + 0x10000);
+
+        DLOG(@"[V3-PEN] 暴力扫描 %p ~ %p", scanStart, scanEnd);
+        for (uint32_t *p = scanStart; p < scanEnd; p++) {
+            uint32_t val = *p;
+            if (val == 0 || val > 500) continue;
+            // gRebinds 紧随 gRebindCount (偏移 +8)
+            uintptr_t rebPtr = *(uintptr_t *)(p + 2);  // 跳过 uint32 (4字节) + 4字节padding
+            if (rebPtr >= base && rebPtr < base + 0x20000) {
+                // 验证: rebPtr 指向的 rebind_entry.name 应是有效指针
+                const char *nameCheck = *(const char **)rebPtr;
+                if (nameCheck && (uintptr_t)nameCheck > 0x10000 && (uintptr_t)nameCheck < 0x100000000ULL) {
+                    rebindCountPtr = p;
+                    rebindsBasePtr = (rebind_entry_t *)rebPtr;
+                    DLOG(@"[V3-PEN] ✅ 暴力扫描命中: gRebindCount=%p(=%u) gRebinds=%p",
+                         rebindCountPtr, val, rebindsBasePtr);
+                    break;
+                }
+            }
+        }
+        if (!rebindCountPtr) {
+            DLOG(@"[V3-PEN] ❌ 暴力扫描也未找到 rebind 表 → 放弃修复");
+        }
+    }
+
+    // 4. 修复 rebind 表: 将关键符号的 new_func 改回真实地址
+    if (rebindCountPtr && rebindsBasePtr) {
+        uint32_t count = *rebindCountPtr;
+        DLOG(@"[V3-PEN] 当前 rebind 总数=%u", count);
+
+        int fixed = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            // 用 rebind_entry_t 结构体方式访问
+            rebind_entry_t *entry = &rebindsBasePtr[i];
+            char *namePtr = (char *)entry->name;
+            void *oldFunc = entry->old_func;
+            void *newFunc = entry->new_func;
+
+            if (!namePtr || !*namePtr) continue;
+
+            // 检查是否是我们关心的符号
+            void *targetFix = NULL;
+            if (strstr(namePtr, "SCNetworkReachabilityGetFlags")) {
+                targetFix = realSCNetwork;
+            } else if (strcmp(namePtr, "connect") == 0 || strcmp(namePtr, "_connect") == 0) {
+                targetFix = realConnect;
+            } else if (strcmp(namePtr, "send") == 0 || strcmp(namePtr, "_send") == 0) {
+                targetFix = realSend;
+            } else if (strcmp(namePtr, "recv") == 0 || strcmp(namePtr, "_recv") == 0) {
+                targetFix = realRecv;
+            }
+
+            if (targetFix && newFunc != targetFix) {
+                DLOG(@"[V3-PEN] 🎯 修复 rebind[%u] %s: old=%p cur_new=%p → real=%p",
+                     i, namePtr, oldFunc, newFunc, targetFix);
+
+                // 将 new_func 指针改回真实地址
+                entry->new_func = targetFix;
+                fixed++;
+
+                // 验证写入成功
+                void *verify = entry->new_func;
+                DLOG(@"[V3-PEN]   ✅ 验证写入: %s new_func=%p", namePtr, verify);
+            }
+        }
+        DLOG(@"[V3-PEN] ✅ 共修复 %d 个 rebind 条目", fixed);
+    } else {
+        DLOG(@"[V3-PEN] ⚠️ 未找到 rebind 表 → 跳过修复 (依赖 MSHookFunction 内联 patch 兜底)");
+    }
+
+    // 5. 额外防护: 安装 dyld_dlsym_hook 拦截
+    // 当 systemhook 的 dyld_dlsym_hook 拦截我们的 dlsym 时，它返回被污染的地址
+    // 我们可以 Hook dyld_dlsym_hook 自身，当它返回 SCNetworkReachabilityGetFlags 时
+    // 返回我们已知的真实地址
+    {
+        typedef void* (*dyld_dlsym_hook_t)(const char *name);
+        dyld_dlsym_hook_t orig_dyld_dlsym_hook = NULL;
+
+        // 用 fishhook 或 MSHookFunction 拦截 dyld_dlsym_hook
+        void *dlsymHookFn = dlsym(RTLD_DEFAULT, "dyld_dlsym_hook");
+        if (!dlsymHookFn) dlsymHookFn = dlsym(RTLD_DEFAULT, "_dyld_dlsym_hook");
+
+        if (dlsymHookFn && g_msHookFunction) {
+            // MSHookFunction 内联 patch
+            DLOG(@"[V3-PEN] 发现 dyld_dlsym_hook=%p → MSHook 拦截", dlsymHookFn);
+            g_msHookFunction(dlsymHookFn,
+                             (void *)hook_v3_dyld_dlsym_hook,
+                             (void **)&orig_dyld_dlsym_hook);
+            DLOG(@"[V3-PEN] ✅ dyld_dlsym_hook MSHook安装完成 orig=%p", orig_dyld_dlsym_hook);
+        } else if (dlsymHookFn) {
+            // fishhook 兜底
+            int r = rebindSymbol("_dyld_dlsym_hook",
+                                 (void *)hook_v3_dyld_dlsym_hook,
+                                 (void **)&orig_dyld_dlsym_hook);
+            if (r == 0) {
+                DLOG(@"[V3-PEN] ✅ dyld_dlsym_hook fishhook rebind 成功");
+            } else {
+                DLOG(@"[V3-PEN] dyld_dlsym_hook fishhook 失败 r=%d", r);
+            }
+        }
+    }
+
+    DLOG(@"[V3-PEN] === systemhook rebind 穿透完成 ===");
+}
+
+// FIX21 辅助: dyld_dlsym_hook 拦截器
+// 当 systemhook 的 dyld_dlsym_hook 拦截关键符号查找时，返回真实地址
+// 避免 dlsym 返回被 systemhook 污染的 new_func 指针
+static void* (*g_orig_dyld_dlsym_hook)(const char *name) = NULL;
+static void* hook_v3_dyld_dlsym_hook(const char *name) {
+    // 先调原 dyld_dlsym_hook (可能返回被污染的地址)
+    void *result = NULL;
+    if (g_orig_dyld_dlsym_hook) {
+        result = g_orig_dyld_dlsym_hook(name);
+    }
+    // 如果查询的是关键网络符号，强制返回真实地址
+    // (在穿透修复已完成后，rebind 表已被修复，此处是兜底)
+    if (name) {
+        if (strcmp(name, "SCNetworkReachabilityGetFlags") == 0 ||
+            strcmp(name, "_SCNetworkReachabilityGetFlags") == 0) {
+            void *real = dlsym(RTLD_DEFAULT, "SCNetworkReachabilityGetFlags");
+            if (real && real != result) {
+                DLOG(@"[V3-PEN-HOOK] dyld_dlsym_hook(%s) 返回被污染=%p → 替换为真实=%p", name, result, real);
+                return real;
+            }
+        }
+    }
+    return result;
+}
+
 static BOOL detectV3Environment(void) {
     // 检测 zsign 类是否存在（只有 V3 自签系统才会注入 zsign.dylib）
     Class zs = objc_getClass("zsign");
@@ -10290,8 +10545,14 @@ static BOOL detectV3Environment(void) {
         } else {
             DLOG(@"[V3-DETECT] ⚠️ MSHookFunction不可用 → 网络层Hook退化: fishhook+二次flags覆盖兜底");
         }
+        // === FIX21: 在return前穿透systemhook的rebind链 ===
+        // systemhook.dylib (DYLD 0号) 先于 WangXianHook 执行 rebind
+        // 将关键网络符号(SCNetworkReachabilityGetFlags/connect/send/recv)替换为stub
+        // 必须在installSCNetworkReachabilityHook之前修复
+        v3_penetrateSystemhookRebinds();
         return YES;
     }
+
     // zsign不存在=全能签正常环境，不打印任何V3日志避免干扰
     return NO;
 }
@@ -10329,7 +10590,7 @@ static void installV3ZsignBypass(void) {
     } else {
         DLOG(@"[V3-zsign] ⚠️ 未找到 +getRootVC 选择子");
     }
-    DLOG(@"[V3-zsign] zsign绕过安装完成 → 首次启动"无网络连接"弹窗永不出现，不会再在zsign层挂起");
+    DLOG(@"[V3-zsign] zsign绕过安装完成 → 首次启动\"无网络连接\"弹窗永不出现，不会再在zsign层挂起");
 }
 
 // ============================================================
