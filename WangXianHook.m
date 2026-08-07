@@ -1,31 +1,30 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX29: V3环境HTTP hook修复 — 跳过V3特有的postAppInfoApi/getAppInfoApi
+ * WangXianHook v37.134-FIX30: V3闪退修复 + DYLD隐藏条件化
  *
- * v37.134-FIX29 CHANGES (V3环境HTTP hook修复 — 解决"卡在启动页面无联网"根因):
- *   ROOT CAUSE: wxhook 16.log确认FIX28生效(V3-PEN跳过, g_isV3Environment=NO, 全能签路径),
- *   但游戏仍不connect。对比全能签正常版: connect在HTTP验证之前; V3版: HTTP验证但无connect。
- *   关键差异: V3版有全能签没有的postAppInfoApi和getAppInfoApi调用(2个额外HTTP请求)。
- *   WangXianHook的SIGN-BYPASS代码拦截这2个URL并修改response:
- *     postAppInfoApi: code:1→code:0 (V3中code:1=成功, code:0=失败!)
- *     getAppInfoApi: {"code":1,"message":"OK"} → 替换为完整data结构+code:0
- *   这导致V3验证失败→游戏不connect→卡在启动页面无联网。
- *   证据: 全能签版无这2个调用→正常运行; V3版有这2个调用→被错误修改→不connect。
- *   FIX: 添加g_zsignPresent标记, V3环境(zsign存在)时跳过postAppInfoApi和getAppInfoApi:
- *     1. SIGN-BYPASS: if(g_zsignPresent) 不修改response
- *     2. NET-PATCH(legacy): if(g_zsignPresent) 不因ENDTIME触发patch
- *   保留: FIX28 V3环境完全使用全能签路径 + FIX26 DYLD隐藏 + FFF493-REPL DISABLED
- *         + FIX18 UUID + FIX17 hash
+ * v37.134-FIX30 CHANGES (修复FIX28闪退问题):
+ *   ROOT CAUSE 1(zsign alert空实现): FIX28中 zsign +alert: 替换为完全空实现导致闪退!
+ *   在V3环境下,zsign内部初始化流程必须调用+alert:的原实现(即使是空实现也有内部状态初始化),
+ *   完全跳过orig会导致后续zsign内部状态错乱 → 崩溃/闪退。
+ *   FIX: +alert:替换为透明调用orig(必须调用orig!), 仅记录日志(无弹窗风险).
+ *   UIAlertView.show仍被Hook→即使zsign调用orig show弹窗也被压制。
+ *
+ *   ROOT CAUSE 2(DYLD隐藏全能签无的dylib): g_hiddenDylibs包含systemhook和zsign,
+ *   在全能签环境(645张图,无这两个dylib)中DYLD image hook遍历每一张图片,
+ *   虽然不会错误隐藏,但之前的代码逻辑仍会走分支→之前没问题,
+ *   但V3环境(444张图)比全能签环境早触发zsign初始化→顺序差异导致alert空实现崩溃。
+ *   FIX: DYLD隐藏systemhook/zsign条件化: 只有g_zsignPresent时才隐藏这两个.
+ *
+ *   保留: FIX29 HTTP hook跳过V3特有postAppInfoApi/getAppInfoApi + FIX28 V3环境全能签路径
+ *         + FIX26 DYLD隐藏其余dylib + FFF493-REPL DISABLED + FIX18 UUID + FIX17 hash
  *
  *   验证点(打包安装后看wxhook.log):
- *     ✅ [V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:... (FIX28+29)
- *     ✅ [SIGN-BYPASS] FIX29: 跳过postAppInfoApi (V3环境, code:1=成功, 不修改)
- *     ✅ [SIGN-BYPASS] FIX29: 跳过getAppInfoApi (V3环境, 让zsign处理, 不替换response)
- *     ✅ 不再有 [SIGN-BYPASS] Format: postAppInfoApi (patch code:1→0)
- *     ✅ 不再有 [SIGN-BYPASS] Format: getAppInfoApi (FULL data structure)
- *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=修复成功!
- *     ✅ 无"卡在启动页面无联网"→进入登录页
+ *     ✅ 横幅: v37.134-FIX30 loaded
+ *     ✅ [V3-zsign] FIX30: +alert: 透明调用orig(必须调orig否则闪退!)
+ *     ✅ 不再出现闪退, App正常打开
+ *     ✅ [SIGN-BYPASS] FIX29: 跳过postAppInfoApi/getAppInfoApi
+ *     ✅ [SOCK] connect START target=...:5678  ← 出现=修复成功!
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
  *   ROOT CAUSE: V3自签系统额外注入zsign.dylib做签名验证。
@@ -1009,7 +1008,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX29 loaded (V3环境HTTP hook修复: 跳过V3特有的postAppInfoApi/getAppInfoApi + V3环境完全使用全能签路径 + DYLD隐藏systemhook+zsign + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX30 loaded (V3闪退修复: zsign+alert透明调用orig + DYLD隐藏systemhook/zsign条件化 + FIX29跳过postAppInfoApi/getAppInfoApi + V3环境全能签路径 + DYLD隐藏 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -9458,6 +9457,12 @@ static const char *g_hiddenDylibs[] = {
 static BOOL shouldHideDylib(const char *name) {
     if (!name) return NO;
     for (int i = 0; g_hiddenDylibs[i]; i++) {
+        // FIX30: DYLD隐藏条件化: 只有V3环境(g_zsignPresent=YES)才隐藏systemhook和zsign
+        // 全能签环境(无zsign)不隐藏这两个不存在的dylib, 避免额外分支
+        if ((strcmp(g_hiddenDylibs[i], "systemhook") == 0 || strcmp(g_hiddenDylibs[i], "zsign") == 0)
+            && !g_zsignPresent) {
+            continue;
+        }
         if (strstr(name, g_hiddenDylibs[i])) return YES;
     }
     return NO;
@@ -10424,10 +10429,17 @@ IMP        method_setImplementation(Method m, IMP imp);
 // v37.134-FIX20: g_isV3Environment/g_msHookFunction/g_origZsign* 已在文件顶部(770行附近)前向声明，
 // 这里不再重复定义。所有 V3 相关全局变量的初始化都在 entry → installAllHooks() → detectV3Environment() 中完成。
 
-// +[zsign alert:] 替换为空实现：永不弹窗
+// +[zsign alert:] FIX30: 透明调用orig! 必须调用orig,否则zsign内部状态错乱→闪退!
+// UIAlertView.show仍被Hook压制弹窗, 所以即使orig调用show也不会显示
 static void v3hook_zsign_alert(id self, SEL _cmd, id param) {
-    DLOG(@"[V3-zsign] +alert: 被拦截替换为空实现！原参数类型=%@ 内容=%@",
-         [param class], [(param && [param respondsToSelector:@selector(description)]) ? [param description] : nil description]);
+    DLOG(@"[V3-zsign] FIX30: +alert: 透明调用orig(必须调orig否则闪退!) param类型=%@", [param class]);
+    if (g_origZsignAlertImp) {
+        void (*fn)(id, SEL, id) = (typeof(fn))g_origZsignAlertImp;
+        fn(self, _cmd, param);
+        DLOG(@"[V3-zsign] FIX30: +alert: orig调用完成, UIAlertView.show hook仍会拦截真实弹窗");
+    } else {
+        DLOG(@"[V3-zsign] FIX30: +alert: orig为空(无IMP), 安全跳过(之前空实现会闪退)");
+    }
 }
 
 // +[zsign request] 替换为返回空字典@{}(=V3校验总是"通过")，不发起真实请求，避免挂起
@@ -10719,25 +10731,25 @@ static BOOL detectV3Environment(void) {
     return NO;
 }
 
-// FIX28: 只替换zsign +alert:阻止弹窗，不替换+request(让V3验证正常执行)
-// 原因: 替换+request为空字典会导致游戏缺少V3验证返回的必要数据 → 不发起connect
+// FIX28/30: 只替换zsign +alert:透明调用orig(阻止弹窗+不闪退)，不替换+request(让V3验证正常执行)
+// FIX30关键修复: +alert:空实现(不调用orig)会导致zsign内部状态错乱→闪退! 必须透明调用orig.
+// 即使zsign调用orig内部show UIAlertView, UIAlertView.show hook仍会被拦截→永不弹窗.
 static void installV3ZsignAlertOnlyBypass(void) {
     Class zs = objc_getClass("zsign");
     if (!zs) return;
-    DLOG(@"[V3-zsign] FIX28: 只替换 +alert: (阻止弹窗)，+request 保持原实现(让V3验证正常执行)");
+    DLOG(@"[V3-zsign] FIX30: 只替换 +alert:透明调用orig(防闪退), +request 保持原实现(让V3验证正常执行)");
 
     Method mAlert = class_getClassMethod(zs, @selector(alert:));
     if (mAlert) {
         g_origZsignAlertImp = method_getImplementation(mAlert);
         method_setImplementation(mAlert, (IMP)v3hook_zsign_alert);
-        DLOG(@"[V3-zsign] +alert: IMP替换成功! 原IMP=%p → 新IMP=%p (空实现永不弹窗)",
+        DLOG(@"[V3-zsign] FIX30: +alert: IMP替换成功! 原IMP=%p → 新IMP=%p (透明调用orig,无弹窗+不闪退)",
              g_origZsignAlertImp, (IMP)v3hook_zsign_alert);
     } else {
         DLOG(@"[V3-zsign] ⚠️ 未找到 +alert: 选择子");
     }
-    // FIX28: 不替换 +request 和 +getRootVC！
-    // +request返回空字典会导致游戏不发起connect(缺少V3验证返回数据)
-    DLOG(@"[V3-zsign] FIX28: +request/+getRootVC 保持原实现(不替换) → V3验证正常执行");
+    // FIX28/30: 不替换 +request 和 +getRootVC！
+    DLOG(@"[V3-zsign] FIX30: +request/+getRootVC 保持原实现(不替换) → V3验证正常执行");
 }
 
 // ============================================================
@@ -12536,9 +12548,9 @@ static void installAllHooks(void) {
     BOOL isV3 = detectV3Environment();
     if (isV3) {
         g_zsignPresent = YES;  // FIX29: 标记zsign存在，HTTP hook将跳过V3特有API
-        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28+29)");
+        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → zsign+alert透明调用orig(防闪退FIX30)，其余走全能签路径(FIX28+29+30)");
         installV3ZsignAlertOnlyBypass();
-        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换完成，g_isV3Environment=NO → 所有hook走全能签路径");
+        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换(透明调用orig)完成，g_isV3Environment=NO → 所有hook走全能签路径");
     }
     // g_isV3Environment 保持 NO → 所有hook(SCNetwork/socket/CC_MD5/CCCrypt)走全能签路径
 
