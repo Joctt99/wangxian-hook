@@ -1,27 +1,29 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX28: V3环境完全使用全能签路径
+ * WangXianHook v37.134-FIX29: V3环境HTTP hook修复 — 跳过V3特有的postAppInfoApi/getAppInfoApi
  *
- * v37.134-FIX28 CHANGES (V3环境完全使用全能签路径 — 解决"卡在启动页面无联网"根因):
- *   ROOT CAUSE: Frida诊断(deep_diag_output/v3_diag_log_20260807_153044.txt)证明:
- *   无WangXianHook时V3环境connect正常(connect=2, send=35, recv=30)。
- *   → WangXianHook的V3特有代码导致游戏不发起connect!
- *   V3特有代码: V3-PEN / zsign +request替换为空字典 / hook_SCNetwork调用orig
- *   FIX28: V3环境下完全使用全能签路径(g_isV3Environment=NO):
- *     1. 跳过V3-PEN(完全注释掉v3_penetrateSystemhookRebinds调用)
- *     2. 只替换zsign +alert:阻止弹窗，不替换+request(让V3验证正常执行)
- *     3. g_isV3Environment=NO → hook_SCNetwork走全能签路径(不调用orig，直接flags=0x02)
- *     4. g_isV3Environment=NO → socket/CC_MD5/CCCrypt hooks走全能签路径(不尝试MSHookFunction)
- *   保留: FIX26 DYLD隐藏(systemhook+zsign) + FFF493-REPL DISABLED + FIX18 UUID + FIX17 hash
- *   保留: 全能签环境所有原有hook不变
+ * v37.134-FIX29 CHANGES (V3环境HTTP hook修复 — 解决"卡在启动页面无联网"根因):
+ *   ROOT CAUSE: wxhook 16.log确认FIX28生效(V3-PEN跳过, g_isV3Environment=NO, 全能签路径),
+ *   但游戏仍不connect。对比全能签正常版: connect在HTTP验证之前; V3版: HTTP验证但无connect。
+ *   关键差异: V3版有全能签没有的postAppInfoApi和getAppInfoApi调用(2个额外HTTP请求)。
+ *   WangXianHook的SIGN-BYPASS代码拦截这2个URL并修改response:
+ *     postAppInfoApi: code:1→code:0 (V3中code:1=成功, code:0=失败!)
+ *     getAppInfoApi: {"code":1,"message":"OK"} → 替换为完整data结构+code:0
+ *   这导致V3验证失败→游戏不connect→卡在启动页面无联网。
+ *   证据: 全能签版无这2个调用→正常运行; V3版有这2个调用→被错误修改→不connect。
+ *   FIX: 添加g_zsignPresent标记, V3环境(zsign存在)时跳过postAppInfoApi和getAppInfoApi:
+ *     1. SIGN-BYPASS: if(g_zsignPresent) 不修改response
+ *     2. NET-PATCH(legacy): if(g_zsignPresent) 不因ENDTIME触发patch
+ *   保留: FIX28 V3环境完全使用全能签路径 + FIX26 DYLD隐藏 + FFF493-REPL DISABLED
+ *         + FIX18 UUID + FIX17 hash
  *
  *   验证点(打包安装后看wxhook.log):
- *     ✅ [V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28)
- *     ✅ [V3-zsign] FIX28: 只替换 +alert: ... +request 保持原实现
- *     ✅ [V3-DETECT] FIX28: V3-PEN已跳过
- *     ✅ [SEC] SCNetworkReachabilityGetFlags hook: rebind=X (全能签路径, 无V3-SCNETWORK日志)
- *     ✅ [SOCK] Hooks: connect=X send=X ... (全能签路径, 无V3-SOCK日志)
+ *     ✅ [V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:... (FIX28+29)
+ *     ✅ [SIGN-BYPASS] FIX29: 跳过postAppInfoApi (V3环境, code:1=成功, 不修改)
+ *     ✅ [SIGN-BYPASS] FIX29: 跳过getAppInfoApi (V3环境, 让zsign处理, 不替换response)
+ *     ✅ 不再有 [SIGN-BYPASS] Format: postAppInfoApi (patch code:1→0)
+ *     ✅ 不再有 [SIGN-BYPASS] Format: getAppInfoApi (FULL data structure)
  *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=修复成功!
  *     ✅ 无"卡在启动页面无联网"→进入登录页
  *
@@ -803,6 +805,7 @@ static BOOL g_isActivated = NO; // activation status
 
 // v37.134-FIX20: V3环境检测标记 + MSHookFunction指针 (前向声明，在10251行附近初始化)
 static BOOL g_isV3Environment = NO;
+static BOOL g_zsignPresent = NO;  // FIX29: zsign存在标记(用于HTTP hook跳过V3特有API)
 static IMP g_origZsignAlertImp = NULL;
 static IMP g_origZsignRequestImp = NULL;
 static IMP g_origZsignGetRootVCImp = NULL;
@@ -1006,7 +1009,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX28 loaded (V3环境完全使用全能签路径: 跳过V3-PEN+zsign只替换alert+g_isV3Environment=NO + DYLD隐藏systemhook+zsign + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX29 loaded (V3环境HTTP hook修复: 跳过V3特有的postAppInfoApi/getAppInfoApi + V3环境完全使用全能签路径 + DYLD隐藏systemhook+zsign + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1793,15 +1796,25 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     }
     // --- postAppInfoApi ---
     // V3's lnSignature returns code:1, fix to code:0
+    // FIX29: V3环境(zsign存在)时跳过! 这些是V3验证特有API, code:1=成功
+    // 错误修改为code:0会导致V3验证失败→游戏不connect→卡在启动页面
     else if ([url containsString:@"postAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi (patch code:1→0)");
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+        if (g_zsignPresent) {
+            DLOG(@"[SIGN-BYPASS] FIX29: 跳过postAppInfoApi (V3环境, code:1=成功, 不修改)");
+        } else {
+            DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi (patch code:1→0)");
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+        }
     }
     // --- getAppInfoApi ---
     // V3's lnSignature returns code:1 with NO data object (just {"code":1, "message":"OK"})
     // V3's [SignatureCheck nettimes] accesses data.ENDTIME → SIGSEGV if data missing!
     // Fix: return FULL data structure with ENDTIME to prevent crash
+    // FIX29: V3环境(zsign存在)时跳过! 让zsign处理V3验证,不替换response
     else if ([url containsString:@"getAppInfoApi"]) {
+        if (g_zsignPresent) {
+            DLOG(@"[SIGN-BYPASS] FIX29: 跳过getAppInfoApi (V3环境, 让zsign处理, 不替换response)");
+        } else {
         DLOG(@"[SIGN-BYPASS] v37.134: Format: getAppInfoApi (FULL data structure with ENDTIME)");
         // Build complete response that V3's lnSignature expects
         NSDictionary *fullResp = @{
@@ -1837,6 +1850,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
             // Fallback with minimal data structure
             patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
         }
+        }  // end if (!g_zsignPresent)
     }
     // --- Fallback: generic cert endpoint ---
     else {
@@ -1946,7 +1960,8 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
     }
     
     // v37.122: Also patch delegate-mode responses for sign/cert APIs (legacy fallback)
-    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || [dataStr containsString:@"ENDTIME"])) {
+    // FIX29: V3环境(zsign存在)时跳过含ENDTIME的response(可能是V3验证response,不应修改)
+    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || ([dataStr containsString:@"ENDTIME"] && !g_zsignPresent))) {
         DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response (legacy)");
         NSString *newBody = dataStr;
         // Extend ENDTIME to future
@@ -12516,10 +12531,12 @@ static void installAllHooks(void) {
     // → WangXianHook的V3特有代码(V3-PEN/zsign +request替换/SCNetwork V3路径)导致游戏不connect!
     // FIX28: V3环境下完全使用全能签路径(g_isV3Environment=NO)，只保留zsign +alert:替换。
     // 不替换zsign +request(让V3验证正常执行)，不执行V3-PEN，hook_SCNetwork走全能签路径。
+    // FIX29: 设置g_zsignPresent标记，HTTP hook跳过V3特有的postAppInfoApi/getAppInfoApi。
     // ============================================================
     BOOL isV3 = detectV3Environment();
     if (isV3) {
-        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28)");
+        g_zsignPresent = YES;  // FIX29: 标记zsign存在，HTTP hook将跳过V3特有API
+        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28+29)");
         installV3ZsignAlertOnlyBypass();
         DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换完成，g_isV3Environment=NO → 所有hook走全能签路径");
     }
