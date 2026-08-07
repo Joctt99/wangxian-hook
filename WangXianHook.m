@@ -1,31 +1,28 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX27: V3环境dyld_dlsym_hook致命bug修复
+ * WangXianHook v37.134-FIX28: V3环境完全使用全能签路径
  *
- * v37.134-FIX27 CHANGES (V3环境dyld_dlsym_hook致命bug修复 — 解决"卡在启动页面无联网"根因):
- *   ROOT CAUSE: wxhook 14.log确认FIX26的DYLD隐藏(systemhook+zsign)已生效(Total hidden: 6/444),
- *   所有Hook通过rebindSymbol fallback安装成功(SCNetwork/CC_MD5/CCCrypt/socket),
- *   HTTP签名验证通过,zsign +request被拦截,但日志中**没有任何[SOCK] connect START**。
- *   对比全能签正常版: "All hooks installed" → **立即connect 5678** → send/recv。
- *   V3版: "All hooks installed" → SCNetwork → MD5 → UI → HTTP → zsign → **无connect**。
- *
- *   定位: v3_penetrateSystemhookRebinds()中MSHookFunction替换了dyld_dlsym_hook，
- *   但orig=0x0(MSHookFunction在本环境100%失败0/7，无法创建trampoline)。
- *   且代码有变量bug: MSHook存到局部变量orig_dyld_dlsym_hook，但hook函数读全局
- *   g_orig_dyld_dlsym_hook(始终NULL)→所有经过dyld_dlsym_hook的dlsym调用返回NULL
- *   →游戏无法解析connect等网络符号→不发起socket连接→"卡在启动页面无联网"。
- *
- *   证据: rebind总数=0(日志第30行确认)→根本不需要穿透dyld_dlsym_hook。
- *   FIX: 完全禁用dyld_dlsym_hook的MSHook(#if 0注释掉)。
- *   保留: FIX26 DYLD隐藏(systemhook+zsign) + FIX25 MSHook优先+fallback
- *         + FIX21 zsign绕过 + FIX20 V3检测 + FIX18 UUID + FIX17 hash
- *         + FFF493-REPL DISABLED
+ * v37.134-FIX28 CHANGES (V3环境完全使用全能签路径 — 解决"卡在启动页面无联网"根因):
+ *   ROOT CAUSE: Frida诊断(deep_diag_output/v3_diag_log_20260807_153044.txt)证明:
+ *   无WangXianHook时V3环境connect正常(connect=2, send=35, recv=30)。
+ *   → WangXianHook的V3特有代码导致游戏不发起connect!
+ *   V3特有代码: V3-PEN / zsign +request替换为空字典 / hook_SCNetwork调用orig
+ *   FIX28: V3环境下完全使用全能签路径(g_isV3Environment=NO):
+ *     1. 跳过V3-PEN(完全注释掉v3_penetrateSystemhookRebinds调用)
+ *     2. 只替换zsign +alert:阻止弹窗，不替换+request(让V3验证正常执行)
+ *     3. g_isV3Environment=NO → hook_SCNetwork走全能签路径(不调用orig，直接flags=0x02)
+ *     4. g_isV3Environment=NO → socket/CC_MD5/CCCrypt hooks走全能签路径(不尝试MSHookFunction)
+ *   保留: FIX26 DYLD隐藏(systemhook+zsign) + FFF493-REPL DISABLED + FIX18 UUID + FIX17 hash
+ *   保留: 全能签环境所有原有hook不变
  *
  *   验证点(打包安装后看wxhook.log):
- *     ✅ [V3-PEN] dyld_dlsym_hook MSHook 已禁用(FIX27...)
- *     ✅ 不再出现 [V3-PEN] ✅ dyld_dlsym_hook MSHook安装完成 orig=0x0
- *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=修复成功
+ *     ✅ [V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28)
+ *     ✅ [V3-zsign] FIX28: 只替换 +alert: ... +request 保持原实现
+ *     ✅ [V3-DETECT] FIX28: V3-PEN已跳过
+ *     ✅ [SEC] SCNetworkReachabilityGetFlags hook: rebind=X (全能签路径, 无V3-SCNETWORK日志)
+ *     ✅ [SOCK] Hooks: connect=X send=X ... (全能签路径, 无V3-SOCK日志)
+ *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=修复成功!
  *     ✅ 无"卡在启动页面无联网"→进入登录页
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
@@ -1009,7 +1006,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX27 loaded (V3环境dyld_dlsym_hook致命bug修复: 禁用破坏dlsym的MSHook + DYLD隐藏systemhook+zsign + MSHook优先+fallback + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX28 loaded (V3环境完全使用全能签路径: 跳过V3-PEN+zsign只替换alert+g_isV3Environment=NO + DYLD隐藏systemhook+zsign + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10695,11 +10692,11 @@ static BOOL detectV3Environment(void) {
         } else {
             DLOG(@"[V3-DETECT] ⚠️ MSHookFunction不可用 → 网络层Hook退化: fishhook+二次flags覆盖兜底");
         }
-        // === FIX21: 在return前穿透systemhook的rebind链 ===
-        // systemhook.dylib (DYLD 0号) 先于 WangXianHook 执行 rebind
-        // 将关键网络符号(SCNetworkReachabilityGetFlags/connect/send/recv)替换为stub
-        // 必须在installSCNetworkReachabilityHook之前修复
-        v3_penetrateSystemhookRebinds();
+        // === FIX28: 完全跳过 V3-PEN systemhook rebind穿透 ===
+        // 原因: Frida诊断证明无WangXianHook时V3环境connect正常 → V3-PEN的副作用导致游戏不connect
+        // rebind总数=0(日志确认)，V3-PEN实际上什么都没做，但dlsym调用可能触发副作用
+        // v3_penetrateSystemhookRebinds();  // FIX28: 完全跳过
+        DLOG(@"[V3-DETECT] FIX28: V3-PEN已跳过(rebind=0无需穿透,避免副作用)");
         return YES;
     }
 
@@ -10707,10 +10704,12 @@ static BOOL detectV3Environment(void) {
     return NO;
 }
 
-static void installV3ZsignBypass(void) {
+// FIX28: 只替换zsign +alert:阻止弹窗，不替换+request(让V3验证正常执行)
+// 原因: 替换+request为空字典会导致游戏缺少V3验证返回的必要数据 → 不发起connect
+static void installV3ZsignAlertOnlyBypass(void) {
     Class zs = objc_getClass("zsign");
     if (!zs) return;
-    DLOG(@"[V3-zsign] 开始替换 zsign.dylib 3个类方法 IMP");
+    DLOG(@"[V3-zsign] FIX28: 只替换 +alert: (阻止弹窗)，+request 保持原实现(让V3验证正常执行)");
 
     Method mAlert = class_getClassMethod(zs, @selector(alert:));
     if (mAlert) {
@@ -10721,26 +10720,9 @@ static void installV3ZsignBypass(void) {
     } else {
         DLOG(@"[V3-zsign] ⚠️ 未找到 +alert: 选择子");
     }
-
-    Method mReq = class_getClassMethod(zs, @selector(request));
-    if (mReq) {
-        g_origZsignRequestImp = method_getImplementation(mReq);
-        method_setImplementation(mReq, (IMP)v3hook_zsign_request);
-        DLOG(@"[V3-zsign] +request IMP替换成功! 原IMP=%p → 新IMP=%p (直接返回空字典=V3校验通过)",
-             g_origZsignRequestImp, (IMP)v3hook_zsign_request);
-    } else {
-        DLOG(@"[V3-zsign] ⚠️ 未找到 +request 选择子");
-    }
-
-    Method mRoot = class_getClassMethod(zs, @selector(getRootVC));
-    if (mRoot) {
-        g_origZsignGetRootVCImp = method_getImplementation(mRoot);
-        method_setImplementation(mRoot, (IMP)v3hook_zsign_getRootVC);
-        DLOG(@"[V3-zsign] +getRootVC IMP替换成功(透明包装)");
-    } else {
-        DLOG(@"[V3-zsign] ⚠️ 未找到 +getRootVC 选择子");
-    }
-    DLOG(@"[V3-zsign] zsign绕过安装完成 → 首次启动\"无网络连接\"弹窗永不出现，不会再在zsign层挂起");
+    // FIX28: 不替换 +request 和 +getRootVC！
+    // +request返回空字典会导致游戏不发起connect(缺少V3验证返回数据)
+    DLOG(@"[V3-zsign] FIX28: +request/+getRootVC 保持原实现(不替换) → V3验证正常执行");
 }
 
 // ============================================================
@@ -12529,18 +12511,19 @@ static void installAllHooks(void) {
     installChannelInterceptLayers();
 
     // ============================================================
-    // v37.134-FIX20: 【最先执行】V3分发自签环境检测 + zsign绕过安装
-    // 仅当 zsign 类存在(V3自签系统额外注入zsign.dylib)时激活，全能签环境完全跳过
-    // 必须放在 installSecurityHooks 之前，因为:
-    //   (1) zsign.request/alert 会在 entry 早期执行阻断流程
-    //   (2) g_isV3Environment 被后面 SCNetwork/connect 等 installXXHook 读取
+    // v37.134-FIX28: 【最先执行】V3分发自签环境检测 + zsign +alert:绕过
+    // 关键发现: Frida诊断证明无WangXianHook时V3环境connect正常(connect=2,send=35)
+    // → WangXianHook的V3特有代码(V3-PEN/zsign +request替换/SCNetwork V3路径)导致游戏不connect!
+    // FIX28: V3环境下完全使用全能签路径(g_isV3Environment=NO)，只保留zsign +alert:替换。
+    // 不替换zsign +request(让V3验证正常执行)，不执行V3-PEN，hook_SCNetwork走全能签路径。
     // ============================================================
-    g_isV3Environment = detectV3Environment();
-    if (g_isV3Environment) {
-        DLOG(@"[V3-ENTRY] 🚀 启动V3专用修复流程：先绕过zsign → 再强化SCNetwork+connect兜底");
-        installV3ZsignBypass();
-        DLOG(@"[V3-ENTRY] ✅ V3专用修复前置流程安装完成，后续Hook将以V3模式安装");
+    BOOL isV3 = detectV3Environment();
+    if (isV3) {
+        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → 只替换zsign +alert:阻止弹窗，其余走全能签路径(FIX28)");
+        installV3ZsignAlertOnlyBypass();
+        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换完成，g_isV3Environment=NO → 所有hook走全能签路径");
     }
+    // g_isV3Environment 保持 NO → 所有hook(SCNetwork/socket/CC_MD5/CCCrypt)走全能签路径
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
     // v37.0-v37.12 minimal mode failed — injection detected → '版本过低'
