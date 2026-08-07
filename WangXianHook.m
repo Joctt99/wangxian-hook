@@ -909,6 +909,8 @@ static const uint8_t s_cleanA018[223] = {
 
 #include <signal.h>
 #include <execinfo.h>
+#include <pthread.h>      // FIX31-build: pthread_self/pthread_mach_thread_np 声明
+#include <exception>      // FIX31-build: std::set_terminate 声明
 
 // ============================================================
 // FIX31: 崩溃信息收集增强 + 独立crash文件 + exit/_Exit/abort拦截
@@ -984,7 +986,8 @@ static void fix31_writeCrashFile(NSString *summary, void *callstackArr[], int fr
             if (g_fix31LastLogs[idx]) {
                 size_t L = strlen(g_fix31LastLogs[idx]);
                 if (L > 0) {
-                    char *endsInNl = (g_fix31LastLogs[idx][L-1] == '\n') ? "" : "\n";
+                    // FIX31-build: endsInNl 改为 const char* (字符串字面量默认const)
+                    const char *endsInNl = (g_fix31LastLogs[idx][L-1] == '\n') ? "" : "\n";
                     [s appendFormat:@"  [%02d] %s%s", j, g_fix31LastLogs[idx], endsInNl];
                 }
             }
@@ -1155,9 +1158,8 @@ static void fix31_hook__Exit(int code) {
 static void fix31_hook_abort(void) {
     if (__atomic_exchange_n(&g_fix31InExitHook, 1, __ATOMIC_SEQ_CST)) { if (orig_abort) orig_abort(); return; }
     void *callstack[128]; int frames = backtrace(callstack, 128);
-    NSString *summary = [NSString stringWithString:
-        @"--- abort() called (PROCESS INTENTIONAL ABORT) ---\n"
-        "通常触发: assert() 失败 / ObjC exception 未捕获 / std::terminate / 签名验证失败 abort\n"];
+    NSString *summary = @"--- abort() called (PROCESS INTENTIONAL ABORT) ---\n"
+        "通常触发: assert() 失败 / ObjC exception 未捕获 / std::terminate / 签名验证失败 abort\n";
     fix31_writeCrashFile(summary, callstack, frames);
     if (orig_abort) orig_abort();
 }
@@ -1175,9 +1177,10 @@ static void setupSignalHandlers(void) {
     signal(SIGHUP, signalHandler);
     
     // FIX31: Hook exit / _Exit / abort（主动自杀函数）
-    orig_exit  = dlsym(RTLD_DEFAULT, "exit");
-    orig__Exit = dlsym(RTLD_DEFAULT, "_Exit");
-    orig_abort = dlsym(RTLD_DEFAULT, "abort");
+    // FIX31-build: dlsym返回void*, 强制转换为对应函数指针类型(禁止隐式void*→函数指针)
+    orig_exit  = (void (*)(int))            dlsym(RTLD_DEFAULT, "exit");
+    orig__Exit = (void (*)(int))            dlsym(RTLD_DEFAULT, "_Exit");
+    orig_abort = (void (*)(void))           dlsym(RTLD_DEFAULT, "abort");
     if (orig_exit)  rebind_symbols((struct rebinding[1]){{"exit",  (void *)fix31_hook_exit,  (void **)&orig_exit}},  1);
     if (orig__Exit) rebind_symbols((struct rebinding[1]){{"_Exit", (void *)fix31_hook__Exit, (void **)&orig__Exit}}, 1);
     if (orig_abort) rebind_symbols((struct rebinding[1]){{"abort", (void *)fix31_hook_abort, (void **)&orig_abort}}, 1);
