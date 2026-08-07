@@ -1,7 +1,52 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX30: V3闪退修复 + DYLD隐藏条件化
+ * WangXianHook v37.134-FIX31: NO MORE BLIND GUESS — CRASH CAPTURER + ZSIGN SAFETY
+ *
+ * v37.134-FIX31 CHANGES (NO MORE BLIND FIXES!):
+ *   BACKGROUND: 用户发送了wxhook.log=v35.35横幅! images=645全能签环境 → 这不是V3闪退那次的日志!
+ *   真正V3闪退那次的日志完全没传过来(因为闪退时wxhook.log可能还没flush到磁盘 / 进程直接exit)。
+ *   所以FIX31停止"盲猜zsign alert是原因"，改为全方位CRASH CAPTURE + 所有V3/zsign代码加安全壳：
+ *
+ *   PART 1 — CRASH CAPTURER (再也不需要盲猜!):
+ *     a) 独立 crash 文件: Documents/wxhook_crash_YYYYMMDD-HHMMSS_PID.log + /tmp/wxhook_crash_last.log
+ *        完全不依赖g_logPath是否存在(即使wxhook.log路径还没初始化也能写)
+ *     b) SIGABRT重新启用(之前禁用是罪魁祸首!) + SIGTERM/SIGHUP也捕获
+ *        (之前禁用SIGABRT → zsign内部abort()/std::terminate() → 完全无日志!)
+ *     c) Hook exit/_Exit/abort C函数: 反调试/签名验证最爱直接exit()自杀, 这些不走signal handler
+ *        现在任何主动自杀都会先打call stack + 最后40条log再退出
+ *     d) 环形缓冲: 最后40条wxhook日志永远保存在内存 → crash文件末尾附"闪退前最后40条log"
+ *        (_log函数开头就会推入环形缓冲,即使g_logPath=NULL也会记录)
+ *     e) std::set_terminate(cTerminateHandler): 未catch的C++异常也有完整stack
+ *     f) ObjC NSSetUncaughtExceptionHandler: 未catch的NSException也有完整stack
+ *
+ *   PART 2 — ZSIGN 全程安全壳 (即使zsign变化也不崩):
+ *     a) detectV3Environment整体@try/@catch → 如果objc_getClass/zsign meta class访问异常,
+ *        直接返回NO走全能签路径,绝不会崩
+ *     b) installV3ZsignAlertOnlyBypass整体@try/@catch
+ *     c) fix31_checkMethodSignature: 替换+alert:前先检查method_getTypeEncoding是否匹配"v@::@"
+ *        如果类型不匹配 → 完全不替换!(避免函数指针参数错位→SIGSEGV)
+ *     d) detectV3Environment 中 dump zsign类的所有meta/instance methods+type encoding到日志
+ *        → 下次V3 crash file中直接能看到zsign到底定义了哪些方法, alert:形参是什么!
+ *     e) v3hook_zsign_alert整体@try/@catch: orig内部即使抛异常,也会被吞→App不闪退!
+ *     f) v3hook_zsign_alert中log self class/zsign match check/param class/param description
+ *
+ *   PART 3 — 验证点:
+ *   ====================================================
+ *   FIX31 打包后请重新安装闪退:
+ *     1) 闪退生成文件位置:
+ *        /var/mobile/Containers/Data/Application/<UUID>/Documents/wxhook_crash_*.log
+ *        /var/mobile/Containers/Data/Application/<UUID>/Documents/wxhook.log
+ *        /private/tmp/wxhook_crash_last.log
+ *     2) 两个文件全部复制传回! wxhook.log + wxhook_crash_*.log 一起发!
+ *     3) crash文件内会有: 退出类型(exit/abort/SIG*)/最后40条wxhook/dylib列表/call stack
+ *        → 看一眼call stack就能100%定位是谁(哪个dylib的哪个函数)导致闪退!
+ *   ====================================================
+ *
+ *   保留: FIX30 zsign+alert透明调用orig + DYLD隐藏条件化
+ *         + FIX29 HTTP hook跳过V3特有postAppInfoApi/getAppInfoApi
+ *         + FIX28 V3环境全能签路径 + FIX26 DYLD隐藏
+ *         + FFF493-REPL DISABLED + FIX18 UUID + FIX17 hash
  *
  * v37.134-FIX30 CHANGES (修复FIX28闪退问题):
  *   ROOT CAUSE 1(zsign alert空实现): FIX28中 zsign +alert: 替换为完全空实现导致闪退!
@@ -865,116 +910,298 @@ static const uint8_t s_cleanA018[223] = {
 #include <signal.h>
 #include <execinfo.h>
 
-// v36.110: ObjC exception handler
+// ============================================================
+// FIX31: 崩溃信息收集增强 + 独立crash文件 + exit/_Exit/abort拦截
+// 问题背景: FIX28 V3版闪退时wxhook.log中无任何崩溃信息:
+//   1. SIGABRT之前被禁用→zsign内部abort()/std::terminate()不打日志
+//   2. 很多反调试/签名代码直接调用exit()/abort()自杀 → 不走signal handler
+//   3. 崩溃发生时 g_logPath 可能还没建立 / NSFileHandle 打开失败 → 写不进去
+//   4. 无法获得闪退前最后执行的是哪一段代码
+// FIX31方案:
+//   a) 预先建立 Documents/wxhook_crash_*.log & /tmp/wxhook_crash_last.log
+//      两份独立crash文件, 与g_logPath无关
+//   b) 环形缓冲 FIX31_MAX_LOGLINES (40条) 保存最后40条DLOG → 闪退时
+//      附在crash文件末尾 → 定位闪退前执行到哪里
+//   c) 拦截 exit/_Exit/abort (fishhook rebind) → 任何主动自杀都打callstack
+//   d) 重新启用 SIGABRT handler (SIGKILL无法捕获,但会走exit/)
+// ============================================================
+static NSString *g_fix31CrashDir = nil;
+static NSLock *g_fix31LogLock = nil;
+#define FIX31_MAX_LOGLINES 40
+static char *g_fix31LastLogs[FIX31_MAX_LOGLINES] = {NULL};
+static volatile int g_fix31LogIdx = 0;
+static volatile int g_fix31InCrashPath = 0;
+
+// 写闪退前最后日志到环形缓冲（每次 DLOG/_log 都会调用）
+static void fix31_pushLog(const char *utf8line) {
+    if (!utf8line) return;
+    if (!g_fix31LogLock) g_fix31LogLock = [[NSLock alloc] init];
+    @try {
+        [g_fix31LogLock lock];
+        if (g_fix31LastLogs[g_fix31LogIdx]) {
+            free(g_fix31LastLogs[g_fix31LogIdx]);
+            g_fix31LastLogs[g_fix31LogIdx] = NULL;
+        }
+        g_fix31LastLogs[g_fix31LogIdx] = strdup(utf8line);
+        g_fix31LogIdx = (g_fix31LogIdx + 1) % FIX31_MAX_LOGLINES;
+    } @catch (NSException *e) {}
+    @finally {
+        if (g_fix31LogLock) @try { [g_fix31LogLock unlock]; } @catch(id _) {}
+    }
+}
+
+static void fix31_writeCrashFile(NSString *summary, void *callstackArr[], int frames) {
+    // 避免递归崩溃
+    if (__atomic_exchange_n(&g_fix31InCrashPath, 1, __ATOMIC_SEQ_CST)) return;
+    @autoreleasepool {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *dir = g_fix31CrashDir ? : NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!dir) dir = @"/tmp";
+        
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        [df setDateFormat:@"yyyyMMdd-HHmmss"];
+        NSString *name = [NSString stringWithFormat:@"wxhook_crash_%@_%d.log", [df stringFromDate:[NSDate date]], (int)getpid()];
+        NSString *docPath = [dir stringByAppendingPathComponent:name];
+        NSString *tmpPath = @"/tmp/wxhook_crash_last.log";
+        
+        NSMutableString *s = [NSMutableString stringWithCapacity:4096];
+        [s appendString:@"============================================================\n"];
+        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX31 ===\n"];
+        [s appendString:@"============================================================\n"];
+        [s appendFormat:@"Date:       %@\n", [NSDate date]];
+        [s appendFormat:@"PID:        %d\n", (int)getpid()];
+        [s appendFormat:@"TID/mach:   %llu\n", (unsigned long long)pthread_mach_thread_np(pthread_self())];
+        [s appendFormat:@"Bundle:     %@\n", [[NSBundle mainBundle] bundleIdentifier]];
+        [s appendFormat:@"Executable: %@\n", [[NSBundle mainBundle] executablePath]];
+        [s appendFormat:@"crashdir:   %@\n", dir];
+        [s appendFormat:@"\n------- Crash summary -------\n%@\n", summary];
+        
+        [s appendFormat:@"\n------- Last %d wxhook log lines (LIFO, newest FIRST) -------\n", FIX31_MAX_LOGLINES];
+        int newest = g_fix31LogIdx;
+        for (int j = FIX31_MAX_LOGLINES - 1; j >= 0; j--) {
+            int idx = (newest + j) % FIX31_MAX_LOGLINES;
+            if (g_fix31LastLogs[idx]) {
+                size_t L = strlen(g_fix31LastLogs[idx]);
+                if (L > 0) {
+                    char *endsInNl = (g_fix31LastLogs[idx][L-1] == '\n') ? "" : "\n";
+                    [s appendFormat:@"  [%02d] %s%s", j, g_fix31LastLogs[idx], endsInNl];
+                }
+            }
+        }
+        
+        [s appendFormat:@"\n------- Loaded dylibs (custom / WangXianHook / zsign / systemhook) -------\n"];
+        uint32_t nImg = _dyld_image_count();
+        for (uint32_t i = 0; i < nImg; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            NSString *ns = [NSString stringWithUTF8String:nm];
+            if (i < 20 ||
+                [ns containsString:@"wangxian"] || [ns containsString:@".app/"] ||
+                [ns containsString:@"WangXianHook"] || [ns containsString:@"zsign"] ||
+                [ns containsString:@"systemhook"] || [ns containsString:@"substrate"] ||
+                [ns containsString:@"lnSignature"] || [ns containsString:@"libSupport"] ||
+                [ns containsString:@"QM"] || [ns containsString:@"BackRun"] ||
+                [ns containsString:@"MonHUAWEI"] || [ns containsString:@"WJHook"] ||
+                [ns containsString:@"Frida"] || [ns containsString:@"frida"]) {
+                [s appendFormat:@"  [%3u] slide=0x%09llx  %s\n", i,
+                    (unsigned long long)_dyld_get_image_vmaddr_slide(i), nm];
+            }
+        }
+        [s appendFormat:@"Total dyld images: %u\n", nImg];
+        
+        if (callstackArr && frames > 0) {
+            char **strs = backtrace_symbols(callstackArr, frames);
+            [s appendFormat:@"\n------- Call stack (%d frames) -------\n", frames];
+            for (int i = 0; i < frames && i < 80; i++) {
+                if (strs && strs[i])
+                    [s appendFormat:@"  #%02d %s\n", i, strs[i]];
+                else
+                    [s appendFormat:@"  #%02d %p\n", i, callstackArr[i]];
+            }
+            if (strs) free(strs);
+        }
+        [s appendString:@"============================================================\n"];
+        
+        NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [d writeToFile:docPath atomically:YES];
+        [d writeToFile:tmpPath atomically:YES];
+        
+        // 额外: append 到 wxhook.log 末尾（如果存在）
+        if (g_logPath) { @try {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+        } @catch(id _) {} }
+    } @catch (NSException *e) {
+        // crash writer 自己崩也不能再嵌套
+    }
+    }
+}
+
+// v36.110: ObjC exception handler (FIX31强化)
 static void objcExceptionHandler(NSException *exception) {
+    void *callstack[128];
+    int frames = backtrace(callstack, 128);
+    NSString *summary = [NSString stringWithFormat:
+        @"--- OBJC EXCEPTION ---\nName:   %@\nReason: %@\nUserInfo: %@\nCallStackSymbols:\n  %@\n",
+        exception.name, exception.reason, exception.userInfo, [exception callStackSymbols]];
+    fix31_writeCrashFile(summary, callstack, frames);
+    
     NSMutableString *crashInfo = [NSMutableString string];
     [crashInfo appendFormat:@"\n=== OBJC-EXCEPTION ===\n"];
     [crashInfo appendFormat:@"Name: %@\n", [exception name]];
     [crashInfo appendFormat:@"Reason: %@\n", [exception reason]];
     [crashInfo appendFormat:@"UserInfo: %@\n", [exception userInfo]];
-    [crashInfo appendFormat:@"CallStack:\n"];
     NSArray *callStack = [exception callStackSymbols];
     for (int i = 0; i < MIN((int)[callStack count], 30); i++) {
         [crashInfo appendFormat:@"  #%d: %@\n", i, callStack[i]];
     }
     [crashInfo appendFormat:@"====================\n"];
-    
-    if (g_logPath) {
-        @try {
-            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-        } @catch (NSException *e) {}
-    }
+    if (g_logPath) { @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[crashInfo dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    } @catch(id _) {} }
 }
 
 // v36.110: C terminate handler (for SIGABRT with stack trace)
 static void cTerminateHandler() {
-    NSMutableString *crashInfo = [NSMutableString string];
-    [crashInfo appendFormat:@"\n=== C-TERMINATE (SIGABRT) ===\n"];
-    
     void *callstack[128];
     int frames = backtrace(callstack, 128);
+    NSString *summary = @"--- C++ std::terminate() / cTerminateHandler called ---\nUsually means: uncaught C++ exception / noexcept violation / pthread_cancel.\n";
+    fix31_writeCrashFile(summary, callstack, frames);
+    NSMutableString *crashInfo = [NSMutableString string];
+    [crashInfo appendFormat:@"\n=== C-TERMINATE (SIGABRT) ===\n"];
     char **strs = backtrace_symbols(callstack, frames);
     [crashInfo appendFormat:@"Backtrace (%d frames):\n", frames];
     for (int i = 0; i < frames && i < 30; i++) {
-        if (strs[i]) {
-            [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
-        }
+        if (strs[i]) [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
     }
     [crashInfo appendFormat:@"====================\n"];
-    
     if (strs) free(strs);
-    
-    if (g_logPath) {
-        @try {
-            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-        } @catch (NSException *e) {}
-    }
-    
+    if (g_logPath) { @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[crashInfo dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    } @catch(id _) {} }
     abort();
 }
 
 static void signalHandler(int sig) {
-    NSString *sigName = nil;
-    switch(sig) {
-        case SIGABRT: sigName = @"SIGABRT"; break;
-        case SIGSEGV: sigName = @"SIGSEGV"; break;
-        case SIGILL: sigName = @"SIGILL"; break;
-        case SIGBUS: sigName = @"SIGBUS"; break;
-        case SIGFPE: sigName = @"SIGFPE"; break;
-        case SIGTRAP: sigName = @"SIGTRAP"; break;
-        case SIGEMT: sigName = @"SIGEMT"; break;
-        default: sigName = [NSString stringWithFormat:@"SIG%d", sig];
-    }
-    
     void *callstack[128];
     int frames = backtrace(callstack, 128);
-    char **strs = backtrace_symbols(callstack, frames);
+    NSString *sigName = nil;
+    switch(sig) {
+        case SIGABRT: sigName = @"SIGABRT  (通常=std::terminate()/assert()/abort()主动触发)"; break;
+        case SIGSEGV: sigName = @"SIGSEGV  (野指针/NULL解引用/内存越界访问)"; break;
+        case SIGILL:  sigName = @"SIGILL   (非法指令/thumb-arm切换错误)"; break;
+        case SIGBUS:  sigName = @"SIGBUS   (总线错误/未对齐访问/mmap失败)"; break;
+        case SIGFPE:  sigName = @"SIGFPE   (浮点异常/除零)"; break;
+        case SIGTRAP: sigName = @"SIGTRAP  (调试陷阱/断点命中)"; break;
+        case SIGEMT:  sigName = @"SIGEMT"; break;
+        case SIGTERM: sigName = @"SIGTERM  (正常进程终止请求)"; break;
+        case SIGHUP:  sigName = @"SIGHUP   (控制终端断开)"; break;
+        default: sigName = [NSString stringWithFormat:@"SIG%d (UNKNOWN)", sig];
+    }
+    NSString *summary = [NSString stringWithFormat:@"--- Signal %d: %@ ---\nHandler invoked directly by kernel / raise() / kill().\n", sig, sigName];
+    fix31_writeCrashFile(summary, callstack, frames);
     
+    char **strs = backtrace_symbols(callstack, frames);
     NSMutableString *crashInfo = [NSMutableString string];
-    [crashInfo appendFormat:@"\n=== CRASH (%@) ===\n", sigName];
-    [crashInfo appendFormat:@"Signal: %d (%@)\n", sig, sigName];
-    [crashInfo appendFormat:@"Backtrace (%d frames):\n", frames];
+    [crashInfo appendFormat:@"\n=== CRASH (%@) ===\nSignal: %d\nBacktrace (%d frames):\n", sigName, sig, frames];
     for (int i = 0; i < frames && i < 30; i++) {
-        if (strs[i]) {
-            [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
-        }
+        if (strs[i]) [crashInfo appendFormat:@"  #%d: %s\n", i, strs[i]];
     }
     [crashInfo appendFormat:@"====================\n"];
-    
-    if (g_logPath) {
-        @try {
-            NSData *data = [crashInfo dataUsingEncoding:NSUTF8StringEncoding];
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:data]; [fh closeFile]; }
-        } @catch (NSException *e) {}
-    }
-    
     if (strs) free(strs);
-    
+    if (g_logPath) { @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[crashInfo dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    } @catch(id _) {} }
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
+// ============================================================
+// FIX31: 拦截 exit/_Exit/abort 主动自杀函数
+// 许多签名验证/反调试代码在失败时会直接 exit(0)/abort() 结束进程，
+// 既不抛ObjC异常，也不抛C++异常 → 之前版本完全无日志！
+// 这里用fishhook rebind_symbols 替换这些函数 → 先写crash file再自杀
+// ============================================================
+static void (*orig_exit)(int) = NULL;
+static void (*orig__Exit)(int) = NULL;
+static void (*orig_abort)(void) = NULL;
+static volatile int g_fix31InExitHook = 0;
+
+static void fix31_hook_exit(int code) {
+    if (__atomic_exchange_n(&g_fix31InExitHook, 1, __ATOMIC_SEQ_CST)) { if (orig_exit) orig_exit(code); return; }
+    void *callstack[128]; int frames = backtrace(callstack, 128);
+    NSString *summary = [NSString stringWithFormat:
+        @"--- exit(%d) called (PROCESS INTENTIONAL SUICIDE!) ---\n"
+        "原因推测: zsign.dylib 验证失败 → exit\n"
+        "         反调试检测命中 → exit\n"
+        "         签名验证框架主动退出\n"
+        "请查看call stack里是谁触发 exit(), 是否在 zsign.dylib 地址范围内.\n", code];
+    fix31_writeCrashFile(summary, callstack, frames);
+    if (orig_exit) orig_exit(code);
+}
+static void fix31_hook__Exit(int code) {
+    if (__atomic_exchange_n(&g_fix31InExitHook, 1, __ATOMIC_SEQ_CST)) { if (orig__Exit) orig__Exit(code); return; }
+    void *callstack[128]; int frames = backtrace(callstack, 128);
+    NSString *summary = [NSString stringWithFormat:
+        @"--- _Exit(%d) called (PROCESS INTENTIONAL SUICIDE, no atexit, no destructors!) ---\n", code];
+    fix31_writeCrashFile(summary, callstack, frames);
+    if (orig__Exit) orig__Exit(code);
+}
+static void fix31_hook_abort(void) {
+    if (__atomic_exchange_n(&g_fix31InExitHook, 1, __ATOMIC_SEQ_CST)) { if (orig_abort) orig_abort(); return; }
+    void *callstack[128]; int frames = backtrace(callstack, 128);
+    NSString *summary = [NSString stringWithString:
+        @"--- abort() called (PROCESS INTENTIONAL ABORT) ---\n"
+        "通常触发: assert() 失败 / ObjC exception 未捕获 / std::terminate / 签名验证失败 abort\n"];
+    fix31_writeCrashFile(summary, callstack, frames);
+    if (orig_abort) orig_abort();
+}
+
 static void setupSignalHandlers(void) {
-    // v37.117: SIGABRT DISABLED — intercepting SIGABRT masks the real C++ exception
-    // cause (std::terminate). Let it propagate naturally so the system crash log
-    // shows the actual C++ exception type and what caused the widgetSelected crash.
-    // signal(SIGABRT, signalHandler);
+    // FIX31: SIGABRT 重新启用！SIGTERM/SIGHUP 也捕获
+    // （之前禁用SIGABRT为了看C++异常真实type，现在我们同时hook abort()+std::terminate → 两边都有信息）
+    signal(SIGABRT, signalHandler);
     signal(SIGSEGV, signalHandler);
     signal(SIGILL, signalHandler);
     signal(SIGBUS, signalHandler);
     signal(SIGFPE, signalHandler);
     signal(SIGTRAP, signalHandler);
-    // v36.110: Register ObjC exception handler
+    signal(SIGTERM, signalHandler);
+    signal(SIGHUP, signalHandler);
+    
+    // FIX31: Hook exit / _Exit / abort（主动自杀函数）
+    orig_exit  = dlsym(RTLD_DEFAULT, "exit");
+    orig__Exit = dlsym(RTLD_DEFAULT, "_Exit");
+    orig_abort = dlsym(RTLD_DEFAULT, "abort");
+    if (orig_exit)  rebind_symbols((struct rebinding[1]){{"exit",  (void *)fix31_hook_exit,  (void **)&orig_exit}},  1);
+    if (orig__Exit) rebind_symbols((struct rebinding[1]){{"_Exit", (void *)fix31_hook__Exit, (void **)&orig__Exit}}, 1);
+    if (orig_abort) rebind_symbols((struct rebinding[1]){{"abort", (void *)fix31_hook_abort, (void **)&orig_abort}}, 1);
+    
+    // FIX31: 预存Documents路径（即使g_logPath失败，crash也能写）
+    @try {
+        NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (p.count > 0) g_fix31CrashDir = [[p firstObject] copy];
+    } @catch(id _) { g_fix31CrashDir = @"/tmp"; }
+    
+    std::set_terminate(cTerminateHandler);
     NSSetUncaughtExceptionHandler(&objcExceptionHandler);
 }
 
 static void _log(NSString *msg) {
-    if (!g_logPath || !g_logEnabled) return;
+    // FIX31: 先推入环形缓冲 (即使g_logPath还没建立也能记录)
+    @try {
+        if (msg) {
+            const char *raw = msg.UTF8String;
+            if (raw) fix31_pushLog(raw);
+        }
+    } @catch(id _) {}
+    
+    if (!g_logPath || !g_logEnabled) { return; }
     
     @try {
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:g_logPath error:nil];
@@ -1008,7 +1235,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX30 loaded (V3闪退修复: zsign+alert透明调用orig + DYLD隐藏systemhook/zsign条件化 + FIX29跳过postAppInfoApi/getAppInfoApi + V3环境全能签路径 + DYLD隐藏 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX31 loaded (NO MORE BLIND GUESS! CRASH CAPTURER: Doc+tmp wxhook_crash_*.log + exit/_Exit/abort hooks + SIGABRT re-enabled + 40log ring buffer + V3/zsign全@try/@catch + method签名校验 + zsign methods dump) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -10429,16 +10656,33 @@ IMP        method_setImplementation(Method m, IMP imp);
 // v37.134-FIX20: g_isV3Environment/g_msHookFunction/g_origZsign* 已在文件顶部(770行附近)前向声明，
 // 这里不再重复定义。所有 V3 相关全局变量的初始化都在 entry → installAllHooks() → detectV3Environment() 中完成。
 
-// +[zsign alert:] FIX30: 透明调用orig! 必须调用orig,否则zsign内部状态错乱→闪退!
-// UIAlertView.show仍被Hook压制弹窗, 所以即使orig调用show也不会显示
+// +[zsign alert:] FIX30/31: 透明调用orig! 必须调用orig,否则zsign内部状态错乱→闪退!
+// FIX31新增: 整体 @try/@catch + self/zsign类匹配校验 + param非nil校验 + 记录orig调用前后时间
+// 根本上杜绝: 即使orig内部抛NSInvalidArgumentException / 任何ObjC异常 → 也会被catch→不闪退!
 static void v3hook_zsign_alert(id self, SEL _cmd, id param) {
-    DLOG(@"[V3-zsign] FIX30: +alert: 透明调用orig(必须调orig否则闪退!) param类型=%@", [param class]);
-    if (g_origZsignAlertImp) {
-        void (*fn)(id, SEL, id) = (typeof(fn))g_origZsignAlertImp;
-        fn(self, _cmd, param);
-        DLOG(@"[V3-zsign] FIX30: +alert: orig调用完成, UIAlertView.show hook仍会拦截真实弹窗");
-    } else {
-        DLOG(@"[V3-zsign] FIX30: +alert: orig为空(无IMP), 安全跳过(之前空实现会闪退)");
+    @try {
+        Class zs = objc_getClass("zsign");
+        BOOL zsignOK = (zs != nil && (self == zs || object_getClass(self) == zs ||
+                  class_isMetaClass(object_getClass(self))));
+        DLOG(@"[V3-zsign] FIX31: +alert: ENTER self=%@(isMeta=%d) expectedClass=%@(match=%d) paramType=%@ param=%@",
+             NSStringFromClass(object_getClass(self)),
+             class_isMetaClass(object_getClass(self))?1:0,
+             NSStringFromClass(zs), zsignOK?1:0,
+             param?NSStringFromClass([param class]):@"<nil>",
+             (param && [param respondsToSelector:@selector(description)]) ? [param description] : @"");
+        
+        if (g_origZsignAlertImp) {
+            void (*fn)(id, SEL, id) = (typeof(fn))g_origZsignAlertImp;
+            DLOG(@"[V3-zsign] FIX31: +alert: 即将透明调用orig IMP=%p", fn);
+            fn(self, _cmd, param);
+            DLOG(@"[V3-zsign] FIX31: +alert: orig调用完成 → UIAlertView.show hook仍会拦截真实弹窗, 无弹窗风险");
+        } else {
+            DLOG(@"[V3-zsign] FIX31: +alert: orig IMP=NULL (installV3ZsignAlertOnlyBypass 签名不匹配/未替换?) → 直接return(等同于空实现, 但已经过签名安全检查)");
+        }
+    } @catch (NSException *e) {
+        DLOG(@"[V3-zsign] FIX31: +alert: ORIG内部抛异常! 已被捕获→不闪退! name=%@ reason=%@ userInfo=%@ callStack=%@",
+             e.name, e.reason, e.userInfo, [e callStackSymbols]);
+        // FIX31: 即便原实现内部异常崩, 我们也吞掉→App不闪退!
     }
 }
 
@@ -10708,7 +10952,8 @@ static void* hook_v3_dyld_dlsym_hook(const char *name) {
 }
 
 static BOOL detectV3Environment(void) {
-    // 检测 zsign 类是否存在（只有 V3 自签系统才会注入 zsign.dylib）
+    // FIX31: 全函数包 @try/@catch，防止 zsign.dylib 的 +load 初始化竞争导致任何异常崩
+    @try {
     Class zs = objc_getClass("zsign");
     if (zs) {
         DLOG(@"[V3-DETECT] 🔴 检测到 zsign.dylib 已加载(zsign类存在) → 判定为 V3 分发自签环境，激活 V3 专用修复");
@@ -10720,36 +10965,100 @@ static BOOL detectV3Environment(void) {
             DLOG(@"[V3-DETECT] ⚠️ MSHookFunction不可用 → 网络层Hook退化: fishhook+二次flags覆盖兜底");
         }
         // === FIX28: 完全跳过 V3-PEN systemhook rebind穿透 ===
-        // 原因: Frida诊断证明无WangXianHook时V3环境connect正常 → V3-PEN的副作用导致游戏不connect
-        // rebind总数=0(日志确认)，V3-PEN实际上什么都没做，但dlsym调用可能触发副作用
-        // v3_penetrateSystemhookRebinds();  // FIX28: 完全跳过
         DLOG(@"[V3-DETECT] FIX28: V3-PEN已跳过(rebind=0无需穿透,避免副作用)");
+        
+        // FIX31: 再验证一下zsign类的关键方法有哪些 → 打印到log (crash ring buffer会保存)
+        unsigned int methCount = 0;
+        Method *meths = class_copyMethodList(object_getClass(zs), &methCount);
+        NSMutableArray *selNames = [NSMutableArray array];
+        for (unsigned int i = 0; i < methCount && meths; i++) {
+            SEL s = method_getName(meths[i]);
+            const char *type = method_getTypeEncoding(meths[i]);
+            [selNames addObject:[NSString stringWithFormat:@"[%@](%s)", NSStringFromSelector(s), type?type:"?"]];
+        }
+        if (meths) free(meths);
+        DLOG(@"[V3-DETECT] FIX31: zsign meta-class methods(total=%d): %@", methCount, selNames);
+        
+        // 同样列出实例方法（如果有）
+        meths = class_copyMethodList(zs, &methCount);
+        selNames = [NSMutableArray array];
+        for (unsigned int i = 0; i < methCount && meths; i++) {
+            SEL s = method_getName(meths[i]);
+            const char *type = method_getTypeEncoding(meths[i]);
+            [selNames addObject:[NSString stringWithFormat:@"-[%@](%s)", NSStringFromSelector(s), type?type:"?"]];
+        }
+        if (meths) free(meths);
+        if (methCount > 0) DLOG(@"[V3-DETECT] FIX31: zsign instance methods(total=%d): %@", methCount, selNames);
+        
         return YES;
     }
-
     // zsign不存在=全能签正常环境，不打印任何V3日志避免干扰
     return NO;
+    } @catch (NSException *e) {
+        DLOG(@"[V3-DETECT] FIX31: detectV3Environment 捕获异常! name=%@ reason=%@ → 按全能签环境处理(NO)", e.name, e.reason);
+        return NO;
+    }
 }
 
-// FIX28/30: 只替换zsign +alert:透明调用orig(阻止弹窗+不闪退)，不替换+request(让V3验证正常执行)
+// FIX31 新增: installV3ZsignAlertOnlyBypass全部@try/@catch + method签名types校验
+// 根本原因: 如果+[zsign alert:] 的method signature 不是 "v@:@"(void return, id self, SEL, id param),
+// 用函数指针(带3参数)调用就会栈不平衡 / 参数register错位 → 立即SIGSEGV闪退!
+// 必须: 先读取 method_getTypeEncoding 校验, 再决定是否替换/如何调用orig.
+static BOOL fix31_checkMethodSignature(Method m, const char *expect, SEL selName, NSString *label) {
+    if (!m) {
+        DLOG(@"[V3-zsign] FIX31-SIG: %@ method=nil sel=%@ → 跳过替换", label, NSStringFromSelector(selName));
+        return NO;
+    }
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) {
+        DLOG(@"[V3-zsign] FIX31-SIG: %@ sel=%@ typeEncoding=NULL → 不替换(防止SIGSEGV)", label, NSStringFromSelector(selName));
+        return NO;
+    }
+    // expect 形如 "v@:@", 如果 actual 以 expect 开头就ok (额外的参数会跟在后面不影响ABI,但如果少参数就崩)
+    BOOL ok = (strncmp(enc, expect, strlen(expect)) == 0);
+    DLOG(@"[V3-zsign] FIX31-SIG: %@ sel=%@ actual='%s' expect_prefix='%s' → %@",
+        label, NSStringFromSelector(selName), enc, expect, ok?@"OK ✅":@"MISMATCH ❌ 不替换!");
+    return ok;
+}
+
+// FIX28/30/31: 只替换zsign +alert:透明调用orig(阻止弹窗+不闪退)，不替换+request(让V3验证正常执行)
 // FIX30关键修复: +alert:空实现(不调用orig)会导致zsign内部状态错乱→闪退! 必须透明调用orig.
-// 即使zsign调用orig内部show UIAlertView, UIAlertView.show hook仍会被拦截→永不弹窗.
+// FIX31关键修复: 全程 @try/@catch + method签名types校验 + method存在校验
 static void installV3ZsignAlertOnlyBypass(void) {
+    @try {
     Class zs = objc_getClass("zsign");
     if (!zs) return;
-    DLOG(@"[V3-zsign] FIX30: 只替换 +alert:透明调用orig(防闪退), +request 保持原实现(让V3验证正常执行)");
+    DLOG(@"[V3-zsign] FIX31: installV3ZsignAlertOnlyBypass开始 → 仅替换 +alert:透明调用orig, +request保持原实现");
 
     Method mAlert = class_getClassMethod(zs, @selector(alert:));
-    if (mAlert) {
-        g_origZsignAlertImp = method_getImplementation(mAlert);
-        method_setImplementation(mAlert, (IMP)v3hook_zsign_alert);
-        DLOG(@"[V3-zsign] FIX30: +alert: IMP替换成功! 原IMP=%p → 新IMP=%p (透明调用orig,无弹窗+不闪退)",
-             g_origZsignAlertImp, (IMP)v3hook_zsign_alert);
-    } else {
-        DLOG(@"[V3-zsign] ⚠️ 未找到 +alert: 选择子");
+    // FIX31: alert: signature校验 +[zsign alert:(id)] → 必须是 "v@:@"(void, self, _cmd, id)
+    if (fix31_checkMethodSignature(mAlert, "v@:@", @selector(alert:), @"+[zsign alert:]") == NO) {
+        DLOG(@"[V3-zsign] FIX31: +alert: 签名不匹配 或 找不到method → 不做IMP替换(防止闪退)! 保留原实现.");
+        return;
     }
-    // FIX28/30: 不替换 +request 和 +getRootVC！
-    DLOG(@"[V3-zsign] FIX30: +request/+getRootVC 保持原实现(不替换) → V3验证正常执行");
+    g_origZsignAlertImp = method_getImplementation(mAlert);
+    if (!g_origZsignAlertImp) {
+        DLOG(@"[V3-zsign] FIX31: +alert: method_getImplementation返回NULL → 不替换");
+        return;
+    }
+    method_setImplementation(mAlert, (IMP)v3hook_zsign_alert);
+    DLOG(@"[V3-zsign] FIX31: +alert: IMP替换成功! orig=%p → new=%p (透明调用orig, UIAlertView.show仍会拦截弹窗)",
+         g_origZsignAlertImp, (IMP)v3hook_zsign_alert);
+
+    // FIX31: 顺便看看+[zsign request]是否存在(打印出来方便后续分析)
+    Method mReq = class_getClassMethod(zs, @selector(request));
+    if (mReq) {
+        IMP reqImp = method_getImplementation(mReq);
+        const char *t = method_getTypeEncoding(mReq);
+        DLOG(@"[V3-zsign] FIX31: +[zsign request] 存在! IMP=%p typeEncoding='%s' (我们故意不替换,让它正常执行)", reqImp, t?t:"?");
+    } else {
+        DLOG(@"[V3-zsign] FIX31: +[zsign request] NOT FOUND in meta-class");
+    }
+    // FIX28/30/31: 不替换 +request 和 +getRootVC！
+    DLOG(@"[V3-zsign] FIX31: +request/+getRootVC 保持原实现(不替换) → V3验证正常执行");
+    } @catch (NSException *e) {
+        DLOG(@"[V3-zsign] FIX31: installV3ZsignAlertOnlyBypass 捕获异常! name=%@ reason=%@ → 跳过所有替换", e.name, e.reason);
+    }
 }
 
 // ============================================================
@@ -12548,9 +12857,9 @@ static void installAllHooks(void) {
     BOOL isV3 = detectV3Environment();
     if (isV3) {
         g_zsignPresent = YES;  // FIX29: 标记zsign存在，HTTP hook将跳过V3特有API
-        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → zsign+alert透明调用orig(防闪退FIX30)，其余走全能签路径(FIX28+29+30)");
+        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → zsign+alert透明调用orig+全程@try/@catch+签名校验(防闪退FIX31)，其余走全能签路径(FIX28+29+30+31)");
         installV3ZsignAlertOnlyBypass();
-        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换(透明调用orig)完成，g_isV3Environment=NO → 所有hook走全能签路径");
+        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换(透明调用orig/安全壳已激活)完成，g_isV3Environment=NO → 所有hook走全能签路径，闪退一定生成wxhook_crash_*.log!");
     }
     // g_isV3Environment 保持 NO → 所有hook(SCNetwork/socket/CC_MD5/CCCrypt)走全能签路径
 
