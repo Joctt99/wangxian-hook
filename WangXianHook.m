@@ -1,7 +1,19 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX19: Disable FFF493-REPL — root cause of "卡住正在进入" after FIX18
+ * WangXianHook v37.134-FIX20: V3自签分发环境修复 — zsign绕过 + SCNetwork多层rebind强化
+ *
+ * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
+ *   ROOT CAUSE: V3自签系统额外注入zsign.dylib做签名验证。
+ *   - zsign.dylib在应用启动早期调用+alert:弹窗阻止流程，+request发起HTTP验证请求可能挂起
+ *   - systemhook.dylib(DYLD 0号)的SCNetworkReachabilityGetFlags返回"不可达"覆盖了WangXianHook的Hook
+ *   - V3版多了6-8层rebind链(systemhook/zsign的fishhook)，简单fishhook rebind符号解析无法穿透
+ *   FIX: (1) 检测zsign类是否存在来判定V3环境 (detectV3Environment)
+ *   (2) 替换zsign 3个类方法IMP: +alert:→空实现 / +request→返回空字典 / +getRootVC→透明包装
+ *   (3) SCNetworkReachabilityGetFlags: V3环境优先用MSHookFunction内联patch(穿透所有层)，
+ *       不可用时退化fishhook+二次flags内存屏障强制覆盖兜底
+ *   (4) connect(5678/12003): 多层rebind拦截返回-1时，用Module.findExportByName(RTLD_DEFAULT)的真实connect重试
+ *   所有V3修复仅在检测到zsign类时激活，全能签正常环境100%不受影响。
  *
  * v37.134-FIX19 CHANGES (CRITICAL — root cause of "卡住正在进入" PERSISTING after FIX18):
  *   ROOT CAUSE: FFF493-REPL system was RE-ENCRYPTING FFF493#2 packets after FIX18 fixed EE121.
@@ -952,7 +964,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX19 loaded (FFF493-REPL DISABLED — send original FFF493#2 as-is + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX20 loaded (V3自签环境修复: zsign绕过+SCNetwork多层rebind强化+connect兜底重试 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -4739,6 +4751,44 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 } @catch (NSException *e) {
                     DLOG(@"[SOCK] Exception during rotation: %@", e.reason);
                 }
+            }
+        }
+
+        // === FIX20 V3环境兜底：多层rebind链导致游戏服connect被中间层拦截返回-1时，
+        // 直接用 dlsym(RTLD_DEFAULT, connect) 拿最底层未被污染的系统 connect 再调一次，
+        // 跳过 6-8 层 rebind/inline patch 链的中间层拦截
+        if (g_isV3Environment && result == -1 && (port == 5678 || port == 12003)) {
+            static ConnectFunc real_connect = NULL;
+            static int  vc3_hitCount = 0;
+            if (!real_connect) real_connect = (ConnectFunc)dlsym(RTLD_DEFAULT, "connect");
+            if (real_connect && real_connect != orig_connect) {
+                int prevErrno = connectErrno;
+                int ret2 = real_connect(sockfd, actualAddr, actualAddrLen);
+                int err2 = errno;
+                if (vc3_hitCount < 8) {
+                    vc3_hitCount++;
+                    DLOG(@"[V3-CONNECT] 🟢 fd=%d %s:%d orig_ret=-1 errno=%d(%s) → 调用RTLD_DEFAULT真实connect → ret=%d errno=%d(%s) 命中#%d",
+                         sockfd, host, port,
+                         prevErrno, strerror(prevErrno),
+                         ret2, ret2==-1?err2:0, ret2==-1?strerror(err2):"",
+                         vc3_hitCount);
+                }
+                // 用真实 connect 的返回值替换给游戏
+                result = ret2;
+                connectErrno = (ret2 == -1) ? err2 : 0;
+
+                // 如果真实 connect 成功了，也需要更新游戏服连接状态
+                if (result == 0 && (port == 12003 || isGameServerPort)) {
+                    g_gameServerConnected = YES;
+                    g_gameServerFd = sockfd;
+                    g_gameConnectTime = [[NSDate date] timeIntervalSince1970];
+                    DLOG(@"[V3-CONNECT] 🎯 游戏服兜底connect成功! fd=%d target=%s:%d → 重置游戏登录状态", sockfd, host, port);
+                    resetGameStateForReconnect();
+                }
+            } else if (vc3_hitCount < 8) {
+                vc3_hitCount++;
+                DLOG(@"[V3-CONNECT] ⚠️ fd=%d %s:%d 想用RTLD_DEFAULT真实connect兜底, 但dlsym未找到或与orig相同! real=%p orig=%p",
+                     sockfd, host, port, real_connect, orig_connect);
             }
         }
         
@@ -10182,7 +10232,106 @@ static CFDataRef hook_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm a
 }
 
 // ============================================================
-#pragma mark - v37.3 SCNetworkReachabilityGetFlags hook
+#pragma mark - v37.134-FIX20 V3自签分发环境修复 (zsign.dylib + 多层rebind链问题)
+// 仅当 objc_getClass("zsign") 存在时激活，全能签环境逻辑100%不动。
+// ============================================================
+
+// --- 手动声明 ObjC Runtime 函数 (避免import<objc/runtime.h>引发BOM冲突) ---
+Class      objc_getClass(const char *name);
+Method     class_getClassMethod(Class cls, SEL name);
+Method     class_getInstanceMethod(Class cls, SEL name);
+IMP        method_getImplementation(Method m);
+IMP        method_setImplementation(Method m, IMP imp);
+
+// --- MSHookFunction 原型 (libsubstrate.dylib 动态加载，失败就退化用fishhook+二次覆盖) ---
+typedef void (*MSHookFunction_t)(void *function, void *replace, void **result);
+static MSHookFunction_t g_msHookFunction = NULL;
+
+// --- 全局 V3 环境标记 (在 entry constructor 最开始检测) ---
+static BOOL g_isV3Environment = NO;
+static IMP g_origZsignAlertImp = NULL;
+static IMP g_origZsignRequestImp = NULL;
+static IMP g_origZsignGetRootVCImp = NULL;
+
+// +[zsign alert:] 替换为空实现：永不弹窗
+static void v3hook_zsign_alert(id self, SEL _cmd, id param) {
+    DLOG(@"[V3-zsign] +alert: 被拦截替换为空实现！原参数类型=%@ 内容=%@",
+         [param class], [(param && [param respondsToSelector:@selector(description)]) ? [param description] : nil description]);
+}
+
+// +[zsign request] 替换为返回空字典@{}(=V3校验总是"通过")，不发起真实请求，避免挂起
+static id v3hook_zsign_request(id self, SEL _cmd) {
+    DLOG(@"[V3-zsign] +request 被拦截替换！直接返回空字典(校验通过)，原实现不执行");
+    // 不调 orig，直接返回成功空字典
+    return @{};
+}
+
+// +[zsign getRootVC] 透明调用原实现（不影响）
+static id v3hook_zsign_getRootVC(id self, SEL _cmd) {
+    DLOG(@"[V3-zsign] +getRootVC 经过Hook(正常返回原实现)");
+    if (g_origZsignGetRootVCImp) {
+        id (*fn)(id, SEL) = (typeof(fn))g_origZsignGetRootVCImp;
+        return fn(self, _cmd);
+    }
+    return nil;
+}
+
+static BOOL detectV3Environment(void) {
+    // 检测 zsign 类是否存在（只有 V3 自签系统才会注入 zsign.dylib）
+    Class zs = objc_getClass("zsign");
+    if (zs) {
+        DLOG(@"[V3-DETECT] 🔴 检测到 zsign.dylib 已加载(zsign类存在) → 判定为 V3 分发自签环境，激活 V3 专用修复");
+        // 顺便尝试动态加载 libsubstrate 的 MSHookFunction (优先用内联patch代替fishhook)
+        g_msHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        if (g_msHookFunction) {
+            DLOG(@"[V3-DETECT] ✅ libsubstrate 已加载，MSHookFunction 可用(%p) → 网络层Hook优先用内联patch", g_msHookFunction);
+        } else {
+            DLOG(@"[V3-DETECT] ⚠️ MSHookFunction不可用 → 网络层Hook退化: fishhook+二次flags覆盖兜底");
+        }
+        return YES;
+    }
+    // zsign不存在=全能签正常环境，不打印任何V3日志避免干扰
+    return NO;
+}
+
+static void installV3ZsignBypass(void) {
+    Class zs = objc_getClass("zsign");
+    if (!zs) return;
+    DLOG(@"[V3-zsign] 开始替换 zsign.dylib 3个类方法 IMP");
+
+    Method mAlert = class_getClassMethod(zs, @selector(alert:));
+    if (mAlert) {
+        g_origZsignAlertImp = method_getImplementation(mAlert);
+        method_setImplementation(mAlert, (IMP)v3hook_zsign_alert);
+        DLOG(@"[V3-zsign] +alert: IMP替换成功! 原IMP=%p → 新IMP=%p (空实现永不弹窗)",
+             g_origZsignAlertImp, (IMP)v3hook_zsign_alert);
+    } else {
+        DLOG(@"[V3-zsign] ⚠️ 未找到 +alert: 选择子");
+    }
+
+    Method mReq = class_getClassMethod(zs, @selector(request));
+    if (mReq) {
+        g_origZsignRequestImp = method_getImplementation(mReq);
+        method_setImplementation(mReq, (IMP)v3hook_zsign_request);
+        DLOG(@"[V3-zsign] +request IMP替换成功! 原IMP=%p → 新IMP=%p (直接返回空字典=V3校验通过)",
+             g_origZsignRequestImp, (IMP)v3hook_zsign_request);
+    } else {
+        DLOG(@"[V3-zsign] ⚠️ 未找到 +request 选择子");
+    }
+
+    Method mRoot = class_getClassMethod(zs, @selector(getRootVC));
+    if (mRoot) {
+        g_origZsignGetRootVCImp = method_getImplementation(mRoot);
+        method_setImplementation(mRoot, (IMP)v3hook_zsign_getRootVC);
+        DLOG(@"[V3-zsign] +getRootVC IMP替换成功(透明包装)");
+    } else {
+        DLOG(@"[V3-zsign] ⚠️ 未找到 +getRootVC 选择子");
+    }
+    DLOG(@"[V3-zsign] zsign绕过安装完成 → 首次启动"无网络连接"弹窗永不出现，不会再在zsign层挂起");
+}
+
+// ============================================================
+#pragma mark - v37.3 SCNetworkReachabilityGetFlags hook (+ FIX20 V3强化)
 // Force return kSCNetworkReachabilityFlagsReachable so client's
 // pre-connect network check passes for game server (port 12003)
 // ============================================================
@@ -10191,9 +10340,38 @@ typedef int (*SCNetworkReachabilityGetFlagsFunc)(void *target, uint32_t *flags);
 static SCNetworkReachabilityGetFlagsFunc orig_SCNetworkReachabilityGetFlags = NULL;
 
 static int hook_SCNetworkReachabilityGetFlags(void *target, uint32_t *flags) {
-    // v37.3: Force reachable — kSCNetworkReachabilityFlagsReachable = 0x02
-    if (flags) *flags = 0x02;
-    return 1;  // TRUE
+    if (!g_isV3Environment) {
+        // === 全能签环境：原始一行逻辑完全不变 ===
+        // v37.3: Force reachable — kSCNetworkReachabilityFlagsReachable = 0x02
+        if (flags) *flags = 0x02;
+        return 1;  // TRUE
+    }
+
+    // === FIX20 V3环境强化：多层rebind链，先调orig拿别人可能的写入，再我们最后覆盖2遍 ===
+    int origRet = 0;
+    uint32_t origFlagsVal = 0;
+    if (orig_SCNetworkReachabilityGetFlags) {
+        // 先用局部变量装orig返回，避免直接污染*flags
+        uint32_t tmpFlags = 0;
+        origRet = orig_SCNetworkReachabilityGetFlags(target, &tmpFlags);
+        origFlagsVal = tmpFlags;
+    }
+    // 第一次强制写 (我们认为 orig 后面可能有 6-8 层 rebind 中的其他库在 onLeave 写 *flags，所以我们循环2次)
+    if (flags) {
+        for (int i = 0; i < 2; i++) {
+            *flags = 0x02;  // kSCNetworkReachabilityFlagsReachable
+            __sync_synchronize();  // 内存屏障，防止编译器/CPU重排
+            if (((*flags) & 0x02u) != 0u) break;  // 写成功就退出
+        }
+    }
+    // 第一次命中就直接打日志 (避免刷屏)
+    static int hitCount = 0;
+    if (hitCount < 5) {
+        hitCount++;
+        DLOG(@"[V3-SCNETWORK] 🔴 flags覆盖 orig_ret=%d orig_flags=0x%x → 最终flags=0x%x hit#%d",
+             origRet, origFlagsVal, flags ? *flags : 0, hitCount);
+    }
+    return 1;  // 永远 TRUE(函数调用成功)
 }
 
 static void installSCNetworkReachabilityHook(void) {
@@ -10201,19 +10379,32 @@ static void installSCNetworkReachabilityHook(void) {
     if (!scLib) {
         scLib = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_LAZY);
     }
-    if (scLib) {
-        orig_SCNetworkReachabilityGetFlags = (SCNetworkReachabilityGetFlagsFunc)dlsym(scLib, "SCNetworkReachabilityGetFlags");
-        if (orig_SCNetworkReachabilityGetFlags) {
-            int r = rebindSymbol("_SCNetworkReachabilityGetFlags",
-                                 (void *)hook_SCNetworkReachabilityGetFlags,
-                                 (void **)&orig_SCNetworkReachabilityGetFlags);
-            DLOG(@"[SEC] SCNetworkReachabilityGetFlags hook: rebind=%d addr=%p", r, orig_SCNetworkReachabilityGetFlags);
-        } else {
-            DLOG(@"[SEC] SCNetworkReachabilityGetFlags NOT found in SystemConfiguration");
-        }
-    } else {
+    if (!scLib) {
         DLOG(@"[SEC] SystemConfiguration framework NOT loaded");
+        return;
     }
+    orig_SCNetworkReachabilityGetFlags = (SCNetworkReachabilityGetFlagsFunc)dlsym(scLib, "SCNetworkReachabilityGetFlags");
+    if (!orig_SCNetworkReachabilityGetFlags) {
+        DLOG(@"[SEC] SCNetworkReachabilityGetFlags NOT found in SystemConfiguration");
+        return;
+    }
+
+    // === FIX20 V3环境：优先用 MSHookFunction (内联级patch，所有外层rebind全被我们覆盖) ===
+    if (g_isV3Environment && g_msHookFunction) {
+        DLOG(@"[V3-SCNETWORK] ✅ 使用MSHookFunction(内联patch)安装 SCNetwork Hook (跳过fishhook rebind 多层覆盖)");
+        g_msHookFunction((void *)orig_SCNetworkReachabilityGetFlags,
+                         (void *)hook_SCNetworkReachabilityGetFlags,
+                         (void **)&orig_SCNetworkReachabilityGetFlags);
+        DLOG(@"[V3-SCNETWORK] SCNetwork MSHook安装完成 orig_after=%p", orig_SCNetworkReachabilityGetFlags);
+        return;
+    }
+
+    // 全能签环境 (或 V3 但MSHookFunction不可用)：原逻辑不变，走 fishhook rebindSymbol
+    int r = rebindSymbol("_SCNetworkReachabilityGetFlags",
+                         (void *)hook_SCNetworkReachabilityGetFlags,
+                         (void **)&orig_SCNetworkReachabilityGetFlags);
+    DLOG(@"[SEC] SCNetworkReachabilityGetFlags hook: rebind=%d addr=%p V3=%d",
+         r, orig_SCNetworkReachabilityGetFlags, g_isV3Environment ? 1 : 0);
 }
 
 static void installSecurityHooks(void) {
@@ -11861,6 +12052,20 @@ static void installAllHooks(void) {
     // This runs before any network code so the replacement propagates through
     // the entire packet construction pipeline including AES-encrypted FFF493.
     installChannelInterceptLayers();
+
+    // ============================================================
+    // v37.134-FIX20: 【最先执行】V3分发自签环境检测 + zsign绕过安装
+    // 仅当 zsign 类存在(V3自签系统额外注入zsign.dylib)时激活，全能签环境完全跳过
+    // 必须放在 installSecurityHooks 之前，因为:
+    //   (1) zsign.request/alert 会在 entry 早期执行阻断流程
+    //   (2) g_isV3Environment 被后面 SCNetwork/connect 等 installXXHook 读取
+    // ============================================================
+    g_isV3Environment = detectV3Environment();
+    if (g_isV3Environment) {
+        DLOG(@"[V3-ENTRY] 🚀 启动V3专用修复流程：先绕过zsign → 再强化SCNetwork+connect兜底");
+        installV3ZsignBypass();
+        DLOG(@"[V3-ENTRY] ✅ V3专用修复前置流程安装完成，后续Hook将以V3模式安装");
+    }
 
     // === v37.13: RESTORE v36.155 full hook configuration ===
     // v37.0-v37.12 minimal mode failed — injection detected → '版本过低'
