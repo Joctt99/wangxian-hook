@@ -1,21 +1,19 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX21: V3自签分发环境修复 — systemhook rebind穿透 + zsign绕过
+ * WangXianHook v37.134-FIX24: V3环境Hook修复 — 移除MSHookFunction，统一使用rebindSymbol
  *
- * v37.134-FIX21 CHANGES (V3自签分发环境systemhook rebind穿透 — 解决"无网络连接"根因):
- *   ROOT CAUSE: systemhook.dylib (DYLD 0号, 先于WangXianHook加载) 的 fishhook 将
- *   SCNetworkReachabilityGetFlags/connect/send/recv 等关键网络符号 rebind 到自己的 stub
- *   (返回"不可达"/-1)，而 WangXianHook 的 dlsym() 也被 systemhook 的 dyld_dlsym_hook 拦截，
- *   拿到的已是被污染的地址 → MSHookFunction/fishhook 全部基于错误地址 → 修复失效。
- *   FIX: (v3_penetrateSystemhookRebinds)
- *   (1) detectV3Environment 阶段立即执行: 通过 固定偏移法(0x10028/0x10030) + dlsym + 暴力扫描
- *       三重保险定位 systemhook 的 gRebindCount 和 gRebinds
- *   (2) 遍历 rebind 表，将 SCNetworkReachabilityGetFlags/connect/send/recv 的 new_func 指针
- *       强制改回真实 SystemConfiguration/libSystem 实现
- *   (3) Hook dyld_dlsym_hook 自身: 当关键符号查询被拦截时，返回已知真实地址作为兜底
- *   (4) 保留 FIX20 所有修复: zsign IMP替换 + SCNetwork MSHook强化 + connect兜底重试
- *   所有 V3 修复仅在检测到 zsign 类时激活，全能签正常环境 100% 不受影响。
+ * v37.134-FIX24 CHANGES (V3环境Hook修复 — 解决"版本过低"根因):
+ *   ROOT CAUSE: V3环境下MSHookFunction的fallback判断 `if(!orig_XXX)` 永远不触发
+ *   （MSHookFunction失败时不会将orig指针置NULL，而orig已通过dlsym设为非NULL值），
+ *   导致CC_MD5/CCCrypt/socket/SCNetwork hooks可能未安装，服务器返回status=4（版本过低）。
+ *   Frida诊断确认systemhook的gRebindCount=0（无rebind污染），MSHookFunction完全多余。
+ *   FIX: 移除所有V3环境下的MSHookFunction分支，统一使用rebindSymbol（与全能签环境一致）:
+ *     1. socket hooks (connect/send/recv/write/read/recvfrom/close) — 统一rebindSymbol
+ *     2. CC_MD5 hook — 统一rebindSymbol
+ *     3. CCCrypt hook — 统一rebindSymbol
+ *     4. SCNetworkReachabilityGetFlags hook — 统一rebindSymbol
+ *   保留: FIX21 zsign绕过 + FIX20 V3检测 + FIX18 UUID + FIX17 hash + FFF493-REPL DISABLED
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
  *   ROOT CAUSE: V3自签系统额外注入zsign.dylib做签名验证。
@@ -998,7 +996,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX20 loaded (V3自签环境修复: zsign绕过+SCNetwork多层rebind强化+connect兜底重试 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX24 loaded (V3环境Hook修复: 移除MSHookFunction统一rebindSymbol + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -9270,143 +9268,32 @@ static void installSocketHooks(void) {
     orig_close = NULL;
     orig_getsockopt = NULL;
 
-    // v37.134-FIX22: V3环境下优先使用MSHookFunction安装socket hooks
-    // 原因: systemhook.dylib的fishhook可能已经rebind了socket函数，
-    // 导致我们的rebindSymbol失败。MSHookFunction使用内联patch更可靠。
-    if (g_isV3Environment && g_msHookFunction) {
-        DLOG(@"[V3-SOCK] 使用MSHookFunction(内联patch)安装socket hooks");
+    // v37.134-FIX24: 统一使用rebindSymbol (Frida诊断确认systemhook rebind总数=0，无干扰)
+    // 之前V3环境用MSHookFunction但fallback判断 `if(!orig)` 永远不触发（MSHook失败不会置NULL）
+    int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
+    int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
+    int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
+    int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
+    int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
+    int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
+    int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
+    int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
+    int gs = rebindSymbol("_getsockopt", (void *)hook_getsockopt, (void **)&orig_getsockopt);
+    int p = rebindSymbol("_poll", (void *)hook_poll, (void **)&orig_poll);
+    int sel = rebindSymbol("_select", (void *)hook_select, (void **)&orig_select);
 
-        void *libsys = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
-        if (!libsys) libsys = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+    if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
+    if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
+    if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
+    if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
+    if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
+    if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
+    if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
+    if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
+    if (!orig_poll) orig_poll = (PollFunc)dlsym(RTLD_NEXT, "poll");
+    if (!orig_select) orig_select = (SelectFunc)dlsym(RTLD_NEXT, "select");
 
-        if (libsys) {
-            // connect
-            void *connPtr = dlsym(libsys, "connect");
-            if (connPtr) {
-                g_msHookFunction(connPtr, (void *)hook_connect, (void **)&orig_connect);
-                DLOG(@"[V3-SOCK] connect MSHook完成 orig=%p", orig_connect);
-            }
-
-            // send
-            void *sendPtr = dlsym(libsys, "send");
-            if (sendPtr) {
-                g_msHookFunction(sendPtr, (void *)hook_send, (void **)&orig_send);
-                DLOG(@"[V3-SOCK] send MSHook完成 orig=%p", orig_send);
-            }
-
-            // recv
-            void *recvPtr = dlsym(libsys, "recv");
-            if (recvPtr) {
-                g_msHookFunction(recvPtr, (void *)hook_recv, (void **)&orig_recv);
-                DLOG(@"[V3-SOCK] recv MSHook完成 orig=%p", orig_recv);
-            }
-
-            // write
-            void *writePtr = dlsym(libsys, "write");
-            if (writePtr) {
-                g_msHookFunction(writePtr, (void *)hook_write, (void **)&orig_write);
-                DLOG(@"[V3-SOCK] write MSHook完成 orig=%p", orig_write);
-            }
-
-            // read
-            void *readPtr = dlsym(libsys, "read");
-            if (readPtr) {
-                g_msHookFunction(readPtr, (void *)hook_read, (void **)&orig_read);
-                DLOG(@"[V3-SOCK] read MSHook完成 orig=%p", orig_read);
-            }
-
-            // recvfrom
-            void *recvfromPtr = dlsym(libsys, "recvfrom");
-            if (recvfromPtr) {
-                g_msHookFunction(recvfromPtr, (void *)hook_recvfrom, (void **)&orig_recvfrom);
-                DLOG(@"[V3-SOCK] recvfrom MSHook完成 orig=%p", orig_recvfrom);
-            }
-
-            // close
-            void *closePtr = dlsym(libsys, "close");
-            if (closePtr) {
-                g_msHookFunction(closePtr, (void *)hook_close, (void **)&orig_close);
-                DLOG(@"[V3-SOCK] close MSHook完成 orig=%p", orig_close);
-            }
-        }
-
-        // v37.134-FIX23: 兜底: 如果MSHookFunction安装失败，使用rebindSymbol回退
-        // 原因: MSHookFunction在某些V3环境下可能不稳定，导致hook未正确安装
-        // 回退机制确保至少有一个hook方法能正常工作
-        int c_rb = 0, s_rb = 0, r_rb = 0, rf_rb = 0, rm_rb = 0;
-        int w_rb = 0, rd_rb = 0, cl_rb = 0, gs_rb = 0, p_rb = 0, sel_rb = 0;
-        
-        if (!orig_connect) {
-            c_rb = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
-            DLOG(@"[V3-SOCK-FALLBACK] connect MSHook失败 → rebind=%d orig=%p", c_rb, orig_connect);
-        }
-        if (!orig_send) {
-            s_rb = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
-            DLOG(@"[V3-SOCK-FALLBACK] send MSHook失败 → rebind=%d orig=%p", s_rb, orig_send);
-        }
-        if (!orig_recv) {
-            r_rb = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
-            DLOG(@"[V3-SOCK-FALLBACK] recv MSHook失败 → rebind=%d orig=%p (版本过低修复依赖此!)", r_rb, orig_recv);
-        }
-        if (!orig_recvfrom) {
-            rf_rb = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
-            DLOG(@"[V3-SOCK-FALLBACK] recvfrom MSHook失败 → rebind=%d", rf_rb);
-        }
-        if (!orig_write) {
-            w_rb = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
-            DLOG(@"[V3-SOCK-FALLBACK] write MSHook失败 → rebind=%d", w_rb);
-        }
-        if (!orig_read) {
-            rd_rb = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
-            DLOG(@"[V3-SOCK-FALLBACK] read MSHook失败 → rebind=%d", rd_rb);
-        }
-        if (!orig_close) {
-            cl_rb = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
-            DLOG(@"[V3-SOCK-FALLBACK] close MSHook失败 → rebind=%d", cl_rb);
-        }
-        
-        // 设置兜底orig指针（如果MSHook和rebind都失败）
-        if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-        if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
-        if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-        if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
-        if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
-        if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-        if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
-        if (!orig_recvmsg) orig_recvmsg = (RecvmsgFunc)dlsym(RTLD_NEXT, "recvmsg");
-        if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
-        if (!orig_poll) orig_poll = (PollFunc)dlsym(RTLD_NEXT, "poll");
-        if (!orig_select) orig_select = (SelectFunc)dlsym(RTLD_NEXT, "select");
-        
-        DLOG(@"[V3-SOCK-FALLBACK] rebind回退: connect=%d send=%d recv=%d recvfrom=%d write=%d read=%d close=%d",
-             c_rb, s_rb, r_rb, rf_rb, w_rb, rd_rb, cl_rb);
-    } else {
-        // 全能签环境: 使用原有的rebindSymbol方式
-        int c = rebindSymbol("_connect", (void *)hook_connect, (void **)&orig_connect);
-        int s = rebindSymbol("_send", (void *)hook_send, (void **)&orig_send);
-        int r = rebindSymbol("_recv", (void *)hook_recv, (void **)&orig_recv);
-        int rf = rebindSymbol("_recvfrom", (void *)hook_recvfrom, (void **)&orig_recvfrom);
-        int rm = rebindSymbol("_recvmsg", (void *)hook_recvmsg, (void **)&orig_recvmsg);
-        int w = rebindSymbol("_write", (void *)hook_write, (void **)&orig_write);
-        int rd = rebindSymbol("_read", (void *)hook_read, (void **)&orig_read);
-        int cl = rebindSymbol("_close", (void *)hook_close, (void **)&orig_close);
-        int gs = rebindSymbol("_getsockopt", (void *)hook_getsockopt, (void **)&orig_getsockopt);
-        int p = rebindSymbol("_poll", (void *)hook_poll, (void **)&orig_poll);
-        int sel = rebindSymbol("_select", (void *)hook_select, (void **)&orig_select);
-
-        if (!orig_connect) orig_connect = (ConnectFunc)dlsym(RTLD_NEXT, "connect");
-        if (!orig_send) orig_send = (SendFunc)dlsym(RTLD_NEXT, "send");
-        if (!orig_recv) orig_recv = (RecvFunc)dlsym(RTLD_NEXT, "recv");
-        if (!orig_recvfrom) orig_recvfrom = (RecvfromFunc)dlsym(RTLD_NEXT, "recvfrom");
-        if (!orig_write) orig_write = (WriteFunc)dlsym(RTLD_NEXT, "write");
-        if (!orig_read) orig_read = (ReadFunc)dlsym(RTLD_NEXT, "read");
-        if (!orig_close) orig_close = (CloseFunc)dlsym(RTLD_NEXT, "close");
-        if (!orig_getsockopt) orig_getsockopt = (GetsockoptFunc)dlsym(RTLD_NEXT, "getsockopt");
-        if (!orig_poll) orig_poll = (PollFunc)dlsym(RTLD_NEXT, "poll");
-        if (!orig_select) orig_select = (SelectFunc)dlsym(RTLD_NEXT, "select");
-
-        DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d getsockopt=%d poll=%d select=%d", c, s, r, rf, rm, w, rd, cl, gs, p, sel);
-    }
+    DLOG(@"[SOCK] Hooks: connect=%d send=%d recv=%d recvfrom=%d recvmsg=%d write=%d read=%d close=%d getsockopt=%d poll=%d select=%d", c, s, r, rf, rm, w, rd, cl, gs, p, sel);
 
     DLOG(@"[SOCK] Original: connect=%p send=%p recv=%p recvfrom=%p recvmsg=%p write=%p read=%p close=%p getsockopt=%p poll=%p select=%p", 
          orig_connect, orig_send, orig_recv, orig_recvfrom, orig_recvmsg, orig_write, orig_read, orig_close, orig_getsockopt, orig_poll, orig_select);
@@ -10776,22 +10663,8 @@ static void installSCNetworkReachabilityHook(void) {
         return;
     }
 
-    // === FIX20 V3环境：优先用 MSHookFunction (内联级patch，所有外层rebind全被我们覆盖) ===
-    // v37.134-FIX23: 添加回退机制 - 如果MSHookFunction安装失败，使用rebindSymbol
-    if (g_isV3Environment && g_msHookFunction) {
-        DLOG(@"[V3-SCNETWORK] ✅ 使用MSHookFunction(内联patch)安装 SCNetwork Hook");
-        g_msHookFunction((void *)orig_SCNetworkReachabilityGetFlags,
-                         (void *)hook_SCNetworkReachabilityGetFlags,
-                         (void **)&orig_SCNetworkReachabilityGetFlags);
-        DLOG(@"[V3-SCNETWORK] SCNetwork MSHook安装完成 orig_after=%p", orig_SCNetworkReachabilityGetFlags);
-        // v37.134-FIX23: 如果MSHook失败，继续执行rebindSymbol回退
-        if (orig_SCNetworkReachabilityGetFlags) {
-            return;  // MSHook成功，直接返回
-        }
-        DLOG(@"[V3-SCNETWORK-FALLBACK] MSHook失败 → 回退到rebindSymbol");
-    }
-
-    // 全能签环境 (或 V3 MSHook失败)：走 fishhook rebindSymbol
+    // v37.134-FIX24: 统一使用rebindSymbol (Frida诊断确认systemhook rebind总数=0，无干扰)
+    // 之前MSHookFunction的fallback判断 `if(!orig)` 永远不触发（MSHook失败不会置NULL）
     int r = rebindSymbol("_SCNetworkReachabilityGetFlags",
                          (void *)hook_SCNetworkReachabilityGetFlags,
                          (void **)&orig_SCNetworkReachabilityGetFlags);
@@ -10837,22 +10710,9 @@ static void installSecurityHooks(void) {
     {
         orig_CCCrypt = (CCCryptFunc)dlsym(RTLD_NEXT, "CCCrypt");
         if (orig_CCCrypt) {
-            // v37.134-FIX22: V3环境下优先使用MSHookFunction安装CCCrypt hook
-            if (g_isV3Environment && g_msHookFunction) {
-                DLOG(@"[V3-CCCRYPT] 使用MSHookFunction(内联patch)安装 CCCrypt hook");
-                g_msHookFunction((void *)orig_CCCrypt,
-                                 (void *)hook_CCCrypt,
-                                 (void **)&orig_CCCrypt);
-                DLOG(@"[V3-CCCRYPT] CCCrypt MSHook安装完成 orig=%p", orig_CCCrypt);
-                // v37.134-FIX23: 回退机制 - 如果MSHook失败，使用rebindSymbol
-                if (!orig_CCCrypt) {
-                    int r1_fb = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-                    DLOG(@"[V3-CCCRYPT-FALLBACK] MSHook失败 → rebind=%d orig=%p", r1_fb, orig_CCCrypt);
-                }
-            } else {
-                int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-                DLOG(@"[SEC] CCCrypt hook v37.30: rebind=%d addr=%p (GATED after 0x80FFF495 per v37.28 safe)", r1, orig_CCCrypt);
-            }
+            // v37.134-FIX24: 统一使用rebindSymbol (systemhook rebind=0, MSHookFunction fallback bug已移除)
+            int r1 = rebindSymbol("_CCCrypt", (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+            DLOG(@"[SEC] CCCrypt hook v37.30: rebind=%d addr=%p (GATED after 0x80FFF495 per v37.28 safe)", r1, orig_CCCrypt);
         } else {
             DLOG(@"[SEC] CCCrypt not found via dlsym (L4 won't work!)");
         }
@@ -10891,26 +10751,9 @@ static void installSecurityHooks(void) {
         }
 
         if (orig_CC_MD5) {
-            // v37.134-FIX22: V3环境下优先使用MSHookFunction安装CC_MD5 hook
-            // 原因: systemhook.dylib的fishhook可能已经rebind了CC_MD5，
-            // 导致我们的rebindSymbol失败(返回-1)。MSHookFunction使用内联patch，
-            // 直接修改函数入口指令，不受fishhook rebind表影响。
-            if (g_isV3Environment && g_msHookFunction) {
-                DLOG(@"[V3-MD5] 使用MSHookFunction(内联patch)安装 CC_MD5 hook");
-                g_msHookFunction((void *)orig_CC_MD5,
-                                 (void *)hook_CC_MD5,
-                                 (void **)&orig_CC_MD5);
-                DLOG(@"[V3-MD5] CC_MD5 MSHook安装完成 orig=%p", orig_CC_MD5);
-                // v37.134-FIX23: 回退机制 - 如果MSHook失败，使用rebindSymbol
-                if (!orig_CC_MD5) {
-                    int rm_fb = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-                    DLOG(@"[V3-MD5-FALLBACK] MSHook失败 → rebind=%d orig=%p (版本过低修复依赖此!)", rm_fb, orig_CC_MD5);
-                }
-            } else {
-                // 全能签环境: 使用原有的rebindSymbol方式
-                int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
-                DLOG(@"[SEC] CC_MD5 hook v37.62: rebind=%d addr=%p", rm, orig_CC_MD5);
-            }
+            // v37.134-FIX24: 统一使用rebindSymbol (systemhook rebind=0, MSHookFunction fallback bug已移除)
+            int rm = rebindSymbol("_CC_MD5", (void *)hook_CC_MD5, (void **)&orig_CC_MD5);
+            DLOG(@"[SEC] CC_MD5 hook v37.62: rebind=%d addr=%p", rm, orig_CC_MD5);
         } else {
             DLOG(@"[SEC] CC_MD5 not found via dlsym");
         }
