@@ -10313,12 +10313,16 @@ static id v3hook_zsign_getRootVC(id self, SEL _cmd) {
 //
 // 注: 此操作在 detectV3Environment 返回 YES 后、installSCNetworkReachabilityHook
 // 之前执行，保证 Hook 拿到的是已修复的地址。
+
+// 前向声明: hook_v3_dyld_dlsym_hook 定义在后面，但v3_penetrateSystemhookRebinds中需要使用
+static void* hook_v3_dyld_dlsym_hook(const char *name);
+
 static void v3_penetrateSystemhookRebinds(void) {
     DLOG(@"[V3-PEN] === 开始穿透 systemhook rebind 表 ===");
 
     // 1. 获取 systemhook.dylib 的基址 (通过 _dyld_image_count 遍历)
     uint32_t imgCnt = _dyld_image_count();
-    void *sysHookBase = NULL;
+    const void *sysHookBase = NULL;
     for (uint32_t i = 0; i < imgCnt; i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "systemhook.dylib")) {
