@@ -33,13 +33,13 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX20" $(SOURCE) || echo "WARNING: FIX20 not found in source!"
+	@grep -c "FIX21" $(SOURCE) || echo "WARNING: FIX21 not found in source!"
 	@grep -c "0 && fffWhich" $(SOURCE) || echo "WARNING: 0 and fffWhich not found!"
 	@echo "=== Building ==="
 	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX20" || echo "WARNING: FIX20 not in binary!"
+	@strings $(TARGET) | grep -c "FIX21" || echo "WARNING: FIX21 not in binary!"
 	@ls -la $(TARGET)
 
 clean:
