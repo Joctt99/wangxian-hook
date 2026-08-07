@@ -1,4 +1,4 @@
-﻿﻿#import "ProtocolPatcher.h"
+#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
  * WangXianHook v37.134-FIX32: 100%铁证根因修复 — SIGSEGV元凶=Safety net改坏V3响应 + Alert签名检查写错前缀
@@ -11084,7 +11084,7 @@ static BOOL fix31_checkMethodSignature(Method m, int minArgCount, char expectRet
     BOOL ok = countOk && retOk;
     DLOG(@"[V3-zsign] FIX32-SIG: %@ sel=%@ encoding='%s' nArgs=%u(need≥%d) retType='%c'(need='%c') → %@",
         label, NSStringFromSelector(selName), enc, argCount, minArgCount, retFirst, expectReturn,
-        ok?@"OK ✅":@(countOk?(@"FAIL: returnType不匹配! 不替换 ❌"):@"FAIL: nArgs不匹配! 不替换 ❌"));
+        ok?@"OK ✅":(countOk?@"FAIL: returnType不匹配! 不替换 ❌":@"FAIL: nArgs不匹配! 不替换 ❌"));
     return ok;
 }
 
