@@ -1,7 +1,43 @@
-﻿#import "ProtocolPatcher.h"
+﻿﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX31: NO MORE BLIND GUESS — CRASH CAPTURER + ZSIGN SAFETY
+ * WangXianHook v37.134-FIX32: 100%铁证根因修复 — SIGSEGV元凶=Safety net改坏V3响应 + Alert签名检查写错前缀
+ *
+ * v37.134-FIX32 CHANGES (2个100%铁证根因,来自wxhook_crash_20260808 call stack + 最后40log):
+ *
+ *   ROOT CAUSE #1 (SIGSEGV SIGSEGV 元凶, call stack #02):
+ *   Crash frame: lnSignature.dylib -[SignatureCheck nettimes] + 0
+ *                 回调路径: GetApp_block_invoke → LCNetworking block_invoke → dispatch → SignatureCheck.nettimes
+ *   日志铁证 (wxhook 17.log L292-305):
+ *     postAppInfoApi: FIX29打印了"跳过",但 L295 Safety net code:1→code:0 applied仍执行!
+ *     getAppInfoApi:  FIX29打印了"跳过",但 L305 Safety net code:1→code:0 applied仍执行!
+ *   原因: FIX29 只把 post/get 分支里的 patcher 包了 if(!g_zsignPresent),但函数末尾 L2095 Safety net
+ *         是 无条件 修改所有response body中 code:1→0! V3环境 lnSign返回code:1=成功, 改成code:0=失败
+ *         → lnSign SignatureCheck.nettimes 解析 response.data 时访问到 NULL/错位字段 → SIGSEGV!
+ *   FIX32-1: 在 patchSignatureResponse() 开头加 BOOL patchResponse = YES; 
+ *         V3特有2个API: g_zsignPresent && (postAppInfoApi||getAppInfoApi) 时 patchResponse=NO
+ *         所有URL patcher分支 + Safety net + generic fallback 都包一层 if(patchResponse && ...)
+ *         → patchResponse=NO 时,整个SIGN-BYPASS链路中绝对不改任何byte,返回服务器原响应.
+ *
+ *   ROOT CAUSE #2 (Alert签名检查写错, wxhook 17.log L32):
+ *     actual='v24@0:8@16' vs expect_prefix='v@:@' → MISMATCH ❌ 不替换!
+ *   原因: ObjC typeEncoding格式总有栈帧offset前缀 v24@0:8@16 (v=returnVoid, 24=frameSize)
+ *         strncmp(enc, "v@:@", 4) 比较前4字节是'v'-'2'-'4'-'@' ≠ 'v'-'@'-':'-'@' → 永远MISMATCH!
+ *         → alert: hook永远不装 → zsign验证失败的弹窗会真实显示(这次虽然先在lnSign处崩,但之后会遇到)
+ *   FIX32-2: 重写fix31_checkMethodSignature() → 不再用strncmp硬编码前缀!
+ *         改用 Runtime API:
+ *           method_getNumberOfArguments(m) ≥ 3 (self+_cmd+param)
+ *           method_copyReturnType(m)[0] == 'v' (必须是void return)
+ *         v24@0:8@16 → argCount=3 retType='v' → OK ✅
+ *
+ *   验证点(打包安装后看wxhook.log):
+ *     ✅ [SIGN-BYPASS] FIX32: V3环境特有API=postAppInfoApi → patchResponse=NO → 均跳过
+ *     ✅ [SIGN-BYPASS] FIX32: V3环境特有API=getAppInfoApi → patchResponse=NO → 均跳过
+ *     ✅ [SIGN-BYPASS] FIX32: Safety net SKIPPED (patchResponse=NO → 返回服务器原始bytes...)
+ *     ✅ [V3-zsign] FIX32-SIG: +[zsign alert:] sel=alert: encoding='v24@0:8@16' nArgs=3(need≥3) retType='v'(need='v') → OK ✅
+ *     ✅ [V3-zsign] FIX32: +alert: IMP替换成功! orig=0x... → new=0x...
+ *     ✅ 不再有 [SIGN-BYPASS] Safety net: code:1→code:0 applied (针对post/get这两个V3 API)
+ *     ✅ App不再闪退 → 能看到connect START / 进入登录页
  *
  * v37.134-FIX31 CHANGES (NO MORE BLIND FIXES!):
  *   BACKGROUND: 用户发送了wxhook.log=v35.35横幅! images=645全能签环境 → 这不是V3闪退那次的日志!
@@ -1238,7 +1274,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX31 loaded (NO MORE BLIND GUESS! CRASH CAPTURER: Doc+tmp wxhook_crash_*.log + exit/_Exit/abort hooks + SIGABRT re-enabled + 40log ring buffer + V3/zsign全@try/@catch + method签名校验 + zsign methods dump) ===");
+        _log(@"=== WangXianHook v37.134-FIX32 loaded (100%铁证修复: BugA Safety net改坏V3响应→lnSign SIGSEGV+BugB alert签名strncmp写错永远MISMATCH → FIX32 patchResponse开关+Runtime API签名检查) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1990,9 +2026,24 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     // "sign", "timeStamp", "randStr" that the game needs for subsequent verification.
 
     NSString *patchedResponse = body ?: @"";
+    // FIX32: 防崩溃核心开关! V3特有API(postAppInfoApi/getAppInfoApi) 设为patchResponse=NO
+    //        → 后面 Safety net code:1→code:0 以及 stringByReplacing 修改body的所有操作都会被跳过
+    // WHY: 之前 FIX29 的分支只是在 if-else 里打印了"跳过",但 L2095 的 Safety net 在整个函数末尾
+    //      无条件执行 → 把 V3 的 code:1(成功) 改成 code:0(失败) → lnSign SignatureCheck.nettimes
+    //      解析错误的 response.data → SIGSEGV (#02 crash frame).
+    BOOL patchResponse = YES;
+    // FIX32: 精确标记 V3 特有API(post/get) → 完全不修改任何 byte, 让 lnSign/zsign 原生验证通过.
+    //        (judgeAppInfoApi/judgeAppInfoSignApi 在全能签+V3 两个环境都需要 patch ENDTIME, 保留)
+    BOOL isV3OnlyApi = NO;
+    if ([url containsString:@"postAppInfoApi"]) isV3OnlyApi = YES;
+    if ([url containsString:@"getAppInfoApi"])  isV3OnlyApi = YES;
+    if (g_zsignPresent && isV3OnlyApi) {
+        patchResponse = NO;
+        DLOG(@"[SIGN-BYPASS] FIX32: V3环境特有API=%@ → patchResponse=NO → 全部Patcher+SafetyNet均跳过, 返回服务器原始bytes (防止改坏V3验证→SignatureCheck.nettimes SIGSEGV)", url.lastPathComponent);
+    }
 
     // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
-    if ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"]) {
+    if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
         DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoSignApi (smart patch)");
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
@@ -2009,7 +2060,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         }
     }
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
-    else if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
+    else if (patchResponse && [url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
         DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoApi (smart ENDTIME patch)");
         NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
         if (start.location != NSNotFound) {
@@ -2027,7 +2078,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     // V3's lnSignature returns code:1, fix to code:0
     // FIX29: V3环境(zsign存在)时跳过! 这些是V3验证特有API, code:1=成功
     // 错误修改为code:0会导致V3验证失败→游戏不connect→卡在启动页面
-    else if ([url containsString:@"postAppInfoApi"]) {
+    else if (patchResponse && [url containsString:@"postAppInfoApi"]) {
         if (g_zsignPresent) {
             DLOG(@"[SIGN-BYPASS] FIX29: 跳过postAppInfoApi (V3环境, code:1=成功, 不修改)");
         } else {
@@ -2040,7 +2091,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     // V3's [SignatureCheck nettimes] accesses data.ENDTIME → SIGSEGV if data missing!
     // Fix: return FULL data structure with ENDTIME to prevent crash
     // FIX29: V3环境(zsign存在)时跳过! 让zsign处理V3验证,不替换response
-    else if ([url containsString:@"getAppInfoApi"]) {
+    else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
         if (g_zsignPresent) {
             DLOG(@"[SIGN-BYPASS] FIX29: 跳过getAppInfoApi (V3环境, 让zsign处理, 不替换response)");
         } else {
@@ -2082,7 +2133,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         }  // end if (!g_zsignPresent)
     }
     // --- Fallback: generic cert endpoint ---
-    else {
+    else if (patchResponse) {
         DLOG(@"[SIGN-BYPASS] v37.134: Format: GENERIC fallback (smart patch)");
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
@@ -2092,11 +2143,14 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
 
-    // Safety net: ensure code:1 → code:0 for ALL signature responses
-    // V3's lnSignature may return code:1 which game treats as failure
-    if ([patchedResponse containsString:@"\"code\":1"]) {
+    // Safety net: ensure code:1 → code:0 for signature responses
+    // FIX32: patchResponse=NO时必须跳过! 否则 V3 code:1(成功)被改成code:0(失败) →
+    //        lnSignature SignatureCheck.nettimes 解析错误 → SIGSEGV (#02 crash frame)
+    if (patchResponse && [patchedResponse containsString:@"\"code\":1"]) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
         DLOG(@"[SIGN-BYPASS] v37.134: Safety net: code:1→code:0 applied");
+    } else if (!patchResponse) {
+        DLOG(@"[SIGN-BYPASS] FIX32: Safety net SKIPPED (patchResponse=NO → 返回服务器原始bytes,保证lnSign能正确解析data字段→不SIGSEGV)");
     }
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
@@ -11003,24 +11057,34 @@ static BOOL detectV3Environment(void) {
     }
 }
 
-// FIX31 新增: installV3ZsignAlertOnlyBypass全部@try/@catch + method签名types校验
-// 根本原因: 如果+[zsign alert:] 的method signature 不是 "v@:@"(void return, id self, SEL, id param),
-// 用函数指针(带3参数)调用就会栈不平衡 / 参数register错位 → 立即SIGSEGV闪退!
-// 必须: 先读取 method_getTypeEncoding 校验, 再决定是否替换/如何调用orig.
-static BOOL fix31_checkMethodSignature(Method m, const char *expect, SEL selName, NSString *label) {
+// FIX32 重写: installV3ZsignAlertOnlyBypass全部@try/@catch + method签名types校验
+// FIX31 BUG: 用 strncmp(actual,"v@:@",4) 错误!
+//   ObjC typeEncoding 格式是  v24@0:8@16  → 前4字节 v-2-4-@, 不是 v-@:-(@)
+//   → 永远 MISMATCH → alert hook 没装上! FIX32 改用 Runtime API:
+//     method_getNumberOfArguments ≥ 3 (self + _cmd + 至少1参数)
+//     method_copyReturnType[0] == 'v'  (void return, 不会被当成NSObject释放引起crash)
+static BOOL fix31_checkMethodSignature(Method m, int minArgCount, char expectReturn, SEL selName, NSString *label) {
     if (!m) {
-        DLOG(@"[V3-zsign] FIX31-SIG: %@ method=nil sel=%@ → 跳过替换", label, NSStringFromSelector(selName));
+        DLOG(@"[V3-zsign] FIX32-SIG: %@ method=nil sel=%@ → 跳过替换", label, NSStringFromSelector(selName));
         return NO;
     }
     const char *enc = method_getTypeEncoding(m);
     if (!enc) {
-        DLOG(@"[V3-zsign] FIX31-SIG: %@ sel=%@ typeEncoding=NULL → 不替换(防止SIGSEGV)", label, NSStringFromSelector(selName));
+        DLOG(@"[V3-zsign] FIX32-SIG: %@ sel=%@ typeEncoding=NULL → 不替换(防止SIGSEGV)", label, NSStringFromSelector(selName));
         return NO;
     }
-    // expect 形如 "v@:@", 如果 actual 以 expect 开头就ok (额外的参数会跟在后面不影响ABI,但如果少参数就崩)
-    BOOL ok = (strncmp(enc, expect, strlen(expect)) == 0);
-    DLOG(@"[V3-zsign] FIX31-SIG: %@ sel=%@ actual='%s' expect_prefix='%s' → %@",
-        label, NSStringFromSelector(selName), enc, expect, ok?@"OK ✅":@"MISMATCH ❌ 不替换!");
+    unsigned int argCount = method_getNumberOfArguments(m);
+    char *retType = method_copyReturnType(m);
+    char retFirst = retType ? retType[0] : '?';
+    if (retType) free(retType);
+    // arg count 规则: ObjC方法总有 self(0) + _cmd(1), 所以 alert:(id) 总参数=3 (self,_cmd,param)
+    // return 'v'=void. 如果return是@(对象), 调用orig后ARC会尝试retain/autorelease可能乱
+    BOOL countOk = ((int)argCount >= minArgCount);
+    BOOL retOk = (retFirst == expectReturn);
+    BOOL ok = countOk && retOk;
+    DLOG(@"[V3-zsign] FIX32-SIG: %@ sel=%@ encoding='%s' nArgs=%u(need≥%d) retType='%c'(need='%c') → %@",
+        label, NSStringFromSelector(selName), enc, argCount, minArgCount, retFirst, expectReturn,
+        ok?@"OK ✅":@(countOk?(@"FAIL: returnType不匹配! 不替换 ❌"):@"FAIL: nArgs不匹配! 不替换 ❌"));
     return ok;
 }
 
@@ -11034,9 +11098,11 @@ static void installV3ZsignAlertOnlyBypass(void) {
     DLOG(@"[V3-zsign] FIX31: installV3ZsignAlertOnlyBypass开始 → 仅替换 +alert:透明调用orig, +request保持原实现");
 
     Method mAlert = class_getClassMethod(zs, @selector(alert:));
-    // FIX31: alert: signature校验 +[zsign alert:(id)] → 必须是 "v@:@"(void, self, _cmd, id)
-    if (fix31_checkMethodSignature(mAlert, "v@:@", @selector(alert:), @"+[zsign alert:]") == NO) {
-        DLOG(@"[V3-zsign] FIX31: +alert: 签名不匹配 或 找不到method → 不做IMP替换(防止闪退)! 保留原实现.");
+    // FIX32: alert:签名校验用Runtime API: nArgs≥3 + return='v'
+    //   v24@0:8@16 → method_getNumberOfArguments=3, method_copyReturnType='v' → OK!
+    // FIX31错误写法: 用strncmp("v@:@")前缀匹配 → v24@0:8@16前4字节v24@≠v@:@ → FAIL不替换
+    if (fix31_checkMethodSignature(mAlert, 3, 'v', @selector(alert:), @"+[zsign alert:]") == NO) {
+        DLOG(@"[V3-zsign] FIX32: +alert: 签名不匹配(返回非void / 参数 < 3) → 不做IMP替换(防止闪退)! 保留原实现.");
         return;
     }
     g_origZsignAlertImp = method_getImplementation(mAlert);
