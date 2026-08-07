@@ -1,36 +1,31 @@
 ﻿#import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX25: V3环境Hook修复 — 恢复MSHookFunction优先(穿透多层rebind) + fallback判断修正
+ * WangXianHook v37.134-FIX26: V3环境DYLD隐藏修复 — 隐藏systemhook.dylib和zsign.dylib
  *
- * v37.134-FIX25 CHANGES (V3环境Hook修复 — 解决"卡在启动页面无联网"+"版本过低"根因):
- *   ROOT CAUSE (FIX24回归): 移除MSHookFunction后，V3环境有6-9层rebind链(systemhook/zsign/libWJHook)
- *   WangXianHook的rebindSymbol夹在中间层，数据流被外层stub截断/返回错误 → ①SCNetwork flags!=0x02
- *   →游戏直接判定"无网络"卡在启动页，根本不发起connect；②CC_MD5/CCCrypt/socket hook不生效
- *   →hash计算错误→服务器返回status=4（版本过低）。
- *   Frida wxhook 12.log确认: 全能签正常版connect=1/write=2/read=0；V3版connect=3/write=9/read=6。
- *   FIX: 恢复V3环境下MSHookFunction优先(内联patch穿透所有rebind层)+fallback逻辑修正:
- *     1. socket hooks — MSHookFunction优先(connect/send/recv/write/read/recvfrom/close 7个)
- *     2. SCNetworkReachabilityGetFlags hook — MSHookFunction优先(强制flags=0x02最外层拦截)
- *     3. CC_MD5 hook — MSHookFunction优先(版本过低修复依赖此!)
- *     4. CCCrypt hook — MSHookFunction优先(GATED after 0x80FFF495 safe)
- *   FALLBACK判断修正: 不能用`if(!orig_XXX)`(MSHook失败不会置NULL)，改用
- *     `preMS == orig_after || orig_after == NULL` 判断失败 → 触发rebindSymbol兜底。
- *   保留: FIX21 zsign绕过 + FIX20 V3检测 + FIX18 UUID + FIX17 hash + FFF493-REPL DISABLED
+ * v37.134-FIX26 CHANGES (V3环境DYLD隐藏修复 — 解决"卡在启动页面无联网"根因):
+ *   ROOT CAUSE: wxhook 13.log确认所有Hook都通过rebindSymbol fallback安装成功:
+ *     - SCNetworkReachabilityGetFlags hook生效(flags=0x3→0x02) ✅
+ *     - CC_MD5 hook生效(mod=2,输入被替换) ✅
+ *     - HTTP签名验证正常通过 ✅
+ *     - zsign +alert:/+request/+getRootVC 替换成功 ✅
+ *   但日志中**没有任何[SOCK] connect START记录** → 游戏根本不发起socket连接。
+ *   原因: DYLD隐藏列表只隐藏了4个dylib(lnSignature/libSupport/WangXianHook/libsubstrate)，
+ *   但**没有隐藏systemhook.dylib和zsign.dylib**。游戏通过_dyld_image_count()/
+ *   _dyld_get_image_name()遍历检测到这两个V3特有dylib → 判定环境异常 → 不联网。
+ *   证据: 全能签环境无systemhook/zsign → 正常运行；V3环境有这两个dylib → 卡启动页无联网。
+ *   FIX: 将"systemhook"和"zsign"添加到g_hiddenDylibs[]列表中。
+ *   DYLD隐藏只是让_dyld_image_count/get_image_name不返回被隐藏的dylib信息，
+ *   不影响实际的dylib加载和符号解析，安全无副作用。
+ *   保留: FIX25 MSHookFunction优先+fallback + FIX21 zsign绕过 + FIX20 V3检测
+ *         + FIX18 UUID + FIX17 hash + FFF493-REPL DISABLED
  *
- *   关键日志标识:
- *     [V3-SCNETWORK]/[V3-SCNETWORK-FB], [V3-SOCK]/[V3-SOCK-FB],
- *     [V3-MD5]/[V3-MD5-FB],      [V3-CCCRYPT]/[V3-CCCRYPT-FB]
- *
- *   验证点(打包安装后看wxhook.log最前面):
- *     ✅ [V3-SCNETWORK] ✅ 用MSHookFunction内联patch ... (或FB fallback)
- *     ✅ [V3-SOCK] ✅ 用MSHookFunction内联patch ... MSHook完成率=7/7
- *     ✅ [V3-MD5] ✅ 用MSHookFunction内联patch (或FB fallback)
- *     ✅ [V3-CCCRYPT] ✅ 用MSHookFunction内联patch (或FB fallback)
- *     ✅ [V3-SCNETWORK] 🔴 flags覆盖 orig_ret=... orig_flags=... → 最终flags=0x2 hit#1
- *     ✅ [SOCK] connect START fd=... target=...:5678 rewrite=0 isGamePort=0
+ *   验证点(打包安装后看wxhook.log):
+ *     ✅ [DYLD-HIDE] Index 0: 'systemhook.dylib' will be hidden  ← 新增
+ *     ✅ [DYLD-HIDE] Index 10: 'zsign.dylib' will be hidden      ← 新增
+ *     ✅ [DYLD-HIDE] Total hidden: 6 / 444 (之前是4)
+ *     ✅ [SOCK] connect START fd=... target=...:5678  ← 出现=游戏发起了连接
  *     ✅ 无"卡在启动页面无联网"→进入登录页
- *     ✅ 输入账号密码后无"版本过低"→进入游戏
  *
  * v37.134-FIX20 CHANGES (V3自签分发环境修复 — 解决"无网络连接"弹窗+正在联网卡住):
  *   ROOT CAUSE: V3自签系统额外注入zsign.dylib做签名验证。
@@ -1013,7 +1008,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX25 loaded (V3环境Hook修复: 恢复MSHookFunction优先穿透多层rebind+fallback修正 + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
+        _log(@"=== WangXianHook v37.134-FIX26 loaded (V3环境DYLD隐藏修复: 隐藏systemhook+zsign + MSHookFunction优先+fallback + zsign绕过 + FFF493-REPL DISABLED + FIX18 UUID TLV insertion + FIX17 hash1/hash3 replacement + EE007-ALIGN body reconstruction + CC_MD5 ch/dm/gp replacement + binary hash runtime compute + FIX9 session captures) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -9443,7 +9438,8 @@ static void installSocketHooks(void) {
 // ============================================================
 
 static const char *g_hiddenDylibs[] = {
-    "WangXianHook", "lnSignature", "libSupport", "liblnSignature", "substrate", "frida", NULL
+    "WangXianHook", "lnSignature", "libSupport", "liblnSignature", "substrate", "frida",
+    "systemhook", "zsign", NULL
 };
 
 static BOOL shouldHideDylib(const char *name) {
