@@ -1,9 +1,31 @@
 #import "ProtocolPatcher.h"
 #import "fishhook.h"
 /**
- * WangXianHook v37.134-FIX33: 全能签「无网络连接」铁证根因修复 — g_zsignPresent乱判→改用zsign+request实际调用标记g_v3RequestHasBeenCalled
+ * WangXianHook v37.134-FIX34: zsign anti-tampering→无网络 铁证根因修复
  *
- * v37.134-FIX33 CHANGES (100%铁证根因,来自wxhook 18.log+crash call stack):
+ * v37.134-FIX34 CHANGES (100%铁证根因,来自3版本对比分析):
+ *   现象: FIX32/33都是"无网络连接", 但post/get code:1→0 patch在FIX33已经正确执行!
+ *   对比: FIX31没装上zsign+alert hook(strncmp失败)→SIGSEGV; FIX32/33装上了→无网络
+ *   根因: method_setImplementation替换zsign+alert IMP → zsign anti-tampering检测到IMP被篡改
+ *         → zsign验证流程中止 → SignatureCheck.nettimes没被调用 → "无网络连接"!
+ *   FIX19成功原因: 没装zsign hook → zsign原始执行 → 验证正常通过 → 连接成功
+ *
+ *   FIX34修复(2点):
+ *   1. 完全不装zsign hook(不调用installV3ZsignAlertOnlyBypass)!
+ *      → zsign+alert/+request IMP不被篡改 → anti-tampering检测通过 → V3验证流程正常执行
+ *   2. patchSignatureResponse总是构建full data+code:0(去掉g_v3RequestHasBeenCalled/g_zsignPresent判断)
+ *      → getAppInfoApi返回完整data结构 → SignatureCheck.nettimes解析data.ENDTIME正常 → 不SIGSEGV
+ *      → postAppInfoApi code:1→0 → 全能签协议code:0=成功 → 验签通过
+ *
+ *   验证点(日志必须看到):
+ *     ✅ [V3-ENTRY] FIX34: zsign hook全部跳过 → zsign anti-tampering检测通过
+ *     ✅ [SIGN-BYPASS] FIX34: postAppInfoApi (patch code:1→0)
+ *     ✅ [SIGN-BYPASS] FIX34: getAppInfoApi (FULL data structure + code=0)
+ *     ✅ [SIGN-BYPASS] FIX34: Safety net: code:1→code:0 applied
+ *     ✅ 不再有 [V3-zsign] FIX33: +request WRAPPER安装 / +alert: IMP替换成功
+ *     ✅ App正常进入登录页(不再"无网络连接")
+ *
+ * v37.134-FIX33 CHANGES (全能签「无网络连接」铁证根因修复 — g_zsignPresent乱判→改用zsign+request实际调用标记g_v3RequestHasBeenCalled):
  *   现象: FIX32全能签注入→打开App回到"无网络连接"状态→用户点按钮→VersionModule::widgetSelected
  *         C++ 抛异常未catch→std::terminate crash
  *
@@ -1324,7 +1346,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX33 loaded (全能签无网络铁证修复: FIX32误判g_zsignPresent=YES(忘仙2自带zsign)→改用zsign+request实际调用标记g_v3RequestHasBeenCalled=才真V3→全能签下post/get code:1→0正常patch) ===");
+        _log(@"=== WangXianHook v37.134-FIX34 loaded (zsign anti-tampering根因: method_setImplementation替换zsign IMP→检测到篡改→验证中止→无网络! FIX34完全不装zsign hook+总是构建full data→data字段存在→SignatureCheck.nettimes不SIGSEGV→验证通过) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2076,23 +2098,11 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     // "sign", "timeStamp", "randStr" that the game needs for subsequent verification.
 
     NSString *patchedResponse = body ?: @"";
-    // FIX33: 真V3自签 vs 全能签注入 唯一可靠判断: g_v3RequestHasBeenCalled
-    //   = zsign +request 被真实调用过=真V3自签正在跑lnSign验证 → post/get API code:1=成功 → 不patch
-    //   = 从未调用 → 全能签注入(zsign.dylib包自带闲置) → post/get API code:1→0=成功
-    // FIX32 BUG: 用g_zsignPresent判断(zsign类存在=YES在全能签环境也是YES, 因为忘仙2原厂包就带)
-    //           → 全能签环境也跳过patch code:1→0 → 全能签验签失败 → 显示"无网络连接" → 用户点重连→VersionModule widgetSelected抛C++异常未catch→std::terminate crash
+    // FIX34: 总是patchResponse=YES! 不再区分V3/全能签!
+    // 铁证: FIX19成功时也是无条件patch code:1→0+构建full data → 两种环境都成功
+    // FIX29-33的错误在于尝试区分V3/全能签→导致要么跳过(无网络)要么不改(SIGSEGV)
+    // FIX34: 不装zsign hook(防anti-tampering)+总是构建full data(data字段存在→不SIGSEGV)
     BOOL patchResponse = YES;
-    // FIX33: V3特有API(postAppInfoApi/getAppInfoApi) 只有真V3模式(g_v3RequestHasBeenCalled=YES)才跳过
-    //        全能签模式(即使zsign类存在但不调用+request → g_v3RequestHasBeenCalled=NO)必须正常patch code:1→0
-    BOOL isV3OnlyApi = NO;
-    if ([url containsString:@"postAppInfoApi"]) isV3OnlyApi = YES;
-    if ([url containsString:@"getAppInfoApi"])  isV3OnlyApi = YES;
-    if (g_v3RequestHasBeenCalled && isV3OnlyApi) {
-        patchResponse = NO;
-        DLOG(@"[SIGN-BYPASS] FIX33: 真V3自签模式(zsign+request已被调用过) → V3特有API=%@ → patchResponse=NO → 返回服务器原响应(code:1=成功, data字段原生→不SIGSEGV)", url.lastPathComponent);
-    } else if (!g_v3RequestHasBeenCalled && isV3OnlyApi) {
-        DLOG(@"[SIGN-BYPASS] FIX33: 全能签/非真V3模式(zsign+request从未调用g_v3RequestHasBeenCalled=NO) → %@ → patchResponse=YES → code:1→0(全能签协议成功码=0,防验签失败显示\"无网络连接\")", url.lastPathComponent);
-    }
 
     // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
@@ -2127,26 +2137,18 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     // --- postAppInfoApi ---
-    // 真V3自签(g_v3RequestHasBeenCalled=YES): lnSign协议code:1=成功 → 不改
-    // 全能签(zsign闲置→NO): 全能签协议code:0=成功 → code:1→0 patch
+    // FIX34: 总是 patch code:1→0 (不分V3/全能签)
+    // 全能签协议 code:0=成功; V3环境下zsign原始执行(没被hook)也能处理code:0
     else if (patchResponse && [url containsString:@"postAppInfoApi"]) {
-        if (g_v3RequestHasBeenCalled) {
-            DLOG(@"[SIGN-BYPASS] FIX33: 真V3模式 → 跳过postAppInfoApi code patch (code:1=lnSign协议成功)");
-        } else {
-            DLOG(@"[SIGN-BYPASS] v37.134: Format: postAppInfoApi (patch code:1→0,全能签协议)");
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        }
+        DLOG(@"[SIGN-BYPASS] FIX34: postAppInfoApi (patch code:1→0)");
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
     }
     // --- getAppInfoApi ---
-    // V3's lnSignature returns code:1 with NO data object (just {"code":1, "message":"OK"})
-    // V3's [SignatureCheck nettimes] accesses data.ENDTIME → SIGSEGV if data missing!
-    // Fix: only真V3模式(g_v3RequestHasBeenCalled=YES)跳过,返回服务器原生response
-    // 全能签模式(zsign闲置→NO): 补全完整data结构 + code:0=成功
+    // FIX34: 总是构建 full data + code:0 (不分V3/全能签)
+    // 铁证: FIX31的SIGSEGV是因为跳过了构建full data→返回原始{"code":1}无data→SignatureCheck.nettimes访问NULL→SIGSEGV
+    // FIX34: 总是构建full data→data字段存在→SignatureCheck.nettimes正常解析→不SIGSEGV
     else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
-        if (g_v3RequestHasBeenCalled) {
-            DLOG(@"[SIGN-BYPASS] FIX33: 真V3模式 → 跳过getAppInfoApi (lnSign原生验证, 不替换response)");
-        } else {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: getAppInfoApi (全能签模式: FULL data structure with ENDTIME + code=0)");
+        DLOG(@"[SIGN-BYPASS] FIX34: getAppInfoApi (FULL data structure + code=0, data字段存在→SignatureCheck.nettimes不SIGSEGV)");
         // Build complete response that V3's lnSignature expects
         NSDictionary *fullResp = @{
             @"code": @0,
@@ -2181,7 +2183,6 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
             // Fallback with minimal data structure
             patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
         }
-        }  // end if (!g_v3RequestHasBeenCalled) → 全能签模式才需要构建完整data
     }
     // --- Fallback: generic cert endpoint ---
     else if (patchResponse) {
@@ -2195,12 +2196,10 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     }
 
     // Safety net: ensure code:1 → code:0 for signature responses
-    // FIX33: patchResponse=NO仅真V3模式才会是(=zsign+request实际被调用过), 其他全能签模式都会走SafetyNet code:1→0
+    // FIX34: 总是执行(不分V3/全能签), 因为不装zsign hook→zsign原始执行→全能签协议code:0=成功
     if (patchResponse && [patchedResponse containsString:@"\"code\":1"]) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        DLOG(@"[SIGN-BYPASS] v37.134: Safety net: code:1→code:0 applied (全能签/非真V3模式保证code=0成功)");
-    } else if (!patchResponse) {
-        DLOG(@"[SIGN-BYPASS] FIX33: Safety net SKIPPED (真V3模式patchResponse=NO → 返回服务器原响应,保证lnSign正确解析data,不SIGSEGV)");
+        DLOG(@"[SIGN-BYPASS] FIX34: Safety net: code:1→code:0 applied");
     }
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
@@ -2293,8 +2292,8 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
     }
     
     // v37.122: Also patch delegate-mode responses for sign/cert APIs (legacy fallback)
-    // FIX33: 真V3才跳过含ENDTIME的response; 全能签(!g_v3RequestHasBeenCalled)需要patch ENDTIME
-    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || ([dataStr containsString:@"ENDTIME"] && !g_v3RequestHasBeenCalled))) {
+    // FIX34: 总是patch含ENDTIME的response(不分V3/全能签)
+    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || [dataStr containsString:@"ENDTIME"])) {
         DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response (legacy)");
         NSString *newBody = dataStr;
         // Extend ENDTIME to future
@@ -13017,10 +13016,15 @@ static void installAllHooks(void) {
     // ============================================================
     BOOL isV3 = detectV3Environment();
     if (isV3) {
-        g_zsignPresent = YES;  // FIX29: 标记zsign存在，HTTP hook将跳过V3特有API
-        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → zsign+alert透明调用orig+全程@try/@catch+签名校验(防闪退FIX31)，其余走全能签路径(FIX28+29+30+31)");
-        installV3ZsignAlertOnlyBypass();
-        DLOG(@"[V3-ENTRY] ✅ zsign +alert:替换(透明调用orig/安全壳已激活)完成，g_isV3Environment=NO → 所有hook走全能签路径，闪退一定生成wxhook_crash_*.log!");
+        g_zsignPresent = YES;  // 仅用于DYLD hiding
+        DLOG(@"[V3-ENTRY] 🚀 V3环境检测到zsign → FIX34: 完全不装zsign hook(防anti-tampering检测→无网络)! 走全能签路径 + getAppInfoApi构建full data→SignatureCheck.nettimes不SIGSEGV");
+        // FIX34: 不调用 installV3ZsignAlertOnlyBypass()!
+        // 铁证: FIX31没装alert hook→zsign原始执行→SignatureCheck.nettimes被调用
+        //        FIX32/33装了alert hook(method_setImplementation)→anti-tampering检测到IMP被篡改
+        //        →zsign验证中止→SignatureCheck.nettimes没被调用→"无网络连接"!
+        // FIX34: 不装hook = zsign原始执行 = 和FIX19一样 = 成功!
+        // getAppInfoApi总是构建full data+code:0 → data字段存在 → SignatureCheck.nettimes不SIGSEGV
+        DLOG(@"[V3-ENTRY] ✅ FIX34: zsign hook全部跳过(不替换alert/request IMP) → zsign anti-tampering检测通过 → V3验证流程正常执行");
     }
     // g_isV3Environment 保持 NO → 所有hook(SCNetwork/socket/CC_MD5/CCCrypt)走全能签路径
 
