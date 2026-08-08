@@ -1077,7 +1077,7 @@ static void fix31_writeCrashFile(NSString *summary, void *callstackArr[], int fr
         
         NSMutableString *s = [NSMutableString stringWithCapacity:4096];
         [s appendString:@"============================================================\n"];
-        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX38 ===\n"];
+        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX39 ===\n"];
         [s appendString:@"============================================================\n"];
         [s appendFormat:@"Date:       %@\n", [NSDate date]];
         [s appendFormat:@"PID:        %d\n", (int)getpid()];
@@ -1346,7 +1346,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX38 loaded (铁证根因: FIX19成功=LCNetworking假响应; GET={code:0,data:{result:true,verity:1,tip:0,END,OPEN,ENDTIME,id,COUNT,MAXLIMIT}} POST={code:0,message:OK,无data!}; FIX37失败=judgeAppInfoSignApi缺result字段+postAppInfoApi被UNIVERSAL injector错误添加data字段! FIX38: 所有4个API返回与FIX19完全相同的假响应,UNIVERSAL injector完全禁用) ===");
+        _log(@"=== WangXianHook v37.134-FIX39 loaded (铁证根因: FIX38失败=judgeAppInfoSignApi删sign字段→全能签MD5/sign自校验失败! FIX39: judgeAppInfoSignApi保留原始sign/timeStamp/randStr/limit字段+仅插入result:true! 同时新增SignatureKit/SignatureCheck完整状态机诊断hook(只打印不修改), 精确找到验签哪一步失败) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -1435,6 +1435,116 @@ static id hook_createSigParams(id self, SEL _cmd, id arg) {
 static void hook_judgeApp(id self, SEL _cmd) {
     DLOG(@"[SC] SignatureCheck.JudgeApp called (SAFE STUB - no orig call)");
     // v37.121: Don't call original, just log and suppress
+}
+
+// ============================================================
+#pragma mark - FIX39: SignatureKit + SignatureCheck DIAG诊断Wrappers (只打印,调用orig,不修改)
+// ============================================================
+// v37.129: 绝对不能stub这些方法!必须调用orig,否则状态机卡死→无网络
+// FIX39: 用DIAG wrapper包裹,打印调用前后的参数+返回值,精确找到哪一步失败
+// ------ SignatureKit orig IMP保存 ------
+static IMP g_origSK_judgeBase = NULL;
+static IMP g_origSK_judgeNet = NULL;
+static IMP g_origSK_handleResult = NULL;
+static IMP g_origSK_verifySig = NULL;
+// ------ SignatureCheck orig IMP保存 ------
+static IMP g_origSC_JudgeApp = NULL;
+static IMP g_origSC_nettimes = NULL;  // 关键: 之前崩溃在这,现在打印data解析字段
+
+// --- [SK-DIAG] judgeAppInfoWithBaseUrl: wrapper ---
+static void diagSK_judgeBase(id self, SEL _cmd, id baseUrl) {
+    DLOG(@"[SK-DIAG] >>> judgeAppInfoWithBaseUrl: BEGIN baseUrl=%@", baseUrl);
+    if (g_origSK_judgeBase) {
+        ((void(*)(id,SEL,id))g_origSK_judgeBase)(self, _cmd, baseUrl);
+    } else {
+        DLOG(@"[SK-DIAG] >>> judgeAppInfoWithBaseUrl: ⚠️ orig IMP=NULL → 跳过调用orig");
+    }
+    DLOG(@"[SK-DIAG] <<< judgeAppInfoWithBaseUrl: END (orig已执行完成)");
+}
+
+// --- [SK-DIAG] judgeNet wrapper ---
+static void diagSK_judgeNet(id self, SEL _cmd) {
+    DLOG(@"[SK-DIAG] >>> judgeNet: BEGIN");
+    if (g_origSK_judgeNet) {
+        ((void(*)(id,SEL))g_origSK_judgeNet)(self, _cmd);
+    } else {
+        DLOG(@"[SK-DIAG] >>> judgeNet: ⚠️ orig IMP=NULL → 跳过调用orig");
+    }
+    DLOG(@"[SK-DIAG] <<< judgeNet: END (orig已执行完成)");
+}
+
+// --- [SK-DIAG] handleAppInfoResult: wrapper ---
+static void diagSK_handleResult(id self, SEL _cmd, id result) {
+    DLOG(@"[SK-DIAG] >>> handleAppInfoResult: BEGIN result=%@", result);
+    if (g_origSK_handleResult) {
+        ((void(*)(id,SEL,id))g_origSK_handleResult)(self, _cmd, result);
+    } else {
+        DLOG(@"[SK-DIAG] >>> handleAppInfoResult: ⚠️ orig IMP=NULL → 跳过调用orig");
+    }
+    DLOG(@"[SK-DIAG] <<< handleAppInfoResult: END");
+}
+
+// --- [SK-DIAG] verifySignatureFromParameters: wrapper ---
+static id diagSK_verifySig(id self, SEL _cmd, id params) {
+    DLOG(@"[SK-DIAG] >>> verifySignatureFromParameters: BEGIN params=%@", params);
+    id ret = nil;
+    if (g_origSK_verifySig) {
+        ret = ((id(*)(id,SEL,id))g_origSK_verifySig)(self, _cmd, params);
+        DLOG(@"[SK-DIAG] <<< verifySignatureFromParameters: END orig返回=%@", ret);
+    } else {
+        DLOG(@"[SK-DIAG] >>> verifySignatureFromParameters: ⚠️ orig IMP=NULL → 返回nil");
+    }
+    return ret;
+}
+
+// --- [SC-DIAG] SignatureCheck.JudgeApp wrapper ---
+static void diagSC_JudgeApp(id self, SEL _cmd) {
+    DLOG(@"[SC-DIAG] >>> SignatureCheck.JudgeApp: BEGIN self=%@", self);
+    if (g_origSC_JudgeApp) {
+        ((void(*)(id,SEL))g_origSC_JudgeApp)(self, _cmd);
+    } else {
+        DLOG(@"[SC-DIAG] >>> SignatureCheck.JudgeApp: ⚠️ orig IMP=NULL → 跳过调用orig");
+    }
+    DLOG(@"[SC-DIAG] <<< SignatureCheck.JudgeApp: END");
+}
+
+// --- [SC-DIAG] SignatureCheck.nettimes wrapper (打印data所有关键字段!) ---
+// FIX31/FIX38的历史元凶: SignatureCheck.nettimes解析data.ENDTIME/result等字段时出错
+// FIX39: 在调用orig前后打印data完整字段值,确认HTTP patch后的值是否被正确解析!
+static void diagSC_nettimes(id self, SEL _cmd) {
+    DLOG(@"[SC-DIAG] >>> SignatureCheck.nettimes: BEGIN self=%@", self);
+    // 尝试打印self的ivar(最关键的responseData/result等)
+    @try {
+        unsigned int ivarCount = 0;
+        Ivar *ivars = class_copyIvarList([self class], &ivarCount);
+        NSMutableArray *keyFields = [NSMutableArray array];
+        for (unsigned int i = 0; i < ivarCount && ivars; i++) {
+            Ivar iv = ivars[i];
+            const char *name = ivar_getName(iv);
+            NSString *nsName = name ? [NSString stringWithUTF8String:name] : nil;
+            if (!nsName) continue;
+            // 只打印关键字段,避免日志爆炸
+            BOOL isKey = ([nsName containsString:@"esult"] || [nsName containsString:@"erity"] ||
+                         [nsName containsString:@"tip"]  || [nsName containsString:@"data"]  ||
+                         [nsName containsString:@"END"]  || [nsName containsString:@"OPEN"]  ||
+                         [nsName containsString:@"esp"]  || [nsName containsString:@"code"]  ||
+                         [nsName containsString:@"sign"] || [nsName containsString:@"time"]);
+            if (!isKey) continue;
+            ptrdiff_t offset = ivar_getOffset(iv);
+            id val = ((id(*)(id, Ivar))object_getIvar)(self, iv);
+            if (val || offset) [keyFields addObject:[NSString stringWithFormat:@"%@=%@", nsName, val ?: @"(nil)"]];
+        }
+        if (ivars) free(ivars);
+        if (keyFields.count > 0) DLOG(@"[SC-DIAG] nettimes 关键字段IVAR snapshot: %@", keyFields);
+    } @catch (NSException *e) {
+        DLOG(@"[SC-DIAG] nettimes ivar读取异常: %@", e);
+    }
+    if (g_origSC_nettimes) {
+        ((void(*)(id,SEL))g_origSC_nettimes)(self, _cmd);
+        DLOG(@"[SC-DIAG] <<< SignatureCheck.nettimes: END (orig执行完成✅,未SIGSEGV!)");
+    } else {
+        DLOG(@"[SC-DIAG] <<< SignatureCheck.nettimes: ⚠️ orig IMP=NULL → 跳过调用orig");
+    }
 }
 
 static void hook_showTip(id self, SEL _cmd, id arg) {
@@ -1530,47 +1640,152 @@ static void installSecurityFrameworkHooks(void) {
 
 // --- Layer 2: SignatureKit Method Hooks (Safe, no original IMP calls) ---
 // v37.129: MINIMAL SignatureKit hooks — only suppress UI and block exit.
-// DO NOT hook judgeNet/judgeBase/JudgeApp/verifySig/handleResult —
+// DO NOT stub judgeNet/judgeBase/JudgeApp/verifySig/handleResult —
 // stubbing them to do nothing BREAKS the game's state machine.
 // The game's verification flow must run naturally so it progresses
 // to HTTP requests, which our HTTP hooks intercept.
+// FIX39: ADD DIAG诊断Wrappers (只打印,调用orig,不修改任何行为)
+//        打印judgeBase/judgeNet/handleResult/verifySig/JudgeApp/nettimes
+//        的调用参数+返回值+关键字段IVAR,100%定位验签失败的精确位置
 static void installSignatureKitBypassHooks(void) {
     Class sigKitCls = NSClassFromString(@"SignatureKit");
     if (!sigKitCls) {
         DLOG(@"[SIGKIT-BYPASS] SignatureKit class not found, skipping");
+    } else {
+        // ONLY hook showAlert: and exitApplication — these are safe to stub.
+        // They don't affect the verification flow, just prevent error UI and app exit.
+
+        // Hook +[SignatureKit showAlert:] — suppress alerts
+        Method m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showAlert:"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_showAlert);
+            DLOG(@"[SIGKIT-BYPASS] showAlert: HOOKED (suppress)");
+        }
+
+        // Hook +[SignatureKit exitApplication] — block exit
+        m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"exitApplication"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_exitApp);
+            DLOG(@"[SIGKIT-BYPASS] exitApplication HOOKED (block)");
+        }
+
+        // Hook +[SignatureKit showTipViewEND:] if it exists — suppress version expired popup
+        m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showTipViewEND:"));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_showTip);
+            DLOG(@"[SIGKIT-BYPASS] showTipViewEND: HOOKED (suppress)");
+        }
+
+        // ====== FIX39: SignatureKit DIAG诊断Wrappers安装 ======
+        // 用 method_setImplementation 替换保存orig到全局,设置wrapper为新IMP
+        // 绝对不修改任何返回值! 只打印!
+        @try {
+            int diagInstalled = 0;
+            // 1. judgeAppInfoWithBaseUrl:
+            SEL jbSel = NSSelectorFromString(@"judgeAppInfoWithBaseUrl:");
+            Method jbM = class_getClassMethod(sigKitCls, jbSel);
+            if (jbM) {
+                g_origSK_judgeBase = method_getImplementation(jbM);
+                method_setImplementation(jbM, (IMP)diagSK_judgeBase);
+                DLOG(@"[SK-DIAG-INSTALL] ✅ judgeAppInfoWithBaseUrl: orig=%p → diag wrapper", g_origSK_judgeBase);
+                diagInstalled++;
+            } else {
+                DLOG(@"[SK-DIAG-INSTALL] ⚠️ judgeAppInfoWithBaseUrl: method not found");
+            }
+            // 2. judgeNet
+            SEL jnSel = NSSelectorFromString(@"judgeNet");
+            Method jnM = class_getClassMethod(sigKitCls, jnSel);
+            if (jnM) {
+                g_origSK_judgeNet = method_getImplementation(jnM);
+                method_setImplementation(jnM, (IMP)diagSK_judgeNet);
+                DLOG(@"[SK-DIAG-INSTALL] ✅ judgeNet orig=%p → diag wrapper", g_origSK_judgeNet);
+                diagInstalled++;
+            } else {
+                DLOG(@"[SK-DIAG-INSTALL] ⚠️ judgeNet method not found");
+            }
+            // 3. handleAppInfoResult: (可能是class or instance,都试)
+            SEL hrSel = NSSelectorFromString(@"handleAppInfoResult:");
+            Method hrM = class_getClassMethod(sigKitCls, hrSel);
+            if (!hrM) hrM = class_getInstanceMethod(sigKitCls, hrSel);
+            if (hrM) {
+                g_origSK_handleResult = method_getImplementation(hrM);
+                method_setImplementation(hrM, (IMP)diagSK_handleResult);
+                DLOG(@"[SK-DIAG-INSTALL] ✅ handleAppInfoResult: orig=%p → diag wrapper", g_origSK_handleResult);
+                diagInstalled++;
+            } else {
+                DLOG(@"[SK-DIAG-INSTALL] ℹ️ handleAppInfoResult: not found (正常,可能方法名不同)");
+            }
+            // 4. verifySignatureFromParameters: (可能class or instance)
+            SEL vsSel = NSSelectorFromString(@"verifySignatureFromParameters:");
+            Method vsM = class_getClassMethod(sigKitCls, vsSel);
+            if (!vsM) vsM = class_getInstanceMethod(sigKitCls, vsSel);
+            if (vsM) {
+                g_origSK_verifySig = method_getImplementation(vsM);
+                method_setImplementation(vsM, (IMP)diagSK_verifySig);
+                DLOG(@"[SK-DIAG-INSTALL] ✅ verifySignatureFromParameters: orig=%p → diag wrapper", g_origSK_verifySig);
+                diagInstalled++;
+            } else {
+                DLOG(@"[SK-DIAG-INSTALL] ℹ️ verifySignatureFromParameters: not found (正常,可能方法名不同)");
+            }
+            DLOG(@"[SK-DIAG-INSTALL] FIX39: SignatureKit 共安装 %d 个DIAG wrappers", diagInstalled);
+        } @catch (NSException *e) {
+            DLOG(@"[SK-DIAG-INSTALL] ❌ SignatureKit DIAG安装异常: %@ → 跳过(不影响运行)", e);
+        }
+
+        DLOG(@"[SIGKIT-BYPASS] Minimal hooks installed (showAlert/exitApp/showTip only + FIX39 DIAG wrappers)");
+    }
+
+    // ====== FIX39: SignatureCheck DIAG诊断Wrappers安装 ======
+    // SignatureCheck class: JudgeApp, nettimes, showTipViewEND, exitApplication
+    Class sigCheckCls = NSClassFromString(@"SignatureCheck");
+    if (!sigCheckCls) {
+        DLOG(@"[SC-DIAG-INSTALL] SignatureCheck class not found, skipping");
         return;
     }
-
-    // ONLY hook showAlert: and exitApplication — these are safe to stub.
-    // They don't affect the verification flow, just prevent error UI and app exit.
-
-    // Hook +[SignatureKit showAlert:] — suppress alerts
-    Method m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showAlert:"));
-    if (m) {
-        method_setImplementation(m, (IMP)hook_showAlert);
-        DLOG(@"[SIGKIT-BYPASS] showAlert: HOOKED (suppress)");
+    @try {
+        int scDiag = 0;
+        // 1. SignatureCheck.JudgeApp (class or instance method? 之前hook的是instance,都试一下)
+        SEL jaSel = NSSelectorFromString(@"JudgeApp");
+        Method jaM = class_getClassMethod(sigCheckCls, jaSel);
+        if (!jaM) jaM = class_getInstanceMethod(sigCheckCls, jaSel);
+        if (jaM) {
+            g_origSC_JudgeApp = method_getImplementation(jaM);
+            method_setImplementation(jaM, (IMP)diagSC_JudgeApp);
+            DLOG(@"[SC-DIAG-INSTALL] ✅ SignatureCheck.JudgeApp orig=%p → diag wrapper", g_origSC_JudgeApp);
+            scDiag++;
+        } else {
+            DLOG(@"[SC-DIAG-INSTALL] ⚠️ SignatureCheck.JudgeApp method not found");
+        }
+        // 2. SignatureCheck.nettimes (instance method, v37.134-FIX31崩溃点)
+        SEL ntSel = NSSelectorFromString(@"nettimes");
+        Method ntM = class_getInstanceMethod(sigCheckCls, ntSel);
+        if (ntM) {
+            g_origSC_nettimes = method_getImplementation(ntM);
+            method_setImplementation(ntM, (IMP)diagSC_nettimes);
+            DLOG(@"[SC-DIAG-INSTALL] ✅ SignatureCheck.nettimes orig=%p → diag wrapper (打印IVAR关键字段!)", g_origSC_nettimes);
+            scDiag++;
+        } else {
+            DLOG(@"[SC-DIAG-INSTALL] ⚠️ SignatureCheck.nettimes method not found (class或superclass中无此selector)");
+        }
+        // showTipViewEND 和 exitApplication 继续用SAFE stub(阻止UI/退出)
+        Method tipM = class_getInstanceMethod(sigCheckCls, NSSelectorFromString(@"showTipViewEND:"));
+        if (!tipM) tipM = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"showTipViewEND:"));
+        if (tipM) {
+            method_setImplementation(tipM, (IMP)hook_showTip);
+            DLOG(@"[SC-DIAG-INSTALL] ✅ SignatureCheck.showTipViewEND: stubbed");
+            scDiag++;
+        }
+        Method exitM = class_getInstanceMethod(sigCheckCls, NSSelectorFromString(@"exitApplication"));
+        if (!exitM) exitM = class_getClassMethod(sigCheckCls, NSSelectorFromString(@"exitApplication"));
+        if (exitM) {
+            method_setImplementation(exitM, (IMP)hook_scExit);
+            DLOG(@"[SC-DIAG-INSTALL] ✅ SignatureCheck.exitApplication: BLOCKED");
+            scDiag++;
+        }
+        DLOG(@"[SC-DIAG-INSTALL] FIX39: SignatureCheck 共安装 %d hooks (DIAG+UI拦截)", scDiag);
+    } @catch (NSException *e) {
+        DLOG(@"[SC-DIAG-INSTALL] ❌ SignatureCheck DIAG安装异常: %@ → 跳过(不影响运行)", e);
     }
-
-    // Hook +[SignatureKit exitApplication] — block exit
-    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"exitApplication"));
-    if (m) {
-        method_setImplementation(m, (IMP)hook_exitApp);
-        DLOG(@"[SIGKIT-BYPASS] exitApplication HOOKED (block)");
-    }
-
-    // Hook +[SignatureKit showTipViewEND:] if it exists — suppress version expired popup
-    m = class_getClassMethod(sigKitCls, NSSelectorFromString(@"showTipViewEND:"));
-    if (m) {
-        method_setImplementation(m, (IMP)hook_showTip);
-        DLOG(@"[SIGKIT-BYPASS] showTipViewEND: HOOKED (suppress)");
-    }
-
-    // v37.129: DO NOT hook judgeBase, judgeNet, verifySig, handleResult, JudgeApp
-    // These methods are part of the game's verification state machine.
-    // Stubbing them to do nothing prevents the game from progressing.
-    // Let them run naturally — HTTP hooks will intercept the verification responses.
-
-    DLOG(@"[SIGKIT-BYPASS] Minimal hooks installed (showAlert/exitApp/showTip only)");
 }
 
 // --- Layer 3: LCNetworking Hooks ---
@@ -1578,11 +1793,14 @@ static void installSignatureKitBypassHooks(void) {
 // Hook it to intercept signature verification requests at the application level.
 
 static void installLCNetworkingHooks(void) {
+    // FIX39: 添加入口打印. FIX38日志中完全无LCNET打印→不知道是否执行到此
+    DLOG(@"[LCNET-BYPASS] >>> BEGIN installLCNetworkingHooks()");
     Class lcnetCls = NSClassFromString(@"LCNetworking");
     if (!lcnetCls) {
-        DLOG(@"[LCNET-BYPASS] LCNetworking class not found, skipping");
+        DLOG(@"[LCNET-BYPASS] LCNetworking class not found, skipping (✅ 入口日志确认:函数已执行,只是当前Runtime未加载该类)");
         return;
     }
+    DLOG(@"[LCNET-BYPASS] LCNetworking class FOUND: %@ → proceeding to hook methods", NSStringFromClass(lcnetCls));
 
     // Hook getWithURL:parameters:success:failure:
     SEL getSel = NSSelectorFromString(@"getWithURL:parameters:success:failure:");
@@ -1619,6 +1837,8 @@ static void installLCNetworkingHooks(void) {
         });
         method_setImplementation(m, newImpl);
         DLOG(@"[LCNET-BYPASS] getWithURL: HOOKED");
+    } else {
+        DLOG(@"[LCNET-BYPASS] getWithURL:parameters:success:failure: method NOT FOUND on LCNetworking (selector可能已改名)");
     }
 
     // Hook PostWithURL:parameters:success:failure:
@@ -1642,7 +1862,10 @@ static void installLCNetworkingHooks(void) {
         });
         method_setImplementation(m, newImpl);
         DLOG(@"[LCNET-BYPASS] PostWithURL: HOOKED");
+    } else {
+        DLOG(@"[LCNET-BYPASS] PostWithURL:parameters:success:failure: method NOT FOUND on LCNetworking");
     }
+    DLOG(@"[LCNET-BYPASS] <<< END installLCNetworkingHooks()");
 }
 
 // ============================================================
@@ -2113,27 +2336,75 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     NSString *fix19PostResp = @"{\"code\":0,\"message\":\"OK\"}";
 
     // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
+    // FIX39: 铁证根因! 全能签cert.qunhongtech.com返回的data里已经有sign签名!
+    //   FIX38原始响应(L278): data={timeStamp,randStr,limit,sign,end:0,tip:0,verity:1,open:1}
+    //   → verity/tip/end/open已经是正确值!只差result字段!
+    //   FIX38错误: 完全替换响应→删掉sign→全能签自己的MD5/sign自校验失败→"无网络连接"!
+    // FIX39策略: 保留原始响应的sign/timeStamp/randStr/limit/verity/tip/end/open全部字段!
+    //          仅在data对象中插入"result":true (游戏SignatureKit需要这个字段判成功)
+    //          如果JSON解析失败→fallback字符串插入(保证不破坏sign字段)
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
-        DLOG(@"[SIGN-BYPASS] FIX38: judgeAppInfoSignApi → 返回FIX19假响应(有result字段,无sign字段→游戏不验证sign)");
-        patchedResponse = fix19GetResp;
+        DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi → 保留原始sign/timeStamp/randStr!仅插入result:true(全能签sign自校验必须保留sign)");
+        NSError *jsonErr = nil;
+        NSDictionary *origDict = [NSJSONSerialization JSONObjectWithData:[body dataUsingEncoding:NSUTF8StringEncoding] options:0 error:&jsonErr];
+        if (origDict && [origDict isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *mut = [origDict mutableCopy];
+            NSMutableDictionary *data = [origDict[@"data"] mutableCopy];
+            if (data && [data isKindOfClass:[NSDictionary class]]) {
+                data[@"result"] = @YES;  // 仅插入result=true!
+                mut[@"data"] = data;
+                NSData *d = [NSJSONSerialization dataWithJSONObject:mut options:0 error:nil];
+                if (d) {
+                    patchedResponse = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON解析成功→插入result:true, sign=%@保留!", data[@"sign"] ? @"✅已" : @"⚠️原始无sign");
+                } else {
+                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON序列化失败→fallback字符串插入");
+                }
+            } else {
+                DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi data字段不存在/非字典→fallback字符串插入");
+            }
+        } else {
+            DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON解析失败(err=%@)→fallback字符串插入", jsonErr.localizedDescription);
+        }
+        // === JSON失败时的字符串fallback: 在"verity"之前或"data":{"之后插入"result":true, → 绝对不碰sign字段! ===
+        if ([patchedResponse isEqualToString:body]) {
+            // 优先: 在data字典开头 "data":{" 后插入
+            NSString *dataOpen = @"\"data\":{";
+            NSRange rData = [patchedResponse rangeOfString:dataOpen];
+            if (rData.location != NSNotFound) {
+                NSUInteger insertPos = rData.location + rData.length;
+                patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(insertPos, 0) withString:@"\"result\":true,"];
+                DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi字符串fallback→data开头插入result:true");
+            } else {
+                // 次优先: 在verity:1之前插入
+                NSString *verityStr = @"\"verity\":1";
+                NSRange rV = [patchedResponse rangeOfString:verityStr];
+                if (rV.location != NSNotFound) {
+                    patchedResponse = [patchedResponse stringByReplacingCharactersInRange:rV withString:@"\"result\":true,\"verity\":1"];
+                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi字符串fallback→verity前插入result:true");
+                } else {
+                    DLOG(@"[SIGN-BYPASS] FIX39: ⚠️ judgeAppInfoSignApi字符串fallback未找到插入点→保持原样");
+                }
+            }
+        }
     }
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
     else if (patchResponse && [url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX38: judgeAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
         patchedResponse = fix19GetResp;
     }
     // --- postAppInfoApi ---
-    // FIX38: 返回FIX19假响应 {code:0, message:"OK"} — 无data字段!
+    // FIX39: 返回FIX19假响应 {code:0, message:"OK"} — 无data字段!
     //   铁证: FIX19 LCNetworking POST假响应 = {code:0, message:"OK"} (无data)
     //   FIX36/37错误: UNIVERSAL injector给postAppInfoApi添加了data字段→游戏解析出错
     else if (patchResponse && [url containsString:@"postAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX38: postAppInfoApi → 返回FIX19假响应(code:0+message:OK, 无data字段!)");
+        DLOG(@"[SIGN-BYPASS] FIX39: postAppInfoApi → 返回FIX19假响应(code:0+message:OK, 无data字段!)");
         patchedResponse = fix19PostResp;
     }
     // --- getAppInfoApi ---
-    // FIX38: 返回FIX19假响应(统一result/verity/tip)
+    // FIX39: 返回FIX19假响应(统一result/verity/tip)
     else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX38: getAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        DLOG(@"[SIGN-BYPASS] FIX39: getAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
         patchedResponse = fix19GetResp;
     }
     // --- Fallback: generic cert endpoint ---
@@ -2155,11 +2426,11 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         DLOG(@"[SIGN-BYPASS] FIX37: Safety net SKIPPED (含sign字段, 保持原始JSON不变→sign验证通过)");
     }
 
-    // FIX38: UNIVERSAL injector 已禁用!
+    // FIX39: UNIVERSAL injector 已禁用!
     // 原因: FIX19 LCNetworking假响应对每个API返回不同的假响应(GET=data, POST=无data)
     //        UNIVERSAL injector统一添加data字段给所有API→postAppInfoApi不应有data→游戏出错
-    // FIX38: 所有4个API在各分支中已有明确的FIX19假响应,不再需要UNIVERSAL injector
-    DLOG(@"[SIGN-BYPASS] FIX38: UNIVERSAL injector DISABLED (all 4 APIs use FIX19 fake responses)");
+    // FIX39: 所有4个API在各分支中已有明确的FIX19假响应,不再需要UNIVERSAL injector
+    DLOG(@"[SIGN-BYPASS] FIX39: UNIVERSAL injector DISABLED (all 4 APIs use FIX19 fake responses)");
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
     DLOG(@"[SIGN-BYPASS] v37.134: Patched body: %@", patchedResponse);
