@@ -2368,14 +2368,29 @@ static void cTerminateHandler() {
     // FIX41: 尝试获取当前未捕获的C++异常,打印what()和type! (VersionModule::widgetSelected抛terminate时完全不知道原因!)
     NSMutableString *exceptionDetails = [NSMutableString stringWithString:@"\n--- FIX41: C++ Uncaught Exception Diagnostics ---\n"];
     @try {
-        // 用current_exception()尝试获取 (C++11) - 通过桥接Objective-C++
-        Class nsException = NSClassFromString(@"NSException");
-        if (nsException) {
-            NSException *topMost = [nsException defaultValueForException:@"_reserved"] ?: nil;
-            if (topMost) [exceptionDetails appendFormat:@"ObjC NSException: name=%@ reason=%@ userInfo=%@\n", topMost.name, topMost.reason, topMost.userInfo];
+        // 1. 尝试通过NSSetUncaughtExceptionHandler获取最后一个NSException
+        // 通过全局lastUncaught (如果已在handler中保存的话) + call_registered_functions
+        // 简单起见: 尝试调用 [NSException previousException] / 或 _initialize_topLevelErrorHandler 机制
+        // 如果取不到也没关系 - 我们还有__cxa_current_primary_exception
+        Class excClass = NSClassFromString(@"NSException");
+        if (excClass) {
+            @try {
+                // +[NSException raise...]格式的API可能存正在uncaught stack中
+                id excMaybe = objc_getClass? objc_getClass("NSException") : Nil;
+                // 尝试调用class方法"uncaughtException"如果实现了
+                SEL uncSel = NSSelectorFromString(@"uncaughtException");
+                if (excMaybe && [excMaybe respondsToSelector:uncSel]) {
+                    id unc = ((id(*)(id,SEL))objc_msgSend)(excMaybe, uncSel);
+                    if (unc) [exceptionDetails appendFormat:@"ObjC NSException.uncaughtException: name=%@ reason=%@\n", [unc name], [unc reason]];
+                } else {
+                    [exceptionDetails appendFormat:@"ℹ️ NSException.uncaughtException not implemented (大多数情况正常,此方法是自定义的)\n"];
+                }
+            } @catch (NSException *e2) {
+                [exceptionDetails appendFormat:@"⚠️ NSException读取内部异常: %@\n", e2];
+            }
         }
 
-        // 尝试调用std::current_exception().what()通过内联asm/abi: 先尝试简单的typeinfo demangle
+        // 2. 尝试C++ __cxa_current_primary_exception()通过dlsym
         // std::set_terminate handler中 current_exception() 在大多数ABI中是有效的
         void* (*cxa_curr)(void) = (void*(*)(void))dlsym(RTLD_DEFAULT, "__cxa_current_primary_exception");
         void *currExc = cxa_curr ? cxa_curr() : NULL;
@@ -4777,7 +4792,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
 
-        DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → 🔴全程纯字符串插入(取消JSON序列化→保持字段顺序+code第1位+sign字节100%一致!)");
+        DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → 全程纯字符串插入(取消JSON序列化→保持字段顺序+code第1位+sign字节100%%一致!)");
 
         // === 第一步: 如果data中没有"result"字段→插入(位置在data开头第一个字段前,保持字段顺序不变) ===
         if (![patchedResponse containsString:@"\"result\""]) {
@@ -4789,7 +4804,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
                 NSUInteger insertPos = rData.location + rData.length;
                 patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(insertPos, 0) withString:@"\"result\":true,"];
-                DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → data开头插入\"result\":true,(字段顺序100%保持不变!)");
+                DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → data开头插入\"result\":true,(字段顺序100%%保持不变!)");
 
             } else {
 
