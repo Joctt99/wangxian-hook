@@ -20760,7 +20760,7 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
         if (feof(stream) == 0 && ferror(stream) == 0) {
             char *rr = real_libSystem_fgets(buf, size, stream);
             if (rr != NULL) {
-                DLOG(@"[FIX45-FIO] fgets FALLBACK: stream=%p bufsize=%d → systemhook=NULL ❌ → real_libSystem=%s (trunc20)", stream, size, rr ? [NSString stringWithUTF8String:rr] : nil);
+                DLOG(@"[FIX45-FIO] fgets FALLBACK: stream=%p bufsize=%d → systemhook=NULL ❌ → real_libSystem=%@ (trunc20)", stream, size, rr ? [NSString stringWithUTF8String:rr] : nil);
             }
             result = rr;
         }
@@ -20782,9 +20782,9 @@ static char *hook_fgets(char *buf, int size, FILE *stream) {
 
 // FIX45: C++ mangled symbol from crash stack LINE469
 #define FIX45_VM_WS_MANGLED "_ZN13VersionModule14widgetSelectedER14SelectionEvent"
-// Itanium C++ ABI: instance method arg1=this*, arg2=SelectionEvent&(=void* impl)
-typedef void (*VMWidgetSelectedFunc)(void* thisPtr, void& selEventRef);  // C++ reference param
-typedef void (*VMWidgetSelectedFuncCC)(void* thisPtr, void* selEventPtr); // C compatible cast
+// Itanium C++ ABI (arm64): 实例方法 arg1=this* (x0), arg2=SelectionEvent&(内部就是指针x1).
+// 为避免C++ void引用类型编译错误, 统一用void*指针版本(ABI完全兼容)
+typedef void (*VMWidgetSelectedFuncCC)(void* thisPtr, void* selEventPtr);
 static VMWidgetSelectedFuncCC orig_FIX45_VM_ws = NULL;
 
 // FIX45: C++ try/catch requires compiling as objective-c++ (Makefile already does -x objective-c++)
