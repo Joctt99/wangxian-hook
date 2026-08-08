@@ -1077,7 +1077,7 @@ static void fix31_writeCrashFile(NSString *summary, void *callstackArr[], int fr
         
         NSMutableString *s = [NSMutableString stringWithCapacity:4096];
         [s appendString:@"============================================================\n"];
-        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX36 ===\n"];
+        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX37 ===\n"];
         [s appendString:@"============================================================\n"];
         [s appendFormat:@"Date:       %@\n", [NSDate date]];
         [s appendFormat:@"PID:        %d\n", (int)getpid()];
@@ -1346,7 +1346,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX36 loaded (100%铁证根因: FIX31-35都漏了SignatureKit状态机必需的data.result/verity/tip(小写)三字段! 只改code值永远不会成功. FIX19=LCNetworking假响应包含这三字段→成功; FIX34/35=patch分支漏了→状态机判失败→无网络! FIX36: 所有签名URL统一注入6个成功字段(code:0 + data.result=YES/verity=1/tip=0/END=0/OPEN=1) + Safety net强制code:1→code:0(不再区分V3)) ===");
+        _log(@"=== WangXianHook v37.134-FIX37 loaded (铁证根因: FIX36的UNIVERSAL injector对judgeAppInfoSignApi响应做了NSJSONSerialization重新序列化→JSON字段顺序改变+添加额外字段→data.sign(MD5签名)验证失败→游戏判定签名无效→显示无网络连接! 实际上原始响应已经是成功的(code:0,verity:1,tip:0,end:0,open:1)! FIX37: 1)含sign字段的响应完全跳过smart patch+safety net+UNIVERSAL injector→保持原始JSON不变→sign验证通过; 2)无sign字段的响应(postAppInfoApi/getAppInfoApi)仍正常应用UNIVERSAL injector) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2106,19 +2106,24 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
     // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoSignApi (smart patch)");
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-        if (![patchedResponse containsString:@"verity"]) {
+        // FIX37: 如果响应已含sign字段(MD5签名),不做任何字符串替换!
+        // 任何对JSON字符串的修改(即使值不变)都可能影响游戏端的sign验证
+        if ([patchedResponse containsString:@"\"sign\":"]) {
+            DLOG(@"[SIGN-BYPASS] FIX37: judgeAppInfoSignApi 含sign字段 → 完全跳过smart patch(保持原始JSON→sign验证通过)");
+        } else if (![patchedResponse containsString:@"verity"]) {
             // v37.134-FIX4: Server returned error (HTTP 500) — use UNIVERSAL success response
             // with ALL fields the game needs: result, verity, tip, ENDTIME, END, OPEN
             // Previous minimal response (missing ENDTIME/END/OPEN) caused login stuck!
             DLOG(@"[SIGN-BYPASS] v37.134-FIX4: judgeAppInfoSignApi server error — using UNIVERSAL success response");
             patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31\",\"END\":0,\"OPEN\":1}}";
+        } else {
+            DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoSignApi (smart patch, no sign field)");
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
+            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
         }
     }
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
@@ -2198,21 +2203,21 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
 
-    // Safety net: FIX36 — ALWAYS code:1→code:0 (SignatureKit uses code:0=success universally)
-    // FIX35错误地假设V3协议code:1=成功 → 但FIX19铁证LCNetworking假响应code:0=成功!
-    // V3服务器judgeAppInfoApi原始返回code:0(不是code:1)→ lnSign本身code:0=成功
-    // postAppInfoApi/getAppInfoApi原始code:1→服务器返回错误/数据缺失 → 必须改成code:0!
-    if (patchResponse && [patchedResponse containsString:@"\"code\":1"]) {
+    // Safety net: FIX37 — code:1→code:0, 但跳过含sign字段的响应(sign验证需要原始JSON)
+    if (patchResponse && ![patchedResponse containsString:@"\"sign\":"] && [patchedResponse containsString:@"\"code\":1"]) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        DLOG(@"[SIGN-BYPASS] FIX36: Safety net code:1→code:0 (SignatureKit code:0=成功, 不再区分V3)");
+        DLOG(@"[SIGN-BYPASS] FIX37: Safety net code:1→code:0 (无sign字段, 安全)");
+    } else if ([patchedResponse containsString:@"\"sign\":"]) {
+        DLOG(@"[SIGN-BYPASS] FIX37: Safety net SKIPPED (含sign字段, 保持原始JSON不变→sign验证通过)");
     }
 
-    // FIX36: UNIVERSAL SUCCESS FIELD INJECTOR — 100%根因修复!
-    // 铁证: FIX19=LCNetworking假响应每个URL都包含data.result/verity/tip(小写) → 状态机通过
-    //       FIX31-35=各分支patch漏了这三个字段 → 状态机读nil → 判失败 → 无网络
-    // 规则: 所有签名验证响应, 统一保证 code=0, data.result=YES, data.verity=1, data.tip=0
-    //       同时补充 END/OPEN/ENDTIME (如果缺失)
-    if (patchResponse) {
+    // FIX37: UNIVERSAL SUCCESS FIELD INJECTOR — 根因修复!
+    // 铁证(日志wxhook 22.log): judgeAppInfoSignApi原始响应已含sign字段(MD5签名),
+    //   UNIVERSAL injector重新序列化JSON→字段顺序改变+添加额外字段→sign验证失败→无网络!
+    //   修复: 如果data含sign字段,跳过UNIVERSAL injector(保持原始JSON不被重新序列化)
+    //   其他API(judgeAppInfoApi/postAppInfoApi/getAppInfoApi)没有sign字段,UNIVERSAL injector安全
+    if (patchResponse && ![patchedResponse containsString:@"\"sign\":"]) {
+        // 只对没有sign字段的响应应用UNIVERSAL injector
         NSError *jerr = nil;
         id jsonObj = [NSJSONSerialization JSONObjectWithData:[patchedResponse dataUsingEncoding:NSUTF8StringEncoding]
                                                       options:NSJSONReadingAllowFragments error:&jerr];
