@@ -1858,8 +1858,9 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39: Non-DLOG global marker that NEVER gets optimized out (for binary verification)
 
-// FIX39-FINAL: Two ((used)) global string constants NEVER optimized out, used for binary verification and as immutable documentation of release features.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX39-FINAL: [A]patchSignatureResponse_USEDattr [B]judgeAppInfoSignApi_KEEPsign_fields_ONLYinsert_result:true [C]judgeAppApi/postAppInfoApi/getAppInfoApi_use_FIX19responses [D]SignatureKit+SignatureCheck_DIAGhooks_USEDattr [E]LCNetworking_LEGACY_NetPatch_DISABLED_preventsDoublePatch [F]LCNetworking_entry_LOG_installed ";
+// FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
+// Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX39-FINAL: [ROOTCAUSE_A]judgeAppInfoSignApi_DELETED_sign_field→BROKE_全能签_MD5自校验→FIX:PRESERVE_sign/verity/tip+ONLYinsert_result:true; [ROOTCAUSE_B]patchSignatureResponse+installSignatureKitBypassHooks_STATIC_FUNCS_WERE_LINKER_DEADCODE_STRIPPED!!!→FIX:__attribute__((used))FORCE_KEEP; [ROOTCAUSE_C]NETPATCH_legacy_DOUBLE_PATCHED_judgeAppInfoApi_AFTER_correctPatch→OVERWROTE_RESPONSE→FIX:#if0_DISABLE_legacy; [DIAG]SignatureKit_judgeNet/judgeBase/handleResult/verifySig+SignatureCheck_JudgeApp/nettimes_FULL_state_tracing_INSTALLED";
 __attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX39-VERIFY: judgeAppInfoSignApi_preserve_sign_insert_result SK+SC_DIAG LCNET_ENTRY_LOG";  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
 
 
@@ -3304,10 +3305,10 @@ static void installSecurityFrameworkHooks(void) {
 
 //        的调用参数+返回值+关键字段IVAR,100%定位验签失败的精确位置
 
-// FIX39-FINAL: __attribute__((used)) — FORCE linker to keep SignatureKit bypass hooks (DIAG wrappers must be installed!)
+// FIX39-FINAL: __attribute__((used)) on installSignatureKitBypassHooks
+//   FORCE linker to keep SignatureKit DIAG hook wrappers (they MUST be installed for runtime tracing)
 __attribute__((used))
 static void installSignatureKitBypassHooks(void) {
-
     Class sigKitCls = NSClassFromString(@"SignatureKit");
 
     if (!sigKitCls) {
@@ -4619,16 +4620,14 @@ static BOOL isSignatureVerificationURL(NSString *url) {
 //
 
 // v37.134: Smart patching - don't replace entire body, only modify specific fields.
-// Preserves original response data including sign/timeStamp/randStr.
-// FIX39-FINAL: __attribute__((used)) — FORCE linker to keep this static function
-//   (prevents dead-code elimination if cross-module optimizer thinks it's unreachable)
-__attribute__((used))
 
-// FIX39-FINAL: __attribute__((used)) on patchSignatureResponse — FORCE linker to KEEP this static signature patcher function
-//   (cross-module optimizer may incorrectly mark it unreachable due to isSignatureVerificationURL check)
+// Preserves original response data including sign/timeStamp/randStr.
+
+// FIX39-FINAL: __attribute__((used)) on patchSignatureResponse
+//   FORCE linker to KEEP this function (prevents dead-code elimination if cross-module optimizer
+//   incorrectly decides isSignatureVerificationURL() always returns NO, marking function unreachable)
 __attribute__((used))
 static NSData *patchSignatureResponse(NSString *url, NSString *body) {
-
     if (!url) return nil;
 
 
@@ -23751,12 +23750,11 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
 
                     //        新条件: 只匹配URL含judgeAppInfoApi(不含SignApi)的请求
 
-
-// FIX39-FINAL: DISABLED legacy NET-PATCH (judgeAppInfoApi ENDTIME extension)!
-//   FIX38 runtime logs PROOF: this legacy patch runs AFTER patchSignatureResponse(),
-//   OVERWRITING our carefully patched judgeAppInfoApi response with legacy values!
-//   That double-patch BREAKS signature verification! Now use patchSignatureResponse result AS-IS.
-#if 0 // ← DISABLED legacy (was double-patching judgeAppInfoApi response)
+// FIX39-FINAL: DISABLED legacy [NET-PATCH] judgeAppInfoApi double-patch!
+//   IRREFUTABLE PROBLEM: This legacy patch runs AFTER patchSignatureResponse() in the call chain,
+//   OVERWRITING our carefully patched judgeAppInfoApi response with wrong/legacy values.
+//   That double-overwrite BREAKS signature verification! → Now use patchSignatureResponse() result AS-IS.
+#if 0 // ← DISABLED by FIX39-FINAL (was causing fatal double-patching)
                     if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
 
                         DLOG(@"[NET-PATCH] Detected judgeAppInfoApi response, extending ENDTIME (legacy)");
@@ -23778,6 +23776,9 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                         DLOG(@"[NET-PATCH] Patched judgeAppInfoApi: ENDTIME extended, END=0, OPEN=1 (code preserved as-is)");
 
                     }
+#endif
+DLOG(@"[FIX39-FINAL] Legacy NET-PATCH judgeAppInfoApi double-patch SKIPPED → using patchSignatureResponse result verbatim");
+
 
                     
 
@@ -25539,10 +25540,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 pcur += 9;
 
-            }
-#endif
-DLOG(@"[FIX39-FINAL] Legacy NET-PATCH SKIPPED (judgeAppInfoApi already patched correctly, no double-patch!)");
- else if (rem >= 17 && memcmp(pcur, "iPhone 16 Pro Max", 17) == 0) {
+            } else if (rem >= 17 && memcmp(pcur, "iPhone 16 Pro Max", 17) == 0) {
 
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
 
