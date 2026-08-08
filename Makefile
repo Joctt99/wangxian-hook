@@ -38,7 +38,7 @@ $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@grep -c "FIX39" $(SOURCE) || echo "WARNING: FIX39 not found in source!"
 	@grep -c "0 && fffWhich" $(SOURCE) || echo "WARNING: 0 and fffWhich not found!"
 	@echo "=== Building ==="
-	$(CC) $(CFLAGS) -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
+	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
 	@strings $(TARGET) | grep -c "FIX45" || echo "WARNING: FIX45 not in binary!"
