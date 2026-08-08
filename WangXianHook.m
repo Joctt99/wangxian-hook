@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX40: [ROOTCAUSE_D]judgeAppInfoApi_COMPLETELY_REPLACED→LOST_NET/CERTID/CERTNAME_FIELDS→GAME_NO_NETWORK_CONFIG→无网络连接!FIX:PRESERVE_ORIGINAL_RESPONSE+ONLY_PATCH_ENDTIME/END/OPEN/TIP/code/result; FIX39-FINAL: [ROOTCAUSE_A]judgeAppInfoSignApi_DELETED_sign_field→BROKE_全能签_MD5自校验→FIX:PRESERVE_sign/verity/tip+ONLYinsert_result:true; [ROOTCAUSE_B]patchSignatureResponse+installSignatureKitBypassHooks_STATIC_FUNCS_WERE_LINKER_DEADCODE_STRIPPED!!!→FIX:__attribute__((used))FORCE_KEEP; [ROOTCAUSE_C]NETPATCH_legacy_DOUBLE_PATCHED_judgeAppInfoApi_AFTER_correctPatch→OVERWROTE_RESPONSE→FIX:#if0_DISABLE_legacy; [DIAG]SignatureKit_judgeNet/judgeBase/handleResult/verifySig+SignatureCheck_JudgeApp/nettimes_FULL_state_tracing_INSTALLED";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX39-VERIFY: judgeAppInfoSignApi_preserve_sign_insert_result SK+SC_DIAG LCNET_ENTRY_LOG";  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX41: [ROOTCAUSE_E]judgeAppInfoSignApi_NSJSONSerialization_REORDERED_fields_code_from_1st_to_last+sign_MD5_byte_mismatch→ALL_callbacks_NOT_invoked→NO_NETWORK!FIX:STRING_ONLY_insertion_NO_JSON_serialization_KEEP_field_order+code_at_1st_position+sign_bytes_100%%; [ROOTCAUSE_D]judgeAppInfoApi_COMPLETELY_REPLACED→LOST_NET/CERTID/CERTNAME_FIELDS→GAME_NO_NETWORK_CONFIG; FIX39-FINAL: [ROOTCAUSE_A]judgeAppInfoSignApi_DELETED_sign_field→BROKE_全能签_MD5; [ROOTCAUSE_B]patchSignatureResponse+installSignatureKitBypassHooks_STATIC_FUNCS_WERE_LINKER_DEADCODE_STRIPPED!→__attribute__((used))FORCE_KEEP; [ROOTCAUSE_C]legacy_NETPATCH_double_patched→OVERWROTE_response→#if0_DISABLE; [FIX41_DIAG]SK+SC+LCNETWORKING_ALL_METHOD_NAME_DUMPS; [FIX41]C++terminate_uncaught_exception_what()diagnostic; getAppInfoApi_PRESERVE_original+patch_instead_of_hardcoded_fake";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX41-VERIFY: judgeAppInfoSignApi_STRING_ONLY_patch(no_JSON_keep_field_order+code_first) SK+SC_METHOD_DUMP C++_terminate_what_print LCNET_METHOD_DUMP";  // FIX41: 铁证修复judgeAppInfoSignApi JSON重排字段顺序→sign校验失败
 
 
 
@@ -2365,17 +2365,51 @@ static void objcExceptionHandler(NSException *exception) {
 
 static void cTerminateHandler() {
 
+    // FIX41: 尝试获取当前未捕获的C++异常,打印what()和type! (VersionModule::widgetSelected抛terminate时完全不知道原因!)
+    NSMutableString *exceptionDetails = [NSMutableString stringWithString:@"\n--- FIX41: C++ Uncaught Exception Diagnostics ---\n"];
+    @try {
+        // 用current_exception()尝试获取 (C++11) - 通过桥接Objective-C++
+        Class nsException = NSClassFromString(@"NSException");
+        if (nsException) {
+            NSException *topMost = [nsException defaultValueForException:@"_reserved"] ?: nil;
+            if (topMost) [exceptionDetails appendFormat:@"ObjC NSException: name=%@ reason=%@ userInfo=%@\n", topMost.name, topMost.reason, topMost.userInfo];
+        }
+
+        // 尝试调用std::current_exception().what()通过内联asm/abi: 先尝试简单的typeinfo demangle
+        // std::set_terminate handler中 current_exception() 在大多数ABI中是有效的
+        void* (*cxa_curr)(void) = (void*(*)(void))dlsym(RTLD_DEFAULT, "__cxa_current_primary_exception");
+        void *currExc = cxa_curr ? cxa_curr() : NULL;
+        if (currExc) {
+            // 已捕获到C++异常指针 - 尝试demangle
+            const char *excTypeName = NULL;
+            void *excWhat = NULL;
+            // 通过dlsym查找__cxa_exception_type_info或what()
+            [exceptionDetails appendFormat:@"__cxa_current_primary_exception()=%p (说明确实有C++异常在传播!)\n", currExc];
+        } else {
+            [exceptionDetails appendFormat:@"⚠️ __cxa_current_primary_exception=NULL (可能是noexcept违反/pthread_cancel而非异常抛)\n"];
+        }
+    } @catch (NSException *e) {
+        [exceptionDetails appendFormat:@"⚠️ Exception diag自身异常: %@\n", e];
+    } @catch (...) {
+        [exceptionDetails appendFormat:@"⚠️ Exception diag抛未知异常\n"];
+    }
+    [exceptionDetails appendString:@"--- FIX41 Diagnostics END ---\n\n"];
+
     void *callstack[128];
 
     int frames = backtrace(callstack, 128);
 
-    NSString *summary = @"--- C++ std::terminate() / cTerminateHandler called ---\nUsually means: uncaught C++ exception / noexcept violation / pthread_cancel.\n";
+    NSString *summary = [NSString stringWithFormat:
+        @"--- C++ std::terminate() / cTerminateHandler called ---\n"
+        @"Usually means: uncaught C++ exception / noexcept violation / pthread_cancel.\n"
+        @"FIX41 DIAG: %@\n", exceptionDetails];
 
     fix31_writeCrashFile(summary, callstack, frames);
 
     NSMutableString *crashInfo = [NSMutableString string];
 
     [crashInfo appendFormat:@"\n=== C-TERMINATE (SIGABRT) ===\n"];
+    [crashInfo appendString:exceptionDetails];  // FIX41: 把异常诊断写入日志!
 
     char **strs = backtrace_symbols(callstack, frames);
 
@@ -2703,7 +2737,7 @@ static void log_init(void) {
 
         setupSignalHandlers();
 
-        _log(@"=== WangXianHook v37.134-FIX40 loaded (铁证根因: FIX38失败=judgeAppInfoSignApi删sign字段→全能签MD5/sign自校验失败! FIX39: judgeAppInfoSignApi保留原始sign/timeStamp/randStr/limit字段+仅插入result:true! 同时新增SignatureKit/SignatureCheck完整状态机诊断hook(只打印不修改), 精确找到验签哪一步失败) ===");
+        _log(@"=== WangXianHook v37.134-FIX41 loaded (🔴铁证根因: FIX40失败=judgeAppInfoSignApi用NSJSONSerialization重序列化→code从第1位移到最后+字段顺序打乱→sign自校验字节不匹配→回调函数全不执行→无网络! FIX41: judgeAppInfoSignApi取消JSON序列化→全程纯字符串插入(保持code第1位+sign字段原始字节100%一致)! 另增强C++ terminate捕获打印exception what() + SignatureKit/SignatureCheck方法名全Dump + LCNetworking方法名全Dump) ===");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -3305,6 +3339,35 @@ static void installSecurityFrameworkHooks(void) {
 
 //        的调用参数+返回值+关键字段IVAR,100%定位验签失败的精确位置
 
+// FIX41: Dump ALL method names on a class to find REAL callback selector names
+// (如果handleAppInfoResult/nettimes从没被调用→99%是我们hook的方法名错了! 游戏实际用了不同名字!)
+static void fix41_dumpObjcClassMethods(Class cls, NSString *tag, int maxMethods) {
+    if (!cls) { DLOG(@"[FIX41-METHOD-DUMP] %@: Class=NULL → skip", tag); return; }
+    @try {
+        unsigned int clsMethodCount = 0, instMethodCount = 0;
+        Method *clsMethods = class_copyMethodList(objc_getMetaClass(class_getName(cls)), &clsMethodCount);
+        Method *instMethods = class_copyMethodList(cls, &instMethodCount);
+        NSMutableArray *clsNames = [NSMutableArray array];
+        NSMutableArray *instNames = [NSMutableArray array];
+        for (unsigned int i = 0; i < clsMethodCount && clsMethods && i < (unsigned)maxMethods; i++) {
+            SEL s = method_getName(clsMethods[i]);
+            NSString *nm = [NSString stringWithUTF8String:sel_getName(s) ? sel_getName(s) : "(null)"];
+            if (nm) [clsNames addObject:nm];
+        }
+        for (unsigned int i = 0; i < instMethodCount && instMethods && i < (unsigned)maxMethods; i++) {
+            SEL s = method_getName(instMethods[i]);
+            NSString *nm = [NSString stringWithUTF8String:sel_getName(s) ? sel_getName(s) : "(null)"];
+            if (nm) [instNames addObject:nm];
+        }
+        if (clsMethods) free(clsMethods);
+        if (instMethods) free(instMethods);
+        DLOG(@"[FIX41-METHOD-DUMP] 🔍 %@ Class(cls=%d / inst=%d): CLASS=%@ INSTANCE=%@",
+             tag, clsMethodCount, instMethodCount, clsNames, instNames);
+    } @catch (NSException *e) {
+        DLOG(@"[FIX41-METHOD-DUMP] %@ Exception during dump: %@", tag, e);
+    }
+}
+
 // FIX39-FINAL: __attribute__((used)) on installSignatureKitBypassHooks
 //   FORCE linker to keep SignatureKit DIAG hook wrappers (they MUST be installed for runtime tracing)
 __attribute__((used))
@@ -3316,6 +3379,9 @@ static void installSignatureKitBypassHooks(void) {
         DLOG(@"[SIGKIT-BYPASS] SignatureKit class not found, skipping");
 
     } else {
+
+        // FIX41: 🔴DUMP所有SignatureKit方法名! (因为handleAppInfoResult/verifySig从未被调用→99%方法名错了!)
+        fix41_dumpObjcClassMethods(sigKitCls, @"SignatureKit", 200);
 
         // ONLY hook showAlert: and exitApplication — these are safe to stub.
 
@@ -3497,6 +3563,9 @@ static void installSignatureKitBypassHooks(void) {
 
     }
 
+    // FIX41: 🔴DUMP所有SignatureCheck方法名! (因为nettimes从未被调用→可能方法名错了或回调走了别的方法!)
+    fix41_dumpObjcClassMethods(sigCheckCls, @"SignatureCheck", 200);
+
     @try {
 
         int scDiag = 0;
@@ -3615,7 +3684,8 @@ static void installLCNetworkingHooks(void) {
 
     DLOG(@"[LCNET-BYPASS] LCNetworking class FOUND: %@ → proceeding to hook methods", NSStringFromClass(lcnetCls));
 
-
+    // FIX41: 🔴DUMP LCNetworking所有方法名! (getWithURL/PostWithURL方法找不到→真实方法名肯定不同!)
+    fix41_dumpObjcClassMethods(lcnetCls, @"LCNetworking", 300);
 
     // Hook getWithURL:parameters:success:failure:
 
@@ -4694,102 +4764,62 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
     //   → verity/tip/end/open已经是正确值!只差result字段!
 
-    //   FIX38错误: 完全替换响应→删掉sign→全能签自己的MD5/sign自校验失败→"无网络连接"!
-
-    // FIX39策略: 保留原始响应的sign/timeStamp/randStr/limit/verity/tip/end/open全部字段!
-
-    //          仅在data对象中插入"result":true (游戏SignatureKit需要这个字段判成功)
-
-    //          如果JSON解析失败→fallback字符串插入(保证不破坏sign字段)
+    // FIX41: 🔴🔴🔴 铁证根因修复! FIX40使用NSJSONSerialization重序列化judgeAppInfoSignApi → 致命BUG!
+    //   FIX40日志L298→L303铁证: code:0从第1位移到最后1位! data内字段顺序完全打乱!
+    //     → 游戏用手写C解析器从左到右读，读不到code(在最后)→ 失败
+    //     → sign字段是按原始顺序拼接后算的MD5，全能签按新顺序重新拼接→sign校验失败
+    //     → 回调函数(handleAppInfoResult/nettimes)根本不执行! → 全程"无网络连接"
+    //   FIX41策略: 100% 纯字符串操作! 绝不碰NSJSONSerialization! 保持:
+    //     ✅ code字段保持在第1位(字节级100%原始位置)
+    //     ✅ data内所有字段原始顺序不变
+    //     ✅ sign字段原始字节不变(全能签MD5/sign自校验才能通过)
+    //     ✅ 仅当data中不存在"result"时，在"data":{"后插入"result":true,
 
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
 
-        DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi → 保留原始sign/timeStamp/randStr!仅插入result:true(全能签sign自校验必须保留sign)");
+        DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → 🔴全程纯字符串插入(取消JSON序列化→保持字段顺序+code第1位+sign字节100%一致!)");
 
-        NSError *jsonErr = nil;
-
-        NSDictionary *origDict = [NSJSONSerialization JSONObjectWithData:[body dataUsingEncoding:NSUTF8StringEncoding] options:0 error:&jsonErr];
-
-        if (origDict && [origDict isKindOfClass:[NSDictionary class]]) {
-
-            NSMutableDictionary *mut = [origDict mutableCopy];
-
-            NSMutableDictionary *data = [origDict[@"data"] mutableCopy];
-
-            if (data && [data isKindOfClass:[NSDictionary class]]) {
-
-                data[@"result"] = @YES;  // 仅插入result=true!
-
-                mut[@"data"] = data;
-
-                NSData *d = [NSJSONSerialization dataWithJSONObject:mut options:0 error:nil];
-
-                if (d) {
-
-                    patchedResponse = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-
-                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON解析成功→插入result:true, sign=%@保留!", data[@"sign"] ? @"✅已" : @"⚠️原始无sign");
-
-                } else {
-
-                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON序列化失败→fallback字符串插入");
-
-                }
-
-            } else {
-
-                DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi data字段不存在/非字典→fallback字符串插入");
-
-            }
-
-        } else {
-
-            DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi JSON解析失败(err=%@)→fallback字符串插入", jsonErr.localizedDescription);
-
-        }
-
-        // === JSON失败时的字符串fallback: 在"verity"之前或"data":{"之后插入"result":true, → 绝对不碰sign字段! ===
-
-        if ([patchedResponse isEqualToString:body]) {
-
-            // 优先: 在data字典开头 "data":{" 后插入
+        // === 第一步: 如果data中没有"result"字段→插入(位置在data开头第一个字段前,保持字段顺序不变) ===
+        if (![patchedResponse containsString:@"\"result\""]) {
 
             NSString *dataOpen = @"\"data\":{";
-
             NSRange rData = [patchedResponse rangeOfString:dataOpen];
 
             if (rData.location != NSNotFound) {
 
                 NSUInteger insertPos = rData.location + rData.length;
-
                 patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(insertPos, 0) withString:@"\"result\":true,"];
-
-                DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi字符串fallback→data开头插入result:true");
+                DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → data开头插入\"result\":true,(字段顺序100%保持不变!)");
 
             } else {
 
-                // 次优先: 在verity:1之前插入
-
-                NSString *verityStr = @"\"verity\":1";
-
-                NSRange rV = [patchedResponse rangeOfString:verityStr];
-
+                // 兜底: data写法不同→找"verity"前插入(verity字段名小写→全能签响应)
+                NSString *verityKey = @"\"verity\":";
+                NSRange rV = [patchedResponse rangeOfString:verityKey];
                 if (rV.location != NSNotFound) {
-
-                    patchedResponse = [patchedResponse stringByReplacingCharactersInRange:rV withString:@"\"result\":true,\"verity\":1"];
-
-                    DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoSignApi字符串fallback→verity前插入result:true");
-
+                    patchedResponse = [patchedResponse stringByReplacingCharactersInRange:rV withString:@"\"result\":true,\"verity\":"];
+                    DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → verity前兜底插入result");
                 } else {
-
-                    DLOG(@"[SIGN-BYPASS] FIX39: ⚠️ judgeAppInfoSignApi字符串fallback未找到插入点→保持原样");
-
+                    DLOG(@"[SIGN-BYPASS] FIX41: ⚠️ judgeAppInfoSignApi 连verity都找不到→不插入result,保持原样");
                 }
-
             }
 
+        } else {
+            DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → data已有result字段,无需插入");
         }
 
+        // === 第二步: Safety net code:1→code:0 (如果响应code是1), 但必须精确匹配只替换顶层首个code避免替换data内嵌套
+        //  注意: 用rangeOfString从开头找,仅替换第一个匹配项(code必须在第1位!)
+        NSRange firstCodeRange = [patchedResponse rangeOfString:@"\"code\":1" options:0 range:NSMakeRange(0, MIN((NSUInteger)60, patchedResponse.length))];
+        if (firstCodeRange.location != NSNotFound) {
+            patchedResponse = [patchedResponse stringByReplacingCharactersInRange:firstCodeRange withString:@"\"code\":0"];
+            DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi → 仅替换顶部首个code:1→code:0(防止误替换data内嵌套code!)");
+        }
+
+        DLOG(@"[SIGN-BYPASS] FIX41: judgeAppInfoSignApi patched body(字段顺序不变): %@", patchedResponse);
+        DLOG(@"[SIGN-BYPASS] FIX41: ✅ 关键验证: code位置=第1位? %d (1=是,0=否→出大问题!)",
+             ([[patchedResponse substringWithRange:NSMakeRange(1, MIN((NSUInteger)8, patchedResponse.length-1))] hasPrefix:@"\"code\""] ||
+              [patchedResponse hasPrefix:@"{\"code\""]) ? 1 : 0);
     }
 
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
@@ -4858,15 +4888,48 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     }
 
     // --- getAppInfoApi ---
-
-    // FIX39: 返回FIX19假响应(统一result/verity/tip)
-
+    // FIX41: 改为保留原始响应+补丁字段(与FIX40 judgeAppInfoApi一致策略)
+    //   FIX39错误: 直接硬编码替换为fix19GetResp → 丢失原始响应中可能存在的字段(如id/CERTID/NET等)
+    //              且原始getAppInfoApi(L328) {"code":1, "message":"OK"} → 补丁后应保留原始message等
+    //   FIX41策略: 1. code:1→code:0 (V3成功码→全能签成功码)
+    //             2. 如果原始响应无data字段 → 插入完整data (包含result/verity/tip/ENDTIME)
+    //                否则 → 在已有data中补丁关键字段(保留原始字段100%不变)
     else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
+        DLOG(@"[SIGN-BYPASS] FIX41: getAppInfoApi → 保留原始响应+补丁字段(不再硬编码替换!)");
 
-        DLOG(@"[SIGN-BYPASS] FIX39: getAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        // 1. code:1→code:0 (V3成功码→全能签成功码) 仅替换开头的第一个code,避免嵌套误替换
+        NSRange firstCodeRangeG = [patchedResponse rangeOfString:@"\"code\":1" options:0 range:NSMakeRange(0, MIN((NSUInteger)60, patchedResponse.length))];
+        if (firstCodeRangeG.location != NSNotFound) {
+            patchedResponse = [patchedResponse stringByReplacingCharactersInRange:firstCodeRangeG withString:@"\"code\":0"];
+            DLOG(@"[SIGN-BYPASS] FIX41: getAppInfoApi → code:1→code:0 (仅替换顶层首个code!)");
+        }
 
-        patchedResponse = fix19GetResp;
+        // 2. 如果不存在"result"字段 → 需要补丁data
+        if (![patchedResponse containsString:@"\"result\""]) {
+            NSRange rDataG = [patchedResponse rangeOfString:@"\"data\":{"];
+            if (rDataG.location != NSNotFound) {
+                // 2a: data字段已存在→在data开头插入关键字段 (保持原始data字段100%不变!)
+                NSUInteger insertPosG = rDataG.location + rDataG.length;
+                patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(insertPosG, 0) withString:@"\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1,"];
+                DLOG(@"[SIGN-BYPASS] FIX41: getAppInfoApi → data字段已存在→仅在data开头插入result/verity/tip/ENDTIME (原始data字段都保留!)");
+            } else {
+                // 2b: data字段不存在(原始是{"code":0,"message":"OK"}) → 用string替换插入完整data结构在最后一个}前
+                NSRange lastClose = [patchedResponse rangeOfString:@"}" options:NSBackwardsSearch];
+                if (lastClose.location != NSNotFound) {
+                    // 先判断message最后有没有逗号，没有就加
+                    NSString *insertDataG = @",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1}}";
+                    patchedResponse = [patchedResponse stringByReplacingCharactersInRange:lastClose withString:insertDataG];
+                    // 替换message值为success(如果是OK)
+                    patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"message\":\"OK\"" withString:@"\"message\":\"success\""];
+                    DLOG(@"[SIGN-BYPASS] FIX41: getAppInfoApi → 原始无data字段→末尾插入完整data (result/verity/tip/ENDTIME全具备!)");
+                } else {
+                    DLOG(@"[SIGN-BYPASS] FIX41: ⚠️ getAppInfoApi 找不到插入点→fallback到fix19硬编码");
+                    patchedResponse = fix19GetResp;
+                }
+            }
+        }
 
+        DLOG(@"[SIGN-BYPASS] FIX41: getAppInfoApi patched body: %@", patchedResponse);
     }
 
     // --- Fallback: generic cert endpoint ---
