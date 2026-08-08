@@ -1860,7 +1860,7 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX39-FINAL: [ROOTCAUSE_A]judgeAppInfoSignApi_DELETED_sign_field→BROKE_全能签_MD5自校验→FIX:PRESERVE_sign/verity/tip+ONLYinsert_result:true; [ROOTCAUSE_B]patchSignatureResponse+installSignatureKitBypassHooks_STATIC_FUNCS_WERE_LINKER_DEADCODE_STRIPPED!!!→FIX:__attribute__((used))FORCE_KEEP; [ROOTCAUSE_C]NETPATCH_legacy_DOUBLE_PATCHED_judgeAppInfoApi_AFTER_correctPatch→OVERWROTE_RESPONSE→FIX:#if0_DISABLE_legacy; [DIAG]SignatureKit_judgeNet/judgeBase/handleResult/verifySig+SignatureCheck_JudgeApp/nettimes_FULL_state_tracing_INSTALLED";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX40: [ROOTCAUSE_D]judgeAppInfoApi_COMPLETELY_REPLACED→LOST_NET/CERTID/CERTNAME_FIELDS→GAME_NO_NETWORK_CONFIG→无网络连接!FIX:PRESERVE_ORIGINAL_RESPONSE+ONLY_PATCH_ENDTIME/END/OPEN/TIP/code/result; FIX39-FINAL: [ROOTCAUSE_A]judgeAppInfoSignApi_DELETED_sign_field→BROKE_全能签_MD5自校验→FIX:PRESERVE_sign/verity/tip+ONLYinsert_result:true; [ROOTCAUSE_B]patchSignatureResponse+installSignatureKitBypassHooks_STATIC_FUNCS_WERE_LINKER_DEADCODE_STRIPPED!!!→FIX:__attribute__((used))FORCE_KEEP; [ROOTCAUSE_C]NETPATCH_legacy_DOUBLE_PATCHED_judgeAppInfoApi_AFTER_correctPatch→OVERWROTE_RESPONSE→FIX:#if0_DISABLE_legacy; [DIAG]SignatureKit_judgeNet/judgeBase/handleResult/verifySig+SignatureCheck_JudgeApp/nettimes_FULL_state_tracing_INSTALLED";
 __attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX39-VERIFY: judgeAppInfoSignApi_preserve_sign_insert_result SK+SC_DIAG LCNET_ENTRY_LOG";  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
 
 
@@ -2703,7 +2703,7 @@ static void log_init(void) {
 
         setupSignalHandlers();
 
-        _log(@"=== WangXianHook v37.134-FIX39 loaded (铁证根因: FIX38失败=judgeAppInfoSignApi删sign字段→全能签MD5/sign自校验失败! FIX39: judgeAppInfoSignApi保留原始sign/timeStamp/randStr/limit字段+仅插入result:true! 同时新增SignatureKit/SignatureCheck完整状态机诊断hook(只打印不修改), 精确找到验签哪一步失败) ===");
+        _log(@"=== WangXianHook v37.134-FIX40 loaded (铁证根因: FIX38失败=judgeAppInfoSignApi删sign字段→全能签MD5/sign自校验失败! FIX39: judgeAppInfoSignApi保留原始sign/timeStamp/randStr/limit字段+仅插入result:true! 同时新增SignatureKit/SignatureCheck完整状态机诊断hook(只打印不修改), 精确找到验签哪一步失败) ===");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -4796,9 +4796,39 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
 
     else if (patchResponse && [url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
 
-        DLOG(@"[SIGN-BYPASS] FIX39: judgeAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        // FIX40: 铁证根因! FIX19成功版本是"补丁ENDTIME"不是"完全替换"!
+        //   FIX39错误: 完全替换为硬编码假响应 → 丢失原始data中NET/CERTID/CERTNAME/
+        //             LIMITGAP/REMARK/EFLAG/DAYS/CENDDATE/EMAIL/CREATETIME等字段
+        //             → 游戏无法获取网络配置 → 显示"无网络连接"!
+        //   FIX40策略: 保留原始响应body 100%, 只补丁关键字段:
+        //             ENDTIME延长 + END=0 + OPEN=1 + TIP=0 + code:1→0
+        //             + 插入result:true/verity:1 (如果不存在)
+        DLOG(@"[SIGN-BYPASS] FIX40: judgeAppInfoApi → 保留原始响应!仅补丁ENDTIME/END/OPEN/TIP/code/result(和FIX19成功版本一致!)");
 
-        patchedResponse = fix19GetResp;
+        // 1. ENDTIME延长到2027-12-31 (正则替换任何ENDTIME值)
+        NSRegularExpression *endRegex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^"]*\"" options:0 error:nil];
+        patchedResponse = [endRegex stringByReplacingMatchesInString:patchedResponse options:0 range:NSMakeRange(0, patchedResponse.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+
+        // 2. END=0 (大写字段名,和原始响应一致)
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+        // 3. OPEN=1
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        // 4. TIP=0 (大写,和原始响应一致)
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"TIP\":1" withString:@"\"TIP\":0"];
+        // 5. code:1→code:0 (V3成功码→全能签成功码)
+        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+
+        // 6. 插入result:true + verity:1 (如果data中不存在这些字段)
+        if (![patchedResponse containsString:@"\"result\""]) {
+            NSRange rData = [patchedResponse rangeOfString:@"\"data\":{"];
+            if (rData.location != NSNotFound) {
+                NSUInteger insertPos = rData.location + rData.length;
+                patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(insertPos, 0) withString:@"\"result\":true,\"verity\":1,"];
+                DLOG(@"[SIGN-BYPASS] FIX40: judgeAppInfoApi → data中插入result:true+verity:1");
+            }
+        }
+
+        DLOG(@"[SIGN-BYPASS] FIX40: judgeAppInfoApi patched body: %@", patchedResponse);
 
     }
 
