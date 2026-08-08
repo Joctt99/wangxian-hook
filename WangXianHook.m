@@ -4805,9 +4805,18 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         //             + 插入result:true/verity:1 (如果不存在)
         DLOG(@"[SIGN-BYPASS] FIX40: judgeAppInfoApi → 保留原始响应!仅补丁ENDTIME/END/OPEN/TIP/code/result(和FIX19成功版本一致!)");
 
-        // 1. ENDTIME延长到2027-12-31 (正则替换任何ENDTIME值)
-        NSRegularExpression *endRegex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^"]*\"" options:0 error:nil];
-        patchedResponse = [endRegex stringByReplacingMatchesInString:patchedResponse options:0 range:NSMakeRange(0, patchedResponse.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+        // 1. ENDTIME延长到2027-12-31 (字符串搜索替换,避免正则转义问题)
+        {
+            NSString *endKey = @"\"ENDTIME\":\"";
+            NSRange rEnd = [patchedResponse rangeOfString:endKey];
+            if (rEnd.location != NSNotFound) {
+                NSUInteger valStart = rEnd.location + rEnd.length;
+                NSRange rEndQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(valStart, patchedResponse.length - valStart)];
+                if (rEndQuote.location != NSNotFound) {
+                    patchedResponse = [patchedResponse stringByReplacingCharactersInRange:NSMakeRange(rEnd.location, rEndQuote.location + rEndQuote.length - rEnd.location) withString:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+                }
+            }
+        }
 
         // 2. END=0 (大写字段名,和原始响应一致)
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
