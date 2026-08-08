@@ -925,7 +925,10 @@ extern "C" kern_return_t mach_vm_remap(
 // FIX: Use `(void)((fmt), ##__VA_ARGS__)` — comma operator evaluates ALL args,
 // then discards the result. Zero output while preserving ALL side effects.
 // Set to 0 during development to re-enable full diagnostics.
-#define SILENT_DIST_MODE 0  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
+#define SILENT_DIST_MODE 0
+
+// FIX39: Non-DLOG global marker that NEVER gets optimized out (for binary verification)
+const char* FIX39_VERIFY_MARKER = "v37.134-FIX39-VERIFY: judgeAppInfoSignApi_preserve_sign_insert_result SK+SC_DIAG LCNET_ENTRY_LOG";  // v37.123-DIAG: Enable logs to diagnose fresh-install network failure
 
 #if SILENT_DIST_MODE
 #define DLOG(fmt, ...) do { (void)((fmt), ##__VA_ARGS__); } while(0)
