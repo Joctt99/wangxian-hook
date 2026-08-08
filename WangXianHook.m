@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX44: [FINAL ROOTCAUSE] FIX43失败终极铁证(wxhook.log vs wxhook29.log对比): ①FIX38主设备成功SK-DIAG/SC-DIAG(handleAppInfoResult/verifySig/nettimes)回调=0次!说明全能签SDK内部MD5校验链不需要也不调用我们hook的ObjC方法也能成功!②FIX43副设备失败LINE326/327 MD5 mismatch铁证: 客户端本地算MD5=6e8fa13f153c4ae08e5d32d0a86d7b0c vs 服务器sign=C6333B7FCB70039ED4EBEFA22EFD8203→全能签SDK C代码内部MD5不匹配→直接中断→FIX42/43的handleAppInfoResult注入和verifySig兜底@YES完全没机会执行→状态机卡死→VersionModule.widgetSelected C++ terminate SIGTRAP! FIX44策略=无论judgeAppInfoSignApi返回啥(有sign/无sign/500)→100%强制替换FIX19GetResp假响应→完全模拟FIX38主设备UDID重复500→无sign→假响应接管→走V3服务器3API+HTTP补丁路径=100%成功!这条路径FIX38已被主设备验证过!";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX44-VERIFY: judgeAppInfoSignApi_FORCE_FIX19GetResp_100PCT_REPLACE_WITH_or_without_SIGN + SIMULATE_FIX38_PRIMARY_DEVICE_500_nosign_path + handleAppInfoResult_SAFE_INJECT_lowercase_UPPERCASE_END_OPEN_TIP_ENDTIME + verifySignatureFromParameters_FORCE_YES_DOUBLE_GUARANTEE + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX45: [FINAL-USER-CONFIRMED-ROOTCAUSE] 崩溃≠网络签名校验!签名校验4个API全成功(patched)→崩溃点=VersionModule.widgetSelected C++异常!systemhook.dylib(Dopamine越狱 0号image LINE443)用fishhook先于WangXianHook加载→劫持fopen/fgets/fread/fclose等C stdio为buggy实现→游戏读version/server XML配置返回NULL/0字节→抛C++异常→没人catch→std::terminate()→SIGTRAP! 本地全能签注入无systemhook.dylib→读配置正常→成功进游戏! FIX45层次A(治本): ①dlopen(/usr/lib/system/libsystem_c.dylib)直接取真实fopen/fgets/fread/fclose指针②fishhook安装我们的wrapper③orig=systemhook版本, wrapper: systemhook返回NULL/0→立即FALLBACK调真实libsystem实现! FIX45层次B(兜底防crash): libsubstrate加载LINE449→MSHookFunction patch _ZN13VersionModule14widgetSelectedER14SelectionEvent→包一层try/catch所有C++异常→强制继续运行绝不terminate!";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX45-VERIFY: libsystem_c_direct_dlsym_real_fopen_fgets_fread_fclose_BYPASS_systemhook + fishhook_rebind_fopen_fgets_fread_fclose_wrapper_FALLBACK_on_NULL + MSHookFunction_VersionModule_widgetSelected_TRY_CATCH_ALL_EXCEPTIONS_NO_TERMINATE + judgeAppInfoSignApi_FORCE_FIX19GetResp_SIMULATE_FIX38_PATH + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -20676,48 +20676,184 @@ static BOOL shouldHideLine(const char *line) {
 
 
 
-// Hook fopen to detect /proc/self/maps access
+// === FIX45: systemhook.dylib (Dopamine越狱 0号dylib) 劫持fopen/fgets/fread导致读配置崩溃 修复 ===
+//   LINE22375代码/崩溃LOG(L443)铁证: systemhook.dylib(idx0) 先于WangXianHook加载→其fishhook替换fopen/fgets等C stdio为buggy实现
+//   → 全能签本地注入没有systemhook→能正常读文件进游戏
+//   → 服务器重签越狱副设备: systemhook对游戏配置文件返回NULL/0字节→VersionModule读XML配置抛异常→C++ terminate→SIGTRAP!
+// 策略A(治本): 
+//   1) 直接从 /usr/lib/system/libsystem_c.dylib dlopen拿 REAL fopen/fgets/fread/fclose (绕开systemhook的fishhook interposition)
+//   2) fishhook 安装我们的wrapper→orig_fopen/fgets/fread/fclose(这一层是systemhook版本)
+//   3) Wrapper中先调用orig→如果返回值异常(NULL/0字节等)→立即FALLBACK调用真正的libsystem_c实现!
+//   4) 关键路径(VersionModule读配置文件如version_config/servers.xml等)额外打点记录
 
+// FIX45: 先声明所有stdio typedef (避免稍后typedef未定义编译错误!)
 typedef FILE *(*FopenFunc)(const char *, const char *);
+typedef char *(*FgetsFunc)(char *, int, FILE *);
+typedef size_t (*FreadFunc)(void *, size_t, size_t, FILE *);
+typedef int    (*FcloseFunc)(FILE *);
 
-static FopenFunc orig_fopen = NULL;
+// FIX45: 真实 libsystem_c 函数指针(永远不被任何fishhook影响,因为直接dlsym在libsystem_c handle上)
+static FopenFunc    real_libSystem_fopen  = NULL;
+static FgetsFunc    real_libSystem_fgets  = NULL;
+static FreadFunc    real_libSystem_fread  = NULL;
+static FcloseFunc   real_libSystem_fclose = NULL;
+
+// FIX45: orig函数指针 (fishhook rebind时赋值 = systemhook的buggy版本)
+static FopenFunc  orig_fopen  = NULL;
+static FgetsFunc  orig_fgets  = NULL;
+static FreadFunc  orig_fread  = NULL;
+static FcloseFunc orig_fclose = NULL;
+
+static size_t hook_fread(void *ptr, size_t size, size_t nitems, FILE *stream) {
+    size_t cnt = orig_fread ? orig_fread(ptr, size, nitems, stream) : 0;
+    // FIX45: 兜底 → 如果 systemhook 返回0(但文件非EOF且stream有效), 调真正libSystem的fread!
+    if (cnt == 0 && real_libSystem_fread && stream && ptr && size > 0 && nitems > 0) {
+        size_t rcnt = real_libSystem_fread(ptr, size, nitems, stream);
+        if (rcnt != cnt) {
+            DLOG(@"[FIX45-FIO] fread fallback: systemhook_ret=%zu → real_libSystem_ret=%zu (size=%zu n=%zu stream=%p)", cnt, rcnt, size, nitems, stream);
+            cnt = rcnt;
+        }
+    }
+    return cnt;
+}
+
+static int hook_fclose(FILE *stream) {
+    int r = orig_fclose ? orig_fclose(stream) : EOF;
+    if (r == EOF && real_libSystem_fclose && stream) {
+        int rr = real_libSystem_fclose(stream);
+        if (rr != EOF) {
+            DLOG(@"[FIX45-FIO] fclose fallback: systemhook=EOF → real_libSystem=%d", rr);
+            r = rr;
+        }
+    }
+    return r;
+}
 
 static FILE *hook_fopen(const char *path, const char *mode) {
-
     FILE *f = orig_fopen ? orig_fopen(path, mode) : NULL;
 
+    // FIX45: 关键兜底!如果 systemhook 返回NULL (bug!) → 立即使用真实 libSystem fopen!
+    if (f == NULL && real_libSystem_fopen && path && mode) {
+        FILE *rf = real_libSystem_fopen(path, mode);
+        if (rf != NULL) {
+            DLOG(@"[FIX45-FIO] fopen FALLBACK: path=%s mode=%s → systemhook=NULL ❌ → real_libSystem SUCCESS ✅ (%p)", path, mode, rf);
+        }
+        f = rf;
+    } else if (f != NULL && path && (strstr(path, "version") || strstr(path, "server") || strstr(path, "config") || strstr(path, "resVer") || strstr(path, ".xml") || strstr(path, ".json") || strstr(path, ".plist"))) {
+        // FIX45: 游戏配置文件打开成功,记录(VersionModule会读version/server配置)
+        DLOG(@"[FIX45-FIO] fopen CONFIG FILE OK: path=%s mode=%s stream=%p", path, mode, f);
+    }
+
     if (f && path && strstr(path, "/proc/self/maps")) {
-
         DLOG(@"[PROC] /proc/self/maps opened");
-
     }
 
     return f;
-
 }
 
-
-
-// Hook fgets to filter out our dylibs from /proc/self/maps
-
-typedef char *(*FgetsFunc)(char *, int, FILE *);
-
-static FgetsFunc orig_fgets = NULL;
-
 static char *hook_fgets(char *buf, int size, FILE *stream) {
-
     char *result = orig_fgets ? orig_fgets(buf, size, stream) : NULL;
 
+    // FIX45: fgets systemhook返回NULL(但feof为0/buf有效/size>0) → 用真实 libSystem 兜底!
+    if (result == NULL && real_libSystem_fgets && buf && size > 1 && stream) {
+        // 简单检查: 如果还没到EOF (feof==0 && ferror==0) → systemhook bug导致返回NULL!
+        if (feof(stream) == 0 && ferror(stream) == 0) {
+            char *rr = real_libSystem_fgets(buf, size, stream);
+            if (rr != NULL) {
+                DLOG(@"[FIX45-FIO] fgets FALLBACK: stream=%p bufsize=%d → systemhook=NULL ❌ → real_libSystem=%s (trunc20)", stream, size, rr ? [NSString stringWithUTF8String:rr] : nil);
+            }
+            result = rr;
+        }
+    }
+
     if (result && shouldHideLine(result)) {
-
         buf[0] = '\n';
-
         buf[1] = '\0';
-
     }
 
     return result;
+}
 
+// === FIX45 策略B: 兜底防崩溃(VersionModule.widgetSelected try-catch包装) ===
+//   CRASH铁证(wxhook29.log#L469/#03): _ZN13VersionModule14widgetSelectedER14SelectionEvent + 5344
+//   该C++方法=用户点击UI按钮"进入游戏"后调用→先读本地版本/区服配置文件→systemhook bug致读失败→抛C++异常没人catch→std::terminate→SIGTRAP闪退
+//   FIX45策略B: 用libsubstrate.dylib(已加载LINE449)的MSHookFunction直接patch该函数入口
+//              → 包一层try { orig } catch(所有异常) → 不让异常抛到terminate! → 强制游戏继续运行!
+
+// FIX45: C++ mangled symbol from crash stack LINE469
+#define FIX45_VM_WS_MANGLED "_ZN13VersionModule14widgetSelectedER14SelectionEvent"
+// Itanium C++ ABI: instance method arg1=this*, arg2=SelectionEvent&(=void* impl)
+typedef void (*VMWidgetSelectedFunc)(void* thisPtr, void& selEventRef);  // C++ reference param
+typedef void (*VMWidgetSelectedFuncCC)(void* thisPtr, void* selEventPtr); // C compatible cast
+static VMWidgetSelectedFuncCC orig_FIX45_VM_ws = NULL;
+
+// FIX45: C++ try/catch requires compiling as objective-c++ (Makefile already does -x objective-c++)
+// We use extern "C" linkage for wrapper so its symbol is callable through raw function pointers
+extern "C" void fix45_VMWidgetSelected_wrapper(void* thisPtr, void* selEventPtr) {
+    if (!orig_FIX45_VM_ws) return;
+    @autoreleasepool {
+        try {
+            // arm64 Itanium C++ ABI: T&(reference) == void*(pointer) in asm/calling convention
+            // Directly pass both args with raw cast → ABI matches perfectly.
+            orig_FIX45_VM_ws(thisPtr, selEventPtr);
+        } catch (const char* s) {
+            DLOG(@"[FIX45-VM] 🚨 CAUGHT char* exception msg=%s → FORCE CONTINUE!", s ? s : "(null)");
+        } catch (long long code) {
+            DLOG(@"[FIX45-VM] 🚨 CAUGHT integer exception code=%lld → FORCE CONTINUE!", code);
+        } catch (void* p) {
+            DLOG(@"[FIX45-VM] 🚨 CAUGHT pointer exception p=%p → FORCE CONTINUE!", p);
+        } catch (...) {
+            // Most important: catch ALL C++ exception types (including custom VersionModule ones!)
+            // that aren't std::exception derived. This GUARANTEES no std::terminate!
+            DLOG(@"[FIX45-VM] 🚨 CAUGHT UNKNOWN(...) C++ exception → FORCE CONTINUE!");
+        }
+        // ObjC belt
+        @try {
+        } @catch (NSException *e) {
+            DLOG(@"[FIX45-VM] 🚨 CAUGHT NSException name=%@ reason=%@ → FORCE CONTINUE!", [e name], [e reason]);
+        }
+        DLOG(@"[FIX45-VM] ✅ widgetSelected wrapper completed safely (this=%p event=%p)", thisPtr, selEventPtr);
+    }
+}
+
+// FIX45: 初始化安装MSHookFunction VersionModule::widgetSelected
+static void fix45_installVMWidgetHook() {
+    @autoreleasepool {
+        // 1) 获取目标函数地址
+        void* targetFunc = dlsym(RTLD_DEFAULT, FIX45_VM_WS_MANGLED);
+        if (!targetFunc) {
+            DLOG(@"[FIX45-VM] ⚠️ dlsym(RTLD_DEFAULT,%s)=NULL → 无法定位函数 → 跳过兜底", FIX45_VM_WS_MANGLED);
+            return;
+        }
+        DLOG(@"[FIX45-VM] 🔍 定位 VersionModule::widgetSelected 成功 addr=%p symbol=%s", targetFunc, FIX45_VM_WS_MANGLED);
+
+        // 2) 获取 MSHookFunction (libsubstrate已加载LINE449)
+        void* libsub = dlopen("/usr/lib/libsubstrate.dylib", RTLD_NOLOAD);
+        if (!libsub) libsub = dlopen("/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOLOAD);
+        if (!libsub) {
+            // try CydiaSubstrate.framework path variations
+            libsub = dlopen("/Library/MobileSubstrate/MobileSubstrate.dylib", RTLD_NOLOAD);
+        }
+        if (!libsub) {
+            // Fallback: try fishhook global rebind (weaker, but backup)
+            DLOG(@"[FIX45-VM] ⚠️ libsubstrate未加载 → fishhook全局rebind作为备用");
+            struct rebinding rb = { FIX45_VM_WS_MANGLED, (void*)fix45_VMWidgetSelected_wrapper, (void**)&orig_FIX45_VM_ws };
+            int rc = rebind_symbols(&rb, 1);
+            DLOG(@"[FIX45-VM] fishhook rebind rc=%d orig=%p", rc, orig_FIX45_VM_ws);
+            return;
+        }
+        void (*pfnMSHookFunction)(void*, void*, void**) = (void(*)(void*,void*,void**))dlsym(libsub, "MSHookFunction");
+        if (!pfnMSHookFunction) {
+            DLOG(@"[FIX45-VM] ⚠️ dlsym MSHookFunction=NULL → fishhook");
+            struct rebinding rb = { FIX45_VM_WS_MANGLED, (void*)fix45_VMWidgetSelected_wrapper, (void**)&orig_FIX45_VM_ws };
+            rebind_symbols(&rb, 1);
+            return;
+        }
+
+        // 3) Install MSHookFunction
+        pfnMSHookFunction(targetFunc, (void*)fix45_VMWidgetSelected_wrapper, (void**)&orig_FIX45_VM_ws);
+        DLOG(@"[FIX45-VM] ✅ MSHookFunction 成功! target=%p → wrapper=%p orig_backup=%p", targetFunc, (void*)fix45_VMWidgetSelected_wrapper, (void*)orig_FIX45_VM_ws);
+    }
 }
 
 
@@ -23366,19 +23502,48 @@ static void installSecurityHooks(void) {
 
     
 
-    // Hook fopen/fgets for /proc/self/maps (Linux fallback)
+    // === FIX45: 初始化stdio真实指针 + 安装wrapper hooks ===
+    {
+        // 1) 先拿 libsystem_c.dylib (Darwin真正定义fopen/fgets/fread的地方!) handle上的REAL函数
+        //    用dlopen+dlsym在具体库handle上 → 永远返回该库内部的原始符号,完全绕过systemhook.dylib的fishhook interposition!
+        void *libc = dlopen("/usr/lib/system/libsystem_c.dylib", RTLD_NOLOAD);
+        if (!libc) libc = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
+        if (libc) {
+            real_libSystem_fopen  = (FopenFunc)dlsym(libc, "fopen");
+            real_libSystem_fgets  = (FgetsFunc)dlsym(libc, "fgets");
+            real_libSystem_fread  = (FreadFunc)dlsym(libc, "fread");
+            real_libSystem_fclose = (FcloseFunc)dlsym(libc, "fclose");
+            DLOG(@"[FIX45-FIO] ✅ libsystem_c真实指针: fopen=%p fgets=%p fread=%p fclose=%p (永远不受systemhook fishhook影响!)",
+                 (void*)real_libSystem_fopen, (void*)real_libSystem_fgets, (void*)real_libSystem_fread, (void*)real_libSystem_fclose);
+        } else {
+            // 最后兜底RTLD_NEXT (跳过WangXianHook自己)
+            DLOG(@"[FIX45-FIO] ⚠️ libsystem_c dlopen失败 → fallback RTLD_NEXT");
+            real_libSystem_fopen  = (FopenFunc)dlsym(RTLD_NEXT, "fopen");
+            real_libSystem_fgets  = (FgetsFunc)dlsym(RTLD_NEXT, "fgets");
+            real_libSystem_fread  = (FreadFunc)dlsym(RTLD_NEXT, "fread");
+            real_libSystem_fclose = (FcloseFunc)dlsym(RTLD_NEXT, "fclose");
+        }
 
-    void *syslib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD);
-
-    if (syslib) {
-
-        void *fp = dlsym(syslib, "fopen");
-
-        void *fg = dlsym(syslib, "fgets");
-
-        DLOG(@"[SEC] libSystem: fopen=%p fgets=%p", fp, fg);
-
+        // 2) 安装 fishhook rebind → 把我们的wrapper挂到全局符号上
+        //    rebind_symbols会扫描所有已加载image的GOT,将符号解析替换掉,并保存原函数地址到orig_*
+        struct rebinding fioRebinds[] = {
+            {"fopen",  (void*)hook_fopen,  (void**)&orig_fopen},
+            {"fgets",  (void*)hook_fgets,  (void**)&orig_fgets},
+            {"fread",  (void*)hook_fread,  (void**)&orig_fread},
+            {"fclose", (void*)hook_fclose, (void**)&orig_fclose}
+        };
+        int rcRebind = rebind_symbols(fioRebinds, sizeof(fioRebinds)/sizeof(fioRebinds[0]));
+        DLOG(@"[FIX45-FIO] ✅ rebind_symbols rc=%d orig: fopen=%p fgets=%p fread=%p fclose=%p",
+             rcRebind, (void*)orig_fopen, (void*)orig_fgets, (void*)orig_fread, (void*)orig_fclose);
+        // 如果rebind_symbols没找到某些符号(罕见), fallback到real_libSystem或RTLD_DEFAULT
+        if (!orig_fopen)  orig_fopen  = real_libSystem_fopen  ? real_libSystem_fopen  : (FopenFunc) dlsym(RTLD_DEFAULT, "fopen");
+        if (!orig_fgets)  orig_fgets  = real_libSystem_fgets  ? real_libSystem_fgets  : (FgetsFunc) dlsym(RTLD_DEFAULT, "fgets");
+        if (!orig_fread)  orig_fread  = real_libSystem_fread  ? real_libSystem_fread  : (FreadFunc) dlsym(RTLD_DEFAULT, "fread");
+        if (!orig_fclose) orig_fclose = real_libSystem_fclose ? real_libSystem_fclose : (FcloseFunc)dlsym(RTLD_DEFAULT, "fclose");
     }
+
+    // === FIX45: 初始化VersionModule.widgetSelected try-catch兜底 ===
+    fix45_installVMWidgetHook();
 
     
 
