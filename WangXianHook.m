@@ -1077,7 +1077,7 @@ static void fix31_writeCrashFile(NSString *summary, void *callstackArr[], int fr
         
         NSMutableString *s = [NSMutableString stringWithCapacity:4096];
         [s appendString:@"============================================================\n"];
-        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX37 ===\n"];
+        [s appendFormat:@"=== WXHOOK CRASH REPORT v37.134-FIX38 ===\n"];
         [s appendString:@"============================================================\n"];
         [s appendFormat:@"Date:       %@\n", [NSDate date]];
         [s appendFormat:@"PID:        %d\n", (int)getpid()];
@@ -1346,7 +1346,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX37 loaded (铁证根因: FIX36的UNIVERSAL injector对judgeAppInfoSignApi响应做了NSJSONSerialization重新序列化→JSON字段顺序改变+添加额外字段→data.sign(MD5签名)验证失败→游戏判定签名无效→显示无网络连接! 实际上原始响应已经是成功的(code:0,verity:1,tip:0,end:0,open:1)! FIX37: 1)含sign字段的响应完全跳过smart patch+safety net+UNIVERSAL injector→保持原始JSON不变→sign验证通过; 2)无sign字段的响应(postAppInfoApi/getAppInfoApi)仍正常应用UNIVERSAL injector) ===");
+        _log(@"=== WangXianHook v37.134-FIX38 loaded (铁证根因: FIX19成功=LCNetworking假响应; GET={code:0,data:{result:true,verity:1,tip:0,END,OPEN,ENDTIME,id,COUNT,MAXLIMIT}} POST={code:0,message:OK,无data!}; FIX37失败=judgeAppInfoSignApi缺result字段+postAppInfoApi被UNIVERSAL injector错误添加data字段! FIX38: 所有4个API返回与FIX19完全相同的假响应,UNIVERSAL injector完全禁用) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2098,99 +2098,43 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     // "sign", "timeStamp", "randStr" that the game needs for subsequent verification.
 
     NSString *patchedResponse = body ?: @"";
-    // FIX34: 总是patchResponse=YES! 不再区分V3/全能签!
-    // 铁证: FIX19成功时也是无条件patch code:1→0+构建full data → 两种环境都成功
-    // FIX29-33的错误在于尝试区分V3/全能签→导致要么跳过(无网络)要么不改(SIGSEGV)
-    // FIX34: 不装zsign hook(防anti-tampering)+总是构建full data(data字段存在→不SIGSEGV)
     BOOL patchResponse = YES;
+
+    // FIX38: 铁证根因修复! 对比FIX19 LCNetworking假响应(成功) vs FIX37真实响应(失败):
+    //   FIX19 LCNetworking对GET请求返回: {code:0, data:{result:true,verity:1,tip:0,ENDTIME,END:0,OPEN:1,id,COUNT,MAXLIMIT}}
+    //   FIX19 LCNetworking对POST请求返回: {code:0, message:"OK"} (无data!)
+    //   FIX37真实响应: judgeAppInfoSignApi有sign但缺result字段→游戏判失败→无网络
+    //   FIX37错误: postAppInfoApi被UNIVERSAL injector添加了data字段→游戏可能解析出错
+    // FIX38: 所有4个签名API返回与FIX19完全相同的假响应,绕过服务器真实响应!
+
+    // FIX19假响应: GET请求用(含完整data结构)
+    NSString *fix19GetResp = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"END\":0,\"OPEN\":1,\"id\":11927,\"COUNT\":0,\"MAXLIMIT\":5000}}";
+    // FIX19假响应: POST请求用(无data字段!)
+    NSString *fix19PostResp = @"{\"code\":0,\"message\":\"OK\"}";
 
     // --- judgeAppInfoSignApi (cert.qunhongtech.com) ---
     if (patchResponse && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"verifySign"] || [url containsString:@"checkSign"])) {
-        // FIX37: 如果响应已含sign字段(MD5签名),不做任何字符串替换!
-        // 任何对JSON字符串的修改(即使值不变)都可能影响游戏端的sign验证
-        if ([patchedResponse containsString:@"\"sign\":"]) {
-            DLOG(@"[SIGN-BYPASS] FIX37: judgeAppInfoSignApi 含sign字段 → 完全跳过smart patch(保持原始JSON→sign验证通过)");
-        } else if (![patchedResponse containsString:@"verity"]) {
-            // v37.134-FIX4: Server returned error (HTTP 500) — use UNIVERSAL success response
-            // with ALL fields the game needs: result, verity, tip, ENDTIME, END, OPEN
-            // Previous minimal response (missing ENDTIME/END/OPEN) caused login stuck!
-            DLOG(@"[SIGN-BYPASS] v37.134-FIX4: judgeAppInfoSignApi server error — using UNIVERSAL success response");
-            patchedResponse = @"{\"code\":0,\"message\":\"success\",\"data\":{\"result\":true,\"verity\":1,\"tip\":0,\"ENDTIME\":\"2027-12-31\",\"END\":0,\"OPEN\":1}}";
-        } else {
-            DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoSignApi (smart patch, no sign field)");
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"verity\":0" withString:@"\"verity\":1"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"tip\":1" withString:@"\"tip\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"end\":1" withString:@"\"end\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"open\":0" withString:@"\"open\":1"];
-            patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-        }
+        DLOG(@"[SIGN-BYPASS] FIX38: judgeAppInfoSignApi → 返回FIX19假响应(有result字段,无sign字段→游戏不验证sign)");
+        patchedResponse = fix19GetResp;
     }
     // --- judgeAppInfoApi (ln_sign_cert.9iy.com) ---
     else if (patchResponse && [url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
-        DLOG(@"[SIGN-BYPASS] v37.134: Format: judgeAppInfoApi (smart ENDTIME patch)");
-        NSRange start = [patchedResponse rangeOfString:@"\"ENDTIME\":\""];
-        if (start.location != NSNotFound) {
-            NSRange endQuote = [patchedResponse rangeOfString:@"\"" options:0 range:NSMakeRange(start.location + start.length, patchedResponse.length - start.location - start.length)];
-            if (endQuote.location != NSNotFound) {
-                patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:
-                    [patchedResponse substringWithRange:NSMakeRange(start.location + start.length, endQuote.location - start.location - start.length)]
-                    withString:@"2027-12-31 23:59:59"];
-            }
-        }
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+        DLOG(@"[SIGN-BYPASS] FIX38: judgeAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        patchedResponse = fix19GetResp;
     }
     // --- postAppInfoApi ---
-    // FIX35: V3服务器(ln_sign_cert.9iy.com)的postAppInfoApi返回code:1=V3协议成功码!
-    //        不能改成code:0(V3协议中code:0=失败)! FIX34错误地改了→V3验证失败→无网络!
-    //        3版本铁证: FIX31 code:1(正确)但无data→SIGSEGV; FIX34 code:0(错误)→无网络;
-    //                   FIX35 code:1(正确V3成功)+不改 → 应该成功!
+    // FIX38: 返回FIX19假响应 {code:0, message:"OK"} — 无data字段!
+    //   铁证: FIX19 LCNetworking POST假响应 = {code:0, message:"OK"} (无data)
+    //   FIX36/37错误: UNIVERSAL injector给postAppInfoApi添加了data字段→游戏解析出错
     else if (patchResponse && [url containsString:@"postAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX35: postAppInfoApi → 保持code:1不变(V3协议成功码=1, 不改成code:0=失败!)");
-        // 不做任何修改! 直接返回服务器原始response
+        DLOG(@"[SIGN-BYPASS] FIX38: postAppInfoApi → 返回FIX19假响应(code:0+message:OK, 无data字段!)");
+        patchedResponse = fix19PostResp;
     }
     // --- getAppInfoApi ---
-    // FIX35: V3服务器(ln_sign_cert.9iy.com)的getAppInfoApi返回code:1=V3协议成功码!
-    //        保持code:1 + 添加full data结构 → SignatureCheck.nettimes能解析data.ENDTIME → 不SIGSEGV
-    //        3版本铁证: FIX31 code:1正确但无data→SIGSEGV; FIX34 code:0错误→无网络;
-    //                   FIX35 code:1(正确)+full data(data字段存在→nettimes不SIGSEGV) → 应该成功!
+    // FIX38: 返回FIX19假响应(统一result/verity/tip)
     else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX35: getAppInfoApi → 保持code:1(V3成功)+添加full data(data字段存在→SignatureCheck.nettimes不SIGSEGV)");
-        // Build complete response with code:1 (V3 success) + data structure (for nettimes)
-        NSDictionary *fullResp = @{
-            @"code": @1,
-            @"message": @"OK",
-            @"data": @{
-                @"id": @11927,
-                @"CREATETIME": @"2025-04-16 11:47:08",
-                @"COUNT": @0,
-                @"MAXLIMIT": @5000,
-                @"NAME": @"",
-                @"APPID": @"com.sqage.wangxianapp",
-                @"OPEN": @1,
-                @"END": @0,
-                @"ENDTIME": @"2027-12-31 23:59:59",
-                @"CENDDATE": [NSNull null],
-                @"EMAIL": [NSNull null],
-                @"EFLAG": @0,
-                @"DAYS": [NSNull null],
-                @"CERTID": @1,
-                @"CERTNAME": [NSNull null],
-                @"LIMITGAP": [NSNull null],
-                @"TIP": @0,
-                @"REMARK": [NSNull null],
-                @"NET": [NSNull null]
-            }
-        };
-        NSError *err = nil;
-        NSData *json = [NSJSONSerialization dataWithJSONObject:fullResp options:0 error:&err];
-        if (!err && json) {
-            patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        } else {
-            // Fallback with minimal data structure + code:1 (V3 success)
-            patchedResponse = @"{\"code\":1,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
-        }
+        DLOG(@"[SIGN-BYPASS] FIX38: getAppInfoApi → 返回FIX19假响应(统一result/verity/tip)");
+        patchedResponse = fix19GetResp;
     }
     // --- Fallback: generic cert endpoint ---
     else if (patchResponse) {
@@ -2211,72 +2155,11 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         DLOG(@"[SIGN-BYPASS] FIX37: Safety net SKIPPED (含sign字段, 保持原始JSON不变→sign验证通过)");
     }
 
-    // FIX37: UNIVERSAL SUCCESS FIELD INJECTOR — 根因修复!
-    // 铁证(日志wxhook 22.log): judgeAppInfoSignApi原始响应已含sign字段(MD5签名),
-    //   UNIVERSAL injector重新序列化JSON→字段顺序改变+添加额外字段→sign验证失败→无网络!
-    //   修复: 如果data含sign字段,跳过UNIVERSAL injector(保持原始JSON不被重新序列化)
-    //   其他API(judgeAppInfoApi/postAppInfoApi/getAppInfoApi)没有sign字段,UNIVERSAL injector安全
-    if (patchResponse && ![patchedResponse containsString:@"\"sign\":"]) {
-        // 只对没有sign字段的响应应用UNIVERSAL injector
-        NSError *jerr = nil;
-        id jsonObj = [NSJSONSerialization JSONObjectWithData:[patchedResponse dataUsingEncoding:NSUTF8StringEncoding]
-                                                      options:NSJSONReadingAllowFragments error:&jerr];
-        NSMutableDictionary *topDict = nil;
-        if (jerr || ![jsonObj isKindOfClass:[NSDictionary class]]) {
-            // JSON解析失败 → 用通用成功响应做兜底
-            DLOG(@"[SIGN-BYPASS] FIX37: JSON parse failed (%@), using universal fallback", jerr.localizedDescription ?: @"unknown");
-            topDict = [NSMutableDictionary dictionary];
-            topDict[@"code"] = @0;
-            topDict[@"message"] = @"OK";
-        } else {
-            topDict = [jsonObj mutableCopy];
-        }
-        // 1. 顶层保证 code=0
-        topDict[@"code"] = @0;
-        if (!topDict[@"message"]) topDict[@"message"] = @"OK";
-
-        // 2. 保证 data 是可变字典 (没有就创建, 不是字典就替换)
-        NSMutableDictionary *dataDict = nil;
-        id existingData = topDict[@"data"];
-        if ([existingData isKindOfClass:[NSDictionary class]]) {
-            dataDict = [existingData mutableCopy];
-        } else {
-            dataDict = [NSMutableDictionary dictionary];
-            // 保留已有的id/ENDTIME/COUNT/MAXLIMIT字段 (如果data存在但是不是字典, 就用默认)
-            if ([existingData isKindOfClass:[NSString class]] && [existingData length] > 0) {
-                // data是字符串(罕见), 不丢信息, 存result里
-                dataDict[@"raw"] = existingData;
-            }
-        }
-
-        // 3. FIX36核心: 注入6个状态机必需字段 (无论原来有没有都覆盖成正确值)
-        //    铁证对比FIX19 LCNetworking假响应: result/verity/tip是关键字段!
-        dataDict[@"result"] = @YES;                    // FIX35及之前: 缺失 ✗
-        dataDict[@"verity"] = @1;                      // FIX35及之前: 缺失 ✗
-        dataDict[@"tip"]    = @0;                      // FIX35及之前: 只有大写TIP≠tip ✗ (这次补小写!)
-        dataDict[@"END"]    = @0;                      // 未结束
-        dataDict[@"OPEN"]   = @1;                      // 开放
-        dataDict[@"ENDTIME"]= @"2027-12-31 23:59:59";  // 延长有效期
-
-        // 4. 补充兼容字段 (如果原来没有就加上, 保持V3响应的id/COUNT/MAXLIMIT不变)
-        if (!dataDict[@"id"])       dataDict[@"id"]       = @11927;
-        if (!dataDict[@"COUNT"])    dataDict[@"COUNT"]    = @0;
-        if (!dataDict[@"MAXLIMIT"]) dataDict[@"MAXLIMIT"] = @5000;
-        if (!dataDict[@"APPID"])    dataDict[@"APPID"]    = @"com.sqage.wangxianapp";
-
-        // 5. 把处理好的data写回顶层
-        topDict[@"data"] = dataDict;
-
-        // 6. 重新序列化为JSON字符串
-        NSData *finalJson = [NSJSONSerialization dataWithJSONObject:topDict options:0 error:nil];
-        if (finalJson) {
-            patchedResponse = [[NSString alloc] initWithData:finalJson encoding:NSUTF8StringEncoding];
-            DLOG(@"[SIGN-BYPASS] FIX37: UNIVERSAL injector applied → code=0 + data{result=YES,verity=1,tip=0,END=0,OPEN=1,ENDTIME=2027} GUARANTEED (跳过含sign的响应)");
-        } else {
-            // 序列化失败兜底: 字符串替换的方式硬塞字段 (极少见, 但保证安全)
-            DLOG(@"[SIGN-BYPASS] FIX37: WARN - final JSON serialize failed, fallback string inject");
-        }
-    }
+    // FIX38: UNIVERSAL injector 已禁用!
+    // 原因: FIX19 LCNetworking假响应对每个API返回不同的假响应(GET=data, POST=无data)
+    //        UNIVERSAL injector统一添加data字段给所有API→postAppInfoApi不应有data→游戏出错
+    // FIX38: 所有4个API在各分支中已有明确的FIX19假响应,不再需要UNIVERSAL injector
+    DLOG(@"[SIGN-BYPASS] FIX38: UNIVERSAL injector DISABLED (all 4 APIs use FIX19 fake responses)");
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
     DLOG(@"[SIGN-BYPASS] v37.134: Patched body: %@", patchedResponse);
