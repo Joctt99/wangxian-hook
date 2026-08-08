@@ -3091,7 +3091,7 @@ static void diagSK_handleResult(id self, SEL _cmd, id result) {
                 }
             }
             if (fixedResp) {
-                DLOG(@"[FIX42] handleAppInfoResult: ✅ 字段修复(SIGN校验后,100%安全!) orig=%@ → FIXED=%@", result, fixedResp);
+                DLOG(@"[FIX43] handleAppInfoResult: ✅ 字段修复(SIGN校验后,100%%安全!) orig=%@ → FIXED=%@", result, fixedResp);
                 result = fixedResp;  // pass fixed version to original handler below
             } else {
                 DLOG(@"[FIX42] handleAppInfoResult: ℹ️ result字段齐全(含result/verity/tip+code=0),无需修复");
@@ -4915,12 +4915,12 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         BOOL hasSign = [patchedResponse containsString:@"\"sign\""];
         if (hasSign) {
             // CASE A: sign字段存在→全能签server正常返回→100%返回原始字节!sign校验100%通过!
-            DLOG(@"[SIGN-BYPASS] FIX42: judgeAppInfoSignApi → ✅ detect sign字段!→HTTP层100%返回原始字节(不碰任何字段!)→确保sign校验通过! result/verity注入推迟到handleAppInfoResult回调(SIGN之后,安全!)");
+            DLOG(@"[SIGN-BYPASS] FIX42: judgeAppInfoSignApi → ✅ detect sign字段!→HTTP层100%%返回原始字节(不碰任何字段!)→确保sign校验通过! result/verity注入推迟到handleAppInfoResult回调(SIGN之后,安全!)");
             // patchedResponse 不做任何修改!
         } else {
             // CASE B: 无sign字段→server error(500)或空响应→替换为FIX19假响应(FIX9 success同款!)
             DLOG(@"[SIGN-BYPASS] FIX42: judgeAppInfoSignApi → ℹ️ no sign字段!→替换为FIX19假响应(无sign+字段全!)");
-            patchedResponse = fix19SignResp;  // code:0+message:success+data{result:true,verity:1,tip:0,ENDTIME/END/OPEN全有}
+            patchedResponse = fix19GetResp;  // code:0+message:success+data{result:true,verity:1,tip:0,ENDTIME/END/OPEN全有}
         }
 
         DLOG(@"[SIGN-BYPASS] FIX42: judgeAppInfoSignApi final body: %@", patchedResponse);
