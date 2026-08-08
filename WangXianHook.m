@@ -2224,7 +2224,7 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         NSMutableDictionary *topDict = nil;
         if (jerr || ![jsonObj isKindOfClass:[NSDictionary class]]) {
             // JSON解析失败 → 用通用成功响应做兜底
-            DLOG(@"[SIGN-BYPASS] FIX36: JSON parse failed (%@), using universal fallback", jerr.localizedDescription ?: @"unknown");
+            DLOG(@"[SIGN-BYPASS] FIX37: JSON parse failed (%@), using universal fallback", jerr.localizedDescription ?: @"unknown");
             topDict = [NSMutableDictionary dictionary];
             topDict[@"code"] = @0;
             topDict[@"message"] = @"OK";
@@ -2271,10 +2271,10 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         NSData *finalJson = [NSJSONSerialization dataWithJSONObject:topDict options:0 error:nil];
         if (finalJson) {
             patchedResponse = [[NSString alloc] initWithData:finalJson encoding:NSUTF8StringEncoding];
-            DLOG(@"[SIGN-BYPASS] FIX36: UNIVERSAL injector applied → code=0 + data{result=YES,verity=1,tip=0,END=0,OPEN=1,ENDTIME=2027} GUARANTEED");
+            DLOG(@"[SIGN-BYPASS] FIX37: UNIVERSAL injector applied → code=0 + data{result=YES,verity=1,tip=0,END=0,OPEN=1,ENDTIME=2027} GUARANTEED (跳过含sign的响应)");
         } else {
             // 序列化失败兜底: 字符串替换的方式硬塞字段 (极少见, 但保证安全)
-            DLOG(@"[SIGN-BYPASS] FIX36: WARN - final JSON serialize failed, fallback string inject");
+            DLOG(@"[SIGN-BYPASS] FIX37: WARN - final JSON serialize failed, fallback string inject");
         }
     }
 
@@ -2368,21 +2368,28 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
     }
     
     // v37.122: Also patch delegate-mode responses for sign/cert APIs (legacy fallback)
-    // FIX34: 总是patch含ENDTIME的response(不分V3/全能签)
-    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || [url containsString:@"judgeAppInfoApi"] || [dataStr containsString:@"ENDTIME"])) {
-        DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response (legacy)");
-        NSString *newBody = dataStr;
-        // Extend ENDTIME to future
-        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
-        newBody = [regex stringByReplacingMatchesInString:newBody options:0 range:NSMakeRange(0, newBody.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
-        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
-        newBody = [newBody stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
-        // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
-        NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
-        DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
-        if (orig_urlSessionDataTaskDidReceiveData) {
-            orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
-            return;
+    // FIX37: 此分支仅在patchSignatureResponse返回nil时才执行(实际上不会发生)
+    //        但条件仍需精确: 只匹配URL含judgeAppInfoApi(不含SignApi)或judgeAppInfoSignApi
+    //        不再用[dataStr containsString:@"ENDTIME"]误匹配
+    if (dataStr && url && ([url containsString:@"judgeAppInfoSignApi"] || ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]))) {
+        // FIX37: 如果响应含sign字段(MD5签名),跳过legacy fallback(不做任何字符串替换)
+        if ([dataStr containsString:@"\"sign\":"]) {
+            DLOG(@"[HTTP-DATA-PATCH] FIX37: 含sign字段 → 跳过legacy fallback(保持原始JSON→sign验证通过)");
+        } else {
+            DLOG(@"[HTTP-DATA-PATCH] Patching delegate-mode cert/sign API response (legacy)");
+            NSString *newBody = dataStr;
+            // Extend ENDTIME to future
+            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
+            newBody = [regex stringByReplacingMatchesInString:newBody options:0 range:NSMakeRange(0, newBody.length) withTemplate:@"\"ENDTIME\":\"2027-12-31 23:59:59\""];
+            newBody = [newBody stringByReplacingOccurrencesOfString:@"\"END\":1" withString:@"\"END\":0"];
+            newBody = [newBody stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
+            // v37.120: REMOVED code:0→code:1 replacement — game uses code:0 for success.
+            NSData *newData = [newBody dataUsingEncoding:NSUTF8StringEncoding];
+            DLOG(@"[HTTP-DATA-PATCH] Patched delegate response: %@", newBody);
+            if (orig_urlSessionDataTaskDidReceiveData) {
+                orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
+                return;
+            }
         }
     }
     
@@ -11703,7 +11710,10 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                     }
                     
                     // v37.122: LEGACY FALLBACK - Patch judgeAppInfoApi response (if not caught above)
-                    if ([url containsString:@"judgeAppInfoApi"] || [body containsString:@"ENDTIME"]) {
+                    // FIX37: 修复误匹配! 原条件 [body containsString:@"ENDTIME"] 会匹配
+                    //        postAppInfoApi/getAppInfoApi(UNIVERSAL injector添加了ENDTIME)→二次patch
+                    //        新条件: 只匹配URL含judgeAppInfoApi(不含SignApi)的请求
+                    if ([url containsString:@"judgeAppInfoApi"] && ![url containsString:@"SignApi"]) {
                         DLOG(@"[NET-PATCH] Detected judgeAppInfoApi response, extending ENDTIME (legacy)");
                         // Replace any ENDTIME value with a future date (2027-12-31)
                         NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"ENDTIME\":\"[^\"]*\"" options:0 error:nil];
