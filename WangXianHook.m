@@ -1346,7 +1346,7 @@ static void log_init(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
         g_logPath = p;
         setupSignalHandlers();
-        _log(@"=== WangXianHook v37.134-FIX34 loaded (zsign anti-tampering根因: method_setImplementation替换zsign IMP→检测到篡改→验证中止→无网络! FIX34完全不装zsign hook+总是构建full data→data字段存在→SignatureCheck.nettimes不SIGSEGV→验证通过) ===");
+        _log(@"=== WangXianHook v37.134-FIX35 loaded (V3服务器code:1=成功! FIX34错误改code:1→0=V3失败→无网络! FIX35保持code:1+添加full data→nettimes不SIGSEGV+V3验证通过) ===");
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
         g_isActivated = YES;
@@ -2137,21 +2137,24 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"OPEN\":0" withString:@"\"OPEN\":1"];
     }
     // --- postAppInfoApi ---
-    // FIX34: 总是 patch code:1→0 (不分V3/全能签)
-    // 全能签协议 code:0=成功; V3环境下zsign原始执行(没被hook)也能处理code:0
+    // FIX35: V3服务器(ln_sign_cert.9iy.com)的postAppInfoApi返回code:1=V3协议成功码!
+    //        不能改成code:0(V3协议中code:0=失败)! FIX34错误地改了→V3验证失败→无网络!
+    //        3版本铁证: FIX31 code:1(正确)但无data→SIGSEGV; FIX34 code:0(错误)→无网络;
+    //                   FIX35 code:1(正确V3成功)+不改 → 应该成功!
     else if (patchResponse && [url containsString:@"postAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX34: postAppInfoApi (patch code:1→0)");
-        patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
+        DLOG(@"[SIGN-BYPASS] FIX35: postAppInfoApi → 保持code:1不变(V3协议成功码=1, 不改成code:0=失败!)");
+        // 不做任何修改! 直接返回服务器原始response
     }
     // --- getAppInfoApi ---
-    // FIX34: 总是构建 full data + code:0 (不分V3/全能签)
-    // 铁证: FIX31的SIGSEGV是因为跳过了构建full data→返回原始{"code":1}无data→SignatureCheck.nettimes访问NULL→SIGSEGV
-    // FIX34: 总是构建full data→data字段存在→SignatureCheck.nettimes正常解析→不SIGSEGV
+    // FIX35: V3服务器(ln_sign_cert.9iy.com)的getAppInfoApi返回code:1=V3协议成功码!
+    //        保持code:1 + 添加full data结构 → SignatureCheck.nettimes能解析data.ENDTIME → 不SIGSEGV
+    //        3版本铁证: FIX31 code:1正确但无data→SIGSEGV; FIX34 code:0错误→无网络;
+    //                   FIX35 code:1(正确)+full data(data字段存在→nettimes不SIGSEGV) → 应该成功!
     else if (patchResponse && [url containsString:@"getAppInfoApi"]) {
-        DLOG(@"[SIGN-BYPASS] FIX34: getAppInfoApi (FULL data structure + code=0, data字段存在→SignatureCheck.nettimes不SIGSEGV)");
-        // Build complete response that V3's lnSignature expects
+        DLOG(@"[SIGN-BYPASS] FIX35: getAppInfoApi → 保持code:1(V3成功)+添加full data(data字段存在→SignatureCheck.nettimes不SIGSEGV)");
+        // Build complete response with code:1 (V3 success) + data structure (for nettimes)
         NSDictionary *fullResp = @{
-            @"code": @0,
+            @"code": @1,
             @"message": @"OK",
             @"data": @{
                 @"id": @11927,
@@ -2180,8 +2183,8 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
         if (!err && json) {
             patchedResponse = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
         } else {
-            // Fallback with minimal data structure
-            patchedResponse = @"{\"code\":0,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
+            // Fallback with minimal data structure + code:1 (V3 success)
+            patchedResponse = @"{\"code\":1,\"message\":\"OK\",\"data\":{\"id\":11927,\"CREATETIME\":\"2025-04-16 11:47:08\",\"COUNT\":0,\"MAXLIMIT\":5000,\"NAME\":\"\",\"APPID\":\"com.sqage.wangxianapp\",\"OPEN\":1,\"END\":0,\"ENDTIME\":\"2027-12-31 23:59:59\",\"CERTID\":1,\"TIP\":0}}";
         }
     }
     // --- Fallback: generic cert endpoint ---
@@ -2196,10 +2199,15 @@ static NSData *patchSignatureResponse(NSString *url, NSString *body) {
     }
 
     // Safety net: ensure code:1 → code:0 for signature responses
-    // FIX34: 总是执行(不分V3/全能签), 因为不装zsign hook→zsign原始执行→全能签协议code:0=成功
-    if (patchResponse && [patchedResponse containsString:@"\"code\":1"]) {
+    // FIX35: 跳过postAppInfoApi/getAppInfoApi! 这两个是V3服务器(ln_sign_cert.9iy.com)API,
+    //        code:1=V3协议成功码! Safety net不能改! 否则V3验证失败→无网络!
+    //        其他API(qunhongtech.com等全能签服务器) code:1=失败, Safety net改code:1→0=成功 ✅
+    BOOL isV3SuccessCodeApi = [url containsString:@"postAppInfoApi"] || [url containsString:@"getAppInfoApi"];
+    if (patchResponse && !isV3SuccessCodeApi && [patchedResponse containsString:@"\"code\":1"]) {
         patchedResponse = [patchedResponse stringByReplacingOccurrencesOfString:@"\"code\":1" withString:@"\"code\":0"];
-        DLOG(@"[SIGN-BYPASS] FIX34: Safety net: code:1→code:0 applied");
+        DLOG(@"[SIGN-BYPASS] FIX35: Safety net: code:1→code:0 applied (非V3 API, 全能签协议code:0=成功)");
+    } else if (isV3SuccessCodeApi) {
+        DLOG(@"[SIGN-BYPASS] FIX35: Safety net SKIPPED for V3 API (code:1=V3成功码, 不改!)");
     }
 
     NSData *patchedData = [patchedResponse dataUsingEncoding:NSUTF8StringEncoding];
