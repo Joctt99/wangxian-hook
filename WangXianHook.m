@@ -26521,8 +26521,6 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             out += 36; p += 36; continue;
                         }
 
-                    }
-
                     } else if (rem >= 20) {
 
                         // v37.108-DIST: Do NOT replace 20-digit accountId in CCCrypt plaintext!
