@@ -16952,6 +16952,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                 // 根因: 服务器收到FFF493后立即关闭连接,根本没等到999个心跳,FORGE-0CB0A300从未触发
                 // 需要FFF493#1和#2发送后,收到RECV-CLOSE(ret=0)时立即注入伪造响应
                 // 条件: handshake完成 + FFF493#1和#2都已发送 + 还未注入过伪造角色数据
+                const unsigned char *p = (const unsigned char *)buf;  // FIX54: 本地p定义, ret=0但buf非空
                 if (g_handshakeComplete && g_fff493_1_sent && g_fff493_2_sent && !g_injected_0CB0A300 && isGamePort) {
 
                     DLOG(@"[RECV-CLOSE-BURST-FIX54] fd=%d ret=0 → 立即注入伪造响应! handshake=%d fff493_1=%d fff493_2=%d injected_0CB0=%d",
