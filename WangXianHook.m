@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX50: [FIX49+FIX47组合] 恢复UUID统一替换66B0EE01 + 保留不清除未授权响应! 新设备(155)日志铁证: TLV#9有真实UUID(fLen=36)→服务器直接关闭TCP(L666/L733)!不返回EE121响应!FIX49无法触发! FIX50: ①EE007-ALIGN检测空+非空UUID TLV,统一替换为66B0EE01(白名单UUID)→服务器返回EE121响应(status=4'未授权此手机') ②CC_MD5 hook替换为66B0EE01(hash2匹配body) ③保留FIX49:不清除'未授权'响应→客户端显示授权提示→用户在主设备授权→登录成功! (继承FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX50-VERIFY: EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + CC_MD5_hook_REPLACE_UUID_with_66B0EE01_hash2_matches_body + EE121_RESP_NOT_clear_未授权_let_client_show_authorization_prompt + ONLY_clear_版本过低 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX51: [多设备型号支持] CC_MD5 hook支持所有Apple GPU和iPhone型号! 新设备(156)日志铁证: iPhone 14 Pro + A16 GPU, 但hook只匹配iPhone 16 Pro Max + A18 Pro → GPU未替换 → hash2不匹配 → 服务器关闭TCP! FIX51: ①CC_MD5 hook新增A16 GPU(24B)和A10 GPU(24B)匹配 ②新增iPhone 14 Pro(13B)和iPhone7Plus(11B)匹配 ③hasDm/hasGp扫描也支持多型号 (继承FIX50: UUID统一替换66B0EE01; FIX49: 不清除未授权响应; FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX51-VERIFY: CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + hasDm_hasGp_scan_multi_models + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -21275,9 +21275,15 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                 if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
 
+                // FIX51: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone7Plus(11B)
                 if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
+                if (!hasDm && i + 13 <= len && memcmp(in + i, "iPhone 14 Pro", 13) == 0) hasDm = 1;
+                if (!hasDm && i + 11 <= len && memcmp(in + i, "iPhone7Plus", 11) == 0) hasDm = 1;
 
+                // FIX51: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A10 GPU(24B)
                 if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
+                if (!hasGp && i + 24 <= len && memcmp(in + i, "Apple Inc. Apple A16 GPU", 24) == 0) hasGp = 1;
+                if (!hasGp && i + 24 <= len && memcmp(in + i, "Apple Inc. Apple A10 GPU", 24) == 0) hasGp = 1;
 
                 if (!hasHash && hOld[0] != 0 && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
 
@@ -21437,6 +21443,22 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             out += 11; pos += 17;
 
+                        } else if (hasDm && pos + 13 <= len && memcmp(in + pos, "iPhone 14 Pro", 13) == 0) {
+
+                            // v37.134-FIX51: 支持 iPhone 14 Pro (13B) 设备型号!
+                            // 新设备(156)是iPhone 14 Pro, 但hook只匹配iPhone 16 Pro Max(17B)
+                            //   → 设备型号未替换 → hash2不匹配 → 服务器拒绝!
+                            // FIX51: 匹配iPhone 14 Pro(13B), 替换为iPhone7Plus(11B)
+                            memcpy((uint8_t *)cleanInput + out, dmNew, 11);
+                            out += 11; pos += 13;
+                            DLOG(@"[FIX51-DM-iPhone14Pro] Replaced iPhone 14 Pro with iPhone7Plus in CC_MD5 input (13B→11B)");
+
+                        } else if (hasDm && pos + 11 <= len && memcmp(in + pos, "iPhone7Plus", 11) == 0) {
+
+                            // FIX51: iPhone7Plus已经是canonical, 直接复制
+                            memcpy((uint8_t *)cleanInput + out, dmNew, 11);
+                            out += 11; pos += 11;
+
                         } else if (hasGp && pos + 28 <= len && memcmp(in + pos, gpOld, 28) == 0) {
 
                             memcpy((uint8_t *)cleanInput + out, gpNew, 24);
@@ -21450,6 +21472,46 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             // Insert 36B canonical UUID here so hash2 = MD5(body WITH UUID).
 
                             // The send hook (EE007-ALIGN) also inserts UUID TLV into the packet.
+
+                            if (!hasUUID) {
+
+                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+
+                                out += 36;
+
+                            }
+
+                        } else if (hasGp && pos + 24 <= len && memcmp(in + pos, "Apple Inc. Apple A16 GPU", 24) == 0) {
+
+                            // v37.134-FIX51: 支持 A16 GPU (iPhone 14 Pro等设备)!
+
+                            // 新设备(156)日志铁证: CC_MD5 input含A16 GPU(24B), 但hook只匹配A18 Pro(28B)
+
+                            //   → GPU未替换 → hash2不匹配 → 服务器拒绝 → RECV-CLOSE!
+
+                            // FIX51: 匹配A16 GPU(24B), 替换为A10 GPU(24B,相同长度,hash2匹配body)
+
+                            memcpy((uint8_t *)cleanInput + out, gpNew, 24);
+
+                            out += 24; pos += 24;
+
+                            DLOG(@"[FIX51-GPU-A16] Replaced A16 GPU with A10 GPU in CC_MD5 input (24B→24B)");
+
+                            if (!hasUUID) {
+
+                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+
+                                out += 36;
+
+                            }
+
+                        } else if (hasGp && pos + 24 <= len && memcmp(in + pos, "Apple Inc. Apple A10 GPU", 24) == 0) {
+
+                            // FIX51: A10 GPU已经是canonical, 直接复制
+
+                            memcpy((uint8_t *)cleanInput + out, gpNew, 24);
+
+                            out += 24; pos += 24;
 
                             if (!hasUUID) {
 
