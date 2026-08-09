@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX51: [多设备型号支持] CC_MD5 hook支持所有Apple GPU和iPhone型号! 新设备(156)日志铁证: iPhone 14 Pro + A16 GPU, 但hook只匹配iPhone 16 Pro Max + A18 Pro → GPU未替换 → hash2不匹配 → 服务器关闭TCP! FIX51: ①CC_MD5 hook新增A16 GPU(24B)和A10 GPU(24B)匹配 ②新增iPhone 14 Pro(13B)和iPhone7Plus(11B)匹配 ③hasDm/hasGp扫描也支持多型号 (继承FIX50: UUID统一替换66B0EE01; FIX49: 不清除未授权响应; FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX51-VERIFY: CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + hasDm_hasGp_scan_multi_models + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX52: [3套hook同步+EE118补丁] 同步所有CC_MD5/CCCrypt实现支持多GPU/设备型号 + 0x802EE118独立包补丁! 对比主设备和新设备(156)日志发现3套hook实现不同步: ①hook_CC_MD5(FIX51已修) ②hook_CC_MD5_Update(仅A18Pro) ③CCCrypt L4(仅A18Pro)! 另发现0x802EE118主设备走STICKY-PATCH(status1→0), 新设备独立包未处理! FIX52: ①hook_CC_MD5_Update新增A16/A10/iPhone14Pro/iPhone7Plus ②CCCrypt L4新增A16/A10/iPhone14Pro/iPhone7Plus+变体delta计算 ③0x802EE118独立包也执行status→0补丁 (继承FIX51/50/49/46/45)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX52-VERIFY: hook_CC_MD5_Update_support_A16_A10_iPhone14Pro_iPhone7Plus + CCCrypt_L4_support_A16_A10_iPhone14Pro_iPhone7Plus + variant_delta_calculation + EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
 
 
 
@@ -17403,7 +17403,16 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
                 } else {
 
-                    DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=%u (NOT patched, let client handle)", cmd, status);
+                    // FIX52: 0x802EE118 status=1 补丁!
+                    // 新设备(156)日志铁证: 0x802EE118独立接收(ret=13), status=1, 但未走STICKY-PATCH
+                    // 主设备走STICKY-PATCH(status 1→0), 新设备独立包未处理 → 客户端可能进入错误状态
+                    // FIX52: 对独立接收的0x802EE118也执行status 1→0补丁
+                    if (cmd == 0x802EE118 && status != 0 && ret >= 13) {
+                        DLOG(@"[FIX52-EE118] Patching standalone cmd=0x802EE118 status %u -> 0 (was only in STICKY-PATCH before)", status);
+                        ((unsigned char *)buf)[12] = 0;
+                    } else {
+                        DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=%u (NOT patched, let client handle)", cmd, status);
+                    }
 
                     if (cmd == 0x802EE121 && ret > 13) {
 
@@ -22069,14 +22078,22 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
 
             int hasCh = 0, hasDm = 0, hasGp = 0;
+            int dmVariant = 0; // FIX52: 0=none, 1=16ProMax(17B), 2=14Pro(13B), 3=7Plus(11B)
+            int gpVariant = 0; // FIX52: 0=none, 1=A18Pro(28B), 2=A16(24B), 3=A10(24B)
 
             for (CC_LONG i = 0; i + 9 <= actualLen; i++) {
 
                 if (!hasCh && i + 9 <= actualLen && memcmp((const uint8_t *)actualInput + i, chOld, 9) == 0) hasCh = 1;
 
-                if (!hasDm && i + 17 <= actualLen && memcmp((const uint8_t *)actualInput + i, dmOld, 17) == 0) hasDm = 1;
+                // FIX52: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone7Plus(11B)
+                if (!hasDm && i + 17 <= actualLen && memcmp((const uint8_t *)actualInput + i, dmOld, 17) == 0) { hasDm = 1; dmVariant = 1; }
+                if (!hasDm && i + 13 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPhone 14 Pro", 13) == 0) { hasDm = 1; dmVariant = 2; }
+                if (!hasDm && i + 11 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPhone7Plus", 11) == 0) { hasDm = 1; dmVariant = 3; }
 
-                if (!hasGp && i + 28 <= actualLen && memcmp((const uint8_t *)actualInput + i, gpOld, 28) == 0) hasGp = 1;
+                // FIX52: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A10 GPU(24B)
+                if (!hasGp && i + 28 <= actualLen && memcmp((const uint8_t *)actualInput + i, gpOld, 28) == 0) { hasGp = 1; gpVariant = 1; }
+                if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A16 GPU", 24) == 0) { hasGp = 1; gpVariant = 2; }
+                if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A10 GPU", 24) == 0) { hasGp = 1; gpVariant = 3; }
 
                 if (hasCh && hasDm && hasGp) break;
 
@@ -22090,9 +22107,15 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                 if (hasCh) newLen_i += 9;   // 18 - 9
 
-                if (hasDm) newLen_i -= 6;   // 11 - 17
+                // FIX52: 根据设备型号变体计算delta
+                if (dmVariant == 1) newLen_i -= 6;   // 11 - 17 (16 Pro Max)
+                else if (dmVariant == 2) newLen_i -= 2; // 11 - 13 (14 Pro)
+                else if (dmVariant == 3) newLen_i += 0;  // 11 - 11 (7Plus, no change)
 
-                if (hasGp) newLen_i -= 4;   // 24 - 28
+                // FIX52: 根据GPU变体计算delta
+                if (gpVariant == 1) newLen_i -= 4;   // 24 - 28 (A18 Pro)
+                else if (gpVariant == 2) newLen_i += 0; // 24 - 24 (A16, same length)
+                else if (gpVariant == 3) newLen_i += 0;  // 24 - 24 (A10, same length)
 
                 CC_LONG newLen = (newLen_i > 0) ? (CC_LONG)newLen_i : actualLen;
 
@@ -22114,13 +22137,33 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                             memcpy((uint8_t *)tmp + out, chNew, 18); out += 18; pos += 9;
 
-                        } else if (hasDm && pos + 17 <= actualLen && memcmp(src + pos, dmOld, 17) == 0) {
+                        } else if (hasDm && dmVariant == 1 && pos + 17 <= actualLen && memcmp(src + pos, dmOld, 17) == 0) {
 
                             memcpy((uint8_t *)tmp + out, dmNew, 11); out += 11; pos += 17;
 
-                        } else if (hasGp && pos + 28 <= actualLen && memcmp(src + pos, gpOld, 28) == 0) {
+                        } else if (hasDm && dmVariant == 2 && pos + 13 <= actualLen && memcmp(src + pos, "iPhone 14 Pro", 13) == 0) {
+
+                            // FIX52: iPhone 14 Pro(13B) → iPhone7Plus(11B)
+                            memcpy((uint8_t *)tmp + out, dmNew, 11); out += 11; pos += 13;
+
+                        } else if (hasDm && dmVariant == 3 && pos + 11 <= actualLen && memcmp(src + pos, "iPhone7Plus", 11) == 0) {
+
+                            // FIX52: iPhone7Plus已经是canonical, 直接复制
+                            memcpy((uint8_t *)tmp + out, dmNew, 11); out += 11; pos += 11;
+
+                        } else if (hasGp && gpVariant == 1 && pos + 28 <= actualLen && memcmp(src + pos, gpOld, 28) == 0) {
 
                             memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 28;
+
+                        } else if (hasGp && gpVariant == 2 && pos + 24 <= actualLen && memcmp(src + pos, "Apple Inc. Apple A16 GPU", 24) == 0) {
+
+                            // FIX52: A16 GPU(24B) → A10 GPU(24B, 等长)
+                            memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 24;
+
+                        } else if (hasGp && gpVariant == 3 && pos + 24 <= actualLen && memcmp(src + pos, "Apple Inc. Apple A10 GPU", 24) == 0) {
+
+                            // FIX52: A10 GPU已经是canonical, 直接复制
+                            memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 24;
 
                         } else {
 
@@ -26065,6 +26108,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     int patchCount = 0;
 
     int chCount = 0, dmCount = 0, gpCount = 0;
+    int dm16ProMaxCount = 0, dm14ProCount = 0; // FIX52: 分别计数不同设备型号
+    int gpA18ProCount = 0, gpA16Count = 0; // FIX52: 分别计数不同GPU
 
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
 
@@ -26116,9 +26161,23 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
 
-                if (bounded) dmCount++;
+                if (bounded) { dmCount++; dm16ProMaxCount++; }
 
                 pcur += 17;
+
+            } else if (rem >= 13 && memcmp(pcur, "iPhone 14 Pro", 13) == 0) {
+
+                // FIX52: 支持 iPhone 14 Pro (13B)
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 13 < scanEnd) ? *(pcur+13) : 0;
+                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                if (bounded) { dmCount++; dm14ProCount++; }
+                pcur += 13;
+
+            } else if (rem >= 11 && memcmp(pcur, "iPhone7Plus", 11) == 0) {
+
+                // FIX52: iPhone7Plus已经是canonical, 不需要替换
+                pcur += 11;
 
             } else if (rem >= 28 && memcmp(pcur, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
 
@@ -26128,9 +26187,23 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
 
-                if (bounded) gpCount++;
+                if (bounded) { gpCount++; gpA18ProCount++; }
 
                 pcur += 28;
+
+            } else if (rem >= 24 && memcmp(pcur, "Apple Inc. Apple A16 GPU", 24) == 0) {
+
+                // FIX52: 支持 A16 GPU (24B, 等长替换为A10, delta=0)
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 24 < scanEnd) ? *(pcur+24) : 0;
+                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                if (bounded) { gpCount++; gpA16Count++; }
+                pcur += 24;
+
+            } else if (rem >= 24 && memcmp(pcur, "Apple Inc. Apple A10 GPU", 24) == 0) {
+
+                // FIX52: A10 GPU已经是canonical, 不需要替换
+                pcur += 24;
 
             } else if (rem >= 20) {
 
@@ -26198,7 +26271,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
         if (patchCount > 0) {
 
-            ssize_t delta = (ssize_t)chCount * 9 + (ssize_t)dmCount * (-6) + (ssize_t)gpCount * (-4);
+            // FIX52: 根据变体分别计算delta
+            // dm: 16 Pro Max(17→11, delta=-6), 14 Pro(13→11, delta=-2)
+            // gp: A18 Pro(28→24, delta=-4), A16(24→24, delta=0)
+            ssize_t delta = (ssize_t)chCount * 9
+                          + (ssize_t)dm16ProMaxCount * (-6)
+                          + (ssize_t)dm14ProCount * (-2)
+                          + (ssize_t)gpA18ProCount * (-4)
+                          + (ssize_t)gpA16Count * 0;
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -26250,6 +26330,23 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                         }
 
+                    } else if (rem >= 13 && memcmp(p, "iPhone 14 Pro", 13) == 0) {
+
+                        // FIX52: iPhone 14 Pro(13B) → iPhone7Plus(11B)
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 13 < e) ? *(p+13) : 0;
+                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        if (bounded) {
+                            memcpy(out, "iPhone7Plus", 11);
+                            out += 11; p += 13; continue;
+                        }
+
+                    } else if (rem >= 11 && memcmp(p, "iPhone7Plus", 11) == 0) {
+
+                        // FIX52: iPhone7Plus已经是canonical, 直接复制
+                        memcpy(out, "iPhone7Plus", 11);
+                        out += 11; p += 11; continue;
+
                     } else if (rem >= 28 && memcmp(p, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
 
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
@@ -26265,6 +26362,23 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             out += 24; p += 28; continue;
 
                         }
+
+                    } else if (rem >= 24 && memcmp(p, "Apple Inc. Apple A16 GPU", 24) == 0) {
+
+                        // FIX52: A16 GPU(24B) → A10 GPU(24B, 等长)
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 24 < e) ? *(p+24) : 0;
+                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        if (bounded) {
+                            memcpy(out, "Apple Inc. Apple A10 GPU", 24);
+                            out += 24; p += 24; continue;
+                        }
+
+                    } else if (rem >= 24 && memcmp(p, "Apple Inc. Apple A10 GPU", 24) == 0) {
+
+                        // FIX52: A10 GPU已经是canonical, 直接复制
+                        memcpy(out, "Apple Inc. Apple A10 GPU", 24);
+                        out += 24; p += 24; continue;
 
                     } else if (rem >= 51 && memcmp(p, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) == 0) {
 
