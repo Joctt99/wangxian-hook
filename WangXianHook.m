@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX52: [3套hook同步+EE118补丁] 同步所有CC_MD5/CCCrypt实现支持多GPU/设备型号 + 0x802EE118独立包补丁! 对比主设备和新设备(156)日志发现3套hook实现不同步: ①hook_CC_MD5(FIX51已修) ②hook_CC_MD5_Update(仅A18Pro) ③CCCrypt L4(仅A18Pro)! 另发现0x802EE118主设备走STICKY-PATCH(status1→0), 新设备独立包未处理! FIX52: ①hook_CC_MD5_Update新增A16/A10/iPhone14Pro/iPhone7Plus ②CCCrypt L4新增A16/A10/iPhone14Pro/iPhone7Plus+变体delta计算 ③0x802EE118独立包也执行status→0补丁 (继承FIX51/50/49/46/45)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX52-VERIFY: hook_CC_MD5_Update_support_A16_A10_iPhone14Pro_iPhone7Plus + CCCrypt_L4_support_A16_A10_iPhone14Pro_iPhone7Plus + variant_delta_calculation + EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53: [CCCrypt+CC_MD5_Update UUID替换] 通用UUID替换! 将CCCrypt L4和CC_MD5_Update中任意UUID=MACADDRESS=xxx替换为66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8! 修复新设备点击服务器提示连接异常中断: 根因是CCCrypt明文中UUID(新设备真实UUID)与EE121 TLV#9(66B0EE01)不一致, 游戏服务器(12003)检查UUID发现不匹配后关闭连接! FIX53: CCCrypt L4新增通用UUID检测和替换(53B UUID=MACADDRESS=xxx和36B裸UUID), CC_MD5_Update同步添加UUID替换逻辑 (继承FIX52/51/50/49/46/45)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53-VERIFY: CCCrypt_L4_generic_UUID_replace_66B0EE01 + CC_MD5_Update_generic_UUID_replace_66B0EE01 + UUID_MACADDRESS_53B_replace + bare_UUID_36B_replace + FIX52_EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
 
 
 
@@ -22078,6 +22078,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
 
             int hasCh = 0, hasDm = 0, hasGp = 0;
+            int hasUuidMac = 0;  // FIX53: UUID=MACADDRESS=xxx detected
+            int hasUuidBare = 0; // FIX53: bare UUID detected
             int dmVariant = 0; // FIX52: 0=none, 1=16ProMax(17B), 2=14Pro(13B), 3=7Plus(11B)
             int gpVariant = 0; // FIX52: 0=none, 1=A18Pro(28B), 2=A16(24B), 3=A10(24B)
 
@@ -22095,13 +22097,23 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A16 GPU", 24) == 0) { hasGp = 1; gpVariant = 2; }
                 if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A10 GPU", 24) == 0) { hasGp = 1; gpVariant = 3; }
 
-                if (hasCh && hasDm && hasGp) break;
+                // FIX53: 检测UUID=MACADDRESS=xxx前缀(17B)
+                if (!hasUuidMac && i + 53 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 17) == 0) { hasUuidMac = 1; }
+
+                // FIX53: 检测裸UUID(36B格式, 连字符位置8/13/18/23)
+                if (!hasUuidBare && i + 36 <= actualLen &&
+                    ((const char *)actualInput)[i+8] == '-' &&
+                    ((const char *)actualInput)[i+13] == '-' &&
+                    ((const char *)actualInput)[i+18] == '-' &&
+                    ((const char *)actualInput)[i+23] == '-') { hasUuidBare = 1; }
+
+                if (hasCh && hasDm && hasGp && hasUuidMac) break;
 
             }
 
 
 
-            if (hasCh || hasDm || hasGp) {
+            if (hasCh || hasDm || hasGp || hasUuidMac || hasUuidBare) {
 
                 int32_t newLen_i = (int32_t)actualLen;
 
@@ -22111,6 +22123,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 if (dmVariant == 1) newLen_i -= 6;   // 11 - 17 (16 Pro Max)
                 else if (dmVariant == 2) newLen_i -= 2; // 11 - 13 (14 Pro)
                 else if (dmVariant == 3) newLen_i += 0;  // 11 - 11 (7Plus, no change)
+
+                // FIX53: UUID替换是等长的，不需要调整newLen
 
                 // FIX52: 根据GPU变体计算delta
                 if (gpVariant == 1) newLen_i -= 4;   // 24 - 28 (A18 Pro)
@@ -22165,6 +22179,20 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                             // FIX52: A10 GPU已经是canonical, 直接复制
                             memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 24;
 
+                        } else if (hasUuidMac && pos + 53 <= actualLen && memcmp(src + pos, "UUID=MACADDRESS=", 17) == 0) {
+
+                            // FIX53: UUID=MACADDRESS=xxx → UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
+                            memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53); out += 53; pos += 53;
+
+                        } else if (hasUuidBare && pos + 36 <= actualLen &&
+                                   ((const char *)src)[pos+8] == '-' &&
+                                   ((const char *)src)[pos+13] == '-' &&
+                                   ((const char *)src)[pos+18] == '-' &&
+                                   ((const char *)src)[pos+23] == '-') {
+
+                            // FIX53: bare UUID xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx → 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
+                            memcpy((uint8_t *)tmp + out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36); out += 36; pos += 36;
+
                         } else {
 
                             ((uint8_t *)tmp)[out++] = src[pos++];
@@ -22183,9 +22211,9 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                     inputModified = 1;
 
-                    DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX15: Replaced ch=%d dm=%d gp=%d (oldLen=%lu newLen=%lu)",
+                    DLOG(@"[MD5-UPDATE-HOOK] v37.134-FIX53: Replaced ch=%d dm=%d gp=%d uuidMac=%d uuidBare=%d (oldLen=%lu newLen=%lu)",
 
-                         hasCh, hasDm, hasGp, (unsigned long)len, (unsigned long)actualLen);
+                         hasCh, hasDm, hasGp, hasUuidMac, hasUuidBare, (unsigned long)len, (unsigned long)actualLen);
 
                 }
 
@@ -26380,17 +26408,37 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         memcpy(out, "Apple Inc. Apple A10 GPU", 24);
                         out += 24; p += 24; continue;
 
-                    } else if (rem >= 51 && memcmp(p, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) == 0) {
+                    } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=", 17) == 0) {
 
-                        // v37.107-DIST: Do NOT replace UUID — each user uses their OWN device UUID!
+                        // FIX53: 通用UUID替换! 将任意UUID=MACADDRESS=xxx替换为66B0EE01
+                        // 修复新设备CCCrypt明文中UUID与EE121 TLV#9不一致导致服务器拒绝
 
-                        // Old accounts are bound to their real device UUID on the server.
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 53 < e) ? *(p+53) : 0;
+                        BOOL bounded = (prev == '"') && (next == '"' || next == ',');
 
-                        // Replacing it with a fixed CANONICAL UUID breaks device whitelist auth.
+                        if (bounded) {
 
-                    } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
+                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53);
 
-                        // v37.107-DIST: Do NOT replace bare UUID either — same reason as above.
+                            out += 53; p += 53; continue;
+
+                        }
+
+                    } else if (rem >= 36 && p[8] == '-' && p[13] == '-' && p[18] == '-' && p[23] == '-') {
+
+                        // FIX53: 通用裸UUID替换! 检测36字节UUID格式并替换为66B0EE01
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 36 < e) ? *(p+36) : 0;
+                        BOOL bounded = (prev == '"' || prev == '=') && (next == '"' || next == ',' || next == '}');
+
+                        if (bounded) {
+
+                            memcpy(out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
+
+                            out += 36; p += 36; continue;
+
+                        }
 
                     } else if (rem >= 20) {
 
