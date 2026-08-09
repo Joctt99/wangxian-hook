@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX55: [FFF493-REPL UUID统一为180C4F27] 回退FIX54(BURST注入+额外标志), 保留FIX53基础! FIX55-根因: FFF493走FALLBACK(no plaintext replacement)因为jsonModified=NO → didReplaceUUID=NO → 发送原始包(真实UUID) → 游戏服务器关闭连接! 修复: (1)FFF493-REPL的JSON UUID替换从66B0EE01改为180C4F27, 与CCCrypt L4和CC_MD5_Update保持一致! (2)FFF493-REPL新增检测\"UUID=MACADDRESS=\"格式(JSON某些用key=value格式), 确保didReplaceUUID被设为YES! (3)登录服务器(5678)EE007/EE121仍保持66B0EE01, 游戏服务器(12003)FFF493/CCCrypt用180C4F27 → 双通道互不干扰! (继承FIX53/52/51/50/49/46/45)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX55-VERIFY: REVERT_FIX54_BURST_INJECT_and_EXTRA_FLAG + FFF493-REPL_UUID→180C4F27 + FFF493_UUID=MACADDRESS=detect+replace + CCCrypt_L4_UUID→180C4F27 + CC_MD5_Update_UUID→180C4F27 + EE007_STILL_66B0EE01 + EE121_STILL_66B0EE01 + FIX52_EE118_standalone + A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + md5xor_ispass + libsystem_c_stdio + MSHookFunction_VersionModule_try_catch";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX56: [CC_MD5 UUID双通道修复!] 继承FIX55(FFF493-REPL UUID=180C4F27+UUID=MACADDRESS检测) + FIX56致命修复: FIX55真实原因=CCCrypt明文用180C4F27, 但CC_MD5计算HMAC时仍用66B0EE01 → 密文/HMAC UUID不一致 → 服务器校验HMAC失败 → 关闭连接! FIX56: g_cccrypt_l4_active门控实现双通道 — 登录阶段(EE007/EE121端口5678, 门未激活)=66B0EE01, 游戏阶段(FFF493#1/#2端口12003, 0x80FFF495后门激活)=180C4F27, 保证CCCrypt明文与CC_MD5 HMAC UUID完全一致! (继承FIX55/53/52/51/50/49/46/45)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX56-VERIFY: CC_MD5_UUID_DUAL_CHANNEL_FIX! FIX55 ROOT CAUSE: CCCrypt plaintext used 180C4F27 BUT CC_MD5(HMAC) used 66B0EE01 → HMAC mismatch → server closed! FIX56: g_cccrypt_l4_active gated scheme — LOGIN phase(EE007/EE121 port5678)=66B0EE01, GAME phase(FFF493#1/#2 port12003)=180C4F27. Also FFF493-REPL_UUID→180C4F27 + UUID=MACADDRESS=detect+replace + CCCrypt_L4_UUID→180C4F27 + EE007_66B0EE01 + EE121_66B0EE01 + FIX52_EE118_standalone + A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + md5xor_ispass + libsystem_c_stdio + MSHookFunction_VersionModule_try_catch";
 
 
 
@@ -2752,7 +2752,7 @@ static void log_init(void) {
 
         setupSignalHandlers();
 
-        _log(@"=== WangXianHook v37.134-FIX41 loaded (🔴铁证根因: FIX40失败=judgeAppInfoSignApi用NSJSONSerialization重序列化→code从第1位移到最后+字段顺序打乱→sign自校验字节不匹配→回调函数全不执行→无网络! FIX41: judgeAppInfoSignApi取消JSON序列化→全程纯字符串插入(保持code第1位+sign字段原始字节100%一致)! 另增强C++ terminate捕获打印exception what() + SignatureKit/SignatureCheck方法名全Dump + LCNetworking方法名全Dump) ===");
+        _log(@"=== WangXianHook v37.134-FIX56 loaded (🔴致命修复: FIX55失败根因=CCCrypt L4明文替换180C4F27成功, 但CC_MD5计算HMAC仍用66B0EE01 → 密文/HMAC基于不同UUID → 服务器拒绝! FIX56: g_cccrypt_l4_active门控双通道: 登录阶段(5678, 门未激活)=66B0EE01, 游戏阶段(12003, 0x80FFF495后门激活)=180C4F27, 保证CCCrypt和CC_MD5 UUID 100%一致! 继承FIX55: FFF493-REPL UUID→180C4F27 + UUID=MACADDRESS格式检测. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化+纯字符串替换保持code第1位) ===");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -7431,7 +7431,11 @@ static int g_forceValidDecryptFd = -1;
 
 // CCCrypt calls pass through unchanged to avoid crashing JudgeApp.
 
-static BOOL g_cccrypt_l4_active = NO;
+// FIX56: Changed from static → non-static BOOL, so CC_MD5 hook can access it
+
+// for DUAL-CHANNEL UUID scheme: login server(5678)=66B0EE01, game server(12003)=180C4F27.
+
+BOOL g_cccrypt_l4_active = NO;
 
 
 
@@ -21144,15 +21148,20 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
             // pass:   994624 (6B) already matches — no replacement needed.
 
-            // UUID:   ANY 36B format UUID (8-4-4-4-12 hex) → 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8 (36B same)
-
-            //         Replaced ONLY in EE121-ctx=1 (between GPU/channel and WIFI7.6.3).
-
+            // UUID:   FIX56 DUAL-CHANNEL scheme:
+            //         LOGIN phase (g_cccrypt_l4_active=NO, port 5678): ANY UUID → 66B0EE01 (EE007/EE121 whitelist)
+            //         GAME phase  (g_cccrypt_l4_active=YES, port 12003): ANY UUID → 180C4F27 (FFF493 game-server whitelist)
+            //         CRITICAL FIX: Both CCCrypt plaintext AND CC_MD5 (HMAC) MUST use the SAME UUID,
+            //         otherwise the server computes HMAC over 66B0EE01 while decrypting 180C4F27 → HMAC mismatch → CLOSE.
             // ch/dm/gp: handled below (DY_MIESHI→DYanyou0040 etc.) — dm/gp also length-changing.
-
             // Binary hash hex: handled below (f9cc76c5...→906e707ec...).
 
-            static const char kCanUUIDNew[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // 36 bytes
+            // FIX56: Access the non-static gate set by 0x80FFF495 reception
+            extern BOOL g_cccrypt_l4_active;
+            static const char kLoginUUID[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // 36B — login server (EE007, EE121)
+            static const char kGameUUID[]  = "180C4F27-4414-4623-ACEB-0C12B30E48FD"; // 36B — game server (FFF493#1/#2 HMAC)
+            #define MD5_PHASE_UUID() (g_cccrypt_l4_active ? kGameUUID : kLoginUUID)
+            static const char kCanUUIDNew[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8"; // legacy name, replaced by MD5_PHASE_UUID() below
 
             #define IS_HEX(c) (((c)>='0'&&(c)<='9')||((c)>='a'&&(c)<='f')||((c)>='A'&&(c)<='F'))
 
@@ -21356,9 +21365,10 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                         && IS_HEX(u[30])&&IS_HEX(u[31])&&IS_HEX(u[32])&&IS_HEX(u[33])&&IS_HEX(u[34])&&IS_HEX(u[35])) {
 
-                        // Only accept if NOT already equal to canonical UUID (otherwise no replacement needed)
+                        // FIX56: Only accept if NOT already equal to EITHER canonical UUID
+                        // (login 66B0EE01 or game 180C4F27). Otherwise no replacement needed.
 
-                        if (memcmp(u, kCanUUIDNew, 36) != 0) {
+                        if (memcmp(u, kLoginUUID, 36) != 0 && memcmp(u, kGameUUID, 36) != 0) {
 
                             hasUUID = 1;
 
@@ -21504,9 +21514,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             // The send hook (EE007-ALIGN) also inserts UUID TLV into the packet.
 
+                            // FIX56: DUAL-CHANNEL UUID — login=66B0EE01, game=180C4F27
+
                             if (!hasUUID) {
 
-                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                                memcpy((uint8_t *)cleanInput + out, MD5_PHASE_UUID(), 36);
 
                                 out += 36;
 
@@ -21528,9 +21540,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             DLOG(@"[FIX51-GPU-A16] Replaced A16 GPU with A10 GPU in CC_MD5 input (24B→24B)");
 
+                            // FIX56: DUAL-CHANNEL UUID — login=66B0EE01, game=180C4F27
+
                             if (!hasUUID) {
 
-                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                                memcpy((uint8_t *)cleanInput + out, MD5_PHASE_UUID(), 36);
 
                                 out += 36;
 
@@ -21544,9 +21558,11 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             out += 24; pos += 24;
 
+                            // FIX56: DUAL-CHANNEL UUID — login=66B0EE01, game=180C4F27
+
                             if (!hasUUID) {
 
-                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                                memcpy((uint8_t *)cleanInput + out, MD5_PHASE_UUID(), 36);
 
                                 out += 36;
 
@@ -21560,16 +21576,20 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                         } else if (hasUUID && pos == uuidPos) {
 
-                            // v37.134-FIX50: 恢复FIX47! 替换为66B0EE01!
-                            // 新设备(155)日志铁证: TLV#9有真实UUID → 服务器直接关闭TCP(L666/L733)!
-                            //   原因: 服务器白名单不认识新设备真实UUID → 拒绝连接(不返回EE121响应)
-                            // FIX50: 统一替换为66B0EE01(白名单UUID) → 服务器返回EE121响应(status=4"未授权此手机")
-                            // 配合FIX49: 不清除"未授权"响应 → 客户端显示授权提示 → 用户在主设备授权 → 登录成功
-                            // hash2 = MD5(body with 66B0EE01) → 与EE121 body一致(server校验通过)
-                            static const char kCanUUIDNew[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
-                            memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                            // FIX56 DUAL-CHANNEL UUID replacement!
+                            // LOGIN phase (gate=NO, port 5678, EE007/EE121): use 66B0EE01 (login-server whitelist)
+                            // GAME phase  (gate=YES, port 12003, FFF493 HMAC): use 180C4F27 (game-server whitelist)
+                            // CRITICAL FIX: This value MUST MATCH the UUID in CCCrypt AES plaintext!
+                            //   FIX55 bug: CCCrypt used 180C4F27 for plaintext BUT CC_MD5 used 66B0EE01 for HMAC
+                            //   → server decrypts 180C4F27 ciphertext, recalculates HMAC over 180C4F27 → HMAC mismatch → CLOSE!
+                            const char *phaseUuid = MD5_PHASE_UUID();
+                            memcpy((uint8_t *)cleanInput + out, phaseUuid, 36);
                             out += 36; pos += 36;
-                            DLOG(@"[FIX50-UUID-MD5] Replaced UUID in CC_MD5 input with canonical 66B0EE01 (server whitelist UUID)");
+                            if (g_cccrypt_l4_active) {
+                                DLOG(@"[FIX56-UUID-MD5-GAME] Replaced UUID in CC_MD5 input with 180C4F27 (GAME phase — matches CCCrypt plaintext & game whitelist)");
+                            } else {
+                                DLOG(@"[FIX56-UUID-MD5-LOGIN] Replaced UUID in CC_MD5 input with 66B0EE01 (LOGIN phase — matches EE007/EE121 body)");
+                            }
 
                         } else if (hasAccId && pos + 20 <= len
 
@@ -26161,6 +26181,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     int chCount = 0, dmCount = 0, gpCount = 0;
     int dm16ProMaxCount = 0, dm14ProCount = 0; // FIX52: 分别计数不同设备型号
     int gpA18ProCount = 0, gpA16Count = 0; // FIX52: 分别计数不同GPU
+    int uuidMacCount = 0; // FIX56: UUID=MACADDRESS=计数
+    int uuidBareCount = 0; // FIX56: 裸UUID(36B带-)计数
 
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
 
@@ -26256,6 +26278,30 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 // FIX52: A10 GPU已经是canonical, 不需要替换
                 pcur += 24;
 
+            } else if (rem >= 53 && memcmp(pcur, "UUID=MACADDRESS=", 17) == 0) {
+
+                // FIX56: 检测UUID=MACADDRESS=格式 (53B = 17 + 36)
+                // 注意: 180C4F27比66B0EE01短2B, canonical的UUID=MACADDRESS=只需要51B
+                // 非canonical格式为UUID=MACADDRESS=66B0EE01...(53B)或其他UUID(53B)
+                // 如果当前已经是180C4F27(51B), 则不需要替换
+                if (memcmp(pcur, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) != 0) {
+                    uuidMacCount++;
+                }
+                pcur += 53;
+
+            } else if (rem >= 36 && pcur[8] == '-' && pcur[13] == '-' && pcur[18] == '-' && pcur[23] == '-') {
+
+                // FIX56: 裸36B带横杠的UUID检测
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 36 < scanEnd) ? *(pcur+36) : 0;
+                BOOL bounded = (prev == '"' || prev == '=') && (next == '"' || next == ',' || next == '}');
+                if (bounded) {
+                    if (memcmp(pcur, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) != 0) {
+                        uuidBareCount++;
+                    }
+                }
+                pcur += 36;
+
             } else if (rem >= 20) {
 
                 // v37.79: accId detection DISABLED — skip to next char
@@ -26270,7 +26316,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
         }
 
-        patchCount = chCount + dmCount + gpCount + accCount;
+        patchCount = chCount + dmCount + gpCount + accCount + uuidMacCount + uuidBareCount;
+
+        // FIX56: UUID delta计算
+        // uuidMacCount: 53B(非canonical) → 51B(canonical 180C4F27), 每个delta=-2
+        // uuidBareCount: 36B → 36B(等长替换), 每个delta=0
 
         // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
 
@@ -26325,11 +26375,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             // FIX52: 根据变体分别计算delta
             // dm: 16 Pro Max(17→11, delta=-6), 14 Pro(13→11, delta=-2)
             // gp: A18 Pro(28→24, delta=-4), A16(24→24, delta=0)
+            // uuidMac: UUID=MACADDRESS=xxx(53B) → 180C4F27版(51B), delta=-2 each
             ssize_t delta = (ssize_t)chCount * 9
                           + (ssize_t)dm16ProMaxCount * (-6)
                           + (ssize_t)dm14ProCount * (-2)
                           + (ssize_t)gpA18ProCount * (-4)
-                          + (ssize_t)gpA16Count * 0;
+                          + (ssize_t)gpA16Count * 0
+                          + (ssize_t)uuidMacCount * (-2)
+                          + (ssize_t)uuidBareCount * 0;
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -26431,39 +26484,44 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         memcpy(out, "Apple Inc. Apple A10 GPU", 24);
                         out += 24; p += 24; continue;
 
+                    } else if (rem >= 51 && memcmp(p, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51) == 0) {
+
+                        // FIX56: UUID=MACADDRESS=180C4F27已经是canonical(51B), 直接复制
+                        memcpy(out, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51);
+                        out += 51; p += 51; continue;
+
                     } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=", 17) == 0) {
 
-                        // FIX53: 通用UUID替换! 将任意UUID=MACADDRESS=xxx替换为180C4F27(主设备UUID)
-                        // 180C4F27已在游戏服务器(12003)白名单中(主设备历史登录过)
-                        // v37.107曾停用此替换,但实际原因是v37.108同时强制替换了accountId导致
-                        // 所有用户进入kk994角色。v37.108-DIST已修复accountId不替换,UUID替换可恢复!
-
+                        // FIX56: 非canonical UUID=MACADDRESS=xxx(53B) → 180C4F27版(51B)
+                        // 检测boundary: 前面是"且后面是"或,
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-                        char next = (p + 53 < e) ? *(p+53) : 0;
-                        BOOL bounded = (prev == '"') && (next == '"' || next == ',');
+                        char next53 = (p + 53 < e) ? *(p+53) : 0;
+                        char next51 = (p + 51 < e) ? *(p+51) : 0;
+                        BOOL bounded = (prev == '"') && (next53 == '"' || next53 == ',' || next51 == '"' || next51 == ',');
 
-                        if (bounded) {
-
+                        if (bounded || uuidMacCount > 0) {
                             memcpy(out, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51);
-
                             out += 51; p += 53; continue;
-
                         }
+
+                    } else if (rem >= 36 && memcmp(p, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36) == 0) {
+
+                        // FIX56: canonical裸UUID(36B), 直接复制
+                        memcpy(out, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36);
+                        out += 36; p += 36; continue;
 
                     } else if (rem >= 36 && p[8] == '-' && p[13] == '-' && p[18] == '-' && p[23] == '-') {
 
-                        // FIX53: 通用裸UUID替换! 检测36字节UUID格式并替换为180C4F27(主设备UUID)
+                        // FIX56: 非canonical裸UUID → 180C4F27(等长36B)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 36 < e) ? *(p+36) : 0;
                         BOOL bounded = (prev == '"' || prev == '=') && (next == '"' || next == ',' || next == '}');
-
-                        if (bounded) {
-
+                        if (bounded || uuidBareCount > 0) {
                             memcpy(out, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36);
-
                             out += 36; p += 36; continue;
-
                         }
+
+                    }
 
                     } else if (rem >= 20) {
 
@@ -27205,7 +27263,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.88-DIST — v37.88: 2 MORE ROOT CAUSES fixed! (1) FFF493#1 (IOS_CLIENT_MSG_REQ) JSON has NO sessionId/ticket fields! Previous code tried to REPLACE \"sessionId\": \"\" and \"ticket\": \"\" — these don't exist in #1's JSON (which has: msgs[], time, seqNum, randStr, __msg_clazz, msgtype). Fix: if replacement did nothing (field not found), INSERT sessionId+ticket into JSON before closing brace. (2) FALLBACK marking was INSIDE g_aes_key_saved gating — if AES key wasn't saved for any reason, #1/#2 never marked as sent → heartbeat counter and forged 0x0CB0A300 injection NEVER triggered. Fix: moved FALLBACK marking OUTSIDE g_aes_key_saved gating. Also bumped all v37.87 labels to v37.88.");
+    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX56 — CRITICAL UUID dual-channel fix! FIX55 bug: CCCrypt L4 plaintext used 180C4F27 BUT CC_MD5(HMAC) used 66B0EE01 → HMAC mismatch → game server closed TCP connection after FFF493. FIX56: g_cccrypt_l4_active gate: login phase(EE007/EE121 port5678)=66B0EE01, game phase(FFF493#1/#2 port12003 after 0x80FFF495)=180C4F27, GUARANTEEING CCCrypt plaintext & CC_MD5 HMAC use same UUID. Also inherits v37.88: 2 root causes fixed (#1 has no sessionId/ticket → INSERT when REPLACE 0 hits; FALLBACK mark moved outside AES gating).");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
@@ -27233,7 +27291,7 @@ static void installAllHooks(void) {
 
         g_hashTokenValid = 0; // reset per-session
 
-        DLOG(@"[GLOBALS-INIT] v37.88: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now!)", g_sessionValid, g_sessionId, g_ticketLen);
+        DLOG(@"[GLOBALS-INIT] v37.89-FIX56: FORCE sessionValid=%d sessionId=%s ticketLen=%d (FFF493-REPL uses CAPTURED branch now! + FIX56 CC_MD5 dual-channel UUID gating!)", g_sessionValid, g_sessionId, g_ticketLen);
 
     }
 
