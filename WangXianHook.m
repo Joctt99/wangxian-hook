@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX48-方案B: [USER-CHOICE-REAL-UUID] 用户选择方案B! 每个设备用真实UUID,通过主设备授权机制登录! 回退FIX47(不统一替换66B0EE01)! ①EE007-ALIGN只检测空UUID(fLen==0)插入66B0EE01(主设备fallback),非空UUID保持原样 ②CC_MD5 hook复制原始UUID(hash2匹配body)→每个设备EE121 UUID=真实UUID→服务器用真实UUID验证! (继承FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX48-VERIFY-方案B: REVERT_FIX47_EE007_ALIGN_only_detect_empty_UUID_fLen0_insert_66B0EE01 + CC_MD5_hook_COPY_ORIGINAL_UUID_hash2_matches_body + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX49: [NORMAL-AUTHORIZATION-FLOW] 不清除EE121未授权响应!让设备走正常授权流程! wxhook.log铁证: L2554服务器返回'未授权此手机,如要授权请使用上次登录的设备进行授权,此操作您必须在10分钟内完成'→hook清除body→客户端跳过授权→设备永远无法加入白名单! FIX49: 区分'未授权'(body含'未授权'/'授权')与'版本过低'(body含'版本过低'): ①未授权→不清除,让客户端显示授权提示 ②版本过低→清除(版本检查绕过)! (继承FIX48方案B: 每个设备用真实UUID; FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX49-VERIFY: EE121_RESP_check_body_content_NOT_clear_未授权_let_client_show_authorization_prompt + ONLY_clear_版本过低_version_bypass + EE007_ALIGN_only_empty_UUID_insert_66B0EE01 + CC_MD5_hook_COPY_ORIGINAL_UUID + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -17276,6 +17276,30 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
             // Now we need to bypass the version check so client proceeds to login flow.
 
+            //
+
+            // v37.134-FIX49: DO NOT CLEAR "未授权此手机" RESPONSE! LET DEVICE GO NORMAL AUTHORIZATION!
+
+            // ROOT CAUSE: Previous code cleared ALL status=4 responses (including "未授权此手机"),
+
+            //   which prevented the normal authorization flow:
+
+            //   1. New device login → server returns "未授权此手机" (status=4)
+
+            //   2. Client should show prompt: "如要授权请使用上次登录的设备进行授权"
+
+            //   3. User authorizes on master device within 10 minutes
+
+            //   4. New device UUID added to whitelist → subsequent logins succeed
+
+            //   But hook cleared the response → client skipped authorization → device never authorized!
+
+            // FIX49: Check body content. Only clear "版本过低" responses (version check bypass).
+
+            //   If body contains "未授权" → DO NOT CLEAR, let client show authorization prompt.
+
+            //   If body contains "版本过低" → CLEAR (version check bypass, as before).
+
             if ((cmd == 0x802EE121 || cmd == 0x802EE118 || cmd == 0x802EE120) && ret >= 13) {
 
                 uint8_t status = p[12];
@@ -17284,29 +17308,81 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
                 if (cmd == 0x802EE121 && status == 4) {
 
-                    DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=4→0 (patching for version bypass)", cmd);
+                    // FIX49: Check body content first to distinguish authorization vs version check
 
-                    // Cast away const to modify response in-place (we own this buffer from recv)
+                    NSString *bodyStr = nil;
 
-                    unsigned char *mp = (unsigned char *)p;
+                    BOOL isUnauthorized = NO;  // "未授权此手机" → do NOT clear
 
-                    mp[12] = 0;
-
-                    // Also clear "版本过低"/"登录失败" body text so client state machine doesn't block
+                    BOOL isVersionLow = NO;    // "版本过低" → clear (version bypass)
 
                     if (ret > 13) {
 
-                        NSString *bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
+                        bodyStr = [[NSString alloc] initWithBytes:p+13 length:(NSUInteger)(ret-13) encoding:NSUTF8StringEncoding];
 
                         if (bodyStr && bodyStr.length > 0) {
 
-                            DLOG(@"[EE121-RESP] v37.134-FIX6: Body before patch: %@", bodyStr);
+                            // FIX49: Check for authorization-related keywords
 
-                            // Replace all body bytes with spaces (preserve pktLen)
+                            if ([bodyStr containsString:@"未授权"] || [bodyStr containsString:@"授权"]) {
 
-                            memset(mp+13, 0x20, (size_t)(ret-13));
+                                isUnauthorized = YES;
 
-                            DLOG(@"[EE121-RESP] v37.134-FIX6: Body cleared (status=0, proceeding to login)");
+                            }
+
+                            if ([bodyStr containsString:@"版本过低"] || [bodyStr containsString:@"version"]) {
+
+                                isVersionLow = YES;
+
+                            }
+
+                        }
+
+                    }
+
+                    // FIX49: ONLY clear if it's a version check (版本过低), NOT authorization (未授权)
+
+                    if (isUnauthorized && !isVersionLow) {
+
+                        // "未授权此手机" → DO NOT CLEAR! Let client show authorization prompt!
+
+                        DLOG(@"[EE121-RESP] v37.134-FIX49: cmd=0x%08X status=4, body contains '未授权' → NOT clearing (normal authorization flow)", cmd);
+
+                        if (bodyStr) {
+
+                            DLOG(@"[EE121-RESP] v37.134-FIX49: Body (authorization prompt, let client display): %@", bodyStr);
+
+                        }
+
+                        DLOG(@"[EE121-RESP] v37.134-FIX49: User must authorize this device on master device within 10 minutes!");
+
+                    } else {
+
+                        // "版本过低" or unknown → clear (version check bypass, as before)
+
+                        DLOG(@"[EE121-RESP] v37.134-FIX6: cmd=0x%08X status=4→0 (patching for version bypass, isVersionLow=%d isUnauthorized=%d)", cmd, isVersionLow, isUnauthorized);
+
+                        // Cast away const to modify response in-place (we own this buffer from recv)
+
+                        unsigned char *mp = (unsigned char *)p;
+
+                        mp[12] = 0;
+
+                        // Also clear "版本过低"/"登录失败" body text so client state machine doesn't block
+
+                        if (ret > 13) {
+
+                            if (bodyStr && bodyStr.length > 0) {
+
+                                DLOG(@"[EE121-RESP] v37.134-FIX6: Body before patch: %@", bodyStr);
+
+                                // Replace all body bytes with spaces (preserve pktLen)
+
+                                memset(mp+13, 0x20, (size_t)(ret-13));
+
+                                DLOG(@"[EE121-RESP] v37.134-FIX6: Body cleared (status=0, proceeding to login)");
+
+                            }
 
                         }
 
