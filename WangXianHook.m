@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX45: [FINAL-USER-CONFIRMED-ROOTCAUSE] 崩溃≠网络签名校验!签名校验4个API全成功(patched)→崩溃点=VersionModule.widgetSelected C++异常!systemhook.dylib(Dopamine越狱 0号image LINE443)用fishhook先于WangXianHook加载→劫持fopen/fgets/fread/fclose等C stdio为buggy实现→游戏读version/server XML配置返回NULL/0字节→抛C++异常→没人catch→std::terminate()→SIGTRAP! 本地全能签注入无systemhook.dylib→读配置正常→成功进游戏! FIX45层次A(治本): ①dlopen(/usr/lib/system/libsystem_c.dylib)直接取真实fopen/fgets/fread/fclose指针②fishhook安装我们的wrapper③orig=systemhook版本, wrapper: systemhook返回NULL/0→立即FALLBACK调真实libsystem实现! FIX45层次B(兜底防crash): libsubstrate加载LINE449→MSHookFunction patch _ZN13VersionModule14widgetSelectedER14SelectionEvent→包一层try/catch所有C++异常→强制继续运行绝不terminate!";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX45-VERIFY: libsystem_c_direct_dlsym_real_fopen_fgets_fread_fclose_BYPASS_systemhook + fishhook_rebind_fopen_fgets_fread_fclose_wrapper_FALLBACK_on_NULL + MSHookFunction_VersionModule_widgetSelected_TRY_CATCH_ALL_EXCEPTIONS_NO_TERMINATE + judgeAppInfoSignApi_FORCE_FIX19GetResp_SIMULATE_FIX38_PATH + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX46: [FINAL-USER-CONFIRMED-ROOTCAUSE] 新设备网络断开=设备未授权!wxhook(150).log L592-610铁证: 游戏查询https://x.md5xor.com/jeecg-boot/ios/queryById?id=<IDFV>→服务器返回 ispass=NO/test=NO→游戏判定未授权→关闭TCP连接→网络断开!主设备已授权无此请求! FIX46: NSURLSession completionHandler+delegate双模式拦截md5xor响应→ispass:NO→YES + test:NO→YES(覆盖大小写NO/no)→游戏认为设备已授权→允许登录! (继承FIX45: systemhook fishhook劫持fopen/fgets/fread/fclose→VersionModule读配置C++异常terminate;FIX45-A=dlopen libsystem_c真实stdio指针+wrapper fallback;FIX45-B=MSHookFunction VersionModule.widgetSelected try/catch所有异常)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX46-VERIFY: md5xor_ispass_NO_to_YES_test_NO_to_YES_completionHandler_AND_delegate + libsystem_c_direct_dlsym_real_fopen_fgets_fread_fclose_BYPASS_systemhook + fishhook_rebind_fopen_fgets_fread_fclose_wrapper_FALLBACK_on_NULL + MSHookFunction_VersionModule_widgetSelected_TRY_CATCH_ALL_EXCEPTIONS_NO_TERMINATE + judgeAppInfoSignApi_FORCE_FIX19GetResp_SIMULATE_FIX38_PATH + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -5314,7 +5314,28 @@ static void hook_urlSessionDataTaskDidReceiveData(id self, SEL _cmd, NSURLSessio
 
     }
 
-    
+
+    // === FIX46: delegate模式下也拦截md5xor授权API ispass:NO→YES! ===
+    if (url && [url containsString:@"md5xor"] && data && data.length > 0) {
+        NSString *authStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (authStr && [authStr containsString:@"ispass"]) {
+            DLOG(@"[FIX46-AUTH-DELEGATE] 🔥 检测到md5xor授权API(delegate)! 原始body: %@", authStr);
+            NSString *authBody = authStr;
+            authBody = [authBody stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+            authBody = [authBody stringByReplacingOccurrencesOfString:@"\"ispass\":\"no\"" withString:@"\"ispass\":\"YES\""];
+            authBody = [authBody stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+            authBody = [authBody stringByReplacingOccurrencesOfString:@"\"test\":\"no\"" withString:@"\"test\":\"YES\""];
+            if (![authBody isEqualToString:authStr]) {
+                NSData *newData = [authBody dataUsingEncoding:NSUTF8StringEncoding];
+                DLOG(@"[FIX46-AUTH-DELEGATE] ✅ ispass:NO→YES 补丁完成! newBody: %@", authBody);
+                if (orig_urlSessionDataTaskDidReceiveData) {
+                    orig_urlSessionDataTaskDidReceiveData(self, _cmd, session, dataTask, newData);
+                    return;
+                }
+            }
+        }
+    }
+
 
     if (orig_urlSessionDataTaskDidReceiveData) {
 
@@ -24149,6 +24170,25 @@ static NSURLSessionDataTask *hook_dtwrc(id self, SEL _cmd, NSURLRequest *req, vo
                     }
 #endif
 DLOG(@"[FIX39-FINAL] Legacy NET-PATCH judgeAppInfoApi double-patch SKIPPED → using patchSignatureResponse result verbatim");
+
+
+                    // === FIX46: x.md5xor.com 设备授权API ispass:NO→YES 补丁! ===
+                    //   wxhook(150).log L592-594 铁证: 游戏查询 https://x.md5xor.com/jeecg-boot/ios/queryById?id=<IDFV>
+                    //   服务器返回 {"ispass":"NO"} → 游戏判定设备未授权 → 服务器关闭TCP连接 → "网络断开"!
+                    //   主设备成功日志(wxhook.log)中完全无此请求=主设备已授权或不触发此检查。
+                    //   FIX46: 拦截md5xor响应, 把 ispass:NO→ispass:YES, test:NO→test:YES → 游戏认为设备已授权!
+                    if (url && [url containsString:@"md5xor"] && body && [body containsString:@"ispass"]) {
+                        DLOG(@"[FIX46-AUTH] 🔥 检测到md5xor授权API! 原始body: %@", body);
+                        NSString *authBody = body;
+                        authBody = [authBody stringByReplacingOccurrencesOfString:@"\"ispass\":\"NO\"" withString:@"\"ispass\":\"YES\""];
+                        authBody = [authBody stringByReplacingOccurrencesOfString:@"\"ispass\":\"no\"" withString:@"\"ispass\":\"YES\""];
+                        authBody = [authBody stringByReplacingOccurrencesOfString:@"\"test\":\"NO\"" withString:@"\"test\":\"YES\""];
+                        authBody = [authBody stringByReplacingOccurrencesOfString:@"\"test\":\"no\"" withString:@"\"test\":\"YES\""];
+                        if (![authBody isEqualToString:body]) {
+                            data = [authBody dataUsingEncoding:NSUTF8StringEncoding];
+                            DLOG(@"[FIX46-AUTH] ✅ ispass:NO→YES + test:NO→YES 补丁完成! newBody: %@", authBody);
+                        }
+                    }
 
 
                     
