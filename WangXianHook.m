@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53: [CCCrypt+CC_MD5_Update UUID替换为180C4F27] 通用UUID替换! 将CCCrypt L4和CC_MD5_Update中任意UUID替换为180C4F27-4414-4623-ACEB-0C12B30E48FD(主设备UUID)! 180C4F27已在游戏服务器(12003)白名单中! v37.107曾停用UUID替换,但实际原因是v37.108同时强制替换了accountId导致所有用户进入kk994角色, v37.108-DIST已修复accountId不替换, UUID替换可恢复! FIX53: CCCrypt L4新增通用UUID检测和替换(UUID=MACADDRESS=xxx和裸UUID), CC_MD5_Update同步添加 (继承FIX52/51/50/49/46/45)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53-VERIFY: CCCrypt_L4_generic_UUID_replace_180C4F27 + CC_MD5_Update_generic_UUID_replace_180C4F27 + UUID_MACADDRESS_51B_replace + bare_UUID_36B_replace + FIX52_EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX54: [FIX53-REC54全链路修复] (1)FIX53: CCCrypt L4+CC_MD5_Update UUID替换为180C4F27(主设备UUID已在游戏服务器白名单)! (2)FIX54-1: EE007-ALIGN提前return时设置g_loginPacketsSent=YES (之前绕过导致loginSent=0)! (3)FIX54-2: RECV-CLOSE(ret=0)时立即触发BURST注入伪造0x00A3B010角色数据! 根因: 服务器收到FFF493后立即关闭,FORGE-0CB0A300等待999心跳从未触发 → 需要RECV-CLOSE立即注入! (继承FIX52/51/50/49/46/45)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX54-VERIFY: FIX53_UUID→180C4F27 + FIX54-1_EE007-ALIGN_set_g_loginPacketsSent + FIX54-2_RECV-CLOSE_BURST_inject_0x00A3B010 + CCCrypt_L4_UUID_replace_180C4F27 + CC_MD5_Update_UUID_replace_180C4F27 + FIX52_EE118_standalone_status_patch + A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + md5xor_ispass_NO→YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
 
 
 
@@ -13181,7 +13181,20 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     free(newBuf);
 
-                    if (rret >= 0) return (ssize_t)len;
+                    // FIX54: EE007-ALIGN 提前return绕过了custom_send尾部的g_loginPacketsSent设置
+                    // 设置标志,确保后续RECV-CLOSE能触发BURST注入
+                    if (rret >= 0) {
+                        BOOL isGamePortOnly = (port == 12003 || port == 58158 ||
+                                              (port >= 10000 && port <= 65535 && g_gameServerPort >= 1024));
+                        if (isGamePortOnly && (cmd == 0x000EE007 || cmd == 0x00FFF493 ||
+                                               cmd == 0x80EEE007 || cmd == 0x80F493)) {
+                            if (!g_loginPacketsSent) {
+                                g_loginPacketsSent = YES;
+                                DLOG(@"[LOGIN-PACKETS-FIX54] v37.134: EE007-ALIGN提前发送cmd=0x%08X port=%d, 强制设置g_loginPacketsSent=YES", cmd, port);
+                            }
+                        }
+                        return (ssize_t)len;
+                    }
 
                     return rret;
 
@@ -16935,7 +16948,54 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
 
                 // Native encryption works, let client handle connection close normally.
 
-                if (0 && g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
+                // FIX54: 重新启用BURST注入!
+                // 根因: 服务器收到FFF493后立即关闭连接,根本没等到999个心跳,FORGE-0CB0A300从未触发
+                // 需要FFF493#1和#2发送后,收到RECV-CLOSE(ret=0)时立即注入伪造响应
+                // 条件: handshake完成 + FFF493#1和#2都已发送 + 还未注入过伪造角色数据
+                if (g_handshakeComplete && g_fff493_1_sent && g_fff493_2_sent && !g_injected_0CB0A300 && isGamePort) {
+
+                    DLOG(@"[RECV-CLOSE-BURST-FIX54] fd=%d ret=0 → 立即注入伪造响应! handshake=%d fff493_1=%d fff493_2=%d injected_0CB0=%d",
+                         fd, g_handshakeComplete, g_fff493_1_sent, g_fff493_2_sent, g_injected_0CB0A300);
+
+                    uint32_t fakeSeq = 42;
+                    if (ret >= 12 && p != NULL) {
+                        uint32_t lastCmd = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|(uint32_t)p[7];
+                        if (lastCmd == 0x00000015 || lastCmd == 0x80000015) {
+                            fakeSeq = ((uint32_t)p[8]<<24)|((uint32_t)p[9]<<16)|((uint32_t)p[10]<<8)|(uint32_t)p[11];
+                            fakeSeq += 1;
+                        }
+                    }
+                    DLOG(@"[RECV-CLOSE-BURST-FIX54] fakeSeq=0x%08X", fakeSeq);
+
+                    if (g_roleIndex <= 0) g_roleIndex = 1;
+
+                    uint8_t tmpForged[2048] = {0};
+                    uint32_t forgedLen = generateFakeResponse(0x00FFF493, tmpForged, sizeof(tmpForged), fakeSeq);
+                    DLOG(@"[RECV-CLOSE-BURST-FIX54] generateFakeResponse ret=%u", forgedLen);
+
+                    if (forgedLen >= 12 && forgedLen < sizeof(tmpForged)) {
+                        ssize_t maxAppend = (ssize_t)len;
+                        DLOG(@"[RECV-CLOSE-BURST-FIX54] bufLen=%zd forgedLen=%u maxAppend=%zd p=%p",
+                             len, forgedLen, maxAppend, p);
+
+                        if (maxAppend >= (ssize_t)forgedLen && p != NULL) {
+                            memcpy((void *)p, tmpForged, forgedLen);
+                            DLOG(@"[RECV-CLOSE-BURST-FIX54] ✅ SUCCESS! injected %u bytes, return new ret=%u", forgedLen, forgedLen);
+                            g_injected_0CB0A300 = 1;
+                            g_consec_heartbeats = 0;
+                            g_fakeRespInjected = YES;
+                            g_fakeRespLen = 0;
+                            return (ssize_t)forgedLen;
+                        } else {
+                            DLOG(@"[RECV-CLOSE-BURST-FIX54] ❌ FAILED: maxAppend=%zd < forgedLen=%u OR p=NULL", maxAppend, forgedLen);
+                        }
+                    } else {
+                        DLOG(@"[RECV-CLOSE-BURST-FIX54] ❌ generateFakeResponse too small/large: %u (<12 or >=%zu)", forgedLen, sizeof(tmpForged));
+                    }
+
+                    DLOG(@"[RECV-CLOSE-BURST-FIX54] BURST inject FAILED, falling through to EAGAIN");
+
+                } else if (0 && g_handshakeComplete && g_loginPacketsSent && !g_fakeRespInjected) {
 
                     DLOG(@"[RECV-CLOSE] v36.137: Game server closed connection (fd=%d). DIRECT BURST inject (handshake=%d loginSent=%d).",
 
