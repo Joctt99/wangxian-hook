@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53C: [完全恢复FIX53基线+日志大小限制+轮转开关(默认开)] FIX53C单通道canonical UUID全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均使用66B0EE01), 无双通道门控, 无额外uuid计数器, CCCrypt L4 UUID等长替换. FIX53B: TAG过滤(可选SPARSE_LOG_MODE默认0). FIX53C新增日志大小限制开关(LOG_SIZE_LIMIT_DEFAULT_ON=1默认开启限制): wxhook.log最大LOG_MAX_KB=200KB,超过后轮转保留LOG_ROTATE_COUNT=1份历史(.old). 关闭限制的方法: LOG_SIZE_LIMIT_DEFAULT_ON=0重编译即无大小限制(兜底仍有5MB绝对上限防无限增长). Runtime静态BOOL g_logSizeLimitEnabled可lldb动态切换. [LOG-ROTATED]标记轮转后首行写入. 环形缓冲fix31_pushLog始终保持全量消息不限制.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53C-VERIFY: FIX53_BASELINE_RESTORED + SPARSE_LOG_MODE(default=0) + LOG_SIZE_LIMIT(default=ON). LOG_SIZE_LIMIT_DEFAULT_ON LOG_MAX_KB LOG_ROTATE_COUNT macros compiled in. logRotateChain() static helper and g_logSizeLimitEnabled runtime flag exist. Single-channel canonical UUID 66B0EE01 everywhere. No extra UUID counters or dual-channel gates.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53D: [完全恢复FIX53基线 + 日志大小限制(默认开LOG_MAX_KB=200KB LOG_ROTATE_COUNT=1) + 🆕零门槛Documents空文件运行时开关(wxhook_nolimit取消限制/wxhook_sparse强制TAG过滤/wxhook_logfull恢复编译默认)] FIX53D保持单通道canonical UUID=66B0EE01(CC_MD5/CCCrypt/FFF493-REPL三处一致). 新增运行时切换无需重签/重编/调试器: 把空文件wxhook_nolimit/wxhook_sparse/wxhook_logfull放到App沙盒Documents目录,重启游戏即生效. 删除空文件即恢复编译默认(SPARSE_LOG_MODE=0完整TAG, LOG_SIZE_LIMIT_DEFAULT_ON=1限制200KB轮转). g_logSizeLimitEnabled + g_logSparseEnabled启动时先读宏默认再读Documents空文件覆盖. [LOG-TOGGLE]输出空文件检测结果. [LOG-CONFIG]输出最终生效配置. 兜底5MB绝对上限永不关闭防无限增长.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53D-VERIFY: FIX53_BASELINE_RESTORED + SPARSE_LOG_MODE(default=0) + LOG_SIZE_LIMIT(default=ON LOG_MAX_KB=200 LOG_ROTATE_COUNT=1) + NEW RUNTIME FILE-TOGGLE DOCUMENTS SWITCHES (wxhook_nolimit / wxhook_sparse / wxhook_logfull empty files in Documents override g_logSizeLimitEnabled + g_logSparseEnabled on boot). [LOG-TOGGLE] [LOG-CONFIG] strings present. Single-channel canonical UUID 66B0EE01 everywhere.";
 
 
 
@@ -2981,26 +2981,75 @@ static void log_init(void) {
 
         setupSignalHandlers();
 
-        _log(@"=== WangXianHook v37.134-FIX53C loaded (FIX53基线+SPARSE可选TAG过滤[默认关]+日志大小限制[默认开!]+链式轮转开关) UUID单通道全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均为canonical 66B0EE01), 无双通道逻辑, 无额外UUID计数器/delta修正, CCCrypt L4 UUID替换为等长53→53和36→36. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化+纯字符串替换保持code第1位. FIX53B新功能: SPARSE_LOG_MODE宏(源码L1864)默认0=完整日志, 改1=TAG过滤(跳过RSA/SIGN/V3/SOCK/SEND/RECV噪音TAG写磁盘,但环形缓冲保留). FIX53C新功能: 日志大小限制开关 LOG_SIZE_LIMIT_DEFAULT_ON默认1=开启(源码L1876), LOG_MAX_KB=200KB上限, LOG_ROTATE_COUNT=1历史.old, 超过200KB自动轮转. 关闭限制: 改LOG_SIZE_LIMIT_DEFAULT_ON=0重编译(兜底5MB绝对上限防无限). g_logSizeLimitEnabled可运行时lldb expr切换. logRotateChain()链式轮转最多5份历史. 轮转发生首行写入[LOG-ROTATED]. 环形缓冲fix31_pushLog始终全量保留不受任何开关限制.) ===");
+        // v37.134-FIX53D: RUNTIME FILE-TOGGLE OVERRIDES (zero-config, no lldb / no rebuild / no resign)
+        // Put empty files into <App Sandbox>/Documents via any 3u/爱思/全能签 file manager:
+        //   Documents/wxhook_nolimit   → g_logSizeLimitEnabled=NO (remove 200 KB cap until next restart)
+        //   Documents/wxhook_sparse    → g_logSparseEnabled=YES (enable TAG-filtered sparse logging)
+        //   Documents/wxhook_logfull   → g_logSizeLimitEnabled=YES + g_logSparseEnabled=NO explicit restore default
+        // Notes:
+        //   - Delete the file + restart app → returns to compiled defaults.
+        //   - These files are checked ONLY ONCE at boot (log_init). They are NOT polled mid-run.
+        //   - lldb expr <var>=YES still works if symbols are visible (use e -- (void)Foo instead if static stripped).
+        {
+            NSString *docsDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *toggle_nolimit = [docsDir stringByAppendingPathComponent:@"wxhook_nolimit"];
+            NSString *toggle_sparse  = [docsDir stringByAppendingPathComponent:@"wxhook_sparse"];
+            NSString *toggle_logfull = [docsDir stringByAppendingPathComponent:@"wxhook_logfull"];
+            BOOL nolimitFile = [fm fileExistsAtPath:toggle_nolimit];
+            BOOL sparseFile  = [fm fileExistsAtPath:toggle_sparse];
+            BOOL logfullFile = [fm fileExistsAtPath:toggle_logfull];
+            // wxhook_logfull wins as "explicit default restore"
+            if (logfullFile) {
+                // Force back to compiled defaults (respects macros)
+                #if LOG_SIZE_LIMIT_DEFAULT_ON
+                g_logSizeLimitEnabled = YES;
+                #else
+                g_logSizeLimitEnabled = NO;
+                #endif
+                #if SPARSE_LOG_MODE
+                g_logSparseEnabled = YES;
+                #else
+                g_logSparseEnabled = NO;
+                #endif
+            } else {
+                if (nolimitFile) g_logSizeLimitEnabled = NO;
+                if (sparseFile)  g_logSparseEnabled    = YES;
+            }
+            _log([NSString stringWithFormat:
+                @"[LOG-TOGGLE] File-switch check (Documents/*. no rebuild needed). wxhook_nolimit=%d (size cap off if 1). wxhook_sparse=%d (TAG filter on if 1). wxhook_logfull=%d (restore compiled defaults if 1). Tip: use 3uTools/Aisi/全能签 → Files → Documents → New Empty File named wxhook_nolimit / wxhook_sparse, then restart app.",
+                nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
+        }
+
+        _log(@"=== WangXianHook v37.134-FIX53D loaded (FIX53基线 + SPARSE可选TAG过滤[默认关] + 日志大小限制轮转开关[默认开LOG_MAX_KB=200 LOG_ROTATE_COUNT=1] + 🆕零门槛Documents空文件开关) UUID单通道canonical 66B0EE01全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换). 无双通道逻辑, 无额外UUID计数器/delta修正, CCCrypt L4 UUID替换等长. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化保持code第1位. FIX53D新增运行时切换: 新建Documents/wxhook_nolimit空文件(取消200KB上限,删除即恢复限制), wxhook_sparse空文件(强制TAG过滤精简,删即恢复完整TAG). 不需要lldb/Xcode/重签名. [LOG-CONFIG]后续行显示最终生效配置.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
 
-        // FIX53C: LOG CONFIG SUMMARY — print current switch/limit/rotation state once on boot.
+        // FIX53D: LOG CONFIG SUMMARY — print FINAL effective switch/limit/rotation state once on boot
+        // (AFTER file-toggle overrides applied).
         {
             int copies = LOG_ROTATE_COUNT;
             if (copies < 0) copies = 0;
             if (copies > 5) copies = 5;
+            long long maxKB_effective = g_logSizeLimitEnabled ? LOG_MAX_KB : (5 * 1024 /* unlimited-compiled? still show 5MB safety fallback */);
+            long long totalCapKB_effective = g_logSizeLimitEnabled
+                ? (maxKB_effective + (copies > 0 ? (maxKB_effective * copies) : 0))
+                : (5 * 1024 + (copies > 0 ? (5 * 1024 * copies) : 0)); // disabled → use 5MB fallback
+            NSString *limitStatus = g_logSizeLimitEnabled
+                ? [NSString stringWithFormat:@"LIMITED (LOG_MAX_KB=%d; auto rotate)", LOG_MAX_KB]
+                : @"UNLIMITED-requested (wxhook_nolimit detected or LOG_SIZE_LIMIT_DEFAULT_ON=0; still 5MB hard-safety cap)";
+            NSString *sparseStatus = g_logSparseEnabled
+                ? @"ON (TAG-filtered noise → disk skipped, ring buffer still full)"
+                : @"OFF (full verbose TAGs to disk)";
             NSString *logCfg = [NSString stringWithFormat:
-                @"[LOG-CONFIG] Logger: SPARSE=%d (SPARSE_LOG_MODE; 0=full verbose,1=TAG-filter skip file write). LOG_SIZE_LIMIT=%d (LOG_SIZE_LIMIT_DEFAULT_ON; compiled default). LOG_MAX_KB=%d (max kilobytes before rotation). LOG_ROTATE_COUNT=%d (historical copies kept, max 5). Total max disk footprint ≤ %d KB (%d current + %d history). Runtime toggle (lldb): expr g_logSizeLimitEnabled=NO to remove cap.",
-                SPARSE_LOG_MODE,
-                g_logSizeLimitEnabled ? 1 : 0,
-                LOG_MAX_KB,
+                @"[LOG-CONFIG] Effective (after file-toggle overrides): SPARSE=%d → %@. LOG_SIZE_LIMIT=%d → %@. LOG_ROTATE_COUNT=%d (history kept). Approx max disk: ~%lld KB. Compiled defaults: SPARSE_LOG_MODE=%d, LOG_SIZE_LIMIT_DEFAULT_ON=%d, LOG_MAX_KB=%d. File toggles (restart required to change): Documents/wxhook_nolimit (remove cap) · Documents/wxhook_sparse (enable TAG filter) · Documents/wxhook_logfull (restore defaults).",
+                g_logSparseEnabled ? 1 : 0, sparseStatus,
+                g_logSizeLimitEnabled ? 1 : 0, limitStatus,
                 copies,
-                (LOG_MAX_KB + (copies > 0 ? (LOG_MAX_KB * copies) : 0)),
-                LOG_MAX_KB,
-                (copies > 0 ? (LOG_MAX_KB * copies) : 0)];
+                totalCapKB_effective,
+                SPARSE_LOG_MODE, LOG_SIZE_LIMIT_DEFAULT_ON, LOG_MAX_KB];
             _log(logCfg);
         }
 
@@ -27462,7 +27511,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53C — Fully restored FIX53 baseline + OPTIONAL SPARSE LOGGER [DEFAULT OFF] + LOG SIZE LIMIT & ROTATION [DEFAULT ON!]. Single-channel canonical UUID=66B0EE01 used EVERYWHERE (CC_MD5 HMAC input & CCCrypt L4 plaintext & FFF493-REPL MACADDRESS field — all use 66B0EE01, guaranteed parity). No extra UUID counters, no length-changing UUID replacements, no dual-channel gate. SPARSE_LOG_MODE=0 default (full verbose). LOG_SIZE_LIMIT_DEFAULT_ON=1 default: wxhook.log max LOG_MAX_KB=200 KB, LOG_ROTATE_COUNT=1 (.old history). Size-limit toggle (compile-time): change WangXianHook.m L1876 #define LOG_SIZE_LIMIT_DEFAULT_ON 0 and rebuild to remove the cap (the old 5MB hard cap still applies as a safety). Runtime toggle (lldb): expr g_logSizeLimitEnabled=NO.");
+    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53D — Fully restored FIX53 baseline + OPTIONAL SPARSE LOGGER [DEFAULT OFF] + LOG SIZE LIMIT & ROTATION [DEFAULT ON!] + 🆕 FILE-TOGGLE RUNTIME SWITCHES (NO lldb/rebuild/resign). Single-channel canonical UUID=66B0EE01 used EVERYWHERE (CC_MD5 HMAC input & CCCrypt L4 plaintext & FFF493-REPL MACADDRESS field — all use 66B0EE01, guaranteed parity). No extra UUID counters, no length-changing UUID replacements, no dual-channel gate. SPARSE_LOG_MODE=0 default (full verbose). LOG_SIZE_LIMIT_DEFAULT_ON=1 default: wxhook.log max LOG_MAX_KB=200 KB, LOG_ROTATE_COUNT=1 (.old history). NEW RUNTIME TOGGLES (NO REBUILD NEEDED): Place empty file <Documents>/wxhook_nolimit → size cap OFF; <Documents>/wxhook_sparse → TAG-filter sparse ON; <Documents>/wxhook_logfull → restore compiled defaults. Delete file + restart to revert. Boot prints [LOG-TOGGLE] + [LOG-CONFIG] with final effective state. Safety: 5 MB absolute cap always applies regardless of switches.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
