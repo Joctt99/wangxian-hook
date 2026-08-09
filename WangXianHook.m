@@ -1859,7 +1859,33 @@ extern "C" kern_return_t mach_vm_remap(
 // during file write (still pushed to fix31 ring buffer for crash diagnosis).
 // Expected log size reduction: 80-95% (removes ~550 of ~925 DLOG calls from disk output).
 // Set to 0 during development to re-enable FULL diagnostics.
-#define SPARSE_LOG_MODE 1
+// NOTE (2026-08-10 user request): DEFAULT = 0 (full logging = original FIX53 behavior).
+// To enable sparse logging: change this to 1 and rebuild.
+#define SPARSE_LOG_MODE 0
+
+// v37.134-FIX53C: LOG SIZE LIMIT + ROTATION SWITCH (大小限制+轮转开关)
+// When LOG_SIZE_LIMIT_DEFAULT_ON=1 (default per user request 2026-08-10),
+//   wxhook.log size is capped at LOG_MAX_KB kilobytes. Once exceeded, the file is
+//   rotated: current wxhook.log → .old → .old.1 → ... → oldest gets deleted.
+//   Up to LOG_ROTATE_COUNT historical copies are kept. The limit applies even if
+//   SPARSE_LOG_MODE=0 (so you can have verbose logging but bounded disk usage).
+// When LOG_SIZE_LIMIT_DEFAULT_ON=0, unlimited size (original behavior, fallback
+//   was 5MB hard-coded cap before FIX53C).
+// Runtime control: g_logSizeLimitEnabled static BOOL (change via lldb expr).
+// How to disable entirely: set LOG_SIZE_LIMIT_DEFAULT_ON=0 here and rebuild.
+#define LOG_SIZE_LIMIT_DEFAULT_ON 1
+
+// v37.134-FIX53C: Maximum log size in KILOBYTES. Default 200 KB = 204,800 bytes.
+// Previous hard-coded threshold was 5 MB (5120 KB). 200 KB keeps the last ~15-20
+// minutes of full-verbose diagnostic, which is enough for login+entering-game trace.
+#define LOG_MAX_KB 200
+
+// v37.134-FIX53C: Number of historical rotated copies to retain.
+//   0 = only keep current wxhook.log, overwrite in place when limit reached (no .old)
+//   1 = wxhook.log + 1 wxhook.log.old (default)
+//   2 = wxhook.log + .old + .old.1 (two generations of history)
+//   max 5 supported (to bound NSSearchPathForDirectoriesInDomains disk usage).
+#define LOG_ROTATE_COUNT 1
 
 
 
@@ -1867,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53B: [完全恢复FIX53基线+精简日志] FIX53B单通道canonical UUID全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均使用66B0EE01), 无双通道门控, 无额外uuid计数器, CCCrypt L4 UUID等长替换. FIX53B新增: SPARSE_LOG_MODE=1 日志过滤 高频率噪音TAG(RSA-ENCRYPT/SIGN-BYPASS/V3-zsign/SEC/MSI-STUB/SOCK/SEND*/RECV*/CH-L0/L1/L2/SERVERLIST-PARSE/NSUD/PROTO-DBG等)写入wxhook.log时被跳过, 只保留关键诊断(VERSION/INIT横幅+EE协议patch+FFF493-REPL+FIX53-UUID*+CH-L4 patch计数+PUBKEY/SESSION/GLOBALS+ERROR/BT栈追踪). 预计日志体积减少80-95%.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53B-VERIFY: FIX53_BASELINE_RESTORED + SPARSE_LOG_MODE=1. Single-channel canonical UUID 66B0EE01 everywhere. Tag-filtered sparse logger skips 25+ noisy TAG prefixes during file write. Sparser log = 20-50KB normal usage vs 500KB-3MB before.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53C: [完全恢复FIX53基线+日志大小限制+轮转开关(默认开)] FIX53C单通道canonical UUID全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均使用66B0EE01), 无双通道门控, 无额外uuid计数器, CCCrypt L4 UUID等长替换. FIX53B: TAG过滤(可选SPARSE_LOG_MODE默认0). FIX53C新增日志大小限制开关(LOG_SIZE_LIMIT_DEFAULT_ON=1默认开启限制): wxhook.log最大LOG_MAX_KB=200KB,超过后轮转保留LOG_ROTATE_COUNT=1份历史(.old). 关闭限制的方法: LOG_SIZE_LIMIT_DEFAULT_ON=0重编译即无大小限制(兜底仍有5MB绝对上限防无限增长). Runtime静态BOOL g_logSizeLimitEnabled可lldb动态切换. [LOG-ROTATED]标记轮转后首行写入. 环形缓冲fix31_pushLog始终保持全量消息不限制.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53C-VERIFY: FIX53_BASELINE_RESTORED + SPARSE_LOG_MODE(default=0) + LOG_SIZE_LIMIT(default=ON). LOG_SIZE_LIMIT_DEFAULT_ON LOG_MAX_KB LOG_ROTATE_COUNT macros compiled in. logRotateChain() static helper and g_logSizeLimitEnabled runtime flag exist. Single-channel canonical UUID 66B0EE01 everywhere. No extra UUID counters or dual-channel gates.";
 
 
 
@@ -1989,6 +2015,70 @@ static inline BOOL sparse_log_shouldSkip(const char *utf8msg) {
         }
     }
     return NO;
+}
+
+// v37.134-FIX53C: LOG SIZE LIMIT runtime flag (gated by compile-time default above)
+#if LOG_SIZE_LIMIT_DEFAULT_ON
+static BOOL g_logSizeLimitEnabled = YES;
+#else
+static BOOL g_logSizeLimitEnabled = NO;
+#endif
+
+// v37.134-FIX53C: Chain-rotation helper — rotates .old → .old.1 → ... deletes oldest.
+// Caller must ensure g_logPath is set and file exists. This helper never throws.
+static void logRotateChain(void) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        int maxCopies = LOG_ROTATE_COUNT;
+        if (maxCopies < 0) maxCopies = 0;
+        if (maxCopies > 5) maxCopies = 5; // safety cap
+        // Step 1: if maxCopies == 0, don't keep history — just truncate in place.
+        if (maxCopies == 0) {
+            [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        // Step 2: delete the OLDEST rotated file (index maxCopies-1) if exists.
+        NSString *oldestPath = [g_logPath stringByAppendingPathExtension:
+            [NSString stringWithFormat:@"old.%d", maxCopies - 1]];
+        // Special case: index 0 suffix is ".old" (no trailing .0)
+        if (maxCopies == 1) {
+            oldestPath = [g_logPath stringByAppendingString:@".old"];
+        }
+        [fm removeItemAtPath:oldestPath error:nil];
+        // Step 3: rotate chain from oldest backwards. If maxCopies=2 we have .old and .old.1.
+        //   .old.1 is already removed (it was oldest).
+        //   Move .old → .old.1
+        //   Move current log → .old
+        for (int i = maxCopies - 1; i > 0; i--) {
+            NSString *src;
+            NSString *dst;
+            if (i == 1) {
+                src = [g_logPath stringByAppendingString:@".old"];
+                dst = [g_logPath stringByAppendingString:@".old.1"];
+            } else {
+                src = [g_logPath stringByAppendingPathExtension:
+                    [NSString stringWithFormat:@"old.%d", i - 1]];
+                dst = [g_logPath stringByAppendingPathExtension:
+                    [NSString stringWithFormat:@"old.%d", i]];
+            }
+            if ([fm fileExistsAtPath:src]) {
+                [fm removeItemAtPath:dst error:nil];
+                [fm moveItemAtPath:src toPath:dst error:nil];
+            }
+        }
+        // Step 4: move current wxhook.log → .old (first slot), then truncate current.
+        NSString *firstOld = [g_logPath stringByAppendingString:@".old"];
+        [fm removeItemAtPath:firstOld error:nil];
+        if ([fm fileExistsAtPath:g_logPath]) {
+            [fm copyItemAtPath:g_logPath toPath:firstOld error:nil];
+        }
+        [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *e) {
+        // Last-resort fallback: just truncate.
+        @try {
+            if (g_logPath) [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } @catch(id _) {}
+    }
 }
 
 static BOOL g_isActivated = NO; // activation status
@@ -2785,28 +2875,72 @@ static void _log(NSString *msg) {
 
     @try {
 
+        // v37.134-FIX53C: LOG SIZE LIMIT + CHAIN ROTATION (replaces old 5 MB hard cap)
+        // When LOG_SIZE_LIMIT_DEFAULT_ON=1, current size is checked against
+        // LOG_MAX_KB * 1024 bytes before each write. Old 5 MB safety cap still
+        // applies when g_logSizeLimitEnabled is explicitly disabled (so logs never
+        // grow unbounded even if the user turns the feature off).
+        unsigned long long maxBytes = 0;
+        unsigned long long size = 0;
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:g_logPath error:nil];
+        if (attrs) size = [attrs[NSFileSize] unsignedLongLongValue];
 
-        unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+        if (g_logSizeLimitEnabled) {
+            maxBytes = (unsigned long long)LOG_MAX_KB * 1024ULL;
+            if (LOG_MAX_KB <= 0) maxBytes = 0;
+        } else {
+            // Original safety fallback: 5 MB absolute cap regardless of switch.
+            maxBytes = 5ULL * 1024ULL * 1024ULL;
+        }
 
-        if (size > 5 * 1024 * 1024) {
-
-            NSString *oldLogPath = [g_logPath stringByAppendingString:@".old"];
-
-            [[NSFileManager defaultManager] removeItemAtPath:oldLogPath error:nil];
-
-            [[NSFileManager defaultManager] copyItemAtPath:g_logPath toPath:oldLogPath error:nil];
-
-            [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-            _log(@"[LOG] File too large (>5MB), rotated to .old");
-
+        if (maxBytes > 0 && size > maxBytes) {
+            unsigned long long sizeBefore = size;
+            if (g_logSizeLimitEnabled) {
+                logRotateChain(); // FIX53C: chain rotation (N historical copies)
+            } else {
+                // Legacy single-slot rotation for the disabled-switch fallback case
+                NSString *oldLogPath = [g_logPath stringByAppendingString:@".old"];
+                NSFileManager *fm = [NSFileManager defaultManager];
+                [fm removeItemAtPath:oldLogPath error:nil];
+                [fm copyItemAtPath:g_logPath toPath:oldLogPath error:nil];
+                [@"" writeToFile:g_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            // After rotation/truncation, the first line into the fresh file must be
+            // the rotation announcement.
+            NSString *note;
+            if (g_logSizeLimitEnabled) {
+                note = [NSString stringWithFormat:
+                    @"[LOG-ROTATED] File exceeded LOG_MAX_KB=%d limit (%llu KB). size=%llu KB. Rotated %d historical copies kept (LOG_ROTATE_COUNT=%d). LOG_SIZE_LIMIT=ON (default). Switch off: change LOG_SIZE_LIMIT_DEFAULT_ON=0 in WangXianHook.m L%d and rebuild.",
+                    LOG_MAX_KB, (unsigned long long)LOG_MAX_KB,
+                    sizeBefore / 1024ULL,
+                    (LOG_ROTATE_COUNT < 0 ? 0 : (LOG_ROTATE_COUNT > 5 ? 5 : LOG_ROTATE_COUNT)),
+                    LOG_ROTATE_COUNT,
+                    1876];
+            } else {
+                note = [NSString stringWithFormat:
+                    @"[LOG-ROTATED] File exceeded 5 MB fallback cap (size=%llu KB). LOG_SIZE_LIMIT=OFF. Single .old slot rotation applied.",
+                    sizeBefore / 1024ULL];
+            }
+            // Push directly to ring buffer (already done above for caller msg, but
+            // we need the announcement too).
+            const char *noteRaw = note.UTF8String;
+            if (noteRaw) fix31_pushLog(noteRaw);
+            // Append note to file
+            NSData *noteData = [[NSString stringWithFormat:@"%@\n", note] dataUsingEncoding:NSUTF8StringEncoding];
+            if (noteData) {
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+                if (fh) {
+                    [fh seekToEndOfFile];
+                    [fh writeData:noteData];
+                    [fh synchronizeFile];
+                    [fh closeFile];
+                }
+            }
+            NSLog(@"[WXHook] %@", note);
             return;
-
         }
 
         
-
         NSData *data = [[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
 
         if (data) {
@@ -2847,11 +2981,28 @@ static void log_init(void) {
 
         setupSignalHandlers();
 
-        _log(@"=== WangXianHook v37.134-FIX53B loaded (FIX53基线+精简日志版! UUID单通道全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均为canonical 66B0EE01), 无双通道逻辑, 无额外UUID计数器/delta修正, CCCrypt L4 UUID替换为等长53→53和36→36. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化+纯字符串替换保持code第1位. FIX53B新增: SPARSE_LOG_MODE=1 TAG过滤日志(高频率RSA/SIGN/V3/SOCK/SEND/RECV等噪音TAG跳过写入wxhook.log,预计节省80-95%磁盘I/O). 详细诊断仍保留在环形缓冲fix31_pushLog,崩溃后可恢复.) ===");
+        _log(@"=== WangXianHook v37.134-FIX53C loaded (FIX53基线+SPARSE可选TAG过滤[默认关]+日志大小限制[默认开!]+链式轮转开关) UUID单通道全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换均为canonical 66B0EE01), 无双通道逻辑, 无额外UUID计数器/delta修正, CCCrypt L4 UUID替换为等长53→53和36→36. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化+纯字符串替换保持code第1位. FIX53B新功能: SPARSE_LOG_MODE宏(源码L1864)默认0=完整日志, 改1=TAG过滤(跳过RSA/SIGN/V3/SOCK/SEND/RECV噪音TAG写磁盘,但环形缓冲保留). FIX53C新功能: 日志大小限制开关 LOG_SIZE_LIMIT_DEFAULT_ON默认1=开启(源码L1876), LOG_MAX_KB=200KB上限, LOG_ROTATE_COUNT=1历史.old, 超过200KB自动轮转. 关闭限制: 改LOG_SIZE_LIMIT_DEFAULT_ON=0重编译(兜底5MB绝对上限防无限). g_logSizeLimitEnabled可运行时lldb expr切换. logRotateChain()链式轮转最多5份历史. 轮转发生首行写入[LOG-ROTATED]. 环形缓冲fix31_pushLog始终全量保留不受任何开关限制.) ===");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
         _log(@"[CRASH-HANDLER] Signal handlers + ObjC exception handler registered");
+
+        // FIX53C: LOG CONFIG SUMMARY — print current switch/limit/rotation state once on boot.
+        {
+            int copies = LOG_ROTATE_COUNT;
+            if (copies < 0) copies = 0;
+            if (copies > 5) copies = 5;
+            NSString *logCfg = [NSString stringWithFormat:
+                @"[LOG-CONFIG] Logger: SPARSE=%d (SPARSE_LOG_MODE; 0=full verbose,1=TAG-filter skip file write). LOG_SIZE_LIMIT=%d (LOG_SIZE_LIMIT_DEFAULT_ON; compiled default). LOG_MAX_KB=%d (max kilobytes before rotation). LOG_ROTATE_COUNT=%d (historical copies kept, max 5). Total max disk footprint ≤ %d KB (%d current + %d history). Runtime toggle (lldb): expr g_logSizeLimitEnabled=NO to remove cap.",
+                SPARSE_LOG_MODE,
+                g_logSizeLimitEnabled ? 1 : 0,
+                LOG_MAX_KB,
+                copies,
+                (LOG_MAX_KB + (copies > 0 ? (LOG_MAX_KB * copies) : 0)),
+                LOG_MAX_KB,
+                (copies > 0 ? (LOG_MAX_KB * copies) : 0)];
+            _log(logCfg);
+        }
 
         g_isActivated = YES;
 
@@ -27311,7 +27462,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53B — Fully restored FIX53 baseline + SPARSE LOG! Single-channel canonical UUID=66B0EE01 used EVERYWHERE (CC_MD5 HMAC input & CCCrypt L4 plaintext & FFF493-REPL MACADDRESS field — all use 66B0EE01, guaranteed parity). No extra UUID counters, no length-changing UUID replacements, no dual-channel gate. FIX53B: SPARSE_LOG_MODE=1 filters 25+ noise TAGs from file write (RSA/V3-zsign/SIGN-BYPASS/SERVERLIST-PARSE/SOCK/SEND/RECV/CH-L0/L1/L2/SC-DIAG/SK-DIAG etc), reduces wxhook.log size ~80-95% while keeping ring buffer intact.");
+    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53C — Fully restored FIX53 baseline + OPTIONAL SPARSE LOGGER [DEFAULT OFF] + LOG SIZE LIMIT & ROTATION [DEFAULT ON!]. Single-channel canonical UUID=66B0EE01 used EVERYWHERE (CC_MD5 HMAC input & CCCrypt L4 plaintext & FFF493-REPL MACADDRESS field — all use 66B0EE01, guaranteed parity). No extra UUID counters, no length-changing UUID replacements, no dual-channel gate. SPARSE_LOG_MODE=0 default (full verbose). LOG_SIZE_LIMIT_DEFAULT_ON=1 default: wxhook.log max LOG_MAX_KB=200 KB, LOG_ROTATE_COUNT=1 (.old history). Size-limit toggle (compile-time): change WangXianHook.m L1876 #define LOG_SIZE_LIMIT_DEFAULT_ON 0 and rebuild to remove the cap (the old 5MB hard cap still applies as a safety). Runtime toggle (lldb): expr g_logSizeLimitEnabled=NO.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
