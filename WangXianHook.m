@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX49: [NORMAL-AUTHORIZATION-FLOW] 不清除EE121未授权响应!让设备走正常授权流程! wxhook.log铁证: L2554服务器返回'未授权此手机,如要授权请使用上次登录的设备进行授权,此操作您必须在10分钟内完成'→hook清除body→客户端跳过授权→设备永远无法加入白名单! FIX49: 区分'未授权'(body含'未授权'/'授权')与'版本过低'(body含'版本过低'): ①未授权→不清除,让客户端显示授权提示 ②版本过低→清除(版本检查绕过)! (继承FIX48方案B: 每个设备用真实UUID; FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX49-VERIFY: EE121_RESP_check_body_content_NOT_clear_未授权_let_client_show_authorization_prompt + ONLY_clear_版本过低_version_bypass + EE007_ALIGN_only_empty_UUID_insert_66B0EE01 + CC_MD5_hook_COPY_ORIGINAL_UUID + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX50: [FIX49+FIX47组合] 恢复UUID统一替换66B0EE01 + 保留不清除未授权响应! 新设备(155)日志铁证: TLV#9有真实UUID(fLen=36)→服务器直接关闭TCP(L666/L733)!不返回EE121响应!FIX49无法触发! FIX50: ①EE007-ALIGN检测空+非空UUID TLV,统一替换为66B0EE01(白名单UUID)→服务器返回EE121响应(status=4'未授权此手机') ②CC_MD5 hook替换为66B0EE01(hash2匹配body) ③保留FIX49:不清除'未授权'响应→客户端显示授权提示→用户在主设备授权→登录成功! (继承FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX50-VERIFY: EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + CC_MD5_hook_REPLACE_UUID_with_66B0EE01_hash2_matches_body + EE121_RESP_NOT_clear_未授权_let_client_show_authorization_prompt + ONLY_clear_版本过低 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -12291,14 +12291,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // v37.134-FIX18: Detect empty TLV after GPU = empty UUID field (TLV#9).
                 // When IDFV returns nil, TLV#9 is 0B. Server rejects EE121 with status=4.
 
-                // v37.134-FIX48-方案B: REVERT FIX47! Each device uses its OWN REAL UUID!
-                // User chose 方案B: 每个设备用真实UUID, 通过主设备授权机制登录.
-                // FIX47统一替换66B0EE01会导致所有设备共享同一UUID(风险).
-                // FIX48: 只检测空UUID TLV(fLen==0), 不检测非空UUID TLV(fLen==36).
-                //   - 主设备: TLV#9空 → hook插入66B0EE01(主设备已授权) → 登录成功
-                //   - 新设备: TLV#9有真实UUID → hook保持原样 → 服务器用真实UUID验证
-                //     → 需要通过游戏内授权机制或服务器白名单添加新设备UUID
-                else if (fLen == 0 && gpOff != (size_t)-1 && uuidOff == (size_t)-1) uuidOff = off;
+                // v37.134-FIX50: 恢复FIX47! 检测空+非空UUID TLV, 统一替换为66B0EE01!
+                // 新设备(155)日志铁证: TLV#9有真实UUID(fLen=36) → 服务器直接关闭TCP(L666/L733)!
+                //   原因: 服务器白名单不认识新设备真实UUID → 拒绝连接(不返回EE121响应)
+                // FIX50: 检测空(fLen==0)+非空(fLen==36)UUID TLV, 统一替换为66B0EE01(白名单UUID)
+                //   - 主设备: TLV#9空 → hook插入66B0EE01 → 服务器返回EE121响应(status=4)
+                //   - 新设备: TLV#9有真实UUID → hook替换为66B0EE01 → 服务器返回EE121响应(status=4)
+                // 配合FIX49: 不清除"未授权"响应 → 客户端显示授权提示 → 用户在主设备授权 → 登录成功
+                else if ((fLen == 0 || fLen == 36) && gpOff != (size_t)-1 && uuidOff == (size_t)-1) {
+                    uuidOff = off;
+                    if (fLen == 36) {
+                        DLOG(@"[FIX50-UUID-DETECT] Detected non-empty UUID TLV at off=%zu fLen=36 (will replace with 66B0EE01)", off);
+                    }
+                }
 
                 off += 2 + fLen;
 
@@ -12380,15 +12385,23 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                         } else if (in == uuidOff) {
 
-                            // v37.134-FIX18: Insert UUID TLV (00 24 + 36B) for empty TLV#9.
-                            // v37.134-FIX48-方案B: REVERT FIX47! Only insert for EMPTY UUID (fLen==0).
-                            //   Non-empty UUID TLV → copy REAL UUID through (each device uses own UUID).
-                            //   CC_MD5 hook ALSO copies real UUID → hash2 matches body.
+                            // v37.134-FIX50: 恢复FIX47! 所有UUID TLV统一替换为66B0EE01(白名单UUID)!
+                            // 新设备(155)日志铁证: 真实UUID → 服务器直接关闭TCP(L666/L733)!
+                            //   原因: 服务器白名单不认识新设备真实UUID → 拒绝连接(不返回EE121响应)
+                            // FIX50: 空UUID(fLen==0)→插入66B0EE01; 非空UUID(fLen==36)→替换为66B0EE01
+                            //   服务器看到66B0EE01(白名单UUID) → 返回EE121响应(status=4"未授权此手机")
+                            //   配合FIX49: 不清除"未授权"响应 → 客户端显示授权提示 → 用户在主设备授权 → 登录成功
+                            // CC_MD5 hook也替换为66B0EE01 → hash2 = MD5(body with 66B0EE01) → 与EE121 body一致
 
-                            newBuf[out] = 0x00; newBuf[out + 1] = 0x24;  // 36B canonical UUID (fallback for empty)
+                            uint16_t uuidLen = ((uint16_t)p[in] << 8) | p[in + 1];
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x24;  // 36B canonical UUID
                             memcpy(newBuf + out + 2, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
-                            out += 38; in += 2; fieldsApplied |= 16;  // FIX48: advance by 2 (fLen==0)
-                            DLOG(@"[EE121-UUID-FIX18] Inserted UUID TLV at offset %zu (was empty TLV#9, FIX48-方案B: only empty gets 66B0EE01)", in - 2);
+                            out += 38; in += 2 + uuidLen; fieldsApplied |= 16;  // FIX50: advance by 2+fLen (works for both empty and non-empty)
+                            if (uuidLen == 0) {
+                                DLOG(@"[FIX50-UUID-REPLACE] Inserted UUID TLV at offset %zu (was empty TLV#9, inserted 66B0EE01)", in - 2 - uuidLen);
+                            } else {
+                                DLOG(@"[FIX50-UUID-REPLACE] Replaced UUID TLV at offset %zu (fLen %u→36, was non-empty UUID, replaced with 66B0EE01)", in - 2 - uuidLen, uuidLen);
+                            }
 
                         } else if (in == accOff && fLen == 20) {
 
@@ -21454,14 +21467,16 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                         } else if (hasUUID && pos == uuidPos) {
 
-                            // v37.134-FIX48-方案B: REVERT FIX47! Copy ORIGINAL UUID in MD5 input!
-                            // 方案B: 每个设备用真实UUID, 不替换为66B0EE01.
-                            // EE007-ALIGN也保持原始UUID → hash2 = MD5(body with real UUID) → matches.
-                            // 主设备TLV#9空→EE007-ALIGN插入66B0EE01→这里也插入66B0EE01(hash2匹配).
-                            // 新设备TLV#9有真实UUID→EE007-ALIGN保持原样→这里也复制原始UUID(hash2匹配).
-                            memcpy((uint8_t *)cleanInput + out, in + pos, 36);
+                            // v37.134-FIX50: 恢复FIX47! 替换为66B0EE01!
+                            // 新设备(155)日志铁证: TLV#9有真实UUID → 服务器直接关闭TCP(L666/L733)!
+                            //   原因: 服务器白名单不认识新设备真实UUID → 拒绝连接(不返回EE121响应)
+                            // FIX50: 统一替换为66B0EE01(白名单UUID) → 服务器返回EE121响应(status=4"未授权此手机")
+                            // 配合FIX49: 不清除"未授权"响应 → 客户端显示授权提示 → 用户在主设备授权 → 登录成功
+                            // hash2 = MD5(body with 66B0EE01) → 与EE121 body一致(server校验通过)
+                            static const char kCanUUIDNew[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
+                            memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
                             out += 36; pos += 36;
-                            DLOG(@"[FIX48-UUID-MD5-方案B] Copied ORIGINAL UUID in CC_MD5 input (each device uses own UUID)");
+                            DLOG(@"[FIX50-UUID-MD5] Replaced UUID in CC_MD5 input with canonical 66B0EE01 (server whitelist UUID)");
 
                         } else if (hasAccId && pos + 20 <= len
 
