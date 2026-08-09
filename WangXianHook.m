@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX46: [FINAL-USER-CONFIRMED-ROOTCAUSE] 新设备网络断开=设备未授权!wxhook(150).log L592-610铁证: 游戏查询https://x.md5xor.com/jeecg-boot/ios/queryById?id=<IDFV>→服务器返回 ispass=NO/test=NO→游戏判定未授权→关闭TCP连接→网络断开!主设备已授权无此请求! FIX46: NSURLSession completionHandler+delegate双模式拦截md5xor响应→ispass:NO→YES + test:NO→YES(覆盖大小写NO/no)→游戏认为设备已授权→允许登录! (继承FIX45: systemhook fishhook劫持fopen/fgets/fread/fclose→VersionModule读配置C++异常terminate;FIX45-A=dlopen libsystem_c真实stdio指针+wrapper fallback;FIX45-B=MSHookFunction VersionModule.widgetSelected try/catch所有异常)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX46-VERIFY: md5xor_ispass_NO_to_YES_test_NO_to_YES_completionHandler_AND_delegate + libsystem_c_direct_dlsym_real_fopen_fgets_fread_fclose_BYPASS_systemhook + fishhook_rebind_fopen_fgets_fread_fclose_wrapper_FALLBACK_on_NULL + MSHookFunction_VersionModule_widgetSelected_TRY_CATCH_ALL_EXCEPTIONS_NO_TERMINATE + judgeAppInfoSignApi_FORCE_FIX19GetResp_SIMULATE_FIX38_PATH + FIX41_METHOD_DUMPS + C++terminate_diag";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX47: [FINAL-ROOTCAUSE-UUID-MISMATCH] wxhook(151).log铁证: 新设备TLV#9有真实UUID(9E825E1D-...)→hook只替换空UUID(FIX18)不替换非空→EE121 body UUID=9E825E1D, md5xor IDFV=8E6CB180→服务器交叉验证不匹配→RECV-CLOSE! 主设备TLV#9为空→hook插入66B0EE01→成功! FIX47: ①EE007-ALIGN检测非空UUID TLV(fLen==36 UUID格式)也替换为66B0EE01 ②CC_MD5 hook同步替换UUID为66B0EE01(hash2匹配body)→所有设备EE121 UUID统一为66B0EE01→服务器接受! (继承FIX46: md5xor ispass:NO→YES; FIX45: systemhook stdio fallback)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX47-VERIFY: EE007_ALIGN_detect_NON_EMPTY_UUID_TLV_fLen36_replace_with_66B0EE01 + CC_MD5_hook_REPLACE_UUID_with_canonical_66B0EE01_hash2_matches_body + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch + judgeAppInfoSignApi_FIX19GetResp + FIX41_METHOD_DUMPS + C++terminate_diag";
 
 
 
@@ -12256,6 +12256,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             size_t accOff = (size_t)-1; // v37.77: accountId TLV (20-digit numeric)
 
             size_t uuidOff = (size_t)-1; // v37.134-FIX18: empty UUID TLV (TLV#9, after GPU)
+            uint16_t uuidFLen = 0;  // FIX47: original UUID TLV fLen (0=empty, 36=non-empty)
 
             // v37.119: REMOVED kCanonAccIdEE007 — no longer used; accId is passed through as-is.
 
@@ -12288,10 +12289,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 else if (gpOff == (size_t)-1 && fLen >= 24 && (memmem(val, fLen, "Apple", 5) != NULL && memmem(val, fLen, "GPU", 3) != NULL)) gpOff = off;
 
                 // v37.134-FIX18: Detect empty TLV after GPU = empty UUID field (TLV#9).
-
                 // When IDFV returns nil, TLV#9 is 0B. Server rejects EE121 with status=4.
 
-                else if (fLen == 0 && gpOff != (size_t)-1 && uuidOff == (size_t)-1) uuidOff = off;
+                // v37.134-FIX47: ALSO detect NON-EMPTY UUID TLV (fLen==36, UUID format).
+                // ROOT CAUSE: wxhook(151).log L595 proved: new device TLV#9 has real UUID
+                //   "9E825E1D-CA4B-48A8-A56D-D15242DD4E61" (36B) → hook SKIPPED replacement
+                //   → server cross-validates EE121 UUID vs md5xor IDFV → MISMATCH → RECV-CLOSE!
+                // FIX47: Detect BOTH empty (fLen==0) AND non-empty (fLen==36) UUID TLV after GPU.
+                //   Replace ANY UUID with canonical "66B0EE01-..." → all devices use same UUID → server accepts.
+                else if (gpOff != (size_t)-1 && uuidOff == (size_t)-1 &&
+                         (fLen == 0 || (fLen == 36 && val[8] == '-' && val[13] == '-' &&
+                                        val[18] == '-' && val[23] == '-'))) {
+                    uuidOff = off;
+                    uuidFLen = fLen;  // FIX47: remember original fLen (0 or 36)
+                    DLOG(@"[FIX47-UUID-DETECT] Detected UUID TLV at off=%zu fLen=%u (will replace with 66B0EE01)", off, fLen);
+                }
 
                 off += 2 + fLen;
 
@@ -12371,21 +12383,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                             out += 26; in += 2 + fLen; fieldsApplied |= 4;
 
-                        } else if (in == uuidOff && fLen == 0) {
+                        } else if (in == uuidOff) {
 
                             // v37.134-FIX18: Insert UUID TLV (00 24 + 36B) for empty TLV#9.
+                            // v37.134-FIX47: ALSO replace NON-EMPTY UUID TLV (36B) with canonical UUID.
+                            // CC_MD5 hook ALSO inserts/replaces UUID into hash2 input → hash2 matches body.
 
-                            // When IDFV is nil, TLV#9 is 0B. Server requires non-empty UUID.
-
-                            // CC_MD5 hook ALSO inserts UUID into hash2 input → hash2 matches body.
-
-                            newBuf[out] = 0x00; newBuf[out + 1] = 0x24;
-
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x24;  // always 36B canonical UUID
                             memcpy(newBuf + out + 2, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
+                            out += 38; in += 2 + fLen; fieldsApplied |= 16;  // FIX47: advance by ORIGINAL fLen
 
-                            out += 38; in += 2; fieldsApplied |= 16;
-
-                            DLOG(@"[EE121-UUID-FIX18] Inserted UUID TLV at offset %zu (was empty TLV#9)", in - 2);
+                            if (uuidFLen == 0) {
+                                DLOG(@"[EE121-UUID-FIX18] Inserted UUID TLV at offset %zu (was empty TLV#9)", in - 2 - fLen);
+                            } else {
+                                DLOG(@"[FIX47-UUID-REPLACE] Replaced UUID TLV at offset %zu (fLen %u→36, was non-empty UUID)", in - 2 - fLen, uuidFLen);
+                            }
 
                         } else if (in == accOff && fLen == 20) {
 
@@ -21375,13 +21387,16 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                         } else if (hasUUID && pos == uuidPos) {
 
-                            // v37.107-DIST: Do NOT replace UUID in MD5 input!
-
-                            // Each user uses their OWN device UUID. Copy original bytes.
-
-                            memcpy((uint8_t *)cleanInput + out, in + pos, 36);
-
+                            // v37.134-FIX47: REPLACE UUID in MD5 input with canonical 66B0EE01!
+                            // ROOT CAUSE: wxhook(151).log L595/L661 proved: new device TLV#9 has
+                            //   real UUID "9E825E1D-..." → hash2 input also has this UUID →
+                            //   if EE007-ALIGN replaces body UUID to 66B0EE01 but hash2 keeps
+                            //   real UUID → hash2 != MD5(body) → server rejects!
+                            // FIX47: Replace UUID in hash2 input with canonical 66B0EE01 →
+                            //   hash2 = MD5(body with canonical UUID) → matches EE007-ALIGN body.
+                            memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
                             out += 36; pos += 36;
+                            DLOG(@"[FIX47-UUID-MD5] Replaced UUID in CC_MD5 input with canonical 66B0EE01 (was non-canonical)");
 
                         } else if (hasAccId && pos + 20 <= len
 
