@@ -1860,8 +1860,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53: [CCCrypt+CC_MD5_Update UUID替换] 通用UUID替换! 将CCCrypt L4和CC_MD5_Update中任意UUID=MACADDRESS=xxx替换为66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8! 修复新设备点击服务器提示连接异常中断: 根因是CCCrypt明文中UUID(新设备真实UUID)与EE121 TLV#9(66B0EE01)不一致, 游戏服务器(12003)检查UUID发现不匹配后关闭连接! FIX53: CCCrypt L4新增通用UUID检测和替换(53B UUID=MACADDRESS=xxx和36B裸UUID), CC_MD5_Update同步添加UUID替换逻辑 (继承FIX52/51/50/49/46/45)";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53-VERIFY: CCCrypt_L4_generic_UUID_replace_66B0EE01 + CC_MD5_Update_generic_UUID_replace_66B0EE01 + UUID_MACADDRESS_53B_replace + bare_UUID_36B_replace + FIX52_EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53: [CCCrypt+CC_MD5_Update UUID替换为180C4F27] 通用UUID替换! 将CCCrypt L4和CC_MD5_Update中任意UUID替换为180C4F27-4414-4623-ACEB-0C12B30E48FD(主设备UUID)! 180C4F27已在游戏服务器(12003)白名单中! v37.107曾停用UUID替换,但实际原因是v37.108同时强制替换了accountId导致所有用户进入kk994角色, v37.108-DIST已修复accountId不替换, UUID替换可恢复! FIX53: CCCrypt L4新增通用UUID检测和替换(UUID=MACADDRESS=xxx和裸UUID), CC_MD5_Update同步添加 (继承FIX52/51/50/49/46/45)";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53-VERIFY: CCCrypt_L4_generic_UUID_replace_180C4F27 + CC_MD5_Update_generic_UUID_replace_180C4F27 + UUID_MACADDRESS_51B_replace + bare_UUID_36B_replace + FIX52_EE118_standalone_status_patch + CC_MD5_hook_support_A16_GPU_24B + A10_GPU_24B + iPhone14Pro_13B + iPhone7Plus_11B + EE007_ALIGN_detect_empty_AND_nonempty_UUID_TLV_replace_with_66B0EE01 + EE121_RESP_NOT_clear_未授权 + md5xor_ispass_NO_to_YES + libsystem_c_direct_stdio + MSHookFunction_VersionModule_try_catch";
 
 
 
@@ -22124,7 +22124,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 else if (dmVariant == 2) newLen_i -= 2; // 11 - 13 (14 Pro)
                 else if (dmVariant == 3) newLen_i += 0;  // 11 - 11 (7Plus, no change)
 
-                // FIX53: UUID替换是等长的，不需要调整newLen
+                // FIX53: UUID=MACADDRESS替换 53B→51B(delta=-2), 裸UUID 36→36(delta=0)
+                if (hasUuidMac) newLen_i -= 2;
 
                 // FIX52: 根据GPU变体计算delta
                 if (gpVariant == 1) newLen_i -= 4;   // 24 - 28 (A18 Pro)
@@ -22181,8 +22182,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                         } else if (hasUuidMac && pos + 53 <= actualLen && memcmp(src + pos, "UUID=MACADDRESS=", 17) == 0) {
 
-                            // FIX53: UUID=MACADDRESS=xxx → UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
-                            memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53); out += 53; pos += 53;
+                            // FIX53: UUID=MACADDRESS=xxx → UUID=MACADDRESS=180C4F27(主设备UUID)
+                            memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51); out += 51; pos += 53;
 
                         } else if (hasUuidBare && pos + 36 <= actualLen &&
                                    ((const char *)src)[pos+8] == '-' &&
@@ -22190,8 +22191,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                                    ((const char *)src)[pos+18] == '-' &&
                                    ((const char *)src)[pos+23] == '-') {
 
-                            // FIX53: bare UUID xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx → 66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8
-                            memcpy((uint8_t *)tmp + out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36); out += 36; pos += 36;
+                            // FIX53: bare UUID → 180C4F27(主设备UUID)
+                            memcpy((uint8_t *)tmp + out, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36); out += 36; pos += 36;
 
                         } else {
 
@@ -26410,8 +26411,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                     } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=", 17) == 0) {
 
-                        // FIX53: 通用UUID替换! 将任意UUID=MACADDRESS=xxx替换为66B0EE01
-                        // 修复新设备CCCrypt明文中UUID与EE121 TLV#9不一致导致服务器拒绝
+                        // FIX53: 通用UUID替换! 将任意UUID=MACADDRESS=xxx替换为180C4F27(主设备UUID)
+                        // 180C4F27已在游戏服务器(12003)白名单中(主设备历史登录过)
+                        // v37.107曾停用此替换,但实际原因是v37.108同时强制替换了accountId导致
+                        // 所有用户进入kk994角色。v37.108-DIST已修复accountId不替换,UUID替换可恢复!
 
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 53 < e) ? *(p+53) : 0;
@@ -26419,22 +26422,22 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                         if (bounded) {
 
-                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53);
+                            memcpy(out, "UUID=MACADDRESS=180C4F27-4414-4623-ACEB-0C12B30E48FD", 51);
 
-                            out += 53; p += 53; continue;
+                            out += 51; p += 53; continue;
 
                         }
 
                     } else if (rem >= 36 && p[8] == '-' && p[13] == '-' && p[18] == '-' && p[23] == '-') {
 
-                        // FIX53: 通用裸UUID替换! 检测36字节UUID格式并替换为66B0EE01
+                        // FIX53: 通用裸UUID替换! 检测36字节UUID格式并替换为180C4F27(主设备UUID)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 36 < e) ? *(p+36) : 0;
                         BOOL bounded = (prev == '"' || prev == '=') && (next == '"' || next == ',' || next == '}');
 
                         if (bounded) {
 
-                            memcpy(out, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36);
+                            memcpy(out, "180C4F27-4414-4623-ACEB-0C12B30E48FD", 36);
 
                             out += 36; p += 36; continue;
 
