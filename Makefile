@@ -33,16 +33,16 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53" $(SOURCE) || echo "WARNING: FIX53 not found in source!"
-	@grep -c "FIX53" $(SOURCE) || echo "WARNING: FIX53 not found in source!"
+	@grep -c "FIX53C" $(SOURCE) || echo "WARNING: FIX53C not found in source!"
+	@grep -c "LOG_SIZE_LIMIT" $(SOURCE) || echo "WARNING: LOG_SIZE_LIMIT macro not found in source!"
 	@grep -c "FIX39" $(SOURCE) || echo "WARNING: FIX39 not found in source!"
 	@grep -c "0 && fffWhich" $(SOURCE) || echo "WARNING: 0 and fffWhich not found!"
 	@echo "=== Building ==="
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53" || echo "WARNING: FIX53 not in binary!"
-	@strings $(TARGET) | grep -c "FIX53" || echo "WARNING: FIX53 not in binary!"
+	@strings $(TARGET) | grep -c "FIX53C" || echo "WARNING: FIX53C not in binary!"
+	@strings $(TARGET) | grep -c "LOG_MAX_KB" || echo "WARNING: LOG_MAX_KB not in binary (macro not referenced?)"
 	@strings $(TARGET) | grep -c "FIX39" || echo "WARNING: FIX39 not in binary!"
 	@ls -la $(TARGET)
 
