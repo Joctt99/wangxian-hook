@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53H: [FIX53G基线 + 🚨修复CCCrypt L4与CC_MD5检测逻辑不一致]. 根因: CC_MD5检测纯内容匹配(无bounded检查)→ch=1,dm=1,gp=1全命中; 但CCCrypt L4严格bounded检查(prev必须是\":等)→FFF493 JSON中某些格式下DY_MIESHI/A16 GPU检测不到→加密明文仍含原始值,但HMAC基于canonical计算→HMAC不匹配→服务器关闭连接. 修复: CCCrypt L4第一pass+第二pass的所有bounded检查全部放宽为「非字母数字即单词边界」,与CC_MD5逻辑完全一致.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53H-VERIFY: CCCrypt L4 BOUNDED CHECK RELAXED. All channel/dm/gpu exact-match + generic-fallback bounded checks in both pass-1 (counting) and pass-2 (replacing) now use 'non-alphanumeric = word boundary' instead of strict JSON delimiters. Match CC_MD5 detection parity. FFF493 encrypted plaintext MUST have same field values as CC_MD5 hash input, else server HMAC mismatch → TCP RST. [FIX53H-CH-RELAX] [FIX53H-DM-RELAX] [FIX53H-GPU-RELAX] DLOG tags.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53I: [FIX53H基线 + 🚨修复CCCrypt L4 SAFE FALLBACK导致HMAC↔密文不一致]. 根因(wxhook-173): CCCrypt L4 hook修补明文后(282→312B delta=+30), 加密输出320B > caller buffer 298B → SAFE FALLBACK → 用原始明文加密 → CC_MD5的HMAC基于修补数据但密文基于原始数据 → 服务器校验失败 → TCP RST. 修复: 1)新增g_l4_safe_fallback标志, SAFE FALLBACK时设置. 2)FFF493-REPL send-hook检测到标志后强制重加密saved patched plaintext(含正确channel/dm/gp/uuid+正确md5). 3)重加密成功后重置标志.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53I-VERIFY: CCCrypt L4 SAFE FALLBACK → FFF493-REPL FORCE RE-ENCRYPT. New global: g_l4_safe_fallback (set in CCCrypt L4 SAFE FALLBACK path, reset after FFF493-REPL re-encryption or FALLBACK mark). Send-hook: if g_l4_safe_fallback==YES, force jsonModified=YES + use saved patched plaintext as newStr → re-encrypt → rebuild packet → HMAC consistent with ciphertext. [FIX53I-REENC] DLOG tag. Previous FIX53H bounded-check relaxation retained.";
 
 
 
@@ -7744,6 +7744,13 @@ static uint32_t g_saved_alg = 0;
 static uint32_t g_saved_options = 0;
 
 static BOOL g_aes_key_saved = NO;
+
+// FIX53I: SAFE FALLBACK flag — set when CCCrypt L4 patches plaintext but output buffer
+// is too small → falls back to encrypting ORIGINAL data. When this happens, the
+// FFF493-REPL send-hook MUST re-encrypt the saved patched plaintext (which has correct
+// channel/dm/gp/uuid AND correct md5 from CC_MD5 hook), otherwise:
+// HMAC(based on patched data via CC_MD5) ≠ ciphertext(based on original data) → server REJECT
+static BOOL g_l4_safe_fallback = NO;
 
 static char *g_ext_plaintext = NULL;   // extended plaintext for FFF493#2
 
@@ -14050,6 +14057,30 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     // SKIP re-encryption entirely, fall through to direct orig_send of original packet.
 
+                    // FIX53I: EXCEPTION — if CCCrypt L4 SAFE FALLBACK occurred, the original packet has
+
+                    // HMAC(based on patched data via CC_MD5) but ciphertext(based on ORIGINAL data).
+
+                    // MUST re-encrypt the saved patched plaintext to make HMAC ↔ ciphertext consistent.
+
+                    BOOL forceReencrypt = g_l4_safe_fallback;
+
+                    if (forceReencrypt) {
+
+                        DLOG(@"[FIX53I-REENC] SAFE FALLBACK detected → forcing re-encryption of patched plaintext (fffWhich=%d plainLen=%zu)", fffWhich, nativeLen);
+
+                        jsonModified = YES; // force re-encryption path
+
+                        if (!newStr || newStr.length == 0) {
+
+                            // JSON wasn't modified, use saved patched plaintext directly
+
+                            newStr = [[NSString alloc] initWithBytes:nativePlain length:nativeLen encoding:NSUTF8StringEncoding];
+
+                        }
+
+                    }
+
                     if (jsonModified) {
 
                     const char *newPlain = [newStr UTF8String];
@@ -14170,6 +14201,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                                 }
 
+                                // FIX53I: Reset SAFE FALLBACK flag after successful re-encryption
+                                g_l4_safe_fallback = NO;
+
                                 if (rret >= 0) return (ssize_t)len;
 
                                 return rret;
@@ -14242,6 +14276,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
             DLOG(@"[FFF493-REPL] v37.88: FALLBACK mark #1 sent (len=%zu, no plaintext replacement)", len);
 
+            // FIX53I: Reset SAFE FALLBACK flag
+            g_l4_safe_fallback = NO;
+
         }
 
         if (cmd == 0x00FFF493 && !g_fff493_2_sent && len > 800) {
@@ -14253,6 +14290,9 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
             g_role_0CB0A300_seen = 0;
 
             DLOG(@"[FFF493-REPL] v37.88: FALLBACK mark #2 sent (len=%zu, no plaintext replacement)", len);
+
+            // FIX53I: Reset SAFE FALLBACK flag
+            g_l4_safe_fallback = NO;
 
         }
 
@@ -27385,6 +27425,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 DLOG(@"[CH-L4-BUF] v37.32: tmpOut produced %zu bytes > caller %zu available → SAFE FALLBACK no patch",
 
                      outMovedTmp, dataOutAvailable);
+
+                // FIX53I: Set SAFE FALLBACK flag so FFF493-REPL send-hook forces re-encryption
+                // of the saved patched plaintext. Without this, HMAC(patched) ≠ ciphertext(original).
+                g_l4_safe_fallback = YES;
 
                 if (patchedBuf) { free(patchedBuf); patchedBuf = NULL; realDataIn = dataIn; realDataInLen = dataInLen; }
 
