@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53J: [FIX53I基线 + 🚨修复FFF493-REPL被if(0&&fffWhich==2)完全关闭致命Bug]. 根因(wxhook-174): FIX53I的g_l4_safe_fallback forceReencrypt代码在send-hook中,但send-hook整个重加密块被L13671的`if(0 && fffWhich==2)`完全禁用 → SAFE FALLBACK后HMAC(修补版)≠密文(原始版)的不一致根本无法修复. 同时FIX53I的FIX53H-SCAN static counter已打印4次(LOG_ROTATED前)后节流跳过,导致看不到FIX53标记. 修复(FIX53J): 1) if(0&&fffWhich==2)改为if((fffWhich==1||fffWhich==2)&&...)开放给#1#2都进入 2) origSeq/origAlgo/jsonModified/newStr全部提升到外层作用域 3) sessionId/ticket/UUID插入和md5 recompute用额外`if(fffWhich==2)`包裹避免#1被插入sessionId→JSON损坏 4) forceReencrypt逻辑现在可访问所有变量,FFF493#1(SAFE FALLBACK主犯)也会被强制重加密 5) 保留FIX53H bounded-check放宽+FIX53I g_l4_safe_fallback标志.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53J-VERIFY: FFF493-REPL BLOCK FULLY OPEN for #1+#2. Outer-scope: newStr=nil origSeq=0 origAlgo=0 jsonModified=NO (volatile). Inner fffWhich==2 guard: sessionId/ticket/UUID insert + md5 recompute (only NEW_USER). forceReencrypt block (FIX53I) is NOW REACHABLE: if g_l4_safe_fallback==YES → jsonModified=YES + newStr from nativePlain → re-encrypt using orig_CCCrypt + CCHmac + build packet. Must see [FIX53I-REENC] + [FFF493-REPL] Replaced FFF493#1/#2 in log (NOT FALLBACK mark no plaintext replacement). [FIX53H-SCAN] still limited to 4 prints, use LOG_ROTATE caution.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53J: [FIX53I基线 + 🚨修复FFF493-REPL被if(0&&fffWhich==2)关闭 + MACADDRESS空值导致JSON损坏]. 根因(wxhook-175): 1)FIX53I的forceReencrypt被if(0&&)死路阻止(已修复) 2)FFF493#2 MACADDRESS字段为空(\"\"), UUID替换代码盲目取36字符→吃掉\", \"md5\": \"bebb7223...\"→JSON损坏→服务器无法解析→只发心跳不发角色数据. 修复: 1)开放FFF493-REPL给#1#2都进入 2)UUID替换前检查8-4-4-4-12格式(连字符位置), 无效则跳过 3)sessionId/ticket插入仅限#2 4)forceReencrypt可处理#1#2.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53J-VERIFY: 1) FFF493-REPL BLOCK OPEN for #1+#2 (if(0&&) removed). 2) MACADDRESS UUID replace: isValidUUIDFormat check (hyphens at pos 8,13,18,23). 3) Outer-scope: newStr=nil origSeq=0 origAlgo=0 jsonModified=NO(volatile). 4) Inner fffWhich==2 guard: sessionId/ticket/UUID insert + md5 recompute. 5) forceReencrypt: g_l4_safe_fallback→jsonModified=YES→re-encrypt. Must see [FIX53I-REENC] + [FFF493-UUID] SKIP or REPLACED (not JSON-corrupting).";
 
 
 
@@ -13735,6 +13735,19 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                             NSString *realUUID = [newStr substringWithRange:NSMakeRange(uuidStart, 36)];
 
+                            // FIX53J: Check if MACADDRESS value is a valid UUID (8-4-4-4-12 hex format)
+                            // BEFORE replacing. If MACADDRESS is empty (""), the next 36 chars
+                            // would span across JSON fields (eating ", "md5": "..." etc) → JSON CORRUPTION!
+                            BOOL isValidUUIDFormat = (
+                                [realUUID length] == 36 &&
+                                [realUUID characterAtIndex:8] == '-' &&
+                                [realUUID characterAtIndex:13] == '-' &&
+                                [realUUID characterAtIndex:18] == '-' &&
+                                [realUUID characterAtIndex:23] == '-'
+                            );
+
+                            if (isValidUUIDFormat) {
+
                             // FIX53: Use canonical 66B0EE01 (white-listed login UUID), keeps parity with CCCrypt L4 and CC_MD5.
                             static const char kCanonUUID_v101[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
 
@@ -13753,6 +13766,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             } else {
 
                                 DLOG(@"[FFF493-UUID] v37.101: #%d MACADDRESS already CANONICAL UUID (66B0EE01)", fffWhich);
+
+                            }
+
+                            } else {
+
+                                // FIX53J: MACADDRESS is empty or not a valid UUID — skip replacement
+                                DLOG(@"[FFF493-UUID] v37.101-FIX53J: #%d SKIP UUID replace — MACADDRESS not valid UUID format (val='%@')", fffWhich, realUUID);
 
                             }
 
