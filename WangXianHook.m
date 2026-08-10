@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53K: [FIX53J基线 + 禁用CCCrypt L4空UUID插入 + 保存L4修补明文供send-hook重加密]. 根因(wxhook-178): FFF493#1中CC_MD5 patch了HMAC输入(ch=1 dm=1 gp=1), 但send-hook发送原始包(FALLBACK mark), CCCrypt L4可能未patch成功(scan日志被LOG-ROTATED截断无法确认). 即使CCCrypt L4 patch成功, send-hook也没有使用L4修补后的明文进行重加密. 修复: 1)CCCrypt L4 pass-2后保存patchedBuf到g_l4_saved_patched全局变量 2)send-hook检测g_md5_channel_replaced=1时强制重加密FFF493#1 3)使用g_l4_saved_patched(L4修补后明文,含ch/dm/gp补丁)而非nativePlain(原始明文)进行重加密 4)禁用空UUID插入(同FIX53J).";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53K-VERIFY: 1) g_l4_saved_patched/len/valid globals added. 2) CCCrypt L4 pass-2 saves patchedBuf copy. 3) send-hook: forceReencrypt when g_md5_channel_replaced=1 && g_l4_saved_valid=YES. 4) newStr uses g_l4_saved_patched (NOT nativePlain). Must see [FIX53K-L4-SAVE] in log (patched plaintext saved with ch/dm/gp counts). Must see [FIX53K-REENC] (force re-encrypt with L4 patched plaintext). [FIX53I-REENC] still triggers on SAFE FALLBACK.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53L: [FIX53K基线 + 修复3个致命Bug: flag残留+强制重加密+fmtFlag硬编码]. 根因(wxhook-179): 1)g_l4_safe_fallback全局标志未在CCCrypt L4入口重置→之前某次加密的残留YES值让FFF493#1/#2被错误强制重加密,即使CCCrypt L4已成功修补 2)额外增加g_md5_channel_replaced条件也让正常CCCrypt输出的包被破坏 3)send-hook重建包时fmtFlag硬编码0x0001≠原始包p[12-13],服务器解析格式错误→只发心跳不发角色数据. 修复: 1)CCCrypt L4激活入口处g_l4_safe_fallback=NO 2)send-hook读取flag后立即清零 3)删除g_md5_channel_replaced条件,仅在真实SAFE FALLBACK时重加密 4)fmtFlag从p[12-13]复制不硬编码 5)保留FIX53K全部修复(L4保存修补明文+禁用空UUID插入).";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53L-VERIFY: 1) hook_CCCrypt_v37_26 active-RETURN after: g_l4_safe_fallback=NO. 2) send-hook forceReencrypt ONLY from g_l4_safe_fallback (NOT g_md5_channel_replaced). 3) After BOOL forceReencrypt=g_l4_safe_fallback line: g_l4_safe_fallback=NO CLEAR. 4) newPkt[12]=p[12]; newPkt[13]=p[13]; (NOT hardcoded 0x0001). Must see [FIX53L-REENC] only for packets that really had CH-L4-BUF SAFE FALLBACK. Normal working packets (no SAFE FALLBACK) must see 'JSON unchanged — SKIP re-encrypt' path and work directly!";
 
 
 
@@ -14110,18 +14110,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     // MUST re-encrypt the saved patched plaintext to make HMAC ↔ ciphertext consistent.
 
+                    // FIX53L: ONLY force re-encrypt when ACTUAL SAFE FALLBACK occurred for THIS FFF493 packet.
+                    // DO NOT use g_md5_channel_replaced — CCCrypt L4 may have worked perfectly and
+                    // the original client ciphertext is already correct. Unnecessary re-encryption
+                    // introduces bugs (fmtFlag mismatch, packet format diffs) → server silent reject.
+                    // Also: reset stale flag immediately after reading it.
                     BOOL forceReencrypt = g_l4_safe_fallback;
-
-                    // FIX53K: Also force re-encryption when CC_MD5 patched HMAC input.
-                    // If CC_MD5 replaced channel/device/GPU (g_md5_channel_replaced=1),
-                    // the HMAC is based on PATCHED data. The ciphertext MUST also be
-                    // based on patched data. If CCCrypt L4 didn't patch (for any reason),
-                    // the original packet's ciphertext is based on ORIGINAL data → mismatch.
-                    // Force re-encryption with L4's saved patched plaintext to fix this.
-                    if (!forceReencrypt && g_md5_channel_replaced && g_l4_saved_valid) {
-                        forceReencrypt = YES;
-                        DLOG(@"[FIX53K-REENC] CC_MD5 patched (g_md5_channel_replaced=1) → force re-encrypt #%d with L4 patched plaintext", fffWhich);
-                    }
+                    g_l4_safe_fallback = NO; // FIX53L: CLEAR flag so next packet isn't affected
 
                     if (forceReencrypt) {
 
@@ -14134,11 +14129,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             // FIX53K: Use CCCrypt L4's saved patched plaintext (includes channel/device/GPU patches)
                             if (g_l4_saved_valid && g_l4_saved_patched && g_l4_saved_patched_len > 0) {
                                 newStr = [[NSString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
-                                DLOG(@"[FIX53K-REENC] Using L4 saved patched plaintext %zuB (includes ch/dm/gp patches)", g_l4_saved_patched_len);
+                                DLOG(@"[FIX53L-REENC] Using L4 saved patched plaintext %zuB (ch/dm/gp patches) for SAFE FALLBACK", g_l4_saved_patched_len);
                             } else {
                                 // Fallback: use native plaintext (WARNING: no channel/device/GPU patches!)
                                 newStr = [[NSString alloc] initWithBytes:nativePlain length:nativeLen encoding:NSUTF8StringEncoding];
-                                DLOG(@"[FIX53K-REENC] WARNING: L4 patched plaintext not available, using native %zuB (NO ch/dm/gp patches!)", nativeLen);
+                                DLOG(@"[FIX53L-REENC] WARNING: L4 patched plaintext not available, using native %zuB (NO ch/dm/gp patches!)", nativeLen);
                             }
 
                         }
@@ -14209,7 +14204,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                                 newPkt[10]=(origSeq>>8)&0xFF; newPkt[11]=origSeq&0xFF;
 
-                                newPkt[12]=0x00; newPkt[13]=0x01;
+                                // FIX53L: COPY fmtFlag from ORIGINAL packet (p[12..13]) instead of hardcoding 0x0001.
+                                // Different FFF493 packets may use different fmtFlag values. Hardcoding 0x0001
+                                // made server silently reject rebuilt packets (fmtFlag mismatch → no role data).
+                                newPkt[12]=p[12]; newPkt[13]=p[13];
 
                                 newPkt[14]=(origAlgo>>8)&0xFF; newPkt[15]=origAlgo&0xFF;
 
@@ -26604,6 +26602,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             dataIn, dataInLen, dataOut, dataOutAvailable, dataOutMoved);
 
     }
+
+    // FIX53L: Reset SAFE FALLBACK flag at start of each active CCCrypt L4 call.
+    // Previous stale YES value would trigger unnecessary forceReencrypt in send-hook
+    // for FFF493#1 even though THIS call had a perfectly fine patched output.
+    g_l4_safe_fallback = NO;
 
 
 
