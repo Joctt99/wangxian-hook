@@ -33,18 +33,19 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53D" $(SOURCE) || echo "WARNING: FIX53D not found in source!"
-	@grep -c "wxhook_nolimit" $(SOURCE) || echo "WARNING: wxhook_nolimit (file-toggle switch) not found!"
-	@grep -c "LOG_SIZE_LIMIT" $(SOURCE) || echo "WARNING: LOG_SIZE_LIMIT macro not found in source!"
+	@grep -c "FIX53E" $(SOURCE) || echo "WARNING: FIX53E not found in source!"
+	@grep -c "dmGenericDelta" $(SOURCE) || echo "WARNING: dmGenericDelta (generic fallback) not found!"
+	@grep -c "iPhone " $(SOURCE) || echo "WARNING: iPhone prefix fallback not found!"
+	@grep -c "iPad" $(SOURCE) || echo "WARNING: iPad fallback not found!"
+	@grep -c "Apple Inc. Apple A" $(SOURCE) || echo "WARNING: GPU prefix fallback not found!"
+	@grep -c "wxhook_nolimit" $(SOURCE) || echo "WARNING: wxhook_nolimit not found!"
 	@grep -c "FIX39" $(SOURCE) || echo "WARNING: FIX39 not found in source!"
-	@grep -c "0 && fffWhich" $(SOURCE) || echo "WARNING: 0 and fffWhich not found!"
 	@echo "=== Building ==="
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53D" || echo "WARNING: FIX53D not in binary!"
-	@strings $(TARGET) | grep -c "wxhook_nolimit" || echo "WARNING: wxhook_nolimit file switch not in binary!"
-	@strings $(TARGET) | grep -c "LOG_MAX_KB" || echo "WARNING: LOG_MAX_KB not in binary (macro not referenced?)"
+	@strings $(TARGET) | grep -c "FIX53E" || echo "WARNING: FIX53E not in binary!"
+	@strings $(TARGET) | grep -c "dmGenericDelta" || echo "WARNING: dmGenericDelta not in binary!"
 	@strings $(TARGET) | grep -c "FIX39" || echo "WARNING: FIX39 not in binary!"
 	@ls -la $(TARGET)
 
