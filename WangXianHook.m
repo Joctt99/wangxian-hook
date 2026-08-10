@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53J: [FIX53I基线 + 🚨修复FFF493-REPL被if(0&&fffWhich==2)关闭 + MACADDRESS空值导致JSON损坏]. 根因(wxhook-175): 1)FIX53I的forceReencrypt被if(0&&)死路阻止(已修复) 2)FFF493#2 MACADDRESS字段为空(\"\"), UUID替换代码盲目取36字符→吃掉\", \"md5\": \"bebb7223...\"→JSON损坏→服务器无法解析→只发心跳不发角色数据. 修复: 1)开放FFF493-REPL给#1#2都进入 2)UUID替换前检查8-4-4-4-12格式(连字符位置), 无效则跳过 3)sessionId/ticket插入仅限#2 4)forceReencrypt可处理#1#2.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53J-VERIFY: 1) FFF493-REPL BLOCK OPEN for #1+#2 (if(0&&) removed). 2) MACADDRESS UUID replace: isValidUUIDFormat check (hyphens at pos 8,13,18,23). 3) Outer-scope: newStr=nil origSeq=0 origAlgo=0 jsonModified=NO(volatile). 4) Inner fffWhich==2 guard: sessionId/ticket/UUID insert + md5 recompute. 5) forceReencrypt: g_l4_safe_fallback→jsonModified=YES→re-encrypt. Must see [FIX53I-REENC] + [FFF493-UUID] SKIP or REPLACED (not JSON-corrupting).";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53K: [FIX53J基线 + 🚨禁用CCCrypt L4空UUID插入]. 根因(wxhook-177): FFF493#1(IOS_CLIENT_MSG)中CC_MD5 uuid=0(不插入UUID), 但CCCrypt L4 uuid=1(empty=1)插入了66B0EE01 → HMAC基于空UUID计算, 密文包含UUID=66B0EE01 → 服务器HMAC校验失败 → 关闭连接. 修复: 1)禁用CCCrypt L4空UUID插入(16B→16B原样复制, 不再16B→52B) 2)delta计算中uuidEmptyCount*36改为0 3)pass1和pass2同步修改 4)保留非空UUID等长替换(52B→52B).";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53K-VERIFY: CCCrypt L4 empty UUID insertion DISABLED. Pass1 delta: uuidEmptyCount*36 → 0. Pass2 replace: memcpy(out,p,16) instead of memcpy(out,canon,52). Non-empty UUID (52B→52B) replacement RETAINED. Must see [FIX53H-SCAN] uuid=0(empty=0) for FFF493#1 (was uuid=1(empty=1)). CC_MD5 uuid=0 ↔ CCCrypt L4 uuid=0 = CONSISTENT.";
 
 
 
@@ -26926,7 +26926,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                           + (ssize_t)gpA16Count * 0
                           - (ssize_t)dmGenericDelta   // FIX53E: 通用设备型号 delta (正值=缩短)
                           - (ssize_t)gpGenericDelta    // FIX53E: 通用GPU delta (正值=缩短)
-                          + (ssize_t)uuidEmptyCount * 36; // FIX53G: 空UUID插入canonical (+36B each)
+                          + 0; // FIX53K: uuidEmptyCount * 36 DISABLED — do NOT insert UUID (match CC_MD5 uuid=0)
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -27094,12 +27094,15 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                     } else if (rem >= 16 && memcmp(p, "UUID=MACADDRESS=", 16) == 0) {
 
-                        // FIX53G: UUID=MACADDRESS= 检测 (16B前缀, 修复null终止符bug)
-                        // 检查是否为空UUID (后跟引号/逗号/null)
+                        // FIX53J: UUID=MACADDRESS= 检测 (16B前缀, 修复null终止符bug)
+                        // FIX53K: DISABLE empty UUID insertion! CC_MD5 hook does NOT insert UUID into
+                        // HMAC concat input (uuid=0), so CCCrypt L4 must NOT insert it either.
+                        // Otherwise: HMAC(based on empty UUID) ≠ ciphertext(based on 66B0EE01 UUID).
+                        // Instead: copy original 16B prefix as-is, let the next iteration handle the rest.
                         if (p + 16 < e && (*(p + 16) == '"' || *(p + 16) == ',' || *(p + 16) == 0)) {
-                            // 空UUID: 插入canonical UUID (16B→52B, +36B)
-                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
-                            out += 52; p += 16; continue;
+                            // 空UUID: FIX53K — DO NOT insert canonical UUID, copy original as-is
+                            memcpy(out, p, 16);
+                            out += 16; p += 16; continue;
                         } else if (rem >= 52) {
                             // 非空UUID: 替换为canonical (52B→52B, 等长)
                             memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
@@ -27183,7 +27186,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                                           + (ssize_t)gpA16Count * 0
                                           - (ssize_t)dmGenericDelta
                                           - (ssize_t)gpGenericDelta
-                                          + (ssize_t)uuidEmptyCount * 36;
+                                          + 0; // FIX53K: uuidEmptyCount * 36 DISABLED — do NOT insert UUID
                     ssize_t actualDelta = (long long)realDataInLen - (long long)dataInLen;
                     BOOL deltaOk = (expectedDelta == actualDelta);
                     DLOG(@"[FIX53H-CH-RELAX] [CH-L4] v37.134-FIX8 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu expDelta=%lld actDelta=%lld %@",
