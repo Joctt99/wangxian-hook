@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53D: [完全恢复FIX53基线 + 日志大小限制(默认开LOG_MAX_KB=200KB LOG_ROTATE_COUNT=1) + 🆕零门槛Documents空文件运行时开关(wxhook_nolimit取消限制/wxhook_sparse强制TAG过滤/wxhook_logfull恢复编译默认)] FIX53D保持单通道canonical UUID=66B0EE01(CC_MD5/CCCrypt/FFF493-REPL三处一致). 新增运行时切换无需重签/重编/调试器: 把空文件wxhook_nolimit/wxhook_sparse/wxhook_logfull放到App沙盒Documents目录,重启游戏即生效. 删除空文件即恢复编译默认(SPARSE_LOG_MODE=0完整TAG, LOG_SIZE_LIMIT_DEFAULT_ON=1限制200KB轮转). g_logSizeLimitEnabled + g_logSparseEnabled启动时先读宏默认再读Documents空文件覆盖. [LOG-TOGGLE]输出空文件检测结果. [LOG-CONFIG]输出最终生效配置. 兜底5MB绝对上限永不关闭防无限增长.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53D-VERIFY: FIX53_BASELINE_RESTORED + SPARSE_LOG_MODE(default=0) + LOG_SIZE_LIMIT(default=ON LOG_MAX_KB=200 LOG_ROTATE_COUNT=1) + NEW RUNTIME FILE-TOGGLE DOCUMENTS SWITCHES (wxhook_nolimit / wxhook_sparse / wxhook_logfull empty files in Documents override g_logSizeLimitEnabled + g_logSparseEnabled on boot). [LOG-TOGGLE] [LOG-CONFIG] strings present. Single-channel canonical UUID 66B0EE01 everywhere.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53E: [FIX53基线 + iPhone 13 Pro/A15 GPU精确匹配 + 🆕通用前缀fallback自动支持所有iOS设备(iPhone/iPad全系列+A10~A18全系列GPU)] 单通道canonical UUID=66B0EE01全链路一致. FIX53E新增: 1)iPhone 13 Pro(13B)精确匹配+A15 GPU(24B)精确匹配. 2)通用前缀fallback: 'iPhone '(7B前缀)匹配所有未知iPhone型号, 'iPad'(4B前缀)匹配iPad全系列, 'Apple Inc. Apple A'(19B前缀)匹配所有Apple GPU. fallback动态计算原始长度和delta, 自动替换为canonical值(iPhone7Plus 11B / A10 GPU 24B). 三层hook全部覆盖: CC_MD5(检测+替换) + CCCrypt L4变体1(检测) + CCCrypt L4变体2(检测+替换+delta). 日志大小限制(默认开200KB轮转) + Documents空文件运行时开关(wxhook_nolimit/wxhook_sparse/wxhook_logfull).";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53E-VERIFY: FIX53_BASELINE + iPhone 13 Pro + A15 GPU + GENERIC PREFIX FALLBACK (iPhone / iPad / Apple Inc. Apple A). dmGenericDelta + gpGenericDelta delta variables. [FIX53E-DM-GENERIC] [FIX53E-GPU-GENERIC] [FIX53E-DM-iPad] DLOG tags. Single-channel canonical UUID 66B0EE01 everywhere. SPARSE_LOG_MODE(default=0) + LOG_SIZE_LIMIT(default=ON).";
 
 
 
@@ -3021,7 +3021,7 @@ static void log_init(void) {
                 nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
         }
 
-        _log(@"=== WangXianHook v37.134-FIX53D loaded (FIX53基线 + SPARSE可选TAG过滤[默认关] + 日志大小限制轮转开关[默认开LOG_MAX_KB=200 LOG_ROTATE_COUNT=1] + 🆕零门槛Documents空文件开关) UUID单通道canonical 66B0EE01全链路一致(CC_MD5+CCCrypt+FFF493-REPL三处替换). 无双通道逻辑, 无额外UUID计数器/delta修正, CCCrypt L4 UUID替换等长. FIX41/FIX40: judgeAppInfoSignApi取消NSJSONSerialization重序列化保持code第1位. FIX53D新增运行时切换: 新建Documents/wxhook_nolimit空文件(取消200KB上限,删除即恢复限制), wxhook_sparse空文件(强制TAG过滤精简,删即恢复完整TAG). 不需要lldb/Xcode/重签名. [LOG-CONFIG]后续行显示最终生效配置.");
+        _log(@"=== WangXianHook v37.134-FIX53E loaded (FIX53基线 + iPhone 13 Pro/A15 GPU精确匹配 + 🆕通用前缀fallback自动支持所有iOS设备 + 日志大小限制 + Documents空文件开关) UUID单通道canonical 66B0EE01全链路一致. FIX53E新增通用fallback: 'iPhone '前缀匹配所有未知iPhone型号, 'iPad'前缀匹配iPad全系列, 'Apple Inc. Apple A'前缀匹配所有Apple GPU. 动态计算长度和delta, 自动替换为canonical(iPhone7Plus/A10 GPU). 无需为新设备添加代码. 日志限制(默认开200KB轮转) + wxhook_nolimit/wxhook_sparse/wxhook_logfull空文件运行时开关.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -21574,15 +21574,21 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                 if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
 
-                // FIX51: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone7Plus(11B)
+                // FIX51: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone 13 Pro(13B) + iPhone7Plus(11B)
                 if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
-                if (!hasDm && i + 13 <= len && memcmp(in + i, "iPhone 14 Pro", 13) == 0) hasDm = 1;
+                if (!hasDm && i + 13 <= len && (memcmp(in + i, "iPhone 14 Pro", 13) == 0 || memcmp(in + i, "iPhone 13 Pro", 13) == 0)) hasDm = 1;
                 if (!hasDm && i + 11 <= len && memcmp(in + i, "iPhone7Plus", 11) == 0) hasDm = 1;
 
-                // FIX51: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A10 GPU(24B)
+                // FIX51: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A15 GPU(24B) + A10 GPU(24B)
                 if (!hasGp && i + 28 <= len && memcmp(in + i, gpOld, 28) == 0) hasGp = 1;
-                if (!hasGp && i + 24 <= len && memcmp(in + i, "Apple Inc. Apple A16 GPU", 24) == 0) hasGp = 1;
+                if (!hasGp && i + 24 <= len && (memcmp(in + i, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(in + i, "Apple Inc. Apple A15 GPU", 24) == 0)) hasGp = 1;
                 if (!hasGp && i + 24 <= len && memcmp(in + i, "Apple Inc. Apple A10 GPU", 24) == 0) hasGp = 1;
+
+                // FIX53E: 通用 fallback — 自动识别所有未知的 iPhone/iPad 型号和 Apple GPU
+                // 精确匹配未命中时, 用前缀匹配确保任何设备都能被替换为 canonical 值
+                if (!hasDm && i + 7 <= len && memcmp(in + i, "iPhone ", 7) == 0) hasDm = 1; // "iPhone " (带空格, 不含iPhone7Plus)
+                if (!hasDm && i + 4 <= len && memcmp(in + i, "iPad", 4) == 0) hasDm = 1;      // iPad全系列
+                if (!hasGp && i + 19 <= len && memcmp(in + i, "Apple Inc. Apple A", 19) == 0) hasGp = 1; // A10~A18全系列GPU
 
                 if (!hasHash && hOld[0] != 0 && i + 32 <= len && memcmp(in + i, hOld, 32) == 0) hasHash = 1;
 
@@ -21742,21 +21748,42 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             out += 11; pos += 17;
 
-                        } else if (hasDm && pos + 13 <= len && memcmp(in + pos, "iPhone 14 Pro", 13) == 0) {
+                        } else if (hasDm && pos + 13 <= len && (memcmp(in + pos, "iPhone 14 Pro", 13) == 0 || memcmp(in + pos, "iPhone 13 Pro", 13) == 0)) {
 
-                            // v37.134-FIX51: 支持 iPhone 14 Pro (13B) 设备型号!
-                            // 新设备(156)是iPhone 14 Pro, 但hook只匹配iPhone 16 Pro Max(17B)
-                            //   → 设备型号未替换 → hash2不匹配 → 服务器拒绝!
-                            // FIX51: 匹配iPhone 14 Pro(13B), 替换为iPhone7Plus(11B)
+                            // v37.134-FIX51: 支持 iPhone 14 Pro (13B) + iPhone 13 Pro (13B) 设备型号!
+                            // FIX53E: 新设备(164)是iPhone 13 Pro, 但hook只匹配iPhone 14 Pro
+                            //   → 设备型号未在CC_MD5中替换 → HMAC与包内容不一致 → 服务器拒绝!
+                            // FIX51: 匹配iPhone 14/13 Pro(13B), 替换为iPhone7Plus(11B)
                             memcpy((uint8_t *)cleanInput + out, dmNew, 11);
                             out += 11; pos += 13;
-                            DLOG(@"[FIX51-DM-iPhone14Pro] Replaced iPhone 14 Pro with iPhone7Plus in CC_MD5 input (13B→11B)");
+                            DLOG(@"[FIX51-DM-iPhone14or13Pro] Replaced iPhone 14/13 Pro with iPhone7Plus in CC_MD5 input (13B→11B)");
 
                         } else if (hasDm && pos + 11 <= len && memcmp(in + pos, "iPhone7Plus", 11) == 0) {
 
                             // FIX51: iPhone7Plus已经是canonical, 直接复制
                             memcpy((uint8_t *)cleanInput + out, dmNew, 11);
                             out += 11; pos += 11;
+
+                        } else if (hasDm && pos + 7 <= len && memcmp(in + pos, "iPhone ", 7) == 0) {
+
+                            // FIX53E: 通用设备型号 fallback — 任何未精确匹配的 iPhone 型号 (如iPhone 12/15等)
+                            // 向后扫描到 "Apple Inc. Apple A" (GPU起始) 确定原始长度
+                            int dmEnd = pos + 7;
+                            while (dmEnd + 19 <= len && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
+                            int origDmLen = dmEnd - pos;
+                            memcpy((uint8_t *)cleanInput + out, dmNew, 11);
+                            out += 11; pos += origDmLen;
+                            DLOG(@"[FIX53E-DM-GENERIC] Replaced unknown iPhone model (%dB→11B) in CC_MD5 input", origDmLen);
+
+                        } else if (hasDm && pos + 4 <= len && memcmp(in + pos, "iPad", 4) == 0) {
+
+                            // FIX53E: 通用设备型号 fallback — iPad全系列
+                            int dmEnd = pos + 4;
+                            while (dmEnd + 19 <= len && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
+                            int origDmLen = dmEnd - pos;
+                            memcpy((uint8_t *)cleanInput + out, dmNew, 11);
+                            out += 11; pos += origDmLen;
+                            DLOG(@"[FIX53E-DM-iPad] Replaced iPad model (%dB→11B) in CC_MD5 input", origDmLen);
 
                         } else if (hasGp && pos + 28 <= len && memcmp(in + pos, gpOld, 28) == 0) {
 
@@ -21777,17 +21804,17 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             }
 
-                        } else if (hasGp && pos + 24 <= len && memcmp(in + pos, "Apple Inc. Apple A16 GPU", 24) == 0) {
+                        } else if (hasGp && pos + 24 <= len && (memcmp(in + pos, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(in + pos, "Apple Inc. Apple A15 GPU", 24) == 0)) {
 
-                            // v37.134-FIX51: 支持 A16 GPU (iPhone 14 Pro等设备)!
-                            // 新设备(156)日志铁证: CC_MD5 input含A16 GPU(24B), 但hook只匹配A18 Pro(28B)
-                            //   → GPU未替换 → hash2不匹配 → 服务器拒绝 → RECV-CLOSE!
-                            // FIX51: 匹配A16 GPU(24B), 替换为A10 GPU(24B,相同长度,hash2匹配body)
+                            // v37.134-FIX51: 支持 A16 GPU (24B) + A15 GPU (24B)!
+                            // FIX53E: 新设备(164)是A15 GPU, 但hook只匹配A16 GPU
+                            //   → GPU未在CC_MD5中替换 → HMAC不匹配 → 服务器拒绝!
+                            // FIX51: 匹配A16/A15 GPU(24B), 替换为A10 GPU(24B,相同长度)
                             memcpy((uint8_t *)cleanInput + out, gpNew, 24);
 
                             out += 24; pos += 24;
 
-                            DLOG(@"[FIX51-GPU-A16] Replaced A16 GPU with A10 GPU in CC_MD5 input (24B→24B)");
+                            DLOG(@"[FIX51-GPU-A16orA15] Replaced A16/A15 GPU with A10 GPU in CC_MD5 input (24B→24B)");
 
                             // FIX53: Always use canonical 66B0EE01 after GPU
                             if (!hasUUID) {
@@ -21812,6 +21839,24 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                                 out += 36;
 
+                            }
+
+                        } else if (hasGp && pos + 19 <= len && memcmp(in + pos, "Apple Inc. Apple A", 19) == 0) {
+
+                            // FIX53E: 通用 GPU fallback — 任何未精确匹配的 Apple GPU (如A12/A14/A17等)
+                            // 向后扫描到 "GPU" 确定原始长度, 等长或变长替换为 A10 GPU (24B canonical)
+                            int gpEnd = pos + 19;
+                            while (gpEnd + 3 <= len && memcmp(in + gpEnd, "GPU", 3) != 0) gpEnd++;
+                            int origGpLen = (gpEnd + 3 <= len) ? (gpEnd + 3 - pos) : 24;
+                            memcpy((uint8_t *)cleanInput + out, gpNew, 24);
+                            out += 24; pos += origGpLen;
+
+                            DLOG(@"[FIX53E-GPU-GENERIC] Replaced unknown Apple GPU (%dB→24B) in CC_MD5 input", origGpLen);
+
+                            // FIX53: Always use canonical 66B0EE01 after GPU
+                            if (!hasUUID) {
+                                memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
+                                out += 36;
                             }
 
                         } else if (hasHash && pos + 32 <= len && memcmp(in + pos, hOld, 32) == 0) {
@@ -22366,15 +22411,20 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                 if (!hasCh && i + 9 <= actualLen && memcmp((const uint8_t *)actualInput + i, chOld, 9) == 0) hasCh = 1;
 
-                // FIX52: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone7Plus(11B)
+                // FIX52: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone 13 Pro(13B) + iPhone7Plus(11B)
                 if (!hasDm && i + 17 <= actualLen && memcmp((const uint8_t *)actualInput + i, dmOld, 17) == 0) { hasDm = 1; dmVariant = 1; }
-                if (!hasDm && i + 13 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPhone 14 Pro", 13) == 0) { hasDm = 1; dmVariant = 2; }
+                if (!hasDm && i + 13 <= actualLen && (memcmp((const uint8_t *)actualInput + i, "iPhone 14 Pro", 13) == 0 || memcmp((const uint8_t *)actualInput + i, "iPhone 13 Pro", 13) == 0)) { hasDm = 1; dmVariant = 2; }
                 if (!hasDm && i + 11 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPhone7Plus", 11) == 0) { hasDm = 1; dmVariant = 3; }
 
-                // FIX52: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A10 GPU(24B)
+                // FIX52: 支持A18 Pro GPU(28B) + A16 GPU(24B) + A15 GPU(24B) + A10 GPU(24B)
                 if (!hasGp && i + 28 <= actualLen && memcmp((const uint8_t *)actualInput + i, gpOld, 28) == 0) { hasGp = 1; gpVariant = 1; }
-                if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A16 GPU", 24) == 0) { hasGp = 1; gpVariant = 2; }
+                if (!hasGp && i + 24 <= actualLen && (memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A15 GPU", 24) == 0)) { hasGp = 1; gpVariant = 2; }
                 if (!hasGp && i + 24 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A10 GPU", 24) == 0) { hasGp = 1; gpVariant = 3; }
+
+                // FIX53E: 通用 fallback — 自动识别所有未知 iPhone/iPad 型号和 Apple GPU
+                if (!hasDm && i + 7 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPhone ", 7) == 0) { hasDm = 1; dmVariant = 2; }
+                if (!hasDm && i + 4 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPad", 4) == 0) { hasDm = 1; dmVariant = 2; }
+                if (!hasGp && i + 19 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A", 19) == 0) { hasGp = 1; gpVariant = 2; }
 
                 // FIX53: 检测UUID=MACADDRESS=xxx前缀(17B)
                 if (!hasUuidMac && i + 53 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 17) == 0) { hasUuidMac = 1; }
@@ -26442,6 +26492,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     int chCount = 0, dmCount = 0, gpCount = 0;
     int dm16ProMaxCount = 0, dm14ProCount = 0; // FIX52: 分别计数不同设备型号
     int gpA18ProCount = 0, gpA16Count = 0; // FIX52: 分别计数不同GPU
+    int dmGenericDelta = 0; // FIX53E: 通用设备型号替换的delta累计 (origLen - 11)
+    int gpGenericDelta = 0; // FIX53E: 通用GPU替换的delta累计 (origLen - 24)
     int uuidCount = 0; // FIX53: UUID替换次数(等长替换, 不影响delta)
 
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
@@ -26498,9 +26550,9 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 pcur += 17;
 
-            } else if (rem >= 13 && memcmp(pcur, "iPhone 14 Pro", 13) == 0) {
+            } else if (rem >= 13 && (memcmp(pcur, "iPhone 14 Pro", 13) == 0 || memcmp(pcur, "iPhone 13 Pro", 13) == 0)) {
 
-                // FIX52: 支持 iPhone 14 Pro (13B)
+                // FIX52: 支持 iPhone 14 Pro (13B) + iPhone 13 Pro (13B)
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 char next = (pcur + 13 < scanEnd) ? *(pcur+13) : 0;
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
@@ -26524,9 +26576,9 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 pcur += 28;
 
-            } else if (rem >= 24 && memcmp(pcur, "Apple Inc. Apple A16 GPU", 24) == 0) {
+            } else if (rem >= 24 && (memcmp(pcur, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(pcur, "Apple Inc. Apple A15 GPU", 24) == 0)) {
 
-                // FIX52: 支持 A16 GPU (24B, 等长替换为A10, delta=0)
+                // FIX52: 支持 A16 GPU (24B) + A15 GPU (24B, 等长替换为A10, delta=0)
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 char next = (pcur + 24 < scanEnd) ? *(pcur+24) : 0;
                 BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
@@ -26537,6 +26589,49 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 // FIX52: A10 GPU已经是canonical, 不需要替换
                 pcur += 24;
+
+            } else if (rem >= 7 && memcmp(pcur, "iPhone ", 7) == 0) {
+
+                // FIX53E: 通用 fallback — 任何未知 iPhone 型号 (如iPhone 12/15等)
+                // 向后扫描到 JSON 闭合引号 确定原始长度
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                if (prev == '"' || prev == ':') {
+                    int dmEnd = 7;
+                    while (pcur + dmEnd < scanEnd && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
+                    if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
+                        dmCount++;
+                        dmGenericDelta += (dmEnd - 11); // delta = origLen - 11 (替换后缩短量)
+                    }
+                }
+                pcur += 7; // 至少跳过前缀避免死循环, 后续字符会被正常遍历
+
+            } else if (rem >= 4 && memcmp(pcur, "iPad", 4) == 0) {
+
+                // FIX53E: 通用 fallback — iPad全系列
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                if (prev == '"' || prev == ':') {
+                    int dmEnd = 4;
+                    while (pcur + dmEnd < scanEnd && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
+                    if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
+                        dmCount++;
+                        dmGenericDelta += (dmEnd - 11);
+                    }
+                }
+                pcur += 4;
+
+            } else if (rem >= 19 && memcmp(pcur, "Apple Inc. Apple A", 19) == 0) {
+
+                // FIX53E: 通用 fallback — 任何未知 Apple GPU (如A12/A14/A17等)
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                if (prev == '"' || prev == ':') {
+                    int gpEnd = 19;
+                    while (pcur + gpEnd < scanEnd && *(pcur + gpEnd) != '"' && *(pcur + gpEnd) != ',' && *(pcur + gpEnd) != 0) gpEnd++;
+                    if (pcur + gpEnd < scanEnd && *(pcur + gpEnd) == '"') {
+                        gpCount++;
+                        gpGenericDelta += (gpEnd - 24); // delta = origLen - 24
+                    }
+                }
+                pcur += 19;
 
             } else if (rem >= 53 && memcmp(pcur, "UUID=MACADDRESS=", 17) == 0) {
 
@@ -26627,14 +26722,17 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         if (patchCount > 0) {
 
             // FIX52: 根据变体分别计算delta
-            // dm: 16 Pro Max(17→11, delta=-6), 14 Pro(13→11, delta=-2)
-            // gp: A18 Pro(28→24, delta=-4), A16(24→24, delta=0)
+            // dm: 16 Pro Max(17→11, delta=-6), 14/13 Pro(13→11, delta=-2)
+            // gp: A18 Pro(28→24, delta=-4), A16/A15(24→24, delta=0)
             // FIX53: UUID全部等长替换(53→53, 36→36), 无delta
+            // FIX53E: 通用fallback delta动态计算 (origLen→11/24)
             ssize_t delta = (ssize_t)chCount * 9
                           + (ssize_t)dm16ProMaxCount * (-6)
                           + (ssize_t)dm14ProCount * (-2)
                           + (ssize_t)gpA18ProCount * (-4)
-                          + (ssize_t)gpA16Count * 0;
+                          + (ssize_t)gpA16Count * 0
+                          - (ssize_t)dmGenericDelta   // FIX53E: 通用设备型号 delta (正值=缩短)
+                          - (ssize_t)gpGenericDelta;   // FIX53E: 通用GPU delta (正值=缩短)
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -26686,9 +26784,9 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                         }
 
-                    } else if (rem >= 13 && memcmp(p, "iPhone 14 Pro", 13) == 0) {
+                    } else if (rem >= 13 && (memcmp(p, "iPhone 14 Pro", 13) == 0 || memcmp(p, "iPhone 13 Pro", 13) == 0)) {
 
-                        // FIX52: iPhone 14 Pro(13B) → iPhone7Plus(11B)
+                        // FIX52: iPhone 14/13 Pro(13B) → iPhone7Plus(11B)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 13 < e) ? *(p+13) : 0;
                         BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
@@ -26719,9 +26817,9 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                         }
 
-                    } else if (rem >= 24 && memcmp(p, "Apple Inc. Apple A16 GPU", 24) == 0) {
+                    } else if (rem >= 24 && (memcmp(p, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(p, "Apple Inc. Apple A15 GPU", 24) == 0)) {
 
-                        // FIX52: A16 GPU(24B) → A10 GPU(24B, 等长)
+                        // FIX52: A16/A15 GPU(24B) → A10 GPU(24B, 等长)
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 24 < e) ? *(p+24) : 0;
                         BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
@@ -26735,6 +26833,49 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         // FIX52: A10 GPU已经是canonical, 直接复制
                         memcpy(out, "Apple Inc. Apple A10 GPU", 24);
                         out += 24; p += 24; continue;
+
+                    } else if (rem >= 7 && memcmp(p, "iPhone ", 7) == 0) {
+
+                        // FIX53E: 通用 fallback — 任何未知 iPhone 型号 → iPhone7Plus
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        if (prev == '"' || prev == ':') {
+                            int dmLen = 7;
+                            while (p + dmLen < e && *(p + dmLen) != '"' && *(p + dmLen) != ',' && *(p + dmLen) != 0) dmLen++;
+                            if (p + dmLen < e && *(p + dmLen) == '"') {
+                                memcpy(out, "iPhone7Plus", 11);
+                                out += 11; p += dmLen; continue;
+                            }
+                        }
+                        // bounded不匹配时, 按普通字符处理
+                        *out = *p; out++; p++;
+
+                    } else if (rem >= 4 && memcmp(p, "iPad", 4) == 0) {
+
+                        // FIX53E: 通用 fallback — iPad全系列 → iPhone7Plus
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        if (prev == '"' || prev == ':') {
+                            int dmLen = 4;
+                            while (p + dmLen < e && *(p + dmLen) != '"' && *(p + dmLen) != ',' && *(p + dmLen) != 0) dmLen++;
+                            if (p + dmLen < e && *(p + dmLen) == '"') {
+                                memcpy(out, "iPhone7Plus", 11);
+                                out += 11; p += dmLen; continue;
+                            }
+                        }
+                        *out = *p; out++; p++;
+
+                    } else if (rem >= 19 && memcmp(p, "Apple Inc. Apple A", 19) == 0) {
+
+                        // FIX53E: 通用 fallback — 任何未知 Apple GPU → A10 GPU
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        if (prev == '"' || prev == ':') {
+                            int gpLen = 19;
+                            while (p + gpLen < e && *(p + gpLen) != '"' && *(p + gpLen) != ',' && *(p + gpLen) != 0) gpLen++;
+                            if (p + gpLen < e && *(p + gpLen) == '"') {
+                                memcpy(out, "Apple Inc. Apple A10 GPU", 24);
+                                out += 24; p += gpLen; continue;
+                            }
+                        }
+                        *out = *p; out++; p++;
 
                     } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53) == 0) {
 
@@ -27511,7 +27652,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53D — Fully restored FIX53 baseline + OPTIONAL SPARSE LOGGER [DEFAULT OFF] + LOG SIZE LIMIT & ROTATION [DEFAULT ON!] + 🆕 FILE-TOGGLE RUNTIME SWITCHES (NO lldb/rebuild/resign). Single-channel canonical UUID=66B0EE01 used EVERYWHERE (CC_MD5 HMAC input & CCCrypt L4 plaintext & FFF493-REPL MACADDRESS field — all use 66B0EE01, guaranteed parity). No extra UUID counters, no length-changing UUID replacements, no dual-channel gate. SPARSE_LOG_MODE=0 default (full verbose). LOG_SIZE_LIMIT_DEFAULT_ON=1 default: wxhook.log max LOG_MAX_KB=200 KB, LOG_ROTATE_COUNT=1 (.old history). NEW RUNTIME TOGGLES (NO REBUILD NEEDED): Place empty file <Documents>/wxhook_nolimit → size cap OFF; <Documents>/wxhook_sparse → TAG-filter sparse ON; <Documents>/wxhook_logfull → restore compiled defaults. Delete file + restart to revert. Boot prints [LOG-TOGGLE] + [LOG-CONFIG] with final effective state. Safety: 5 MB absolute cap always applies regardless of switches.");
+    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53E — FIX53 baseline + iPhone 13 Pro/A15 GPU + 🆕 GENERIC PREFIX FALLBACK for ALL iOS devices (iPhone/iPad/A10~A18 GPU). Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: 'iPhone ' prefix matches any unknown iPhone, 'iPad' matches all iPads, 'Apple Inc. Apple A' matches any Apple GPU. Dynamic length & delta calculation — no need to add code for new devices. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
