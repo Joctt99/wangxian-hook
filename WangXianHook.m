@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53K: [FIX53J基线 + 🚨禁用CCCrypt L4空UUID插入]. 根因(wxhook-177): FFF493#1(IOS_CLIENT_MSG)中CC_MD5 uuid=0(不插入UUID), 但CCCrypt L4 uuid=1(empty=1)插入了66B0EE01 → HMAC基于空UUID计算, 密文包含UUID=66B0EE01 → 服务器HMAC校验失败 → 关闭连接. 修复: 1)禁用CCCrypt L4空UUID插入(16B→16B原样复制, 不再16B→52B) 2)delta计算中uuidEmptyCount*36改为0 3)pass1和pass2同步修改 4)保留非空UUID等长替换(52B→52B).";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53K-VERIFY: CCCrypt L4 empty UUID insertion DISABLED. Pass1 delta: uuidEmptyCount*36 → 0. Pass2 replace: memcpy(out,p,16) instead of memcpy(out,canon,52). Non-empty UUID (52B→52B) replacement RETAINED. Must see [FIX53H-SCAN] uuid=0(empty=0) for FFF493#1 (was uuid=1(empty=1)). CC_MD5 uuid=0 ↔ CCCrypt L4 uuid=0 = CONSISTENT.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53K: [FIX53J基线 + 禁用CCCrypt L4空UUID插入 + 保存L4修补明文供send-hook重加密]. 根因(wxhook-178): FFF493#1中CC_MD5 patch了HMAC输入(ch=1 dm=1 gp=1), 但send-hook发送原始包(FALLBACK mark), CCCrypt L4可能未patch成功(scan日志被LOG-ROTATED截断无法确认). 即使CCCrypt L4 patch成功, send-hook也没有使用L4修补后的明文进行重加密. 修复: 1)CCCrypt L4 pass-2后保存patchedBuf到g_l4_saved_patched全局变量 2)send-hook检测g_md5_channel_replaced=1时强制重加密FFF493#1 3)使用g_l4_saved_patched(L4修补后明文,含ch/dm/gp补丁)而非nativePlain(原始明文)进行重加密 4)禁用空UUID插入(同FIX53J).";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53K-VERIFY: 1) g_l4_saved_patched/len/valid globals added. 2) CCCrypt L4 pass-2 saves patchedBuf copy. 3) send-hook: forceReencrypt when g_md5_channel_replaced=1 && g_l4_saved_valid=YES. 4) newStr uses g_l4_saved_patched (NOT nativePlain). Must see [FIX53K-L4-SAVE] in log (patched plaintext saved with ch/dm/gp counts). Must see [FIX53K-REENC] (force re-encrypt with L4 patched plaintext). [FIX53I-REENC] still triggers on SAFE FALLBACK.";
 
 
 
@@ -7724,6 +7724,13 @@ static int g_forceValidDecryptFd = -1;
 // response (0x80FFF495) is received. Before that (login server phase),
 // CCCrypt calls pass through unchanged to avoid crashing JudgeApp.
 static BOOL g_cccrypt_l4_active = NO;
+
+// FIX53K: Save CCCrypt L4 patched plaintext for send-hook re-encryption.
+// When SAFE FALLBACK occurs OR CC_MD5 patched but CCCrypt L4 didn't,
+// the send-hook needs the patched plaintext to re-encrypt correctly.
+static char *g_l4_saved_patched = NULL;
+static size_t g_l4_saved_patched_len = 0;
+static BOOL g_l4_saved_valid = NO;
 
 
 
@@ -14105,6 +14112,17 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     BOOL forceReencrypt = g_l4_safe_fallback;
 
+                    // FIX53K: Also force re-encryption when CC_MD5 patched HMAC input.
+                    // If CC_MD5 replaced channel/device/GPU (g_md5_channel_replaced=1),
+                    // the HMAC is based on PATCHED data. The ciphertext MUST also be
+                    // based on patched data. If CCCrypt L4 didn't patch (for any reason),
+                    // the original packet's ciphertext is based on ORIGINAL data → mismatch.
+                    // Force re-encryption with L4's saved patched plaintext to fix this.
+                    if (!forceReencrypt && g_md5_channel_replaced && g_l4_saved_valid) {
+                        forceReencrypt = YES;
+                        DLOG(@"[FIX53K-REENC] CC_MD5 patched (g_md5_channel_replaced=1) → force re-encrypt #%d with L4 patched plaintext", fffWhich);
+                    }
+
                     if (forceReencrypt) {
 
                         DLOG(@"[FIX53I-REENC] SAFE FALLBACK detected → forcing re-encryption of patched plaintext (fffWhich=%d plainLen=%zu)", fffWhich, nativeLen);
@@ -14113,9 +14131,15 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                         if (!newStr || newStr.length == 0) {
 
-                            // JSON wasn't modified, use saved patched plaintext directly
-
-                            newStr = [[NSString alloc] initWithBytes:nativePlain length:nativeLen encoding:NSUTF8StringEncoding];
+                            // FIX53K: Use CCCrypt L4's saved patched plaintext (includes channel/device/GPU patches)
+                            if (g_l4_saved_valid && g_l4_saved_patched && g_l4_saved_patched_len > 0) {
+                                newStr = [[NSString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
+                                DLOG(@"[FIX53K-REENC] Using L4 saved patched plaintext %zuB (includes ch/dm/gp patches)", g_l4_saved_patched_len);
+                            } else {
+                                // Fallback: use native plaintext (WARNING: no channel/device/GPU patches!)
+                                newStr = [[NSString alloc] initWithBytes:nativePlain length:nativeLen encoding:NSUTF8StringEncoding];
+                                DLOG(@"[FIX53K-REENC] WARNING: L4 patched plaintext not available, using native %zuB (NO ch/dm/gp patches!)", nativeLen);
+                            }
 
                         }
 
@@ -27171,6 +27195,17 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 realDataIn = patchedBuf;
 
                 realDataInLen = (size_t)(out - (char *)patchedBuf);
+
+                // FIX53K: Save patched plaintext for send-hook re-encryption
+                if (g_l4_saved_patched) { free(g_l4_saved_patched); }
+                g_l4_saved_patched = (char *)malloc(realDataInLen);
+                if (g_l4_saved_patched) {
+                    memcpy(g_l4_saved_patched, patchedBuf, realDataInLen);
+                    g_l4_saved_patched_len = realDataInLen;
+                    g_l4_saved_valid = YES;
+                }
+                DLOG(@"[FIX53K-L4-SAVE] Saved patched plaintext %zuB (ch=%d dm=%d gp=%d uuid=%d patchTot=%d) — for send-hook re-encryption",
+                     realDataInLen, chCount, dmCount, gpCount, uuidCount, patchCount);
 
                 static int logged = 0;
 
