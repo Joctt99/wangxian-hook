@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53G: [FIX53基线 + 🚨🚨修复双重null终止符致命bug]. BUG#1: memcmp('Apple Inc. Apple A',19B)包含null终止符→设备型号扫描永远不匹配→吃50B而非17B. BUG#2: memcmp('UUID=MACADDRESS=',17B)包含null终止符→UUID检测永远不匹配→UUID字段永远不被替换→HMAC包含UUID但明文不含→服务器拒绝. 修复: 1)Apple Inc. Apple A: 19B→18B(10处). 2)UUID=MACADDRESS=: 17B→16B, 53B→52B(9处). 3)空UUID处理: UUID=MACADDRESS=“→插入canonical UUID(+36B). 4)设备型号扫描: 20B上限+UUID=/WIFI边界. 单通道canonical UUID=66B0EE01.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53G-VERIFY: CRITICAL FIX - TWO null-terminator bugs in memcmp. BUG1: 'Apple Inc. Apple A' 19B→18B (10 places). BUG2: 'UUID=MACADDRESS=' 17B→16B, 53B→52B (9 places). Empty UUID handling: insert canonical when UUID=MACADDRESS= followed by quote. uuidEmptyCount delta +36. [FIX53G-DM-GENERIC] [FIX53G-GPU-GENERIC] [FIX53G-UUID-INSERT] DLOG tags. Single-channel canonical UUID 66B0EE01.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53H: [FIX53G基线 + 🚨修复CCCrypt L4与CC_MD5检测逻辑不一致]. 根因: CC_MD5检测纯内容匹配(无bounded检查)→ch=1,dm=1,gp=1全命中; 但CCCrypt L4严格bounded检查(prev必须是\":等)→FFF493 JSON中某些格式下DY_MIESHI/A16 GPU检测不到→加密明文仍含原始值,但HMAC基于canonical计算→HMAC不匹配→服务器关闭连接. 修复: CCCrypt L4第一pass+第二pass的所有bounded检查全部放宽为「非字母数字即单词边界」,与CC_MD5逻辑完全一致.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53H-VERIFY: CCCrypt L4 BOUNDED CHECK RELAXED. All channel/dm/gpu exact-match + generic-fallback bounded checks in both pass-1 (counting) and pass-2 (replacing) now use 'non-alphanumeric = word boundary' instead of strict JSON delimiters. Match CC_MD5 detection parity. FFF493 encrypted plaintext MUST have same field values as CC_MD5 hash input, else server HMAC mismatch → TCP RST. [FIX53H-CH-RELAX] [FIX53H-DM-RELAX] [FIX53H-GPU-RELAX] DLOG tags.";
 
 
 
@@ -26591,31 +26591,26 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
             if (rem >= 9 && memcmp(pcur, "DY_MIESHI", 9) == 0) {
 
-                BOOL bounded = YES;
-
-                // Only match when it's clearly the channel field (in JSON, between " or delimiters)
-
-                // To avoid false positives, only match when surrounded by quotes/braces
-
+                // FIX53H: 放宽bounded检查 — 与CC_MD5检测逻辑一致, 只要求前后非字母数字(单词边界)
+                // 之前严格要求prev是": 等, 导致FFF493 JSON中某些格式的channel字段检测不到
+                // → CC_MD5替换了但CCCrypt没替换 → HMAC不匹配 → 服务器关闭连接
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-
                 char next = (pcur + 9 < scanEnd) ? *(pcur+9) : 0;
-
-                bounded = (prev == '"' || prev == ':' || prev == ',' || prev == '{' || prev == '[' || prev == ' ') &&
-
-                          (next == '"' || next == ',' || next == '}' || next == ']' || next == ' ' || next == '\0' || next == ':');
-
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z'); // 非字母
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z'); // 非字母
+                BOOL bounded = prevOk && nextOk;
                 if (bounded) chCount++;
 
                 pcur += 9;
 
             } else if (rem >= 17 && memcmp(pcur, "iPhone 16 Pro Max", 17) == 0) {
 
+                // FIX53H: 放宽bounded检查 — 前后非字母数字即可, 与CC_MD5一致
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-
                 char next = (pcur + 17 < scanEnd) ? *(pcur+17) : 0;
-
-                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                BOOL bounded = prevOk && nextOk;
 
                 if (bounded) { dmCount++; dm16ProMaxCount++; }
 
@@ -26626,9 +26621,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 // FIX53F: 13B匹配仅当后面不是空格(排除"Pro Max"等, 让通用fallback处理)
                 // FIX52: 支持 iPhone 14 Pro (13B) + iPhone 13 Pro (13B)
+                // FIX53H: 放宽bounded检查 — 前后非字母数字即可
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 char next = (pcur + 13 < scanEnd) ? *(pcur+13) : 0;
-                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                BOOL bounded = prevOk && nextOk;
                 if (bounded) { dmCount++; dm14ProCount++; }
                 pcur += 13;
 
@@ -26639,11 +26637,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
             } else if (rem >= 28 && memcmp(pcur, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
 
+                // FIX53H: 放宽bounded检查 — 前后非字母数字即可, 与CC_MD5一致
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-
                 char next = (pcur + 28 < scanEnd) ? *(pcur+28) : 0;
-
-                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                BOOL bounded = prevOk && nextOk;
 
                 if (bounded) { gpCount++; gpA18ProCount++; }
 
@@ -26652,9 +26651,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             } else if (rem >= 24 && (memcmp(pcur, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(pcur, "Apple Inc. Apple A15 GPU", 24) == 0)) {
 
                 // FIX52: 支持 A16 GPU (24B) + A15 GPU (24B, 等长替换为A10, delta=0)
+                // FIX53H: 放宽bounded检查 — 前后非字母数字即可
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 char next = (pcur + 24 < scanEnd) ? *(pcur+24) : 0;
-                BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                BOOL bounded = prevOk && nextOk;
                 if (bounded) { gpCount++; gpA16Count++; }
                 pcur += 24;
 
@@ -26667,8 +26669,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 // FIX53E: 通用 fallback — 任何未知 iPhone 型号 (如iPhone 12/15等)
                 // 向后扫描到 JSON 闭合引号 确定原始长度, 加64字节上限保护
+                // FIX53H: 放宽prev检查 — 非字母数字即边界, 与CC_MD5一致
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-                if (prev == '"' || prev == ':') {
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                if (prevOk) {
                     int dmEnd = 7;
                     while (pcur + dmEnd < scanEnd && dmEnd < 64 && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
                     if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
@@ -26681,8 +26685,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             } else if (rem >= 4 && memcmp(pcur, "iPad", 4) == 0) {
 
                 // FIX53E: 通用 fallback — iPad全系列, 加64字节上限保护
+                // FIX53H: 放宽prev检查 — 非字母数字即边界
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-                if (prev == '"' || prev == ':') {
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                if (prevOk) {
                     int dmEnd = 4;
                     while (pcur + dmEnd < scanEnd && dmEnd < 64 && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
                     if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
@@ -26695,8 +26701,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             } else if (rem >= 18 && memcmp(pcur, "Apple Inc. Apple A", 18) == 0) {
 
                 // FIX53G: 通用 fallback — 任何未知 Apple GPU, 修复19B null终止符bug
+                // FIX53H: 放宽prev检查 — 非字母数字即边界
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
-                if (prev == '"' || prev == ':') {
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                if (prevOk) {
                     int gpEnd = 18;
                     while (pcur + gpEnd < scanEnd && gpEnd < 32 && *(pcur + gpEnd) != '"' && *(pcur + gpEnd) != ',' && *(pcur + gpEnd) != 0) gpEnd++;
                     if (pcur + gpEnd < scanEnd && *(pcur + gpEnd) == '"') {
@@ -26754,6 +26762,25 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
         }
 
         patchCount = chCount + dmCount + gpCount + accCount + uuidCount;
+
+        // FIX53H: Scan-phase diagnostics — detect CC_MD5 vs CCCrypt detection mismatch.
+        // Root cause (wxhook-171): CC_MD5 sees ch=1 gp=1 but CCCrypt-L4 sees ch=0 gp=0
+        // due to overly-strict JSON delimiter bounded checks. newDataInLen below would
+        // silently use the wrong delta → encrypted plaintext != HMAC input → TCP RST.
+        static int scanLogged = 0;
+        if (scanLogged < 4) {
+            BOOL warnCH = (chCount == 0);
+            BOOL warnGP = (gpCount == 0);
+            DLOG(@"[FIX53H-SCAN] L4-pass1 inLen=%zu patchTot=%d ch=%d%@ dm=%d(16PM=%d 14P=%d gen=%d dD=%d) gp=%d(A18P=%d A16=%d gen=%d gD=%d) acc=%d uuid=%d(empty=%d) %@%@",
+                 dataInLen, patchCount,
+                 chCount, warnCH ? @"⚠️NO-CH" : @"",
+                 dmCount, dm16ProMaxCount, dm14ProCount, (dmCount - dm16ProMaxCount - dm14ProCount), dmGenericDelta,
+                 gpCount, gpA18ProCount, gpA16Count, (gpCount - gpA18ProCount - gpA16Count), gpGenericDelta,
+                 accCount, uuidCount, uuidEmptyCount,
+                 warnCH ? @"[WARN-DY_MIESHI-NOT-DETECTED → check JSON format around channel!]" : @"",
+                 warnGP ? @"[WARN-GPU-NOT-DETECTED → check JSON format around GPU!]" : @"");
+            scanLogged++;
+        }
 
         // FIX53: UUID替换全部等长(53→53, 36→36), 所以uuidCount对delta无影响
         // v37.35: Save AES key+iv+alg+options from ANY ENC call in FFF493 range.
@@ -26839,13 +26866,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                     if (rem >= 9 && memcmp(p, "DY_MIESHI", 9) == 0) {
 
+                        // FIX53H: 放宽bounded检查 — 非字母数字即边界, 与第一pass一致
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-
                         char next = (p + 9 < e) ? *(p+9) : 0;
-
-                        BOOL bounded = (prev == '"' || prev == ':' || prev == ',' || prev == '{' || prev == '[' || prev == ' ') &&
-
-                                      (next == '"' || next == ',' || next == '}' || next == ']' || next == ' ' || next == '\0' || next == ':');
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
 
                         if (bounded) {
 
@@ -26857,11 +26883,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                     } else if (rem >= 17 && memcmp(p, "iPhone 16 Pro Max", 17) == 0) {
 
+                        // FIX53H: 放宽bounded检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-
                         char next = (p + 17 < e) ? *(p+17) : 0;
-
-                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
 
                         if (bounded) {
 
@@ -26876,9 +26903,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                         // FIX53F: 13B匹配仅当后面不是空格(排除"Pro Max"等, 让通用fallback处理)
                         // FIX52: iPhone 14/13 Pro(13B) → iPhone7Plus(11B)
+                        // FIX53H: 放宽bounded检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 13 < e) ? *(p+13) : 0;
-                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
                         if (bounded) {
                             memcpy(out, "iPhone7Plus", 11);
                             out += 11; p += 13; continue;
@@ -26892,11 +26922,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                     } else if (rem >= 28 && memcmp(p, "Apple Inc. Apple A18 Pro GPU", 28) == 0) {
 
+                        // FIX53H: 放宽bounded检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-
                         char next = (p + 28 < e) ? *(p+28) : 0;
-
-                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
 
                         if (bounded) {
 
@@ -26909,9 +26940,12 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 24 && (memcmp(p, "Apple Inc. Apple A16 GPU", 24) == 0 || memcmp(p, "Apple Inc. Apple A15 GPU", 24) == 0)) {
 
                         // FIX52: A16/A15 GPU(24B) → A10 GPU(24B, 等长)
+                        // FIX53H: 放宽bounded检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
                         char next = (p + 24 < e) ? *(p+24) : 0;
-                        BOOL bounded = (prev == '"' || prev == ':') && (next == '"' || next == ',');
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
                         if (bounded) {
                             memcpy(out, "Apple Inc. Apple A10 GPU", 24);
                             out += 24; p += 24; continue;
@@ -26926,8 +26960,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 7 && memcmp(p, "iPhone ", 7) == 0) {
 
                         // FIX53E: 通用 fallback — 任何未知 iPhone 型号 → iPhone7Plus
+                        // FIX53H: 放宽prev检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-                        if (prev == '"' || prev == ':') {
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        if (prevOk) {
                             int dmLen = 7;
                             while (p + dmLen < e && *(p + dmLen) != '"' && *(p + dmLen) != ',' && *(p + dmLen) != 0) dmLen++;
                             if (p + dmLen < e && *(p + dmLen) == '"') {
@@ -26941,8 +26977,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 4 && memcmp(p, "iPad", 4) == 0) {
 
                         // FIX53E: 通用 fallback — iPad全系列 → iPhone7Plus
+                        // FIX53H: 放宽prev检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-                        if (prev == '"' || prev == ':') {
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        if (prevOk) {
                             int dmLen = 4;
                             while (p + dmLen < e && *(p + dmLen) != '"' && *(p + dmLen) != ',' && *(p + dmLen) != 0) dmLen++;
                             if (p + dmLen < e && *(p + dmLen) == '"') {
@@ -26955,8 +26993,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 18 && memcmp(p, "Apple Inc. Apple A", 18) == 0) {
 
                         // FIX53G: 通用 fallback — 任何未知 Apple GPU → A10 GPU, 修复19B null终止符bug
+                        // FIX53H: 放宽prev检查 — 非字母数字即边界
                         char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-                        if (prev == '"' || prev == ':') {
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        if (prevOk) {
                             int gpLen = 18;
                             while (p + gpLen < e && *(p + gpLen) != '"' && *(p + gpLen) != ',' && *(p + gpLen) != 0) gpLen++;
                             if (p + gpLen < e && *(p + gpLen) == '"') {
@@ -27053,11 +27093,24 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
                 if (logged < 4) {
 
-                    DLOG(@"[CH-L4] v37.134-FIX8 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu delta=%lld",
+                    // FIX53H: Expected delta re-check — must match pass-1 scan delta.
+                    // If actual delta differs from expected, FFF493-REPL will use the
+                    // WRONG plaintext length to re-encrypt → server HMAC mismatch.
+                    ssize_t expectedDelta = (ssize_t)chCount * 9
+                                          + (ssize_t)dm16ProMaxCount * (-6)
+                                          + (ssize_t)dm14ProCount * (-2)
+                                          + (ssize_t)gpA18ProCount * (-4)
+                                          + (ssize_t)gpA16Count * 0
+                                          - (ssize_t)dmGenericDelta
+                                          - (ssize_t)gpGenericDelta
+                                          + (ssize_t)uuidEmptyCount * 36;
+                    ssize_t actualDelta = (long long)realDataInLen - (long long)dataInLen;
+                    BOOL deltaOk = (expectedDelta == actualDelta);
+                    DLOG(@"[FIX53H-CH-RELAX] [CH-L4] v37.134-FIX8 patchesTot=%d ch=%d dm=%d gp=%d acc=%d origLen=%zu newLen=%zu expDelta=%lld actDelta=%lld %@",
 
                          patchCount, chCount, dmCount, gpCount, accCount, dataInLen, realDataInLen,
-
-                         (long long)realDataInLen - (long long)dataInLen);
+                         (long long)expectedDelta, (long long)actualDelta,
+                         deltaOk ? @"OK" : @"⚠️DELTA-MISMATCH!");
 
                     logged++;
 
