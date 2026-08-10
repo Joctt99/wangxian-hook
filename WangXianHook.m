@@ -21768,8 +21768,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             // FIX53E: 通用设备型号 fallback — 任何未精确匹配的 iPhone 型号 (如iPhone 12/15等)
                             // 向后扫描到 "Apple Inc. Apple A" (GPU起始) 确定原始长度
+                            // 加64字节上限防止JSON字段顺序不同时扫描越界
                             int dmEnd = pos + 7;
-                            while (dmEnd + 19 <= len && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
+                            while (dmEnd + 19 <= len && dmEnd - pos < 64 && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
                             int origDmLen = dmEnd - pos;
                             memcpy((uint8_t *)cleanInput + out, dmNew, 11);
                             out += 11; pos += origDmLen;
@@ -21779,7 +21780,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             // FIX53E: 通用设备型号 fallback — iPad全系列
                             int dmEnd = pos + 4;
-                            while (dmEnd + 19 <= len && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
+                            while (dmEnd + 19 <= len && dmEnd - pos < 64 && memcmp(in + dmEnd, "Apple Inc. Apple A", 19) != 0) dmEnd++;
                             int origDmLen = dmEnd - pos;
                             memcpy((uint8_t *)cleanInput + out, dmNew, 11);
                             out += 11; pos += origDmLen;
@@ -21845,8 +21846,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                             // FIX53E: 通用 GPU fallback — 任何未精确匹配的 Apple GPU (如A12/A14/A17等)
                             // 向后扫描到 "GPU" 确定原始长度, 等长或变长替换为 A10 GPU (24B canonical)
+                            // 加32字节上限防止扫描越界
                             int gpEnd = pos + 19;
-                            while (gpEnd + 3 <= len && memcmp(in + gpEnd, "GPU", 3) != 0) gpEnd++;
+                            while (gpEnd + 3 <= len && gpEnd - pos < 32 && memcmp(in + gpEnd, "GPU", 3) != 0) gpEnd++;
                             int origGpLen = (gpEnd + 3 <= len) ? (gpEnd + 3 - pos) : 24;
                             memcpy((uint8_t *)cleanInput + out, gpNew, 24);
                             out += 24; pos += origGpLen;
@@ -26593,11 +26595,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             } else if (rem >= 7 && memcmp(pcur, "iPhone ", 7) == 0) {
 
                 // FIX53E: 通用 fallback — 任何未知 iPhone 型号 (如iPhone 12/15等)
-                // 向后扫描到 JSON 闭合引号 确定原始长度
+                // 向后扫描到 JSON 闭合引号 确定原始长度, 加64字节上限保护
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 if (prev == '"' || prev == ':') {
                     int dmEnd = 7;
-                    while (pcur + dmEnd < scanEnd && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
+                    while (pcur + dmEnd < scanEnd && dmEnd < 64 && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
                     if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
                         dmCount++;
                         dmGenericDelta += (dmEnd - 11); // delta = origLen - 11 (替换后缩短量)
@@ -26607,11 +26609,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
             } else if (rem >= 4 && memcmp(pcur, "iPad", 4) == 0) {
 
-                // FIX53E: 通用 fallback — iPad全系列
+                // FIX53E: 通用 fallback — iPad全系列, 加64字节上限保护
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 if (prev == '"' || prev == ':') {
                     int dmEnd = 4;
-                    while (pcur + dmEnd < scanEnd && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
+                    while (pcur + dmEnd < scanEnd && dmEnd < 64 && *(pcur + dmEnd) != '"' && *(pcur + dmEnd) != ',' && *(pcur + dmEnd) != 0) dmEnd++;
                     if (pcur + dmEnd < scanEnd && *(pcur + dmEnd) == '"') {
                         dmCount++;
                         dmGenericDelta += (dmEnd - 11);
@@ -26621,11 +26623,11 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
 
             } else if (rem >= 19 && memcmp(pcur, "Apple Inc. Apple A", 19) == 0) {
 
-                // FIX53E: 通用 fallback — 任何未知 Apple GPU (如A12/A14/A17等)
+                // FIX53E: 通用 fallback — 任何未知 Apple GPU (如A12/A14/A17等), 加32字节上限保护
                 char prev = (pcur > scanP) ? *(pcur-1) : 0;
                 if (prev == '"' || prev == ':') {
                     int gpEnd = 19;
-                    while (pcur + gpEnd < scanEnd && *(pcur + gpEnd) != '"' && *(pcur + gpEnd) != ',' && *(pcur + gpEnd) != 0) gpEnd++;
+                    while (pcur + gpEnd < scanEnd && gpEnd < 32 && *(pcur + gpEnd) != '"' && *(pcur + gpEnd) != ',' && *(pcur + gpEnd) != 0) gpEnd++;
                     if (pcur + gpEnd < scanEnd && *(pcur + gpEnd) == '"') {
                         gpCount++;
                         gpGenericDelta += (gpEnd - 24); // delta = origLen - 24
