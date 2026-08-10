@@ -33,22 +33,25 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53H" $(SOURCE) || echo "WARNING: FIX53H not found in source!"
+	@grep -c "FIX53I" $(SOURCE) || echo "WARNING: FIX53I not found in source!"
 	@grep -c "dmGenericDelta" $(SOURCE) || echo "WARNING: dmGenericDelta (generic fallback) not found!"
 	@grep -c "iPhone " $(SOURCE) || echo "WARNING: iPhone prefix fallback not found!"
 	@grep -c "iPad" $(SOURCE) || echo "WARNING: iPad fallback not found!"
 	@grep -c "Apple Inc. Apple A" $(SOURCE) || echo "WARNING: GPU prefix fallback not found!"
 	@grep -c "FIX53G-DM-GENERIC" $(SOURCE) || echo "WARNING: FIX53G-DM-GENERIC not found!"
 	@grep -c "FIX53H-CH-RELAX" $(SOURCE) || echo "WARNING: FIX53H bounded-check relax not found!"
+	@grep -c "g_l4_safe_fallback" $(SOURCE) || echo "WARNING: g_l4_safe_fallback (SAFE FALLBACK flag) not found!"
+	@grep -c "FIX53I-REENC" $(SOURCE) || echo "WARNING: FIX53I-REENC not found!"
 	@grep -c "wxhook_nolimit" $(SOURCE) || echo "WARNING: wxhook_nolimit not found!"
 	@grep -c "FIX39" $(SOURCE) || echo "WARNING: FIX39 not found in source!"
 	@echo "=== Building ==="
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53H" || echo "WARNING: FIX53H not in binary!"
+	@strings $(TARGET) | grep -c "FIX53I" || echo "WARNING: FIX53I not in binary!"
 	@strings $(TARGET) | grep -c "dmGenericDelta" || echo "WARNING: dmGenericDelta not in binary!"
 	@strings $(TARGET) | grep -c "FIX53H-CH-RELAX" || echo "WARNING: FIX53H bounded checks not in binary!"
+	@strings $(TARGET) | grep -c "FIX53I-REENC" || echo "WARNING: FIX53I-REENC not in binary!"
 	@strings $(TARGET) | grep -c "FIX39" || echo "WARNING: FIX39 not in binary!"
 	@ls -la $(TARGET)
 
