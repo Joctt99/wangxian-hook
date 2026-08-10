@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53I: [FIX53H基线 + 🚨修复CCCrypt L4 SAFE FALLBACK导致HMAC↔密文不一致]. 根因(wxhook-173): CCCrypt L4 hook修补明文后(282→312B delta=+30), 加密输出320B > caller buffer 298B → SAFE FALLBACK → 用原始明文加密 → CC_MD5的HMAC基于修补数据但密文基于原始数据 → 服务器校验失败 → TCP RST. 修复: 1)新增g_l4_safe_fallback标志, SAFE FALLBACK时设置. 2)FFF493-REPL send-hook检测到标志后强制重加密saved patched plaintext(含正确channel/dm/gp/uuid+正确md5). 3)重加密成功后重置标志.";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53I-VERIFY: CCCrypt L4 SAFE FALLBACK → FFF493-REPL FORCE RE-ENCRYPT. New global: g_l4_safe_fallback (set in CCCrypt L4 SAFE FALLBACK path, reset after FFF493-REPL re-encryption or FALLBACK mark). Send-hook: if g_l4_safe_fallback==YES, force jsonModified=YES + use saved patched plaintext as newStr → re-encrypt → rebuild packet → HMAC consistent with ciphertext. [FIX53I-REENC] DLOG tag. Previous FIX53H bounded-check relaxation retained.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53J: [FIX53I基线 + 🚨修复FFF493-REPL被if(0&&fffWhich==2)完全关闭致命Bug]. 根因(wxhook-174): FIX53I的g_l4_safe_fallback forceReencrypt代码在send-hook中,但send-hook整个重加密块被L13671的`if(0 && fffWhich==2)`完全禁用 → SAFE FALLBACK后HMAC(修补版)≠密文(原始版)的不一致根本无法修复. 同时FIX53I的FIX53H-SCAN static counter已打印4次(LOG_ROTATED前)后节流跳过,导致看不到FIX53标记. 修复(FIX53J): 1) if(0&&fffWhich==2)改为if((fffWhich==1||fffWhich==2)&&...)开放给#1#2都进入 2) origSeq/origAlgo/jsonModified/newStr全部提升到外层作用域 3) sessionId/ticket/UUID插入和md5 recompute用额外`if(fffWhich==2)`包裹避免#1被插入sessionId→JSON损坏 4) forceReencrypt逻辑现在可访问所有变量,FFF493#1(SAFE FALLBACK主犯)也会被强制重加密 5) 保留FIX53H bounded-check放宽+FIX53I g_l4_safe_fallback标志.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53J-VERIFY: FFF493-REPL BLOCK FULLY OPEN for #1+#2. Outer-scope: newStr=nil origSeq=0 origAlgo=0 jsonModified=NO (volatile). Inner fffWhich==2 guard: sessionId/ticket/UUID insert + md5 recompute (only NEW_USER). forceReencrypt block (FIX53I) is NOW REACHABLE: if g_l4_safe_fallback==YES → jsonModified=YES + newStr from nativePlain → re-encrypt using orig_CCCrypt + CCHmac + build packet. Must see [FIX53I-REENC] + [FFF493-REPL] Replaced FFF493#1/#2 in log (NOT FALLBACK mark no plaintext replacement). [FIX53H-SCAN] still limited to 4 prints, use LOG_ROTATE caution.";
 
 
 
@@ -13668,13 +13668,25 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
             //   computes correct md5. No re-encryption needed!
 
-            if (0 && fffWhich == 2 && nativePlain && nativeLen > 300 && len >= 20) {
+            // FIX53J: OPEN this block for BOTH #1 and #2. The actual sessionId/ticket/UUID
+            // modifications are still gated by fffWhich==2. But if g_l4_safe_fallback==YES
+            // we MUST enter this block to force-re-encrypt the saved patched plaintext
+            // (which has canonical values + matches what CC_MD5 hashed), otherwise:
+            //   HMAC(based on patched data via CC_MD5) ≠ ciphertext(based on ORIGINAL data)
+            //   → server HMAC validation fails → graceful TCP close → "连接异常中断"
+            //   or "正在进入" stuck.
 
-                uint32_t origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
+            NSMutableString *newStr = nil; // FIX53J: declare OUTSIDE fffWhich==2 guard so forceReencrypt below can access
+
+            uint32_t origSeq = 0; uint16_t origAlgo = 0; volatile BOOL jsonModified = NO;
+
+            if ((fffWhich == 1 || fffWhich == 2) && nativePlain && nativeLen > 100 && len >= 20) {
+
+                origSeq = ((uint32_t)p[8] << 24) | ((uint32_t)p[9] << 16) |
 
                                    ((uint32_t)p[10] << 8) | (uint32_t)p[11];
 
-                uint16_t origAlgo = ((uint16_t)p[14] << 8) | p[15];
+                origAlgo = ((uint16_t)p[14] << 8) | p[15];
 
                 NSString *nativeStr = [[NSString alloc] initWithBytesNoCopy:(void *)nativePlain
 
@@ -13686,7 +13698,12 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                 if (nativeStr) {
 
-                    NSMutableString *newStr = [NSMutableString stringWithString:nativeStr];
+                    newStr = [NSMutableString stringWithString:nativeStr];
+
+                    // FIX53J: sessionId/ticket/UUID insertion ONLY for FFF493#2 (NEW_USER).
+                    // FFF493#1 (IOS_CLIENT_MSG) NEVER has these fields — inserting them → corrupt JSON.
+                    if (fffWhich == 2) {
+
 
                     // v37.101 FIX: Replace REAL device UUID in "MACADDRESS" field with CANONICAL UUID!
 
@@ -13799,7 +13816,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     // re-encryption + md5 recomputation to fix EE121/FFF493#2 UUID mismatch.
 
-                    volatile BOOL jsonModified = (didReplaceSession || didReplaceTicket || didReplaceUUID);
+                    // FIX53J: assign to outer-scope jsonModified instead of declaring a new variable
+                    jsonModified = (didReplaceSession || didReplaceTicket || didReplaceUUID);
 
                     // v37.100 FIX: asm compiler barrier — prevent -O2 from tracking jsonModified value
 
@@ -14044,6 +14062,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         }
 
                     }
+
+                    } // FIX53J: end of fffWhich==2 guard (sessionId/ticket/UUID insert + md5 recompute for NEW_USER only)
 
                     // v37.100 FIX: ONLY re-encrypt if JSON was ACTUALLY modified!
 
