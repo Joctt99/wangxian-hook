@@ -1893,8 +1893,8 @@ extern "C" kern_return_t mach_vm_remap(
 
 // FIX39-FINAL: Immutable ((used)) global markers NEVER get dead-code stripped.
 // Used for runtime binary verification & as immutable self-documentation of FINAL release changes.
-__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53G: [FIX53基线 + 通用前缀fallback + 🚨修复memcmp null终止符bug]. FIX53G核心修复: memcmp('Apple Inc. Apple A',19B)包含null终止符导致永远不匹配→设备型号扫描吃50B而非17B→HMAC错误→服务器拒绝. 修复: 1)所有'Apple Inc. Apple A'比较从19B改为18B(10处). 2)设备型号扫描添加20B上限+UUID=/WIFI边界标记. 3)GPU扫描起点从19改为18. 单通道canonical UUID=66B0EE01. 日志大小限制(默认200KB轮转).";
-__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53G-VERIFY: CRITICAL FIX - memcmp('Apple Inc. Apple A') was 19B (included null terminator) causing NEVER MATCH in CC_MD5/CC_MD5_Update/CCCrypt scans. Now 18B. Device model scan: 20B max + UUID=/WIFI boundaries. [FIX53G-DM-GENERIC] [FIX53G-GPU-GENERIC] [FIX53G-DM-iPad] DLOG tags. Single-channel canonical UUID 66B0EE01 everywhere.";
+__attribute__((used)) const char* FIX39_FINAL_MARKER = "v37.134-FIX53G: [FIX53基线 + 🚨🚨修复双重null终止符致命bug]. BUG#1: memcmp('Apple Inc. Apple A',19B)包含null终止符→设备型号扫描永远不匹配→吃50B而非17B. BUG#2: memcmp('UUID=MACADDRESS=',17B)包含null终止符→UUID检测永远不匹配→UUID字段永远不被替换→HMAC包含UUID但明文不含→服务器拒绝. 修复: 1)Apple Inc. Apple A: 19B→18B(10处). 2)UUID=MACADDRESS=: 17B→16B, 53B→52B(9处). 3)空UUID处理: UUID=MACADDRESS=“→插入canonical UUID(+36B). 4)设备型号扫描: 20B上限+UUID=/WIFI边界. 单通道canonical UUID=66B0EE01.";
+__attribute__((used)) const char* FIX39_VERIFY_MARKER = "v37.134-FIX53G-VERIFY: CRITICAL FIX - TWO null-terminator bugs in memcmp. BUG1: 'Apple Inc. Apple A' 19B→18B (10 places). BUG2: 'UUID=MACADDRESS=' 17B→16B, 53B→52B (9 places). Empty UUID handling: insert canonical when UUID=MACADDRESS= followed by quote. uuidEmptyCount delta +36. [FIX53G-DM-GENERIC] [FIX53G-GPU-GENERIC] [FIX53G-UUID-INSERT] DLOG tags. Single-channel canonical UUID 66B0EE01.";
 
 
 
@@ -22444,8 +22444,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 if (!hasDm && i + 4 <= actualLen && memcmp((const uint8_t *)actualInput + i, "iPad", 4) == 0) { hasDm = 1; dmVariant = 2; }
                 if (!hasGp && i + 18 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A", 18) == 0) { hasGp = 1; gpVariant = 2; } // FIX53G: 18B not 19B
 
-                // FIX53: 检测UUID=MACADDRESS=xxx前缀(17B)
-                if (!hasUuidMac && i + 53 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 17) == 0) { hasUuidMac = 1; }
+                // FIX53G: 检测UUID=MACADDRESS=前缀(16B, 非17B — null终止符bug修复)
+                if (!hasUuidMac && i + 16 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 16) == 0) { hasUuidMac = 1; }
 
                 // FIX53: 检测裸UUID(36B格式, 连字符位置8/13/18/23)
                 if (!hasUuidBare && i + 36 <= actualLen &&
@@ -22566,10 +22566,22 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                             // FIX52: A10 GPU已经是canonical, 直接复制
                             memcpy((uint8_t *)tmp + out, gpNew, 24); out += 24; pos += 24;
 
-                        } else if (hasUuidMac && pos + 53 <= actualLen && memcmp(src + pos, "UUID=MACADDRESS=", 17) == 0) {
+                        } else if (hasUuidMac && pos + 16 <= actualLen && memcmp(src + pos, "UUID=MACADDRESS=", 16) == 0) {
 
-                            // FIX53: UUID=MACADDRESS=xxx → UUID=MACADDRESS=66B0EE01 (canonical 66B0EE01, 等长53B)
-                            memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53); out += 53; pos += 53;
+                            // FIX53G: UUID=MACADDRESS=xxx → canonical (52B). 修复null终止符bug(17B→16B, 53B→52B)
+                            // FIX53G: 处理空UUID — 当UUID=MACADDRESS=后紧跟引号(空值), 插入canonical UUID
+                            if (pos + 16 < actualLen && (src[pos + 16] == '"' || src[pos + 16] == ',' || src[pos + 16] == 0)) {
+                                // 空UUID: UUID=MACADDRESS=" → UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8" (+36B)
+                                memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52); out += 52; pos += 16;
+                                DLOG(@"[FIX53G-UUID-INSERT] Inserted canonical UUID into empty UUID=MACADDRESS= field in CC_MD5_Update (+36B)");
+                            } else if (pos + 52 <= actualLen) {
+                                // 非空UUID: UUID=MACADDRESS=xxx(52B) → canonical(52B, 等长)
+                                memcpy((uint8_t *)tmp + out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52); out += 52; pos += 52;
+                            } else {
+                                // 不足52B, 按原样复制
+                                int copyLen = actualLen - pos;
+                                memcpy((uint8_t *)tmp + out, src + pos, copyLen); out += copyLen; pos += copyLen;
+                            }
 
                         } else if (hasUuidBare && pos + 36 <= actualLen &&
                                    ((const char *)src)[pos+8] == '-' &&
@@ -26552,7 +26564,8 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     int gpA18ProCount = 0, gpA16Count = 0; // FIX52: 分别计数不同GPU
     int dmGenericDelta = 0; // FIX53E: 通用设备型号替换的delta累计 (origLen - 11)
     int gpGenericDelta = 0; // FIX53E: 通用GPU替换的delta累计 (origLen - 24)
-    int uuidCount = 0; // FIX53: UUID替换次数(等长替换, 不影响delta)
+    int uuidCount = 0; // FIX53: UUID替换次数
+    int uuidEmptyCount = 0; // FIX53G: 空UUID插入次数(每次+36B delta)
 
     int accCount = 0; // v37.79: ALWAYS 0 — do NOT replace accId in CCCrypt
 
@@ -26693,13 +26706,25 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 }
                 pcur += 19;
 
-            } else if (rem >= 53 && memcmp(pcur, "UUID=MACADDRESS=", 17) == 0) {
+            } else if (rem >= 16 && memcmp(pcur, "UUID=MACADDRESS=", 16) == 0) {
 
-                // FIX53: UUID=MACADDRESS=xxx 格式, 若非66B0EE01则计数(等长53B→53B, 不影响delta)
-                if (memcmp(pcur, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53) != 0) {
+                // FIX53G: UUID=MACADDRESS= 检测 (16B前缀, 非17B — null终止符bug修复)
+                // 检查是否为空UUID (后跟引号/逗号/null)
+                if (pcur + 16 < scanEnd && (*(pcur + 16) == '"' || *(pcur + 16) == ',' || *(pcur + 16) == 0)) {
+                    // 空UUID: 需要插入canonical UUID (+36B delta)
                     uuidCount++;
+                    uuidEmptyCount++;  // 标记空UUID, delta +36
+                    pcur += 16;
+                } else if (rem >= 52 && memcmp(pcur, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52) != 0) {
+                    // 非空非canonical UUID (52B): 等长替换
+                    uuidCount++;
+                    pcur += 52;
+                } else if (rem >= 52) {
+                    // 已是canonical UUID (52B): 跳过
+                    pcur += 52;
+                } else {
+                    pcur += 16;
                 }
-                pcur += 53;
 
             } else if (rem >= 36 && pcur[8] == '-' && pcur[13] == '-' && pcur[18] == '-' && pcur[23] == '-') {
 
@@ -26786,13 +26811,15 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             // gp: A18 Pro(28→24, delta=-4), A16/A15(24→24, delta=0)
             // FIX53: UUID全部等长替换(53→53, 36→36), 无delta
             // FIX53E: 通用fallback delta动态计算 (origLen→11/24)
+            // FIX53G: UUID空值插入 +36B per empty UUID
             ssize_t delta = (ssize_t)chCount * 9
                           + (ssize_t)dm16ProMaxCount * (-6)
                           + (ssize_t)dm14ProCount * (-2)
                           + (ssize_t)gpA18ProCount * (-4)
                           + (ssize_t)gpA16Count * 0
                           - (ssize_t)dmGenericDelta   // FIX53E: 通用设备型号 delta (正值=缩短)
-                          - (ssize_t)gpGenericDelta;   // FIX53E: 通用GPU delta (正值=缩短)
+                          - (ssize_t)gpGenericDelta    // FIX53E: 通用GPU delta (正值=缩短)
+                          + (ssize_t)uuidEmptyCount * 36; // FIX53G: 空UUID插入canonical (+36B each)
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -26939,23 +26966,27 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                         }
                         *out = *p; out++; p++;
 
-                    } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53) == 0) {
+                    } else if (rem >= 52 && memcmp(p, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52) == 0) {
 
-                        // FIX53: UUID=MACADDRESS=66B0EE01已是canonical, 直接复制(53B等长)
-                        memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53);
-                        out += 53; p += 53; continue;
+                        // FIX53G: UUID=MACADDRESS=66B0EE01已是canonical, 直接复制(52B)
+                        memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
+                        out += 52; p += 52; continue;
 
-                    } else if (rem >= 53 && memcmp(p, "UUID=MACADDRESS=", 17) == 0) {
+                    } else if (rem >= 16 && memcmp(p, "UUID=MACADDRESS=", 16) == 0) {
 
-                        // FIX53: 非canonical UUID=MACADDRESS=xxx(53B) → canonical 66B0EE01版(53B等长)
-                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
-                        char next53 = (p + 53 < e) ? *(p+53) : 0;
-                        BOOL bounded = (prev == '"') && (next53 == '"' || next53 == ',');
-
-                        if (bounded || uuidCount > 0) {
-                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 53);
-                            out += 53; p += 53; continue;
+                        // FIX53G: UUID=MACADDRESS= 检测 (16B前缀, 修复null终止符bug)
+                        // 检查是否为空UUID (后跟引号/逗号/null)
+                        if (p + 16 < e && (*(p + 16) == '"' || *(p + 16) == ',' || *(p + 16) == 0)) {
+                            // 空UUID: 插入canonical UUID (16B→52B, +36B)
+                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
+                            out += 52; p += 16; continue;
+                        } else if (rem >= 52) {
+                            // 非空UUID: 替换为canonical (52B→52B, 等长)
+                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
+                            out += 52; p += 52; continue;
                         }
+                        // fallback: 按普通字符处理
+                        *out = *p; out++; p++;
 
                     } else if (rem >= 36 && memcmp(p, "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 36) == 0) {
 
