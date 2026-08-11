@@ -14149,45 +14149,79 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             DLOG(@"[FIX53N-REENC] WARNING: L4 saved plaintext not available, using native %zuB with in-place replacements", nativeLen);
                         }
                         
-                        // Apply fffWhich==2 guard's sessionId/ticket/UUID replacements onto L4 patched base
+                        // Apply fffWhich==2 guard's sessionId/ticket replacements onto L4 patched base
                         if (fffWhich == 2) {
-                            if (sessionIdReplaced) {
-                                // Replace sessionId in baseStr (L4 patched) with UUID
-                                NSRange sessRange = [baseStr rangeOfString:@"DYanyou0040_MIESHI" options:NSCaseInsensitiveSearch];
-                                if (sessRange.location != NSNotFound) {
-                                    // Find the sessionId value after "sessionId":"
-                                    NSString *sessMarker = @"\"sessionId\":\"";
-                                    NSRange markerRange = [baseStr rangeOfString:sessMarker];
-                                    if (markerRange.location != NSNotFound) {
-                                        NSUInteger valStart = markerRange.location + markerRange.length;
-                                        NSUInteger valEnd = valStart;
-                                        while (valEnd < baseStr.length && [baseStr characterAtIndex:valEnd] != '\"') {
-                                            valEnd++;
-                                        }
-                                        if (valEnd > valStart) {
-                                            NSRange valRange = NSMakeRange(valStart, valEnd - valStart);
-                                            [baseStr replaceCharactersInRange:valRange withString:@"66B0EE01-4F6D-DC8A-144C-4A261577EE6E"];
-                                            DLOG(@"[FIX53N-MERGE] Replaced sessionId in L4 base with UUID");
-                                        }
+                            // Re-apply sessionId replacement (same logic as fffWhich==2 guard)
+                            if (didReplaceSession && realSessionId) {
+                                BOOL sessDone = ([baseStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
+                                                                   withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
+                                                                      options:0 range:NSMakeRange(0, baseStr.length)] > 0);
+                                if (sessDone) {
+                                    DLOG(@"[FIX53N-MERGE] Re-applied sessionId replacement in L4 base");
+                                }
+                            }
+                            // Re-apply ticket replacement (same logic as fffWhich==2 guard)
+                            if (didReplaceTicket && realTicket) {
+                                BOOL tickDone = ([baseStr replaceOccurrencesOfString:@"\"ticket\": \"\""
+                                                                   withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
+                                                                      options:0 range:NSMakeRange(0, baseStr.length)] > 0);
+                                if (tickDone) {
+                                    DLOG(@"[FIX53N-MERGE] Re-applied ticket replacement in L4 base");
+                                }
+                            }
+                            // Handle case where sessionId/ticket are ABSENT (not empty)
+                            {
+                                const char *jsonCStr = [baseStr UTF8String];
+                                volatile BOOL hasSessionId = (jsonCStr && strstr(jsonCStr, "\"sessionId\"") != NULL);
+                                volatile BOOL hasTicket = (jsonCStr && strstr(jsonCStr, "\"ticket\"") != NULL);
+                                asm volatile("" ::: "memory");
+                                
+                                if ((!hasSessionId || !hasTicket) && realSessionId && realTicket) {
+                                    NSUInteger lastBrace = [baseStr rangeOfString:@"}" options:NSBackwardsSearch].location;
+                                    if (lastBrace != NSNotFound) {
+                                        NSString *insertStr = [NSString stringWithFormat:@"\"sessionId\": \"%@\", \"ticket\": \"%@\"", realSessionId, realTicket];
+                                        [baseStr insertString:insertStr atIndex:lastBrace];
+                                        DLOG(@"[FIX53N-MERGE] INSERTED sessionId+ticket into L4 base (was absent)");
                                     }
                                 }
                             }
-                            if (ticketReplaced) {
-                                // Replace ticket in baseStr with random UUID
-                                NSString *ticketMarker = @"\"ticket\":\"";
-                                NSRange ticketMarkerRange = [baseStr rangeOfString:ticketMarker];
-                                if (ticketMarkerRange.location != NSNotFound) {
-                                    NSUInteger tValStart = ticketMarkerRange.location + ticketMarkerRange.length;
-                                    NSUInteger tValEnd = tValStart;
-                                    while (tValEnd < baseStr.length && [baseStr characterAtIndex:tValEnd] != '\"') {
-                                        tValEnd++;
+                            // Recompute md5 if sessionId/ticket changed
+                            if (didReplaceSession || didReplaceTicket) {
+                                // Find and replace md5 field
+                                NSString *kMd5Key = @"\"md5\": \"";
+                                NSRange md5KeyRange = [baseStr rangeOfString:kMd5Key];
+                                if (md5KeyRange.location != NSNotFound &&
+                                    md5KeyRange.location + md5KeyRange.length + 32 + 1 <= baseStr.length) {
+                                    NSUInteger valueStart = md5KeyRange.location + md5KeyRange.length;
+                                    NSString *oldMd5 = [baseStr substringWithRange:NSMakeRange(valueStart, 32)];
+                                    
+                                    // Compute new md5
+                                    NSMutableString *jsonWithoutMd5 = [baseStr mutableCopy];
+                                    NSRange md5FullField = NSMakeRange(md5KeyRange.location, kMd5Key.length + 33);
+                                    [jsonWithoutMd5 deleteCharactersInRange:md5FullField];
+                                    
+                                    const char *jsonStr = [jsonWithoutMd5 UTF8String];
+                                    size_t jsonLen = strlen(jsonStr);
+                                    unsigned char md5Raw[16];
+                                    memset(md5Raw, 0, sizeof(md5Raw));
+                                    
+                                    typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
+                                    static RawCCMD5 s_rawMD5_fix53n = NULL;
+                                    if (!s_rawMD5_fix53n) s_rawMD5_fix53n = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
+                                    if (s_rawMD5_fix53n) s_rawMD5_fix53n(jsonStr, (unsigned long)jsonLen, md5Raw);
+                                    
+                                    static const char kHex[] = "0123456789abcdef";
+                                    char newMd5Hex[33];
+                                    for (int hi = 0; hi < 16; hi++) {
+                                        newMd5Hex[hi*2]   = kHex[(md5Raw[hi] >> 4) & 0xF];
+                                        newMd5Hex[hi*2+1] = kHex[md5Raw[hi] & 0xF];
                                     }
-                                    if (tValEnd > tValStart) {
-                                        NSRange tValRange = NSMakeRange(tValStart, tValEnd - tValStart);
-                                        NSString *uuidStr = [[NSUUID UUID] UUIDString];
-                                        [baseStr replaceCharactersInRange:tValRange withString:uuidStr];
-                                        DLOG(@"[FIX53N-MERGE] Replaced ticket in L4 base with new UUID");
-                                    }
+                                    newMd5Hex[32] = 0;
+                                    NSString *newMd5 = [NSString stringWithUTF8String:newMd5Hex];
+                                    
+                                    // Replace old md5 with new
+                                    [baseStr replaceCharactersInRange:NSMakeRange(valueStart, 32) withString:newMd5];
+                                    DLOG(@"[FIX53N-MERGE] Recomputed md5 in L4 base: old=%@ → new=%@", oldMd5, newMd5);
                                 }
                             }
                             newStr = baseStr;
