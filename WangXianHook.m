@@ -3021,7 +3021,7 @@ static void log_init(void) {
                 nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
         }
 
-        _log(@"=== WangXianHook v37.134-FIX53O loaded (FIX53O: 移除强制重加密! 仅JSON实际修改时才重加密, L4修补但JSON未改时发送原始包. CCCrypt L4已加密正确密文, 重加密会产生不同IV导致服务器解密失败→静默拒绝→卡'正在进入'. 恢复原始FIX53行为.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
+        _log(@"=== WangXianHook v37.134-FIX53P loaded (FIX53P: 修复空MACADDRESS! 当MACADDRESS为空时插入canonical UUID(66B0EE01), 解决EE121/FFF493#2 UUID不匹配导致'连接异常中断'. FIX53O: 移除强制重加密, 仅JSON实际修改时才重加密.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -13738,26 +13738,53 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                         NSRange macRange = [newStr rangeOfString:macKey];
 
-                        if (macRange.location != NSNotFound &&
-
-                            macRange.location + macRange.length + 36 <= newStr.length) {
+                        if (macRange.location != NSNotFound) {
 
                             NSUInteger uuidStart = macRange.location + macRange.length;
 
-                            NSString *realUUID = [newStr substringWithRange:NSMakeRange(uuidStart, 36)];
+                            // FIX53P: CRITICAL FIX — Handle EMPTY MACADDRESS field!
+                            // Root cause (wxhook-185): When MACADDRESS is empty (""MACADDRESS": ""),
+                            // the old code tried to read 36 chars → got JSON garbage (", "md5": "..."),
+                            // failed UUID format check, and SKIPPED replacement. But EE121 hook
+                            // inserted canonical UUID (66B0EE01) → server cross-validates EE121 vs
+                            // FFF493#2 UUID → MISMATCH → "连接异常中断" (connection reset).
+                            // FIX: When MACADDRESS is empty (next char is '"'), INSERT canonical UUID
+                            // between the quotes. This changes JSON length (+36B) → triggers re-encryption.
+                            BOOL macIsEmpty = (uuidStart < newStr.length &&
+                                               [newStr characterAtIndex:uuidStart] == '"');
 
-                            // FIX53J: Check if MACADDRESS value is a valid UUID (8-4-4-4-12 hex format)
-                            // BEFORE replacing. If MACADDRESS is empty (""), the next 36 chars
-                            // would span across JSON fields (eating ", "md5": "..." etc) → JSON CORRUPTION!
-                            BOOL isValidUUIDFormat = (
-                                [realUUID length] == 36 &&
-                                [realUUID characterAtIndex:8] == '-' &&
-                                [realUUID characterAtIndex:13] == '-' &&
-                                [realUUID characterAtIndex:18] == '-' &&
-                                [realUUID characterAtIndex:23] == '-'
-                            );
+                            BOOL macHasValidUUID = (!macIsEmpty &&
+                                                     uuidStart + 36 <= newStr.length);
 
-                            if (isValidUUIDFormat) {
+                            NSString *realUUID = nil;
+                            BOOL isValidUUIDFormat = NO;
+
+                            if (macHasValidUUID) {
+                                realUUID = [newStr substringWithRange:NSMakeRange(uuidStart, 36)];
+
+                                // FIX53J: Check if MACADDRESS value is a valid UUID (8-4-4-4-12 hex format)
+                                // BEFORE replacing. If MACADDRESS is empty (""), the next 36 chars
+                                // would span across JSON fields (eating ", "md5": "..." etc) → JSON CORRUPTION!
+                                isValidUUIDFormat = (
+                                    [realUUID length] == 36 &&
+                                    [realUUID characterAtIndex:8] == '-' &&
+                                    [realUUID characterAtIndex:13] == '-' &&
+                                    [realUUID characterAtIndex:18] == '-' &&
+                                    [realUUID characterAtIndex:23] == '-'
+                                );
+                            }
+
+                            if (macIsEmpty) {
+                                // FIX53P: MACADDRESS is empty — INSERT canonical UUID
+                                static const char kCanonUUID_v101p[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
+                                NSString *canonUUID = [NSString stringWithUTF8String:kCanonUUID_v101p];
+
+                                [newStr insertString:canonUUID atIndex:uuidStart];
+                                didReplaceUUID = YES;
+
+                                DLOG(@"[FFF493-UUID] v37.101-FIX53P: #%d INSERTED canonical UUID into EMPTY MACADDRESS (66B0EE01) at pos=%lu", fffWhich, (unsigned long)uuidStart);
+
+                            } else if (isValidUUIDFormat) {
 
                             // FIX53: Use canonical 66B0EE01 (white-listed login UUID), keeps parity with CCCrypt L4 and CC_MD5.
                             static const char kCanonUUID_v101[] = "66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8";
@@ -13782,8 +13809,8 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                             } else {
 
-                                // FIX53J: MACADDRESS is empty or not a valid UUID — skip replacement
-                                DLOG(@"[FFF493-UUID] v37.101-FIX53J: #%d SKIP UUID replace — MACADDRESS not valid UUID format (val='%@')", fffWhich, realUUID);
+                                // FIX53J: MACADDRESS not a valid UUID format — skip replacement
+                                DLOG(@"[FFF493-UUID] v37.101-FIX53J: #%d SKIP UUID replace — MACADDRESS not valid UUID format (val='%@')", fffWhich, realUUID ? realUUID : @"<nil/short>");
 
                             }
 
@@ -27890,7 +27917,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.134-FIX53O — FIX53O: 移除强制重加密. 仅JSON实际修改(sessionId/ticket/UUID)时重加密, L4修补但JSON未改时发送原始包(CCCrypt L4已加密正确密文). Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
+    DLOG(@"[VERSION] WangXianHook v37.134-FIX53P — FIX53P: 修复空MACADDRESS插入canonical UUID. FIX53O: 移除强制重加密. Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
