@@ -14094,89 +14094,82 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     // v37.100 FIX: ONLY re-encrypt if JSON was ACTUALLY modified!
                     //
-                    // If jsonModified=NO (sessionId/ticket already present, no insertion needed),
-                    // the original packet already has correct channel/device/gpu (via CH-L4 CCCrypt hook
-                    // patched plaintext BEFORE client encryption) and correct md5 (matches original JSON).
-                    // Re-encrypting would produce different ciphertext (different IV/seq/HMAC) → server REJECT!
-                    // SKIP re-encryption entirely, fall through to direct orig_send of original packet.
+                    // FIX53N: CRITICAL FIX — ALWAYS re-encrypt when CCCrypt L4 has patched the plaintext.
+                    // Previous FIX53M-SKIP path sent the ORIGINAL client packet, but:
+                    //   1. CCCrypt L4 changed plaintext length (e.g., 280B→274B for FFF493#1)
+                    //   2. PKCS7 padding is different for 274B vs 280B
+                    //   3. Client-built packet header uses original length (280B)
+                    //   4. Server decrypts, strips padding by LAST byte, gets wrong JSON
+                    //   5. → RECV-CLOSE immediately instead of heartbeats
                     //
-                    // FIX53M: NEW approach — detect CCCrypt L4 status by checking:
-                    //   1. g_l4_saved_valid: YES means CCCrypt L4 had SAFE FALLBACK (buffer too small)
-                    //      → saved patched plaintext but original ciphertext is based on ORIGINAL data
-                    //      → MUST re-encrypt to make HMAC ↔ ciphertext consistent
-                    //   2. Native plaintext string check: verify if canonical device values are present
-                    //      → if YES: CCCrypt L4 successfully patched → direct send (no re-encryption needed)
-                    //      → if NO:  CCCrypt L4 didn't patch → need send-hook level patching + re-encryption
-                    //
-                    // This dual-check approach prevents compiler optimization issues (string checks
-                    // cannot be optimized away, unlike simple flag reads).
+                    // Solution: ALWAYS re-encrypt L4 saved patched plaintext in send-hook.
+                    // This rebuilds the packet with correct structure matching actual encrypted content.
+                    // Key fix: copy fmtFlag from original packet (p[12-13]) to preserve correct format.
                     
-                    BOOL l4SafeFallback = g_l4_saved_valid; // FIX53M: check if L4 had buffer overflow
-                    asm volatile("" ::: "memory"); // prevent compiler from optimizing away the read
+                    BOOL needReencrypt = NO;
                     
-                    // FIX53M: Also check native plaintext for canonical values (independent verification)
+                    // Check if CCCrypt L4 patched the plaintext (canonical values present)
                     const char *nativeCStr = [nativeStr UTF8String];
                     BOOL nativeHasCanonicalDevice = NO;
                     BOOL nativeHasCanonicalGPU = NO;
                     BOOL nativeHasCanonicalChannel = NO;
                     
                     if (nativeCStr && nativeLen > 50) {
-                        // Check for canonical device model (iPhone7Plus)
                         if (strstr(nativeCStr, "iPhone7Plus") != NULL) {
                             nativeHasCanonicalDevice = YES;
                         }
-                        // Check for canonical GPU (Apple Inc. Apple A10 GPU)
                         if (strstr(nativeCStr, "Apple Inc. Apple A10 GPU") != NULL) {
                             nativeHasCanonicalGPU = YES;
                         }
-                        // Check for canonical channel (DYanyou0040_MIESHI)
                         if (strstr(nativeCStr, "DYanyou0040_MIESHI") != NULL) {
                             nativeHasCanonicalChannel = YES;
                         }
                     }
-                    asm volatile("" ::: "memory"); // prevent compiler optimization
+                    asm volatile("" ::: "memory");
                     
-                    // FIX53M: Decide whether CCCrypt L4 successfully patched the plaintext.
-                    // L4 successful patch = canonical values present in native plaintext
-                    // (CCCrypt modified the plaintext before AES encryption)
                     BOOL l4PatchedOK = nativeHasCanonicalDevice || nativeHasCanonicalGPU || nativeHasCanonicalChannel;
+                    BOOL l4SafeFallback = g_l4_saved_valid;
+                    asm volatile("" ::: "memory");
                     
-                    // FIX53M: Force re-encrypt ONLY when:
-                    //   - CCCrypt L4 had SAFE FALLBACK (buffer too small to fit patched output)
-                    //   - AND canonical values are NOT present in native plaintext
-                    //     (meaning CCCrypt didn't patch because it couldn't fit)
-                    // In this case, we MUST use send-hook level re-encryption with patched plaintext.
-                    BOOL needForceReencrypt = l4SafeFallback && !l4PatchedOK;
-                    
-                    if (l4SafeFallback) {
-                        DLOG(@"[FIX53M-DETECT] CCCrypt L4 SAFE FALLBACK detected (saved_valid=YES). nativeHasCanonical(dev=%d, gpu=%d, ch=%d). l4PatchedOK=%d needForceReencrypt=%d",
-                             nativeHasCanonicalDevice, nativeHasCanonicalGPU, nativeHasCanonicalChannel,
-                             l4PatchedOK, needForceReencrypt);
+                    if (l4PatchedOK || l4SafeFallback) {
+                        // CCCrypt L4 has patched the plaintext — MUST re-encrypt
+                        needReencrypt = YES;
+                        
+                        // FIX53N: Only set jsonModified if newStr is NOT already set by fffWhich==2 guard
+                        // (which added sessionId/ticket/UUID replacements).
+                        if (!newStr || newStr.length == 0) {
+                            jsonModified = YES;
+                        }
+                        
+                        // Use L4 saved patched plaintext ONLY if newStr is not already set
+                        // (fffWhich==2 guard may have already modified it with UUID/sessionId changes)
+                        if ((!newStr || newStr.length == 0) && g_l4_saved_patched && g_l4_saved_patched_len > 0) {
+                            newStr = [[NSString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
+                            DLOG(@"[FIX53N-REENC] Re-encrypting L4 patched plaintext %zuB (canonical dev=%d gpu=%d ch=%d, safeFallback=%d)",
+                                 g_l4_saved_patched_len, nativeHasCanonicalDevice, nativeHasCanonicalGPU, nativeHasCanonicalChannel, l4SafeFallback);
+                        } else if (!newStr || newStr.length == 0) {
+                            // Fallback: use native plaintext with in-place replacements
+                            newStr = [NSMutableString stringWithString:nativeStr];
+                            DLOG(@"[FIX53N-REENC] WARNING: L4 saved plaintext not available, using native %zuB with in-place replacements", nativeLen);
+                        } else {
+                            // newStr already set by fffWhich==2 guard — use it
+                            DLOG(@"[FIX53N-REENC] Using fffWhich==2 modified plaintext (already has UUID/sessionId changes) for re-encryption");
+                        }
+                    } else {
+                        // CCCrypt L4 did NOT patch the plaintext — use native plaintext
+                        // Fall through to normal jsonModified check
+                        DLOG(@"[FIX53N-NOPATCH] CCCrypt L4 did not patch plaintext (no canonical values detected)");
                     }
                     
-                    if (needForceReencrypt) {
-                        DLOG(@"[FIX53M-REENC] SAFE FALLBACK → forcing re-encryption of patched plaintext (fffWhich=%d plainLen=%zu)", fffWhich, nativeLen);
-                        jsonModified = YES; // force re-encryption path
-                        
-                        if (!newStr || newStr.length == 0) {
-                            // Use CCCrypt L4's saved patched plaintext (includes channel/device/GPU patches)
-                            if (g_l4_saved_patched && g_l4_saved_patched_len > 0) {
-                                newStr = [[NSString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
-                                DLOG(@"[FIX53M-REENC] Using L4 saved patched plaintext %zuB for SAFE FALLBACK", g_l4_saved_patched_len);
-                            } else {
-                                // Fallback: use native plaintext (no channel/device/GPU patches!)
-                                newStr = [[NSString alloc] initWithBytes:nativePlain length:nativeLen encoding:NSUTF8StringEncoding];
-                                DLOG(@"[FIX53M-REENC] WARNING: L4 patched plaintext not available, using native %zuB", nativeLen);
-                            }
-                        }
-                    } else if (l4PatchedOK && jsonModified == NO) {
-                        // FIX53M: CCCrypt L4 successfully patched the plaintext.
-                        // The original client-encrypted packet already has correct ciphertext.
-                        // DO NOT re-encrypt — just send the original packet as-is.
-                        DLOG(@"[FIX53M-SKIP] CCCrypt L4 patched OK (canonical values present). Skipping re-encryption, sending original packet.");
+                    if (needReencrypt) {
+                        DLOG(@"[FIX53N-REENC] Starting re-encryption for fffWhich=%d", fffWhich);
                     }
 
-                    if (jsonModified) {
+                    // FIX53N: Use needReencrypt flag to force re-encryption even when jsonModified=NO
+                    // This handles the case where CCCrypt L4 patched the plaintext but jsonModified is false
+                    BOOL doReencrypt = jsonModified || needReencrypt;
+                    
+                    if (doReencrypt) {
 
                     const char *newPlain = [newStr UTF8String];
 
@@ -14322,34 +14315,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     } else {
 
-                        // v37.100: JSON unchanged — send original packet as-is (NO re-encryption!)
-
-                        // Original packet already has correct channel/device/gpu (CH-L4 patched before
-
-                        // client encryption) + correct sessionId/ticket + correct md5. Don't touch it!
-
-                        DLOG(@"[FFF493-REPL] v37.100: #%d JSON unchanged — SKIP re-encrypt, send original %zuB packet as-is",
-
-                             fffWhich, len);
+                        // FIX53N: This else block only runs when:
+                        //   jsonModified == NO AND needReencrypt == NO
+                        // → CCCrypt L4 did NOT patch the plaintext (no canonical values)
+                        // → Safe to send original packet as-is
+                        DLOG(@"[FIX53N-SEND] No JSON changes + no L4 patch → send original %zuB packet as-is", len);
 
                         // Free native plaintext buffers to avoid leak (will be re-captured on next call)
-
                         if (fffWhich == 2 && g_fff493_2_native_plain) {
-
                             free(g_fff493_2_native_plain);
-
                             g_fff493_2_native_plain = NULL;
-
                             g_fff493_2_native_len = 0;
-
                         }
-
                         if (fffWhich == 1) {
-
                             g_fff493_1_plain_len = 0;
-
                         }
-
                     }
 
                 }
