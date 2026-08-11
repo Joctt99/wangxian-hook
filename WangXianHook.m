@@ -14095,159 +14095,21 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     } // FIX53J: end of fffWhich==2 guard (sessionId/ticket/UUID insert + md5 recompute for NEW_USER only)
 
-                    // v37.100 FIX: ONLY re-encrypt if JSON was ACTUALLY modified!
+                    // FIX53O: CRITICAL FIX — DO NOT re-encrypt when only CCCrypt L4 patched the plaintext.
                     //
-                    // FIX53N: CRITICAL FIX — ALWAYS re-encrypt when CCCrypt L4 has patched the plaintext.
-                    // Previous FIX53M-SKIP path sent the ORIGINAL client packet, but:
-                    //   1. CCCrypt L4 changed plaintext length (e.g., 280B→274B for FFF493#1)
-                    //   2. PKCS7 padding is different for 274B vs 280B
-                    //   3. Client-built packet header uses original length (280B)
-                    //   4. Server decrypts, strips padding by LAST byte, gets wrong JSON
-                    //   5. → RECV-CLOSE immediately instead of heartbeats
+                    // Root cause (wxhook-183): FIX53K~N versions forced re-encryption when L4 patched
+                    // the plaintext, but the original CCCrypt already encrypted the L4-patched plaintext.
+                    // Re-encrypting produced DIFFERENT ciphertext (different IV/context), causing server
+                    // to decrypt wrong data → silent reject (no role data, no connection close).
                     //
-                    // Solution: ALWAYS re-encrypt L4 saved patched plaintext in send-hook.
-                    // This rebuilds the packet with correct structure matching actual encrypted content.
-                    // Key fix: copy fmtFlag from original packet (p[12-13]) to preserve correct format.
+                    // Original FIX53 (which worked!) did NOT re-encrypt. It just sent the original packet.
+                    // The original packet already contains the correct ciphertext from CCCrypt (which used
+                    // the L4-patched plaintext). No need to re-encrypt.
+                    //
+                    // ONLY re-encrypt when JSON was ACTUALLY modified (sessionId/ticket/UUID changes).
+                    // This is the original v37.100 behavior that worked.
                     
-                    BOOL needReencrypt = NO;
-                    
-                    // Check if CCCrypt L4 patched the plaintext (canonical values present)
-                    const char *nativeCStr = [nativeStr UTF8String];
-                    BOOL nativeHasCanonicalDevice = NO;
-                    BOOL nativeHasCanonicalGPU = NO;
-                    BOOL nativeHasCanonicalChannel = NO;
-                    
-                    if (nativeCStr && nativeLen > 50) {
-                        if (strstr(nativeCStr, "iPhone7Plus") != NULL) {
-                            nativeHasCanonicalDevice = YES;
-                        }
-                        if (strstr(nativeCStr, "Apple Inc. Apple A10 GPU") != NULL) {
-                            nativeHasCanonicalGPU = YES;
-                        }
-                        if (strstr(nativeCStr, "DYanyou0040_MIESHI") != NULL) {
-                            nativeHasCanonicalChannel = YES;
-                        }
-                    }
-                    asm volatile("" ::: "memory");
-                    
-                    BOOL l4PatchedOK = nativeHasCanonicalDevice || nativeHasCanonicalGPU || nativeHasCanonicalChannel;
-                    BOOL l4SafeFallback = g_l4_saved_valid;
-                    asm volatile("" ::: "memory");
-                    
-                    if (l4PatchedOK || l4SafeFallback) {
-                        // CCCrypt L4 has patched the plaintext — MUST re-encrypt
-                        needReencrypt = YES;
-                        
-                        // FIX53N: CRITICAL — Always use L4 saved patched plaintext as base
-                        // (it has canonical device info: channel/deviceModel/GPU replaced).
-                        // Then apply fffWhich==2 guard's sessionId/ticket/UUID replacements on top.
-                        NSMutableString *baseStr = nil;
-                        
-                        if (g_l4_saved_patched && g_l4_saved_patched_len > 0) {
-                            baseStr = [[NSMutableString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
-                            DLOG(@"[FIX53N-REENC] Using L4 patched plaintext %zuB as base (canonical dev=%d gpu=%d ch=%d, safeFallback=%d)",
-                                 g_l4_saved_patched_len, nativeHasCanonicalDevice, nativeHasCanonicalGPU, nativeHasCanonicalChannel, l4SafeFallback);
-                        } else {
-                            baseStr = [NSMutableString stringWithString:nativeStr];
-                            DLOG(@"[FIX53N-REENC] WARNING: L4 saved plaintext not available, using native %zuB with in-place replacements", nativeLen);
-                        }
-                        
-                        // Apply fffWhich==2 guard's sessionId/ticket replacements onto L4 patched base
-                        if (fffWhich == 2) {
-                            // Re-apply sessionId replacement (same logic as fffWhich==2 guard)
-                            if (didReplaceSession && realSessionId) {
-                                BOOL sessDone = ([baseStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
-                                                                   withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
-                                                                      options:0 range:NSMakeRange(0, baseStr.length)] > 0);
-                                if (sessDone) {
-                                    DLOG(@"[FIX53N-MERGE] Re-applied sessionId replacement in L4 base");
-                                }
-                            }
-                            // Re-apply ticket replacement (same logic as fffWhich==2 guard)
-                            if (didReplaceTicket && realTicket) {
-                                BOOL tickDone = ([baseStr replaceOccurrencesOfString:@"\"ticket\": \"\""
-                                                                   withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
-                                                                      options:0 range:NSMakeRange(0, baseStr.length)] > 0);
-                                if (tickDone) {
-                                    DLOG(@"[FIX53N-MERGE] Re-applied ticket replacement in L4 base");
-                                }
-                            }
-                            // Handle case where sessionId/ticket are ABSENT (not empty)
-                            {
-                                const char *jsonCStr = [baseStr UTF8String];
-                                volatile BOOL hasSessionId = (jsonCStr && strstr(jsonCStr, "\"sessionId\"") != NULL);
-                                volatile BOOL hasTicket = (jsonCStr && strstr(jsonCStr, "\"ticket\"") != NULL);
-                                asm volatile("" ::: "memory");
-                                
-                                if ((!hasSessionId || !hasTicket) && realSessionId && realTicket) {
-                                    NSUInteger lastBrace = [baseStr rangeOfString:@"}" options:NSBackwardsSearch].location;
-                                    if (lastBrace != NSNotFound) {
-                                        NSString *insertStr = [NSString stringWithFormat:@"\"sessionId\": \"%@\", \"ticket\": \"%@\"", realSessionId, realTicket];
-                                        [baseStr insertString:insertStr atIndex:lastBrace];
-                                        DLOG(@"[FIX53N-MERGE] INSERTED sessionId+ticket into L4 base (was absent)");
-                                    }
-                                }
-                            }
-                            // Recompute md5 if sessionId/ticket changed
-                            if (didReplaceSession || didReplaceTicket) {
-                                // Find and replace md5 field
-                                NSString *kMd5Key = @"\"md5\": \"";
-                                NSRange md5KeyRange = [baseStr rangeOfString:kMd5Key];
-                                if (md5KeyRange.location != NSNotFound &&
-                                    md5KeyRange.location + md5KeyRange.length + 32 + 1 <= baseStr.length) {
-                                    NSUInteger valueStart = md5KeyRange.location + md5KeyRange.length;
-                                    NSString *oldMd5 = [baseStr substringWithRange:NSMakeRange(valueStart, 32)];
-                                    
-                                    // Compute new md5
-                                    NSMutableString *jsonWithoutMd5 = [baseStr mutableCopy];
-                                    NSRange md5FullField = NSMakeRange(md5KeyRange.location, kMd5Key.length + 33);
-                                    [jsonWithoutMd5 deleteCharactersInRange:md5FullField];
-                                    
-                                    const char *jsonStr = [jsonWithoutMd5 UTF8String];
-                                    size_t jsonLen = strlen(jsonStr);
-                                    unsigned char md5Raw[16];
-                                    memset(md5Raw, 0, sizeof(md5Raw));
-                                    
-                                    typedef unsigned char *(*RawCCMD5)(const void *, unsigned long, unsigned char *);
-                                    static RawCCMD5 s_rawMD5_fix53n = NULL;
-                                    if (!s_rawMD5_fix53n) s_rawMD5_fix53n = (RawCCMD5)dlsym(RTLD_DEFAULT, "CC_MD5");
-                                    if (s_rawMD5_fix53n) s_rawMD5_fix53n(jsonStr, (unsigned long)jsonLen, md5Raw);
-                                    
-                                    static const char kHex[] = "0123456789abcdef";
-                                    char newMd5Hex[33];
-                                    for (int hi = 0; hi < 16; hi++) {
-                                        newMd5Hex[hi*2]   = kHex[(md5Raw[hi] >> 4) & 0xF];
-                                        newMd5Hex[hi*2+1] = kHex[md5Raw[hi] & 0xF];
-                                    }
-                                    newMd5Hex[32] = 0;
-                                    NSString *newMd5 = [NSString stringWithUTF8String:newMd5Hex];
-                                    
-                                    // Replace old md5 with new
-                                    [baseStr replaceCharactersInRange:NSMakeRange(valueStart, 32) withString:newMd5];
-                                    DLOG(@"[FIX53N-MERGE] Recomputed md5 in L4 base: old=%@ → new=%@", oldMd5, newMd5);
-                                }
-                            }
-                            newStr = baseStr;
-                            jsonModified = YES;
-                            DLOG(@"[FIX53N-MERGE] Merged fffWhich==2 replacements onto L4 patched base → %luB", (unsigned long)newStr.length);
-                        } else {
-                            // fffWhich==1 — no sessionId/ticket merge needed
-                            newStr = baseStr;
-                            jsonModified = YES;
-                        }
-                    } else {
-                        // CCCrypt L4 did NOT patch the plaintext — use native plaintext
-                        // Fall through to normal jsonModified check
-                        DLOG(@"[FIX53N-NOPATCH] CCCrypt L4 did not patch plaintext (no canonical values detected)");
-                    }
-                    
-                    if (needReencrypt) {
-                        DLOG(@"[FIX53N-REENC] Starting re-encryption for fffWhich=%d", fffWhich);
-                    }
-
-                    // FIX53N: Use needReencrypt flag to force re-encryption even when jsonModified=NO
-                    // This handles the case where CCCrypt L4 patched the plaintext but jsonModified is false
-                    BOOL doReencrypt = jsonModified || needReencrypt;
+                    BOOL doReencrypt = jsonModified;
                     
                     if (doReencrypt) {
 
@@ -14395,11 +14257,11 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     } else {
 
-                        // FIX53N: This else block only runs when:
-                        //   jsonModified == NO AND needReencrypt == NO
-                        // → CCCrypt L4 did NOT patch the plaintext (no canonical values)
-                        // → Safe to send original packet as-is
-                        DLOG(@"[FIX53N-SEND] No JSON changes + no L4 patch → send original %zuB packet as-is", len);
+                        // FIX53O: No JSON modifications → send original packet as-is.
+                        // CCCrypt L4 already patched the plaintext before the original CCCrypt call.
+                        // The client's packet already contains the correct ciphertext.
+                        // Re-encrypting would produce DIFFERENT ciphertext (different IV), breaking server validation.
+                        DLOG(@"[FIX53O-SEND] No JSON changes → send original %zuB packet as-is (L4 already patched by CCCrypt)", len);
 
                         // Free native plaintext buffers to avoid leak (will be re-captured on next call)
                         if (fffWhich == 2 && g_fff493_2_native_plain) {
