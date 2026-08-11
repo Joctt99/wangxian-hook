@@ -26606,7 +26606,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     // FIX53L: Reset SAFE FALLBACK flag at start of each active CCCrypt L4 call.
     // Previous stale YES value would trigger unnecessary forceReencrypt in send-hook
     // for FFF493#1 even though THIS call had a perfectly fine patched output.
+    // Volatile-like approach: write + read back to prevent compiler optimization.
     g_l4_safe_fallback = NO;
+    {
+        int verifyFlag = (int)g_l4_safe_fallback;
+        if (verifyFlag != 0) {
+            DLOG(@"[FIX53L-FLAG] WARNING: g_l4_safe_fallback was unexpectedly YES at CCCrypt L4 entry!");
+        }
+    }
 
 
 
