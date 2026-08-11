@@ -14135,25 +14135,68 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                         // CCCrypt L4 has patched the plaintext — MUST re-encrypt
                         needReencrypt = YES;
                         
-                        // FIX53N: Only set jsonModified if newStr is NOT already set by fffWhich==2 guard
-                        // (which added sessionId/ticket/UUID replacements).
-                        if (!newStr || newStr.length == 0) {
-                            jsonModified = YES;
+                        // FIX53N: CRITICAL — Always use L4 saved patched plaintext as base
+                        // (it has canonical device info: channel/deviceModel/GPU replaced).
+                        // Then apply fffWhich==2 guard's sessionId/ticket/UUID replacements on top.
+                        NSMutableString *baseStr = nil;
+                        
+                        if (g_l4_saved_patched && g_l4_saved_patched_len > 0) {
+                            baseStr = [[NSMutableString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
+                            DLOG(@"[FIX53N-REENC] Using L4 patched plaintext %zuB as base (canonical dev=%d gpu=%d ch=%d, safeFallback=%d)",
+                                 g_l4_saved_patched_len, nativeHasCanonicalDevice, nativeHasCanonicalGPU, nativeHasCanonicalChannel, l4SafeFallback);
+                        } else {
+                            baseStr = [NSMutableString stringWithString:nativeStr];
+                            DLOG(@"[FIX53N-REENC] WARNING: L4 saved plaintext not available, using native %zuB with in-place replacements", nativeLen);
                         }
                         
-                        // Use L4 saved patched plaintext ONLY if newStr is not already set
-                        // (fffWhich==2 guard may have already modified it with UUID/sessionId changes)
-                        if ((!newStr || newStr.length == 0) && g_l4_saved_patched && g_l4_saved_patched_len > 0) {
-                            newStr = [[NSString alloc] initWithBytes:g_l4_saved_patched length:g_l4_saved_patched_len encoding:NSUTF8StringEncoding];
-                            DLOG(@"[FIX53N-REENC] Re-encrypting L4 patched plaintext %zuB (canonical dev=%d gpu=%d ch=%d, safeFallback=%d)",
-                                 g_l4_saved_patched_len, nativeHasCanonicalDevice, nativeHasCanonicalGPU, nativeHasCanonicalChannel, l4SafeFallback);
-                        } else if (!newStr || newStr.length == 0) {
-                            // Fallback: use native plaintext with in-place replacements
-                            newStr = [NSMutableString stringWithString:nativeStr];
-                            DLOG(@"[FIX53N-REENC] WARNING: L4 saved plaintext not available, using native %zuB with in-place replacements", nativeLen);
+                        // Apply fffWhich==2 guard's sessionId/ticket/UUID replacements onto L4 patched base
+                        if (fffWhich == 2) {
+                            if (sessionIdReplaced) {
+                                // Replace sessionId in baseStr (L4 patched) with UUID
+                                NSRange sessRange = [baseStr rangeOfString:@"DYanyou0040_MIESHI" options:NSCaseInsensitiveSearch];
+                                if (sessRange.location != NSNotFound) {
+                                    // Find the sessionId value after "sessionId":"
+                                    NSString *sessMarker = @"\"sessionId\":\"";
+                                    NSRange markerRange = [baseStr rangeOfString:sessMarker];
+                                    if (markerRange.location != NSNotFound) {
+                                        NSUInteger valStart = markerRange.location + markerRange.length;
+                                        NSUInteger valEnd = valStart;
+                                        while (valEnd < baseStr.length && [baseStr characterAtIndex:valEnd] != '\"') {
+                                            valEnd++;
+                                        }
+                                        if (valEnd > valStart) {
+                                            NSRange valRange = NSMakeRange(valStart, valEnd - valStart);
+                                            [baseStr replaceCharactersInRange:valRange withString:@"66B0EE01-4F6D-DC8A-144C-4A261577EE6E"];
+                                            DLOG(@"[FIX53N-MERGE] Replaced sessionId in L4 base with UUID");
+                                        }
+                                    }
+                                }
+                            }
+                            if (ticketReplaced) {
+                                // Replace ticket in baseStr with random UUID
+                                NSString *ticketMarker = @"\"ticket\":\"";
+                                NSRange ticketMarkerRange = [baseStr rangeOfString:ticketMarker];
+                                if (ticketMarkerRange.location != NSNotFound) {
+                                    NSUInteger tValStart = ticketMarkerRange.location + ticketMarkerRange.length;
+                                    NSUInteger tValEnd = tValStart;
+                                    while (tValEnd < baseStr.length && [baseStr characterAtIndex:tValEnd] != '\"') {
+                                        tValEnd++;
+                                    }
+                                    if (tValEnd > tValStart) {
+                                        NSRange tValRange = NSMakeRange(tValStart, tValEnd - tValStart);
+                                        NSString *uuidStr = [[NSUUID UUID] UUIDString];
+                                        [baseStr replaceCharactersInRange:tValRange withString:uuidStr];
+                                        DLOG(@"[FIX53N-MERGE] Replaced ticket in L4 base with new UUID");
+                                    }
+                                }
+                            }
+                            newStr = baseStr;
+                            jsonModified = YES;
+                            DLOG(@"[FIX53N-MERGE] Merged fffWhich==2 replacements onto L4 patched base → %luB", (unsigned long)newStr.length);
                         } else {
-                            // newStr already set by fffWhich==2 guard — use it
-                            DLOG(@"[FIX53N-REENC] Using fffWhich==2 modified plaintext (already has UUID/sessionId changes) for re-encryption");
+                            // fffWhich==1 — no sessionId/ticket merge needed
+                            newStr = baseStr;
+                            jsonModified = YES;
                         }
                     } else {
                         // CCCrypt L4 did NOT patch the plaintext — use native plaintext
