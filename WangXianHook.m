@@ -13707,6 +13707,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     newStr = [NSMutableString stringWithString:nativeStr];
 
+                    // FIX53N: Declare these OUTSIDE the if(fffWhich==2) block so FIX53N merge logic can access them
+                    NSString *realSessionId = nil; NSString *realTicket = nil;
+                    BOOL didReplaceSession = NO; BOOL didReplaceTicket = NO;
+
                     // FIX53J: sessionId/ticket/UUID insertion ONLY for FFF493#2 (NEW_USER).
                     // FFF493#1 (IOS_CLIENT_MSG) NEVER has these fields — inserting them → corrupt JSON.
                     if (fffWhich == 2) {
@@ -13787,8 +13791,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     }
 
-                    NSString *realSessionId = nil; NSString *realTicket = nil;
-
+                    // realSessionId and realTicket already declared above
                     if (g_sessionValid && g_sessionId[0] != 0 && g_ticket[0] != 0) {
 
                         realSessionId = [NSString stringWithUTF8String:g_sessionId];
@@ -13809,13 +13812,13 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     }
 
-                    BOOL didReplaceSession = ([newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
+                    didReplaceSession = ([newStr replaceOccurrencesOfString:@"\"sessionId\": \"\""
 
                                             withString:[NSString stringWithFormat:@"\"sessionId\": \"%@\"", realSessionId]
 
                                                options:0 range:NSMakeRange(0, newStr.length)] > 0);
 
-                    BOOL didReplaceTicket = ([newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
+                    didReplaceTicket = ([newStr replaceOccurrencesOfString:@"\"ticket\": \"\""
 
                                             withString:[NSString stringWithFormat:@"\"ticket\": \"%@\"", realTicket]
 
