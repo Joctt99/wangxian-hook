@@ -33,7 +33,11 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53J" $(SOURCE) || echo "WARNING: FIX53J not found in source!"
+	@grep -c "FIX53L" $(SOURCE) || echo "WARNING: FIX53L not found in source!"
+	@grep -c "FIX53L-REENC" $(SOURCE) || echo "WARNING: FIX53L-REENC not found!"
+	@grep -c "newPkt\[12\]=p\[12\]" $(SOURCE) || echo "WARNING: fmtFlag copy from original not found!"
+	@grep -c "g_l4_safe_fallback = NO;" $(SOURCE) || echo "WARNING: g_l4_safe_fallback reset not found!"
+	@grep -c "verifyFlag" $(SOURCE) || echo "WARNING: flag reset verification not found!"
 	@grep -c "dmGenericDelta" $(SOURCE) || echo "WARNING: dmGenericDelta (generic fallback) not found!"
 	@grep -c "iPhone " $(SOURCE) || echo "WARNING: iPhone prefix fallback not found!"
 	@grep -c "iPad" $(SOURCE) || echo "WARNING: iPad fallback not found!"
@@ -49,7 +53,10 @@ $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53J" || echo "WARNING: FIX53J not in binary!"
+	@strings $(TARGET) | grep -c "FIX53L" || echo "WARNING: FIX53L not in binary!"
+	@strings $(TARGET) | grep -c "FIX53L-REENC" || echo "WARNING: FIX53L-REENC not in binary!"
+	@strings $(TARGET) | grep -c "newPkt\[12\]=p\[12\]" || echo "WARNING: fmtFlag copy not in binary!"
+	@strings $(TARGET) | grep -c "NOT hardcoded 0x0001" || echo "WARNING: fmtFlag comment not in binary!"
 	@strings $(TARGET) | grep -c "dmGenericDelta" || echo "WARNING: dmGenericDelta not in binary!"
 	@strings $(TARGET) | grep -c "FIX53H-CH-RELAX" || echo "WARNING: FIX53H bounded checks not in binary!"
 	@strings $(TARGET) | grep -c "FIX53I-REENC" || echo "WARNING: FIX53I-REENC not in binary!"
