@@ -7757,7 +7757,7 @@ static BOOL g_aes_key_saved = NO;
 // FFF493-REPL send-hook MUST re-encrypt the saved patched plaintext (which has correct
 // channel/dm/gp/uuid AND correct md5 from CC_MD5 hook), otherwise:
 // HMAC(based on patched data via CC_MD5) ≠ ciphertext(based on original data) → server REJECT
-static BOOL g_l4_safe_fallback = NO;
+static volatile BOOL g_l4_safe_fallback = NO;
 
 static char *g_ext_plaintext = NULL;   // extended plaintext for FFF493#2
 
@@ -26606,10 +26606,10 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
     // FIX53L: Reset SAFE FALLBACK flag at start of each active CCCrypt L4 call.
     // Previous stale YES value would trigger unnecessary forceReencrypt in send-hook
     // for FFF493#1 even though THIS call had a perfectly fine patched output.
-    // Use asm volatile to GUARANTEE the compiler does NOT optimize away this reset.
-    __asm__ __volatile__("" : "=m"(g_l4_safe_fallback));
+    // Use asm volatile with "memory" clobber to GUARANTEE the compiler does NOT optimize away this reset.
+    asm volatile("" ::: "memory");
     g_l4_safe_fallback = NO;
-    __asm__ __volatile__("" : : "m"(g_l4_safe_fallback));
+    asm volatile("" ::: "memory");
     {
         int verifyFlag = (int)g_l4_safe_fallback;
         if (verifyFlag != 0) {
