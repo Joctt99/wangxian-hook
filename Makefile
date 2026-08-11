@@ -33,12 +33,9 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53N" $(SOURCE) || echo "WARNING: FIX53N not found in source!"
-	@grep -c "FIX53N-REENC" $(SOURCE) || echo "WARNING: FIX53N-REENC not found!"
-	@grep -c "FIX53N-MERGE" $(SOURCE) || echo "WARNING: FIX53N-MERGE not found!"
-	@grep -c "FIX53N-NOPATCH" $(SOURCE) || echo "WARNING: FIX53N-NOPATCH not found!"
+	@grep -c "FIX53O" $(SOURCE) || echo "WARNING: FIX53O not found in source!"
+	@grep -c "FIX53O-SEND" $(SOURCE) || echo "WARNING: FIX53O-SEND not found!"
 	@grep -c "doReencrypt" $(SOURCE) || echo "WARNING: doReencrypt not found!"
-	@grep -c "needReencrypt" $(SOURCE) || echo "WARNING: needReencrypt not found!"
 	@grep -c "iPhone7Plus" $(SOURCE) || echo "WARNING: iPhone7Plus check not found!"
 	@grep -c "g_l4_saved_valid" $(SOURCE) || echo "WARNING: g_l4_saved_valid check not found!"
 	@grep -c "newPkt\[12\]=p\[12\]" $(SOURCE) || echo "WARNING: fmtFlag copy from original not found!"
@@ -57,9 +54,9 @@ $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53N" || echo "WARNING: FIX53N not in binary!"
-	@strings $(TARGET) | grep -c "FIX53N-REENC" || echo "WARNING: FIX53N-REENC not in binary!"
-	@strings $(TARGET) | grep -c "FIX53N-MERGE" || echo "WARNING: FIX53N-MERGE not in binary!"
+	@strings $(TARGET) | grep -c "FIX53O" || echo "WARNING: FIX53O not in binary!"
+	@strings $(TARGET) | grep -c "FIX53O-SEND" || echo "WARNING: FIX53O-SEND not in binary!"
+	@strings $(TARGET) | grep -c "doReencrypt" || echo "WARNING: doReencrypt not in binary!"
 	@strings $(TARGET) | grep -c "iPhone7Plus" || echo "WARNING: iPhone7Plus check not in binary!"
 	@strings $(TARGET) | grep -c "FIX53H-CH-RELAX" || echo "WARNING: FIX53H bounded checks not in binary!"
 	@strings $(TARGET) | grep -c "fffWhich == 1 || fffWhich == 2" || echo "WARNING: FIX53J open block not in binary!"
