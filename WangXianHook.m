@@ -3021,7 +3021,7 @@ static void log_init(void) {
                 nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
         }
 
-        _log(@"=== WangXianHook v37.134-FIX53F loaded (FIX53基线 + iPhone 13 Pro/A15 GPU精确匹配 + 🆕通用前缀fallback自动支持所有iOS设备 + FIX53F边界检查修复前缀匹配陷阱 + 日志大小限制) UUID单通道canonical 66B0EE01全链路一致. FIX53F修复: 1)13B精确匹配加边界检查(后跟空格时跳过, 防止'iPhone 14 Pro'误匹配'iPhone 14 Pro Max'等17B型号). 2)CC_MD5_Update第二pass补齐iPhone 13 Pro匹配+通用iPhone/iPad/GPU fallback. 3)CCCrypt L4变体2检测+替换全部补齐边界检查. 通用fallback: 'iPhone '前缀匹配所有未知iPhone型号, 'iPad'前缀匹配iPad全系列, 'Apple Inc. Apple A'前缀匹配所有Apple GPU. 动态计算长度和delta, 自动替换为canonical(iPhone7Plus/A10 GPU). 无需为新设备添加代码.");
+        _log(@"=== WangXianHook v37.134-FIX53O loaded (FIX53O: 移除强制重加密! 仅JSON实际修改时才重加密, L4修补但JSON未改时发送原始包. CCCrypt L4已加密正确密文, 重加密会产生不同IV导致服务器解密失败→静默拒绝→卡'正在进入'. 恢复原始FIX53行为.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -27890,7 +27890,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.89-DIST-FIX53E — FIX53 baseline + iPhone 13 Pro/A15 GPU + 🆕 GENERIC PREFIX FALLBACK for ALL iOS devices (iPhone/iPad/A10~A18 GPU). Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: 'iPhone ' prefix matches any unknown iPhone, 'iPad' matches all iPads, 'Apple Inc. Apple A' matches any Apple GPU. Dynamic length & delta calculation — no need to add code for new devices. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
+    DLOG(@"[VERSION] WangXianHook v37.134-FIX53O — FIX53O: 移除强制重加密. 仅JSON实际修改(sessionId/ticket/UUID)时重加密, L4修补但JSON未改时发送原始包(CCCrypt L4已加密正确密文). Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
