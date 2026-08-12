@@ -33,10 +33,11 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53P" $(SOURCE) || echo "WARNING: FIX53P not found in source!"
+	@grep -c "FIX53Q" $(SOURCE) || echo "WARNING: FIX53Q not found in source!"
 	@grep -c "FIX53O-SEND" $(SOURCE) || echo "WARNING: FIX53O-SEND not found!"
 	@grep -c "doReencrypt" $(SOURCE) || echo "WARNING: doReencrypt not found!"
 	@grep -c "macIsEmpty" $(SOURCE) || echo "WARNING: macIsEmpty (FIX53P empty MACADDRESS fix) not found!"
+	@grep -c "hasUuidMac" $(SOURCE) || echo "WARNING: hasUuidMac (FIX53Q CC_MD5 fix) not found!"
 	@grep -c "iPhone7Plus" $(SOURCE) || echo "WARNING: iPhone7Plus check not found!"
 	@grep -c "g_l4_saved_valid" $(SOURCE) || echo "WARNING: g_l4_saved_valid check not found!"
 	@grep -c "newPkt\[12\]=p\[12\]" $(SOURCE) || echo "WARNING: fmtFlag copy from original not found!"
@@ -55,7 +56,7 @@ $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53P" || echo "WARNING: FIX53P not in binary!"
+	@strings $(TARGET) | grep -c "FIX53Q" || echo "WARNING: FIX53Q not in binary!"
 	@strings $(TARGET) | grep -c "FIX53O-SEND" || echo "WARNING: FIX53O-SEND not in binary!"
 	@strings $(TARGET) | grep -c "doReencrypt" || echo "WARNING: doReencrypt not in binary!"
 	@strings $(TARGET) | grep -c "iPhone7Plus" || echo "WARNING: iPhone7Plus check not in binary!"
