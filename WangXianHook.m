@@ -3021,7 +3021,7 @@ static void log_init(void) {
                 nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
         }
 
-        _log(@"=== WangXianHook v37.134-FIX53Q loaded (FIX53Q: CC_MD5 hook仅在EE121 body(含UUID=MACADDRESS=前缀)中插入UUID, 不在FFF493#2 md5 concat中插入! 修复md5不匹配导致静默拒绝. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
+        _log(@"=== WangXianHook v37.134-FIX53R loaded (FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2! EE121(无FULL)→插入UUID; FFF493#2(有FULL)→不插入UUID. 修复FIX53Q误判导致EE121 hash2不含UUID. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -21650,7 +21650,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
             // Scan for replaceable matches
 
             int hasCh = 0, hasDm = 0, hasGp = 0, hasHash = 0, hasUUID = 0;
-            int hasUuidMac = 0; // FIX53Q: UUID=MACADDRESS= prefix (EE121 body only, NOT FFF493#2 concat)
+            int hasFull = 0; // FIX53R: "FULL" marker — present in FFF493#2 concat, NOT in EE121 concat
 
             uint32_t uuidPos = 0; // position of ANY 36B format UUID (when hasEE121Ctx==1)
 
@@ -21734,13 +21734,14 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                 }
 
-                // FIX53Q: Detect UUID=MACADDRESS= prefix (16B) — ONLY present in EE121 TLV body.
-                // FFF493#2 md5 concat does NOT have this prefix → hasUuidMac=0 → skip UUID insertion.
-                // ROOT CAUSE (wxhook-187): CC_MD5 hook inserted UUID after GPU in FFF493#2 concat
-                // (because !hasUUID), but FFF493#2 concat doesn't include MACADDRESS at all!
-                // → md5 = MD5(concat + wrong_uuid) ≠ server's MD5(concat without uuid) → silent reject.
-                if (!hasUuidMac && i + 16 <= len && memcmp(in + i, "UUID=MACADDRESS=", 16) == 0) {
-                    hasUuidMac = 1;
+                // FIX53R: Detect "FULL" (4B) — present in FFF493#2 hash2 concat, NOT in EE121.
+                // ROOT CAUSE (wxhook-188): FIX53Q used hasUuidMac (UUID=MACADDRESS= prefix) to
+                // distinguish EE121 from FFF493#2, but EE121 hash2 concat (121B) does NOT have
+                // this prefix either! → hasUuidMac=0 → UUID NOT inserted → hash2 mismatch → reject.
+                // FIX: Use "FULL" marker instead. FFF493#2 concat has "FULL" (clientFull field),
+                // EE121 concat does NOT. So: !hasFull = EE121 → insert UUID; hasFull = FFF493#2 → skip.
+                if (!hasFull && i + 4 <= len && memcmp(in + i, "FULL", 4) == 0) {
+                    hasFull = 1;
                 }
 
             }
@@ -21815,7 +21816,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                 // Send hook (EE007-ALIGN) also inserts UUID TLV into packet body → body matches hash2.
 
-                if (hasGp && !hasUUID && hasUuidMac) newLen_i += 36; // FIX53Q: only EE121 body
+                if (hasGp && !hasUUID && !hasFull) newLen_i += 36; // FIX53R: EE121 only (not FFF493#2 which has "FULL")
 
                 uint32_t newLen = (newLen_i > 0) ? (uint32_t)newLen_i : len;
 
@@ -21909,7 +21910,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             // Insert 36B canonical UUID here so hash2 = MD5(body WITH UUID).
                             // The send hook (EE007-ALIGN) also inserts UUID TLV into the packet.
                             // FIX53: Always use canonical 66B0EE01 — single UUID scheme for all phases.
-                            if (!hasUUID && hasUuidMac) { // FIX53Q: only EE121 body (has UUID=MACADDRESS= prefix)
+                            if (!hasUUID && !hasFull) { // FIX53R: EE121 only (not FFF493#2 which has "FULL")
 
                                 memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
 
@@ -21930,7 +21931,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             DLOG(@"[FIX51-GPU-A16orA15] Replaced A16/A15 GPU with A10 GPU in CC_MD5 input (24B→24B)");
 
                             // FIX53: Always use canonical 66B0EE01 after GPU
-                            if (!hasUUID && hasUuidMac) { // FIX53Q: only EE121 body (has UUID=MACADDRESS= prefix)
+                            if (!hasUUID && !hasFull) { // FIX53R: EE121 only (not FFF493#2 which has "FULL")
 
                                 memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
 
@@ -21946,7 +21947,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             out += 24; pos += 24;
 
                             // FIX53: Always use canonical 66B0EE01 after GPU
-                            if (!hasUUID && hasUuidMac) { // FIX53Q: only EE121 body (has UUID=MACADDRESS= prefix)
+                            if (!hasUUID && !hasFull) { // FIX53R: EE121 only (not FFF493#2 which has "FULL")
 
                                 memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
 
@@ -21967,7 +21968,7 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
                             DLOG(@"[FIX53G-GPU-GENERIC] Replaced unknown Apple GPU (%dB→24B) in CC_MD5 input", origGpLen);
 
                             // FIX53: Always use canonical 66B0EE01 after GPU
-                            if (!hasUUID && hasUuidMac) { // FIX53Q: only EE121 body (has UUID=MACADDRESS= prefix)
+                            if (!hasUUID && !hasFull) { // FIX53R: EE121 only (not FFF493#2 which has "FULL")
                                 memcpy((uint8_t *)cleanInput + out, kCanUUIDNew, 36);
                                 out += 36;
                             }
@@ -22034,9 +22035,9 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                     inputModified = 2; // content replacement
 
-                    DLOG(@"[MD5-HOOK] v37.97: Replaced input ch=%d dm=%d gp=%d hash=%d uuid=%d accId=%d eeCtx=%d hasUuidMac=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
+                    DLOG(@"[MD5-HOOK] v37.97: Replaced input ch=%d dm=%d gp=%d hash=%d uuid=%d accId=%d eeCtx=%d hasFull=%d (oldLen=%u newLen=%u out=%u) g_md5_channel_replaced=%d",
 
-                         hasCh, hasDm, hasGp, hasHash, hasUUID, hasAccId, hasEE121Ctx, hasUuidMac, len, newLen, out, g_md5_channel_replaced);
+                         hasCh, hasDm, hasGp, hasHash, hasUUID, hasAccId, hasEE121Ctx, hasFull, len, newLen, out, g_md5_channel_replaced);
 
                     // Dump original input for diagnosis
 
@@ -27927,7 +27928,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.134-FIX53Q — FIX53Q: CC_MD5 hook仅在EE121 body插入UUID(不在FFF493#2 concat). FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密. Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
+    DLOG(@"[VERSION] WangXianHook v37.134-FIX53R — FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密. Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
