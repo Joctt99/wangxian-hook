@@ -33,11 +33,13 @@ all: clean $(TARGET)
 
 $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	@echo "=== Source verification ==="
-	@grep -c "FIX53R" $(SOURCE) || echo "WARNING: FIX53R not found in source!"
+	@grep -c "FIX53T" $(SOURCE) || echo "WARNING: FIX53T not found in source!"
+	@grep -c "SQAGE_MIESHI" $(SOURCE) || echo "WARNING: SQAGE_MIESHI (FIX53T new channel) not found in source!"
 	@grep -c "FIX53O-SEND" $(SOURCE) || echo "WARNING: FIX53O-SEND not found!"
 	@grep -c "doReencrypt" $(SOURCE) || echo "WARNING: doReencrypt not found!"
 	@grep -c "macIsEmpty" $(SOURCE) || echo "WARNING: macIsEmpty (FIX53P empty MACADDRESS fix) not found!"
 	@grep -c "hasFull" $(SOURCE) || echo "WARNING: hasFull (FIX53R CC_MD5 fix) not found!"
+	@grep -c "didReplaceSession || didReplaceTicket || didReplaceUUID" $(SOURCE) || echo "WARNING: FIX53T md5_recompute didReplaceUUID check not found!"
 	@grep -c "iPhone7Plus" $(SOURCE) || echo "WARNING: iPhone7Plus check not found!"
 	@grep -c "g_l4_saved_valid" $(SOURCE) || echo "WARNING: g_l4_saved_valid check not found!"
 	@grep -c "newPkt\[12\]=p\[12\]" $(SOURCE) || echo "WARNING: fmtFlag copy from original not found!"
@@ -56,7 +58,8 @@ $(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
 	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
 	@echo "Built: $(TARGET)"
 	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53R" || echo "WARNING: FIX53R not in binary!"
+	@strings $(TARGET) | grep -c "FIX53T" || echo "WARNING: FIX53T not in binary!"
+	@strings $(TARGET) | grep -c "SQAGE_MIESHI" || echo "WARNING: SQAGE_MIESHI not in binary!"
 	@strings $(TARGET) | grep -c "FIX53O-SEND" || echo "WARNING: FIX53O-SEND not in binary!"
 	@strings $(TARGET) | grep -c "doReencrypt" || echo "WARNING: doReencrypt not in binary!"
 	@strings $(TARGET) | grep -c "iPhone7Plus" || echo "WARNING: iPhone7Plus check not in binary!"
