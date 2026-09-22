@@ -3021,7 +3021,7 @@ static void log_init(void) {
                 nolimitFile ? 1 : 0, sparseFile ? 1 : 0, logfullFile ? 1 : 0]);
         }
 
-        _log(@"=== WangXianHook v37.134-FIX53R loaded (FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2! EE121(无FULL)→插入UUID; FFF493#2(有FULL)→不插入UUID. 修复FIX53Q误判导致EE121 hash2不含UUID. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
+        _log(@"=== WangXianHook v37.134-FIX53T loaded (FIX53T: 游戏更新后channel从DY_MIESHI(9B)变为SQAGE_MIESHI(12B)! 所有hook(CC_MD5/EE007-ALIGN/TLV/generic memmem/send/CFString/memcmp/C-string patching)均已添加SQAGE_MIESHI检测,替换为canonical DYanyou0040_MIESHI(18B). FIX53S: didReplaceUUID触发md5_recompute. FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2.) UUID单通道canonical 66B0EE01全链路一致. 通用fallback: iPhone/iPad/Apple GPU前缀自动匹配所有设备.");
 
         _log([NSString stringWithFormat:@"App: %@", [[NSBundle mainBundle] bundleIdentifier]]);
 
@@ -11773,6 +11773,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
             unsigned char *dyPos = (unsigned char *)memmem(p, len, "DY_MIESHI", 9);
 
+            // FIX53T: 游戏更新后channel变为SQAGE_MIESHI(12B), 同时搜索
+
+            unsigned char *sqPos = (unsigned char *)memmem(p, len, "SQAGE_MIESHI", 12);
+
+            int chOldLen = 9; // FIX53T: track old channel length for restStart
+
+            if (sqPos && (!dyPos || sqPos < dyPos)) { dyPos = sqPos; chOldLen = 12; } // FIX53T
+
             if (dyPos && dyPos >= p + 2) {
 
                 size_t dyOffset = (size_t)(dyPos - p);
@@ -11801,7 +11809,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     pos += 18;
 
-                    size_t restStart = dyOffset + 9;
+                    size_t restStart = dyOffset + chOldLen; // FIX53T: 9 or 12
 
                     if (restStart < len) {
 
@@ -11873,6 +11881,14 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
             unsigned char *dyPos = (unsigned char *)memmem(workBuf, workLen, "DY_MIESHI", 9);
 
+            // FIX53T: 游戏更新后channel变为SQAGE_MIESHI(12B), 同时搜索
+
+            unsigned char *sqPos = (unsigned char *)memmem(workBuf, workLen, "SQAGE_MIESHI", 12);
+
+            int chOldLen = 9; // FIX53T
+
+            if (sqPos && (!dyPos || sqPos < dyPos)) { dyPos = sqPos; chOldLen = 12; } // FIX53T
+
             if (dyPos && dyPos >= workBuf + 2) {
 
                 size_t dyOffset = (size_t)(dyPos - workBuf);
@@ -11903,7 +11919,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     pos += 18;
 
-                    size_t restStart = dyOffset + 9;
+                    size_t restStart = dyOffset + chOldLen; // FIX53T: 9 or 12
 
                     if (restStart < workLen) {
 
@@ -11957,7 +11973,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
 
 
-        BOOL hasDY_MIESHI = (memmem(p, len, "DY_MIESHI", 9) != NULL);
+        BOOL hasDY_MIESHI = (memmem(p, len, "DY_MIESHI", 9) != NULL || memmem(p, len, "SQAGE_MIESHI", 12) != NULL); // FIX53T: also detect SQAGE_MIESHI
 
         if (needsPatch && (isEE113 || hasDY_MIESHI)) {
 
@@ -12050,6 +12066,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
 
                             out += 20; in += 11; fieldsApplied |= 1;
+
+                        // FIX53T: SQAGE_MIESHI(12B) → DYanyou0040_MIESHI(18B), in += 14 (2+12)
+
+                        } else if (fLen == 12 && memcmp(val, "SQAGE_MIESHI", 12) == 0) {
+
+                            newBuf[out] = 0x00; newBuf[out+1] = 0x12;
+
+                            memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
+
+                            out += 20; in += 14; fieldsApplied |= 1;
 
                         } else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) {
 
@@ -12578,6 +12604,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                 if (fLen == 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
 
+                // FIX53T: 游戏更新后channel变为SQAGE_MIESHI(12B)
+
+                else if (fLen == 12 && memcmp(val, "SQAGE_MIESHI", 12) == 0) chOff = off;
+
                 else if (fLen == 17 && memcmp(val, "iPhone 16 Pro Max", 17) == 0) dmOff = off;
 
                 else if (fLen == 28 && memcmp(val, "Apple Inc. Apple A18 Pro GPU", 28) == 0) gpOff = off;
@@ -12589,6 +12619,10 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                 // or fallback: if value contains known strings
 
                 else if (chOff == (size_t)-1 && fLen >= 9 && memcmp(val, "DY_MIESHI", 9) == 0) chOff = off;
+
+                // FIX53T: SQAGE_MIESHI fallback (12B)
+
+                else if (chOff == (size_t)-1 && fLen >= 12 && memcmp(val, "SQAGE_MIESHI", 12) == 0) chOff = off;
 
                 else if (dmOff == (size_t)-1 && fLen >= 11 && (memmem(val, fLen, "iPhone", 6) != NULL)) dmOff = off;
 
@@ -12668,6 +12702,16 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
                             memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
 
                             out += 20; in += 11; fieldsApplied |= 1;
+
+                        // FIX53T: SQAGE_MIESHI(12B) → DYanyou0040_MIESHI(18B), in += 14 (2+12)
+
+                        } else if (in == chOff && fLen == 12) {
+
+                            newBuf[out] = 0x00; newBuf[out + 1] = 0x12;
+
+                            memcpy(newBuf + out + 2, "DYanyou0040_MIESHI", 18);
+
+                            out += 20; in += 14; fieldsApplied |= 1;
 
                         } else if (in == dmOff) {
 
@@ -13960,7 +14004,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
                     //   Server kept connection alive (14+ heartbeats) but NEVER sent role data 0x0CB0A300!
 
-                    if (didReplaceSession || didReplaceTicket) {
+                    if (didReplaceSession || didReplaceTicket || didReplaceUUID) {
 
                         NSString *kMd5Key = @"\"md5\": \"";
 
@@ -21662,6 +21706,10 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                 if (!hasCh && i + 9 <= len && memcmp(in + i, chOld, 9) == 0) hasCh = 1;
 
+                // FIX53T: 游戏更新后channel从DY_MIESHI(9B)变为SQAGE_MIESHI(12B)
+
+                if (!hasCh && i + 12 <= len && memcmp(in + i, "SQAGE_MIESHI", 12) == 0) hasCh = 1;
+
                 // FIX51: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone 13 Pro(13B) + iPhone7Plus(11B)
                 if (!hasDm && i + 17 <= len && memcmp(in + i, dmOld, 17) == 0) hasDm = 1;
                 // FIX53F: iPhone 14/13 Pro(13B) 仅当后面不是空格时匹配(排除"Pro Max"等17B型号)
@@ -21834,7 +21882,17 @@ static unsigned char *hook_CC_MD5(const void *data, uint32_t len, unsigned char 
 
                     while (pos < len) {
 
-                        if (hasCh && pos + 9 <= len && memcmp(in + pos, chOld, 9) == 0) {
+                        // FIX53T: SQAGE_MIESHI(12B) → DYanyou0040_MIESHI(18B), +6B
+
+                        if (hasCh && pos + 12 <= len && memcmp(in + pos, "SQAGE_MIESHI", 12) == 0) {
+
+                            memcpy((uint8_t *)cleanInput + out, chNew, 18);
+
+                            out += 18; pos += 12;
+
+                            g_md5_channel_replaced = 1;
+
+                        } else if (hasCh && pos + 9 <= len && memcmp(in + pos, chOld, 9) == 0) {
 
                             memcpy((uint8_t *)cleanInput + out, chNew, 18);
 
@@ -22525,6 +22583,10 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                 if (!hasCh && i + 9 <= actualLen && memcmp((const uint8_t *)actualInput + i, chOld, 9) == 0) hasCh = 1;
 
+                // FIX53T: 游戏更新后channel从DY_MIESHI(9B)变为SQAGE_MIESHI(12B)
+
+                if (!hasCh && i + 12 <= actualLen && memcmp((const uint8_t *)actualInput + i, "SQAGE_MIESHI", 12) == 0) hasCh = 1;
+
                 // FIX52: 支持iPhone 16 Pro Max(17B) + iPhone 14 Pro(13B) + iPhone 13 Pro(13B) + iPhone7Plus(11B)
                 if (!hasDm && i + 17 <= actualLen && memcmp((const uint8_t *)actualInput + i, dmOld, 17) == 0) { hasDm = 1; dmVariant = 1; }
                 // FIX53F: 13B匹配仅当后面不是空格(排除"Pro Max"等, 让通用fallback处理)
@@ -22592,7 +22654,13 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
                     while (pos < actualLen) {
 
-                        if (hasCh && pos + 9 <= actualLen && memcmp(src + pos, chOld, 9) == 0) {
+                        // FIX53T: SQAGE_MIESHI(12B) → DYanyou0040_MIESHI(18B), +6B
+
+                        if (hasCh && pos + 12 <= actualLen && memcmp(src + pos, "SQAGE_MIESHI", 12) == 0) {
+
+                            memcpy((uint8_t *)tmp + out, chNew, 18); out += 18; pos += 12;
+
+                        } else if (hasCh && pos + 9 <= actualLen && memcmp(src + pos, chOld, 9) == 0) {
 
                             memcpy((uint8_t *)tmp + out, chNew, 18); out += 18; pos += 9;
 
@@ -26365,7 +26433,7 @@ static size_t hook_strlen(const char *s) {
 
     // Use memcmp (NOT strcmp — strcmp is hooked and will recurse!)
 
-    if (s && memcmp(s, "DY_MIESHI", 10) == 0) { // 10 = 9 chars + NUL
+    if (s && (memcmp(s, "DY_MIESHI", 10) == 0 || memcmp(s, "SQAGE_MIESHI", 13) == 0)) { // FIX53T: also SQAGE_MIESHI(12B+NUL=13)
 
         return 18;
 
@@ -26389,7 +26457,7 @@ static int hook_strcmp(const char *a, const char *b) {
 
     if (a) {
 
-        if (memcmp(a, "DY_MIESHI", 10) == 0) sa = 1;
+        if (memcmp(a, "DY_MIESHI", 10) == 0 || memcmp(a, "SQAGE_MIESHI", 13) == 0) sa = 1; // FIX53T
 
         else if (memcmp(a, "DYanyou0040_MIESHI", 19) == 0) sa = 2;
 
@@ -26397,7 +26465,7 @@ static int hook_strcmp(const char *a, const char *b) {
 
     if (b) {
 
-        if (memcmp(b, "DY_MIESHI", 10) == 0) sb = 1;
+        if (memcmp(b, "DY_MIESHI", 10) == 0 || memcmp(b, "SQAGE_MIESHI", 13) == 0) sb = 1; // FIX53T
 
         else if (memcmp(b, "DYanyou0040_MIESHI", 19) == 0) sb = 2;
 
@@ -26423,11 +26491,11 @@ static int hook_strncmp(const char *a, const char *b, size_t n) {
 
     BOOL aCh = NO, bCh = NO;
 
-    if (a && n >= 9 && memcmp(a, "DY_MIESHI", 9) == 0) aCh = YES;
+    if (a && n >= 9 && (memcmp(a, "DY_MIESHI", 9) == 0 || (n >= 12 && memcmp(a, "SQAGE_MIESHI", 12) == 0))) aCh = YES; // FIX53T
 
     else if (a && n >= 18 && memcmp(a, "DYanyou0040_MIESHI", 18) == 0) aCh = YES;
 
-    if (b && n >= 9 && memcmp(b, "DY_MIESHI", 9) == 0) bCh = YES;
+    if (b && n >= 9 && (memcmp(b, "DY_MIESHI", 9) == 0 || (n >= 12 && memcmp(b, "SQAGE_MIESHI", 12) == 0))) bCh = YES; // FIX53T
 
     else if (b && n >= 18 && memcmp(b, "DYanyou0040_MIESHI", 18) == 0) bCh = YES;
 
@@ -26461,7 +26529,7 @@ static void *hook_memcpy(void *dest, const void *src, size_t n) {
 
     // Hence dest capacity is sufficient to fit replacement. We just copy.
 
-    if (src && n >= 9 && memcmp(src, "DY_MIESHI", 9) == 0) {
+    if (src && n >= 9 && (memcmp(src, "DY_MIESHI", 9) == 0 || (n >= 12 && memcmp(src, "SQAGE_MIESHI", 12) == 0))) { // FIX53T
 
         // Case A: exact 9-byte or 10-byte (9 + NUL) — handled if n>=18 (thanks to strlen hook).
 
@@ -26511,7 +26579,7 @@ static CFStringRef hook_CFStringCreateWithCString(CFAllocatorRef alloc, const ch
 
     }
 
-    if (cStr && encoding == kCFStringEncodingUTF8 && memcmp(cStr, "DY_MIESHI", 10) == 0) {
+    if (cStr && encoding == kCFStringEncodingUTF8 && (memcmp(cStr, "DY_MIESHI", 10) == 0 || memcmp(cStr, "SQAGE_MIESHI", 13) == 0)) { // FIX53T
 
         static int count = 0;
 
@@ -26533,7 +26601,7 @@ static id (*orig_stringWithUTF8String)(Class self, SEL _cmd, const char *cStr);
 
 static id hook_stringWithUTF8String(Class self, SEL _cmd, const char *cStr) {
 
-    if (cStr && memcmp(cStr, "DY_MIESHI", 10) == 0) {
+    if (cStr && (memcmp(cStr, "DY_MIESHI", 10) == 0 || memcmp(cStr, "SQAGE_MIESHI", 13) == 0)) { // FIX53T
 
         static int count = 0;
 
@@ -26551,7 +26619,7 @@ static id (*orig_initWithUTF8String)(NSString *self, SEL _cmd, const char *cStr)
 
 static id hook_initWithUTF8String(NSString *self, SEL _cmd, const char *cStr) {
 
-    if (cStr && memcmp(cStr, "DY_MIESHI", 10) == 0) {
+    if (cStr && (memcmp(cStr, "DY_MIESHI", 10) == 0 || memcmp(cStr, "SQAGE_MIESHI", 13) == 0)) { // FIX53T
 
         static int count = 0;
 
@@ -26714,6 +26782,18 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                 if (bounded) chCount++;
 
                 pcur += 9;
+
+            // FIX53T: SQAGE_MIESHI(12B) — 游戏更新后新channel
+
+            } else if (rem >= 12 && memcmp(pcur, "SQAGE_MIESHI", 12) == 0) {
+
+                char prev = (pcur > scanP) ? *(pcur-1) : 0;
+                char next = (pcur + 12 < scanEnd) ? *(pcur+12) : 0;
+                BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                BOOL bounded = prevOk && nextOk;
+                if (bounded) chCount++;
+                pcur += 12;
 
             } else if (rem >= 17 && memcmp(pcur, "iPhone 16 Pro Max", 17) == 0) {
 
@@ -26990,6 +27070,24 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                             memcpy(out, "DYanyou0040_MIESHI", 18);
 
                             out += 18; p += 9; continue;
+
+                        }
+
+                    // FIX53T: SQAGE_MIESHI(12B) → DYanyou0040_MIESHI(18B), +6B
+
+                    } else if (rem >= 12 && memcmp(p, "SQAGE_MIESHI", 12) == 0) {
+
+                        char prev = (p > (const char *)dataIn) ? *(p-1) : 0;
+                        char next = (p + 12 < e) ? *(p+12) : 0;
+                        BOOL prevOk = (prev < 'A' || (prev > 'Z' && prev < 'a') || prev > 'z');
+                        BOOL nextOk = (next < 'A' || (next > 'Z' && next < 'a') || next > 'z');
+                        BOOL bounded = prevOk && nextOk;
+
+                        if (bounded) {
+
+                            memcpy(out, "DYanyou0040_MIESHI", 18);
+
+                            out += 18; p += 12; continue;
 
                         }
 
@@ -27800,7 +27898,7 @@ static void patchChannelStringInBinary(void) {
 
                     // written a NUL terminator; p[9] could be stale original data).
 
-                    if (memcmp(p, shortCh, 9) != 0) continue;
+                    if (memcmp(p, shortCh, 9) != 0 && memcmp(p, "SQAGE_MIESHI", 12) != 0) continue; // FIX53T: also match SQAGE_MIESHI(12B)
 
                     // Boundary check: char before must be NUL or non-alphanumeric
 
@@ -27928,7 +28026,7 @@ static void patchChannelStringInBinary(void) {
 
 static void installAllHooks(void) {
 
-    DLOG(@"[VERSION] WangXianHook v37.134-FIX53R — FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密. Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
+    DLOG(@"[VERSION] WangXianHook v37.134-FIX53T — FIX53T: 游戏更新后channel从DY_MIESHI变为SQAGE_MIESHI(12B), 所有hook已添加SQAGE检测+替换为DYanyou0040_MIESHI. FIX53S: didReplaceUUID触发md5_recompute. FIX53R: CC_MD5用FULL标记区分EE121/FFF493#2. FIX53P: 空MACADDRESS插入canonical UUID. FIX53O: 仅JSON修改时重加密. Single-channel canonical UUID=66B0EE01 used EVERYWHERE. Generic fallback: iPhone/iPad/Apple GPU prefix. SPARSE_LOG_MODE=0 default. LOG_SIZE_LIMIT_DEFAULT_ON=1 (200KB cap + rotation). File toggles: wxhook_nolimit/wxhook_sparse/wxhook_logfull in Documents.");
 
     // v37.87: Force session valid global immediately on hook init. This is the single most
 
