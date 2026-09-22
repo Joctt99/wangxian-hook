@@ -1,4 +1,4 @@
-﻿# WangXianHook Makefile
+# WangXianHook Makefile
 # Builds WangXianHook.dylib for iOS arm64
 
 TARGET = WangXianHook.dylib
