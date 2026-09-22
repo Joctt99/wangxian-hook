@@ -1861,7 +1861,7 @@ extern "C" kern_return_t mach_vm_remap(
 // Set to 0 during development to re-enable FULL diagnostics.
 // NOTE (2026-08-10 user request): DEFAULT = 0 (full logging = original FIX53 behavior).
 // To enable sparse logging: change this to 1 and rebuild.
-#define SPARSE_LOG_MODE 0
+#define SPARSE_LOG_MODE 1  // FIX53U: Enable sparse logging to reduce auto-clicker lag (80-95% log reduction)
 
 // v37.134-FIX53C: LOG SIZE LIMIT + ROTATION SWITCH (大小限制+轮转开关)
 // When LOG_SIZE_LIMIT_DEFAULT_ON=1 (default per user request 2026-08-10),
@@ -1966,7 +1966,7 @@ static inline BOOL sparse_log_shouldSkip(const char *utf8msg) {
         "[RECV]", "[PROTO-DBG]", "[HTTP-HOOK]", "[NSUD]", "[NET]",
         "[NET-C]", "[CPP-CRYPTO]", "[SC-DIAG]", "[SK-DIAG]", "[CH-L0]",
         "[CH-L1]", "[CH-L2]", "[CH-INIT]", "[JSON-PARSE]", "[V3-SCNETWORK]",
-        "[LCNET]", "[MSI-PROP]", "[PROTO-VALIDATE]", "[DECODE-FOUND]",
+        "[LCNET]", "[MSI-PROP]", "[PROTO-VALIDATE]", "[DECODE-FOUND]", "[GAME-80FFF494]", "[MD5-DUMP]", "[MD5-LOG]", "[CC-AES-PLAIN-FULL]", "[GAME-SEND-TAIL]", "[DETAIL]", "[GAME-RECV]", "[SERVER-RESP]", "[STICKY-DETECT]", "[STATUS]", "[GAME-FLOW]",
         "[SERVER-CLASS]", "[DYLIB-IMAGE]", "[DECODE-SEARCH]", "[PROTO-DEBUG]",
         "[ENCODE-PATH]", "[SIGN-HOOK]",
         NULL
