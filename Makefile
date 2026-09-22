@@ -1,10 +1,8 @@
-# WangXianHook Makefile - Using OFFICIAL fishhook (C++ support)
+# WangXianHook Makefile
 # Builds WangXianHook.dylib for iOS arm64
 
 TARGET = WangXianHook.dylib
 SOURCE = WangXianHook.m
-PROTO = ProtocolPatcher.m
-FISHHOOK = fishhook.c
 
 SDK_PATH  = $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC        = $(shell xcrun --sdk iphoneos --find clang)
@@ -21,51 +19,15 @@ CFLAGS += -framework Security
 CFLAGS += -framework CoreGraphics
 CFLAGS += -lobjc
 CFLAGS += -lz
-CFLAGS += -lc++
 CFLAGS += -dynamiclib
-CFLAGS += -O0
+CFLAGS += -O2
 CFLAGS += -fobjc-arc
-CFLAGS += -fno-exceptions
-CFLAGS += -fno-rtti
-CFLAGS += -install_name @executable_path/Frameworks/WangXianHook.dylib
 
-all: clean $(TARGET)
+all: $(TARGET)
 
-$(TARGET): $(SOURCE) $(PROTO) $(FISHHOOK)
-	@echo "=== Source verification ==="
-	@grep -c "FIX53T" $(SOURCE) || echo "WARNING: FIX53T not found in source!"
-	@grep -c "SQAGE_MIESHI" $(SOURCE) || echo "WARNING: SQAGE_MIESHI (FIX53T new channel) not found in source!"
-	@grep -c "FIX53O-SEND" $(SOURCE) || echo "WARNING: FIX53O-SEND not found!"
-	@grep -c "doReencrypt" $(SOURCE) || echo "WARNING: doReencrypt not found!"
-	@grep -c "macIsEmpty" $(SOURCE) || echo "WARNING: macIsEmpty (FIX53P empty MACADDRESS fix) not found!"
-	@grep -c "hasFull" $(SOURCE) || echo "WARNING: hasFull (FIX53R CC_MD5 fix) not found!"
-	@grep -c "didReplaceSession || didReplaceTicket || didReplaceUUID" $(SOURCE) || echo "WARNING: FIX53T md5_recompute didReplaceUUID check not found!"
-	@grep -c "iPhone7Plus" $(SOURCE) || echo "WARNING: iPhone7Plus check not found!"
-	@grep -c "g_l4_saved_valid" $(SOURCE) || echo "WARNING: g_l4_saved_valid check not found!"
-	@grep -c "newPkt\[12\]=p\[12\]" $(SOURCE) || echo "WARNING: fmtFlag copy from original not found!"
-	@grep -c "Apple Inc. Apple A10 GPU" $(SOURCE) || echo "WARNING: GPU check not found!"
-	@grep -c "DYanyou0040_MIESHI" $(SOURCE) || echo "WARNING: Channel check not found!"
-	@grep -c "dmGenericDelta" $(SOURCE) || echo "WARNING: dmGenericDelta (generic fallback) not found!"
-	@grep -c "iPhone " $(SOURCE) || echo "WARNING: iPhone prefix fallback not found!"
-	@grep -c "iPad" $(SOURCE) || echo "WARNING: iPad fallback not found!"
-	@grep -c "Apple Inc. Apple A" $(SOURCE) || echo "WARNING: GPU prefix fallback not found!"
-	@grep -c "FIX53G-DM-GENERIC" $(SOURCE) || echo "WARNING: FIX53G-DM-GENERIC not found!"
-	@grep -c "FIX53H-CH-RELAX" $(SOURCE) || echo "WARNING: FIX53H bounded-check relax not found!"
-	@grep -c "fffWhich == 1 || fffWhich == 2" $(SOURCE) || echo "WARNING: FIX53J open block not found!"
-	@grep -c "wxhook_nolimit" $(SOURCE) || echo "WARNING: wxhook_nolimit not found!"
-	@grep -c "FIX39" $(SOURCE) || echo "WARNING: FIX39 not found in source!"
-	@echo "=== Building ==="
-	$(CC) $(CFLAGS) -fexceptions -frtti -x objective-c++ $(SOURCE) -x objective-c++ $(PROTO) -x c $(FISHHOOK) -o $(TARGET)
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
 	@echo "Built: $(TARGET)"
-	@echo "=== Binary verification ==="
-	@strings $(TARGET) | grep -c "FIX53T" || echo "WARNING: FIX53T not in binary!"
-	@strings $(TARGET) | grep -c "SQAGE_MIESHI" || echo "WARNING: SQAGE_MIESHI not in binary!"
-	@strings $(TARGET) | grep -c "FIX53O-SEND" || echo "WARNING: FIX53O-SEND not in binary!"
-	@strings $(TARGET) | grep -c "doReencrypt" || echo "WARNING: doReencrypt not in binary!"
-	@strings $(TARGET) | grep -c "iPhone7Plus" || echo "WARNING: iPhone7Plus check not in binary!"
-	@strings $(TARGET) | grep -c "FIX53H-CH-RELAX" || echo "WARNING: FIX53H bounded checks not in binary!"
-	@strings $(TARGET) | grep -c "fffWhich == 1 || fffWhich == 2" || echo "WARNING: FIX53J open block not in binary!"
-	@strings $(TARGET) | grep -c "FIX39" || echo "WARNING: FIX39 not in binary!"
 	@ls -la $(TARGET)
 
 clean:
