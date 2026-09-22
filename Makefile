@@ -1,4 +1,4 @@
-# WangXianHook Makefile
+﻿# WangXianHook Makefile
 # Builds WangXianHook.dylib for iOS arm64
 
 TARGET = WangXianHook.dylib
@@ -9,7 +9,8 @@ CC        = $(shell xcrun --sdk iphoneos --find clang)
 ARCH      = arm64
 MIN_IOS   = 12.0
 
-CFLAGS  = -arch $(ARCH)
+CFLAGS += -x objective-c++
+CFLAGS += -arch $(ARCH)
 CFLAGS += -isysroot $(SDK_PATH)
 CFLAGS += -miphoneos-version-min=$(MIN_IOS)
 CFLAGS += -framework Foundation
