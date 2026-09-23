@@ -22575,6 +22575,7 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
 
             int hasCh = 0, hasDm = 0, hasGp = 0;
             int hasUuidMac = 0;  // FIX53: UUID=MACADDRESS=xxx detected
+            int hasUuidEmpty = 0; // FIX53V: empty UUID=MACADDRESS=" detected (+36B delta)
             int hasUuidBare = 0; // FIX53: bare UUID detected
             int dmVariant = 0; // FIX52: 0=none, 1=16ProMax(17B), 2=14Pro(13B), 3=7Plus(11B)
             int gpVariant = 0; // FIX52: 0=none, 1=A18Pro(28B), 2=A16(24B), 3=A10(24B)
@@ -22605,7 +22606,16 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 if (!hasGp && i + 18 <= actualLen && memcmp((const uint8_t *)actualInput + i, "Apple Inc. Apple A", 18) == 0) { hasGp = 1; gpVariant = 2; } // FIX53G: 18B not 19B
 
                 // FIX53G: 检测UUID=MACADDRESS=前缀(16B, 非17B — null终止符bug修复)
-                if (!hasUuidMac && i + 16 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 16) == 0) { hasUuidMac = 1; }
+                if (!hasUuidMac && i + 16 <= actualLen && memcmp((const uint8_t *)actualInput + i, "UUID=MACADDRESS=", 16) == 0) {
+                    hasUuidMac = 1;
+                    // FIX53V: Check if UUID value is empty (followed by " , or 0)
+                    if (i + 17 <= actualLen) {
+                        uint8_t afterUuid = ((const uint8_t *)actualInput)[i + 16];
+                        if (afterUuid == '"' || afterUuid == ',' || afterUuid == 0) {
+                            hasUuidEmpty = 1;
+                        }
+                    }
+                }
 
                 // FIX53: 检测裸UUID(36B格式, 连字符位置8/13/18/23)
                 if (!hasUuidBare && i + 36 <= actualLen &&
@@ -22631,7 +22641,8 @@ static int hook_CC_MD5_Update(void *c, const void *data, CC_LONG len) {
                 else if (dmVariant == 2) newLen_i -= 2; // 11 - 13 (14 Pro)
                 else if (dmVariant == 3) newLen_i += 0;  // 11 - 11 (7Plus, no change)
 
-                // FIX53: UUID=MACADDRESS替换 53B→53B(等长, 全部用66B0EE01), 裸UUID 36→36(delta=0)
+                // FIX53V: empty UUID=MACADDRESS=" → canonical (+36B). Non-empty: 52B→52B(等长). bare UUID 36→36(delta=0)
+                if (hasUuidEmpty) newLen_i += 36; // FIX53V: empty UUID insertion delta
 
                 // FIX52: 根据GPU变体计算delta
                 if (gpVariant == 1) newLen_i -= 4;   // 24 - 28 (A18 Pro)
@@ -27028,7 +27039,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
             // FIX52: 根据变体分别计算delta
             // dm: 16 Pro Max(17→11, delta=-6), 14/13 Pro(13→11, delta=-2)
             // gp: A18 Pro(28→24, delta=-4), A16/A15(24→24, delta=0)
-            // FIX53: UUID全部等长替换(53→53, 36→36), 无delta
+            // FIX53V: empty UUID=MACADDRESS=" → canonical (+36B). Non-empty 52B→52B, bare 36B→36B
             // FIX53E: 通用fallback delta动态计算 (origLen→11/24)
             // FIX53G: UUID空值插入 +36B per empty UUID
             ssize_t delta = (ssize_t)chCount * 9
@@ -27038,7 +27049,7 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                           + (ssize_t)gpA16Count * 0
                           - (ssize_t)dmGenericDelta   // FIX53E: 通用设备型号 delta (正值=缩短)
                           - (ssize_t)gpGenericDelta    // FIX53E: 通用GPU delta (正值=缩短)
-                          + 0; // FIX53K: uuidEmptyCount * 36 DISABLED — do NOT insert UUID (match CC_MD5 uuid=0)
+                          + (ssize_t)uuidEmptyCount * 36; // FIX53V: RE-ENABLE empty UUID insertion — must match CC_MD5 (which inserts canonical UUID for empty UUID=MACADDRESS=). FIX53K disabled this causing MD5(canonical) != ciphertext(empty) -> server signature reject.
 
             size_t newDataInLen = (size_t)((ssize_t)dataInLen + delta);
 
@@ -27225,14 +27236,14 @@ static int hook_CCCrypt_v37_26(uint32_t op, uint32_t alg, uint32_t options,
                     } else if (rem >= 16 && memcmp(p, "UUID=MACADDRESS=", 16) == 0) {
 
                         // FIX53J: UUID=MACADDRESS= 检测 (16B前缀, 修复null终止符bug)
-                        // FIX53K: DISABLE empty UUID insertion! CC_MD5 hook does NOT insert UUID into
-                        // HMAC concat input (uuid=0), so CCCrypt L4 must NOT insert it either.
-                        // Otherwise: HMAC(based on empty UUID) ≠ ciphertext(based on 66B0EE01 UUID).
-                        // Instead: copy original 16B prefix as-is, let the next iteration handle the rest.
+                        // FIX53V: RE-ENABLE empty UUID insertion! CC_MD5 hook DOES insert canonical UUID
+                        // for empty UUID=MACADDRESS= (L22739-L22742), so CCCrypt L4 MUST insert it too
+                        // to keep MD5 input == ciphertext plaintext. FIX53K disabled this, causing
+                        // MD5(canonical UUID) != ciphertext(empty UUID) -> server rejects signature.
                         if (p + 16 < e && (*(p + 16) == '"' || *(p + 16) == ',' || *(p + 16) == 0)) {
-                            // 空UUID: FIX53K — DO NOT insert canonical UUID, copy original as-is
-                            memcpy(out, p, 16);
-                            out += 16; p += 16; continue;
+                            // 空UUID: FIX53V — INSERT canonical UUID (16B -> 52B, +36B delta)
+                            memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
+                            out += 52; p += 16; continue;
                         } else if (rem >= 52) {
                             // 非空UUID: 替换为canonical (52B→52B, 等长)
                             memcpy(out, "UUID=MACADDRESS=66B0EE01-5D2B-4EAE-BFB3-ECA9CABF16F8", 52);
